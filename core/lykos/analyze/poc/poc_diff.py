@@ -72,12 +72,20 @@ def poc_diff_stage(ctx) -> dict:
             fnd = a_finds.get(p.finding_id) if p.finding_id else None
             # A crash PoC reproduces by SIGNAL; a no-crash L3 exploit exits cleanly, so it must be
             # verified by the WIN itself (breakpoint / output marker), not by a fault.
-            crash_based = bool(p.signal_name) or bool(dr and dr.crashed)
-            kind = "crash" if crash_based else ("win" if p.level == "L3" else "skip")
+            kind = _poc_kind(p, dr)
             key = (p.input_sha, kind)
             if key not in replayed:
                 if kind == "crash":
                     replayed[key] = _replay_on(ctx, run_input, exe, b, dr, p.input_sha, workdir)
+                elif kind == "hang":
+                    replayed[key] = _replay_hang_on(ctx, exe, b, dr, p, workdir)
+                elif kind == "availability":
+                    # A leak / exhaustion PoC is proven by a measurement (bytes per request, a
+                    # capped drive), not by a fault -- a crash replay of it never faults, and that
+                    # silence used to be reported as "fixed".
+                    replayed[key] = {"reproduced": None, "mode": None, "method": None,
+                                     "error": f"{p.signal_name} PoC is not re-measured by this "
+                                              "diff; a crash replay cannot show it either way"}
                 elif kind == "win":
                     win_name = _win_name(ctx, FindingDAO(ctx.conn), fnd, p)
                     replayed[key] = _verify_win_on(ctx, run_input, exe, a_exe, b, b_bytes, dr,
@@ -120,32 +128,120 @@ def poc_diff_stage(ctx) -> dict:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+#: The PoC signal names that are not faults: a crash replay of these never faults, so they must
+#: not be read through one (see `_poc_kind`).
+_AVAILABILITY_SIGNALS = frozenset({"memory-leak", "resource-exhaustion"})
+#: The channels `run_input` can deliver. Anything else (env, prompt, socket) replayed through it
+#: arrives as plain stdin -- the input never reaches the program, it does not fault, and the
+#: candidate would be reported fixed for a reason that has nothing to do with the patch.
+_REPLAYABLE = ("stdin", "file", "arg")
+
+
+def _poc_kind(poc, dr) -> str:
+    """How this PoC is re-verified: by a fault, by non-termination, by the win, or not at all."""
+    from .dos import HANG_SIGNAL
+    if poc.signal_name == HANG_SIGNAL:
+        return "hang"
+    if poc.signal_name in _AVAILABILITY_SIGNALS:
+        return "availability"
+    if poc.signal_name or (dr and dr.crashed):
+        return "crash"
+    return "win" if poc.level == "L3" else "skip"
+
+
+def _delivery(dr):
+    """(mode, flag prefix) the baseline's crash row recorded. `dyn_result.argv` is the FLAG
+    PREFIX, never the carrier (see capture.how_to_feed) -- this used to drop its last element for
+    arg/file mode, so a crash gated behind a trailing flag was replayed without it, did not
+    fault, and the candidate was reported FIXED."""
+    mode = (dr.input_mode if dr else None) or "stdin"
+    return mode, list(dr.argv) if (dr and dr.argv) else []
+
+
 def _replay_on(ctx, run_input, exe, target, dr, input_sha, workdir, *, times: int = 3,
                timeout: float = 8.0) -> dict:
     """Replay one input against the candidate `times`; return whether it faulted. Delivery mode and
     argv come from the BASELINE's crash row (dr), so a flag-gated crash is replayed w/ the flag."""
+    from .stage import _san_report
     try:
         data = ctx.content.get_bytes(input_sha)
     except Exception:
         observe.absorbed(_log, "falling back")
         return {"error": "input unavailable", "reproduced": None, "mode": None}
-    mode = (dr.input_mode if dr else None) or "stdin"
-    argv = list(dr.argv) if (dr and dr.argv) else []
-    base_argv = argv[:-1] if (mode in ("arg", "file") and argv) else argv
-    crashed = 0
+    mode, base_argv = _delivery(dr)
+    if mode not in _REPLAYABLE or (dr is not None and "prompted" in (dr.isolation or "")):
+        return {"error": f"the crash was delivered via {mode}"
+                         + (" (prompted)" if mode in _REPLAYABLE else "")
+                         + ", which this replay cannot reproduce; not counted either way",
+                "reproduced": None, "mode": mode}
+    crashed = ran = 0
     sig = None
     for _ in range(times):
         try:
-            _, res = run_input(exe, mode, workdir / "in.bin", timeout, target.arch, data,
+            _, res = run_input(exe, mode, _workfile(exe), timeout, target.arch, data,
                                endianness=target.endianness, bits=target.bits, base_argv=base_argv)
         except Exception:
             observe.absorbed(_log, "skipping this item")
             continue                                 # unbuildable delivery is not a crash
-        if res.crashed:
+        from ..dynamic import sandbox
+        if sandbox.did_not_run(getattr(res, "isolation", None)):
+            continue                                 # a candidate that never ran proves nothing
+        ran += 1
+        # A sanitizer build reports and EXITS with a code (libFuzzer's 77, ASan's 1): that is a
+        # reproduction, the same rule build_poc applies, not a clean run.
+        san = None if res.crashed else _san_report(res)
+        if res.crashed or san:
             crashed += 1
-            sig = res.signal_name or sig
-    return {"reproduced": crashed > 0, "crashed": crashed, "runs": times, "signal": sig,
+            sig = res.signal_name or (san or {}).get("class") or sig
+    if not ran:
+        return {"error": "the candidate did not run on any replay", "reproduced": None,
+                "mode": mode, "runs": times}
+    return {"reproduced": crashed > 0, "crashed": crashed, "runs": ran, "signal": sig,
             "mode": mode, "error": None}
+
+
+def _replay_hang_on(ctx, exe, target, dr, poc, workdir) -> dict:
+    """A non-termination PoC still reproduces on the candidate when the same differential holds
+    there: a terminating control, and the input still running at the factor x its runtime."""
+    from . import dos
+    try:
+        data = ctx.content.get_bytes(poc.input_sha)
+    except Exception:
+        observe.absorbed(_log, "falling back")
+        return {"error": "input unavailable", "reproduced": None, "mode": None}
+    rec = dos.hang_record(ctx.conn, target, poc.input_sha) or {}
+    mode = (dr.input_mode if dr else None) or rec.get("mode") or "stdin"
+    argv = list(dr.argv) if (dr and dr.argv) else list(rec.get("argv") or [])
+    shim = _ScratchCtx(ctx, Path(exe).parent)
+    verdict, detail = dos.verify_hang(shim, target, exe, mode, argv, data,
+                                      list(dos._CONTROL_FALLBACKS))
+    if verdict is None:
+        return {"error": "inconclusive: " + str(detail.get("why")), "reproduced": None,
+                "mode": mode, "method": "hang"}
+    return {"reproduced": bool(verdict), "method": "hang", "mode": mode, "runs": 1,
+            "crashed": 0, "signal": dos.HANG_SIGNAL if verdict else None, "error": None}
+
+
+def _workfile(exe) -> Path:
+    """The file-mode carrier, BESIDE the staged executable. The sandbox masks /tmp with an empty
+    tmpfs and binds back only the exe's own directory, so the old `workdir/in.bin` (a sibling of
+    the exe's dir) reached the target as a path it could not open: every file-mode PoC "did not
+    fault" and the candidate was reported FIXED."""
+    return Path(exe).parent / "in.bin"
+
+
+class _ScratchCtx:
+    """`ctx` with scratch() pointed at the staged exe's own directory (inside this diff's
+    workdir, removed when the stage ends), so a file-mode input lands where the sandbox binds."""
+
+    def __init__(self, ctx, workdir):
+        self._ctx, self._wd = ctx, workdir
+
+    def scratch(self):
+        return self._wd
+
+    def __getattr__(self, name):
+        return getattr(self._ctx, name)
 
 
 def _win_name(ctx, fdao, fnd, poc):
@@ -192,9 +288,7 @@ def _verify_win_on(ctx, run_input, exe_b, exe_a, b, b_bytes, dr, input_sha, work
     except Exception:
         observe.absorbed(_log, "falling back")
         return {"error": "input unavailable", "reproduced": None, "mode": None, "method": None}
-    mode = (dr.input_mode if dr else None) or "stdin"
-    argv = list(dr.argv) if (dr and dr.argv) else []
-    base_argv = argv[:-1] if (mode in ("arg", "file") and argv) else argv
+    mode, base_argv = _delivery(dr)
 
     # (1) breakpoint: resolve the win function in B's OWN image (a patched rebuild moves it) and
     # check A's exploit input still reaches it under the debugger.
@@ -232,7 +326,7 @@ def _marker_verify(ctx, run_input, exe_b, exe_a, b, data, mode, base_argv, workd
     check candidate B prints it when fed the same input."""
     def _out(exe, d):
         try:
-            _, res = run_input(exe, mode, workdir / "in.bin", timeout, b.arch, d,
+            _, res = run_input(exe, mode, _workfile(exe), timeout, b.arch, d,
                                endianness=b.endianness, bits=b.bits, base_argv=base_argv)
         except Exception:
             observe.absorbed(_log, "answering None")

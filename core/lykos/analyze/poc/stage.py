@@ -90,6 +90,17 @@ def build_poc_stage(ctx) -> dict:
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
+    # A NON-TERMINATING input (CWE-835, filed by the fuzz stage) is not a crash: there is no
+    # signal to wait for and the crash replay below would file it as an unverified L0 "did not
+    # crash". It gets its own success check -- a control that terminates, and this input still
+    # running at HANG_FACTOR x the control's runtime -- and is filed L1 only when that holds.
+    # Asked for explicitly (`kind: "hang"`) or recognised from the finding the campaign filed.
+    from . import dos
+    if p.get("kind") == "hang" or (p.get("kind") is None
+                                   and dos.is_recorded_hang(ctx.conn, target, input_sha)):
+        return dos.hang_poc(ctx, target, input_sha, exe=exe, params=p,
+                            target_bytes=target_bytes, exec_name=_exec_name)
+
     # A libFuzzer crash is a crash of the HARNESS, which is a different binary from the one that
     # was ingested. Replaying the input against the ingested binary is not a weaker test, it is
     # the wrong one: a heap overflow reached through `TIFFReadRGBAImage` does not reproduce under
@@ -319,7 +330,6 @@ def build_poc_stage(ctx) -> dict:
         # never retract the L1 just filed.
         if res.signal_name == "memory-leak":
             try:
-                from . import dos
                 dos.escalate(ctx, target, input_sha, mode, argv_base=argv)
             except Exception:  # escalation only ADDS a higher PoC; never fail the L1
                 pass                                     # escalation only ADDS; never fail the L1

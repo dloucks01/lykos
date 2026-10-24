@@ -48,6 +48,7 @@ PTRACE_GETSIGINFO = 0x4202
 PTRACE_GETREGSET = 0x4204
 NT_PRSTATUS = 1
 _SI_ADDR_OFFSET = 16          # offset of si_addr in siginfo_t (x86-64 / aarch64)
+_SI_CODE_OFFSET = 8           # offset of si_code (after si_signo, si_errno) on both hosts
 
 # stack window captured around SP at the fault (bytes): enough to hold the saved return
 # address and adjacent controlled slots, so the offset can be recovered even when a
@@ -150,7 +151,22 @@ def _siginfo_addr(libc, pid):
     buf = (ctypes.c_ubyte * 256)()
     if libc.ptrace(PTRACE_GETSIGINFO, pid, 0, ctypes.byref(buf)) != 0:
         return None
-    return int.from_bytes(bytes(buf[_SI_ADDR_OFFSET:_SI_ADDR_OFFSET + 8]), "little")
+    return _si_addr_from(bytes(buf))
+
+
+def _si_addr_from(raw):
+    """si_addr out of a raw siginfo_t, or None when it is not a fault address.
+
+    si_addr is the faulting address only for a KERNEL-generated fault (si_code > 0). A signal sent
+    with raise()/kill()/tgkill() has si_code <= 0 (SI_USER 0, SI_TKILL -6, SI_QUEUE -1, ...) and
+    the same union bytes hold the sender's pid/uid -- reporting that as `fault_addr` would hand
+    the L2 classifier a fabricated address. Mirrors debug/gdb.py and debug/qemu_gdb.py."""
+    if len(raw) < _SI_ADDR_OFFSET + 8:
+        return None
+    si_code = int.from_bytes(raw[_SI_CODE_OFFSET:_SI_CODE_OFFSET + 4], "little", signed=True)
+    if si_code <= 0:
+        return None
+    return int.from_bytes(raw[_SI_ADDR_OFFSET:_SI_ADDR_OFFSET + 8], "little")
 
 
 def _maps(pid):
@@ -368,7 +384,10 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None,
             select.select([out_r], [], [], 0.02)
             _pump_once()
 
+    fired = {"timeout": False}
+
     def _alarm(_s, _f):
+        fired["timeout"] = True
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -428,6 +447,11 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None,
                 break
             libc.ptrace(PTRACE_CONT, pid, 0, sig)      # deliver non-fatal signals
     signal.alarm(0)
+    if fired["timeout"] and not result.get("ok"):
+        # The tracer's own SIGKILL ended the run: that is a TIMEOUT, not a run that finished
+        # without faulting. Reporting it as "no fatal signal" read as a clean negative.
+        result["reason"] = f"timed out after {max(1, int(timeout))}s (killed by the tracer)"
+        result["timed_out"] = True
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:

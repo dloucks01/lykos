@@ -1185,7 +1185,8 @@ def primitive_stage(ctx) -> dict:
                 _av, _demo, _dcap, _dmode = _address_verdict(
                     ctx, lambda m: _capture_for(m), sweep_modes(mode, orig),
                     orig, target.arch or "x86-64",
-                    siblings=_address_siblings(ctx, target, input_sha))
+                    siblings=_address_siblings(ctx, target, input_sha),
+                    endianness=target.endianness)
             if _av and _av.get("confirmed"):
                 # L2 -> L3: a controlled READ is only a step if its bytes come back. Steer the
                 # lever into mapped memory and let the existing leak machinery judge what the
@@ -1215,8 +1216,13 @@ def primitive_stage(ctx) -> dict:
         # The faulting INSTRUCTION first: it decides whether the pc is where control went (a
         # `ret`) or where control was HANDED OVER (an indirect `call` through a register), and
         # the recovery needs to know which.
+        # The target's byte order (and Thumb state, which the emulated capture reports): without
+        # them disasm_one falls back to the arch's default, so a little-endian MIPS fault decoded
+        # as big-endian -- a different instruction, and the wrong memory operand below.
         disasm = rootcause.disasm_one(bytes.fromhex(cap0.get("pc_bytes", "")),
-                                      target.arch or host)
+                                      target.arch or host,
+                                      cap0.get("endianness") or target.endianness,
+                                      bool(cap0.get("thumb")))
         mnem = (disasm or "").split()[0] if disasm else ""
         rec = primitive.recover_ip_offset(cap0, length, endian=endian, word=word, disasm=disasm)
         regs = primitive.controlled_registers(cap0, length, endian=endian, word=word)
@@ -1296,7 +1302,7 @@ def primitive_stage(ctx) -> dict:
 
         # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
         memp = primitive.analyze_memory_primitive(cap0, length, disasm, endian=endian,
-                                                  word=word)
+                                                  word=word, arch=target.arch or host)
         if memp is not None:
             ctx.progress(msg=f"{memp['type']} at addr offset {memp['addr_offset']}; confirming")
             control = frame(primitive.two_marker_input(memp["addr_offset"], memp.get("value_offset"),
@@ -1413,7 +1419,8 @@ def primitive_stage(ctx) -> dict:
             _av, _demo, _dcap, _dmode = _address_verdict(
                 ctx, lambda m: _capture_for(m), sweep_modes(mode, orig),
                 orig, target.arch or "x86-64",
-                siblings=_address_siblings(ctx, target, input_sha))
+                siblings=_address_siblings(ctx, target, input_sha),
+                endianness=target.endianness)
             if _av and _av.get("confirmed"):
                 _disc = _address_disclosure(ctx, target, _dmode or mode, base_argv, orig, _av,
                                             timeout)
@@ -1479,7 +1486,8 @@ def _address_siblings(ctx, target, input_sha, limit: int = _ADDR_SIBLINGS) -> li
     return out
 
 
-def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=()):
+def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(),
+                     endianness=None):
     """(verdict, demonstrating-input, capture, mode) for the ADDRESS of an uninstrumented fault.
 
     The experiment the sanitizer families cannot run on a stripped binary: re-detonate the
@@ -1512,7 +1520,9 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
             "why": "the crashing input did not fault under the capture on any channel"})
         return None, b"", {}, ""
     cap_fn = capture_for(base_mode)
-    disasm = rootcause.disasm_one(bytes.fromhex(base_cap.get("pc_bytes", "")), arch)
+    disasm = rootcause.disasm_one(bytes.fromhex(base_cap.get("pc_bytes", "")), arch,
+                                  base_cap.get("endianness") or endianness,
+                                  bool(base_cap.get("thumb")))
     is_write = rootcause._is_memory_write(disasm)
     # NOT this family's question. A fault at a `ret`, or with the PC outside executable memory,
     # is instruction-pointer control: the address it "touched" is the hijacked target, which

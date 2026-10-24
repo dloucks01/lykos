@@ -33,7 +33,12 @@ from ..invocation import staged_name as _staged_name
 
 
 def _deliver(mode, payload, argv_base, ctx):
+    # `place` honours the `@@` placeholder (a flag-gated target's `-c @@`); appending put the
+    # carrier after a literal `@@` the program then tried to open.
+    from ..fuzz.runner import place
     if mode == "stdin":
+        if "@@" in [str(a) for a in argv_base]:
+            return place(argv_base, "/dev/stdin"), payload
         return list(argv_base), payload
     if mode == "arg":
         # A synthesized payload always carries a sentinel address, and a sentinel always
@@ -41,10 +46,10 @@ def _deliver(mode, payload, argv_base, ctx):
         # every argv-reachable overflow reported "no crash from N synthesized inputs" -- on
         # ncompress, whose overflow is argv-only and already confirmed to L2.
         # execve truncates at the first NUL anyway, so this delivers what the kernel would.
-        return argv_base + [sandbox.argv_arg(payload, truncate=True)], b""
+        return place(argv_base, sandbox.argv_arg(payload, truncate=True)), b""
     wf = ctx.scratch() / "input.bin"          # file
     wf.write_bytes(payload)
-    return argv_base + [str(wf)], b""
+    return place(argv_base, str(wf)), b""
 
 
 def synthesize_stage(ctx) -> dict:
@@ -118,7 +123,7 @@ def synthesize_stage(ctx) -> dict:
                                   arch=target.arch, endianness=target.endianness,
                                   bits=target.bits)
                 if res.crashed:
-                    return _finalize(ctx, target, target_bytes, payload, mode, run_argv,
+                    return _finalize(ctx, target, target_bytes, payload, mode, argv_base,
                                      res, c, off, slack, tried)
 
     # NON-EXECUTED RECIPE: the overflow input is DERIVED from the recovered frame, not from a
@@ -243,7 +248,13 @@ def _file_ret2win_recipe(ctx, target, target_bytes, exact, lead, why, word, endi
         pass
 
 
-def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off, slack, tried):
+def _finalize(ctx, target, target_bytes, payload, mode, argv_base, res, cand, off, slack, tried):
+    """`argv_base` is the FLAG PREFIX the detonation ran under, never the argv with the carrier
+    placed: the dyn_result row, the bundle and meta.json all take the prefix (see
+    capture.how_to_feed). Recording the placed argv made every replay carry the PAYLOAD itself
+    (arg mode) or a scratch path that no longer exists (file mode) ahead of its own carrier, and
+    made the bundle's runner.sh run `./target.bin /tmp/<gone>/input.bin ./input.bin`."""
+    argv_base = list(argv_base or [])
     input_sha = ctx.put_artifact("synth-crash-input", data=payload)
     # Record the fault as a first-class crashing dyn_result, exactly like a fuzzer-found crash. The
     # autopilot's prove/exploit phase selects crashes from the dyn_result table (distinct_crashes),
@@ -253,7 +264,7 @@ def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off
     defect_key = asan_defect_key(res.stderr) if res.signal_name == "SIGABRT" else None
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha, input_mode=mode,
-        argv=list(run_argv), signal=res.signal, signal_name=res.signal_name, crashed=True,
+        argv=list(argv_base), signal=res.signal, signal_name=res.signal_name, crashed=True,
         isolation=res.isolation, duration_ms=res.duration_ms, fault_pc=res.fault_pc,
         defect_key=defect_key, note="synthesized from the static stack frame; no fuzzing")
     detail = (f"synthesized from static CWE-121: {cand['size']}-byte buffer {cand['buffer']} at "
@@ -261,10 +272,10 @@ def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off
               + (f" (predicted {cand['offset']}{'+' if slack > 0 else ''}{slack if slack else ''})"
                  if slack else "") + "; no fuzzing")
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
-            "argv": run_argv, "expected_signal": res.signal_name, "isolation": res.isolation,
+            "argv": argv_base, "expected_signal": res.signal_name, "isolation": res.isolation,
             "verified": True, "level": "L1", "synthesized": True, "offset": off,
             "buffer": cand["buffer"], "buffer_size": cand["size"], "tool_version": TOOL_VERSION}
-    data = bundle.build(target_bytes, payload, meta, res.stderr, mode, run_argv,
+    data = bundle.build(target_bytes, payload, meta, res.stderr, mode, argv_base,
                         res.signal_name or "SIGSEGV")
     bundle_sha = ctx.put_artifact("poc-bundle", data=data,
                                   meta={"verified": True, "level": "L1"})

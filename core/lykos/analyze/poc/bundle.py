@@ -42,10 +42,20 @@ def _argv_text(argv, *, carrier=None) -> str:
     return " ".join(out)
 
 
-def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
-            main_class: str | None = None, sanitizer: str = "", retries: int = 0,
-            marker: str = "", guard_page: str = "", exec_name: str = "") -> bytes:
+def _setup_and_invoke(mode: str, argv, run_cmd=None, runtime: str = "native",
+                      main_class: str | None = None, sanitizer: str = "",
+                      guard_page: str = "", exec_name: str = "", mem_cap_mb: int = 0,
+                      trailing_newline: bool = False):
+    """(setup, invoke): the shell that prepares the replay and the ONE command line that feeds
+    ./input.bin to the target. Shared by runner.sh and the hang check, so the non-termination
+    reproducer runs exactly the command a crash reproducer would.
+
+    `trailing_newline`: the input ends in a newline, which `"$(cat ./input.bin)"` would STRIP --
+    shell command substitution drops every trailing newline, so an arg/env reproducer delivered a
+    shorter value than the one verified. Such an input is read through a sentinel instead."""
     argv = list(argv or [])
+    exact = trailing_newline and mode in ("arg", "env")
+    carrier = '"$LYKOS_IN"' if exact else '"$(cat ./input.bin)"'
     placed = INPUT_PLACEHOLDER in [str(a) for a in argv]
     # A jar is not executable and the JVM is not the target: `./target.bin` is a zip file, and
     # the reproducer has to name the runtime that reads it.
@@ -127,10 +137,10 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         # delivers exactly the bytes the kernel would.
         if placed:
             invoke = (exe + " " + " ".join(
-                '"$(cat ./input.bin)"' if str(a) == INPUT_PLACEHOLDER else shlex.quote(str(a))
+                carrier if str(a) == INPUT_PLACEHOLDER else shlex.quote(str(a))
                 for a in argv))
         else:
-            invoke = f'{exe}{" " + pre if pre else ""} "$(cat ./input.bin)"'
+            invoke = f'{exe}{" " + pre if pre else ""} {carrier}'
     elif mode == "prompt":
         # One field per prompt, paced by the shipped script. `< input.bin` is wrong here for the
         # reason in `_PROMPT_REPLAY`: `read` takes whatever is available, so a bulk feed puts
@@ -150,11 +160,46 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         var, rest = env_var_from_argv(argv)
         pre = _argv_text(rest, carrier="./input.bin")
         if var:
-            invoke = (f'{var}="$(cat ./input.bin)" {exe}' + (" " + pre if pre else ""))
+            invoke = (f'{var}={carrier} {exe}' + (" " + pre if pre else ""))
         else:
             invoke = f'{exe}{" " + pre if pre else ""}'
     else:
         invoke = f'{exe}{" " + pre if pre else ""}'
+    if exact:
+        setup += 'LYKOS_IN="$(cat ./input.bin; printf x)"; LYKOS_IN="${LYKOS_IN%x}"\n'
+    if mem_cap_mb:
+        # AN AVAILABILITY PoC IS ONLY A PoC UNDER THE BUDGET IT WAS MEASURED UNDER. The impact was
+        # shown with the child capped at `mem_cap_mb` of address space; replayed uncapped on a
+        # workstation the same stream simply finishes, and the reproducer "fails". The cap is
+        # applied to this script's own process tree, never to the host.
+        setup += (f"ulimit -v {int(mem_cap_mb) * 1024} || echo 'WARNING: could not apply the "
+                  f"{int(mem_cap_mb)} MB address-space cap this PoC was verified under' >&2\n")
+    return setup, invoke
+
+
+def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
+            main_class: str | None = None, sanitizer: str = "", retries: int = 0,
+            marker: str = "", guard_page: str = "", exec_name: str = "",
+            hang: dict | None = None, mem_cap_mb: int = 0,
+            trailing_newline: bool = False) -> bytes:
+    setup, invoke = _setup_and_invoke(mode, argv, run_cmd, runtime, main_class, sanitizer,
+                                      guard_page, exec_name, mem_cap_mb, trailing_newline)
+    if hang:
+        # A NON-TERMINATION is not an exit status: "it is still running" is only a finding next
+        # to an input that FINISHES under the same limits. The check lives in hang_check.py
+        # (shipped with hang.json, see `_hang_spec`), which runs control.bin and then input.bin
+        # through the very command line below, in their own process groups, and kills them on
+        # the limit -- a shell `timeout` would leave the target running when it is the shell's
+        # grandchild.
+        return ("#!/bin/sh\n"
+                f"# PoC reproducer for a NON-TERMINATING input ({signal_name}).\n"
+                "# Runs control.bin (must finish) and then input.bin (must still be running at\n"
+                f"# {hang.get('factor')}x the control's runtime, floor {hang.get('limit_s')}s).\n"
+                "# Exit 0 = reproduced, 1 = input.bin terminated, 2 = inconclusive.\n"
+                "# RUN IN A SANDBOX/VM -- this executes an untrusted binary. Authorized use only.\n"
+                'cd "$(dirname "$0")"\n'
+                "python3 ./hang_check.py\n"
+                "exit $?\n").encode()
     if runtime in ("jar", "class"):
         # A JVM fault is an uncaught exception on stderr and an exit code of 1, not a signal.
         # Telling the reader to look for 128+signum would have them conclude the reproducer
@@ -696,6 +741,78 @@ sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(1)
 '''
 
 
+_HANG_CHECK = br'''#!/usr/bin/env python3
+"""Does input.bin make the target RUN FOREVER, where control.bin finishes?
+
+A timeout on its own proves nothing -- a slow machine, a target that waits on a terminal, a
+loaded box all time out. What makes a non-termination a finding is the DIFFERENTIAL, under the
+same command line and the same limits:
+  1. control.bin is run first and must TERMINATE (within ceiling/factor seconds);
+  2. input.bin is then run with a limit of max(floor, factor x the control's runtime), and must
+     still be running when it expires.
+Each run is its own process group and is killed whole on the limit, so nothing is left behind.
+Exit 0 = reproduced; 1 = input.bin terminated (not reproduced); 2 = inconclusive.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+spec = json.load(open("hang.json"))
+factor = float(spec["factor"])
+floor = float(spec["limit_s"])
+ceiling = float(spec["ceiling_s"])
+
+
+def run(cmd, limit):
+    t0 = time.monotonic()
+    p = subprocess.Popen(["/bin/sh", "-c", cmd], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        rc = p.wait(timeout=limit)
+        return rc, time.monotonic() - t0, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.wait()
+        return None, time.monotonic() - t0, True
+
+
+c_rc, c_s, c_hung = run(spec["control"], ceiling / factor)
+if c_hung:
+    print("INCONCLUSIVE: the control input (control.bin) did not terminate within %.1fs either, "
+          "so a timeout on input.bin says nothing about input.bin" % (ceiling / factor))
+    sys.exit(2)
+limit = max(floor, factor * c_s)
+print("control.bin terminated in %.3fs (status %s); input.bin limit %.1fs "
+      "(%gx the control, floor %gs)" % (c_s, c_rc, limit, factor, floor))
+i_rc, i_s, i_hung = run(spec["input"], limit)
+if i_hung:
+    print("REPRODUCED: input.bin DID NOT TERMINATE -- still running after %.1fs and killed, "
+          "while control.bin finished in %.3fs" % (i_s, c_s))
+    sys.exit(0)
+print("NOT REPRODUCED: input.bin terminated in %.3fs (status %s)" % (i_s, i_rc))
+sys.exit(1)
+'''
+
+
+def _hang_spec(hang: dict, setup: str, invoke: str) -> bytes:
+    """hang.json for hang_check.py: the limits and the two command lines. The control's command
+    is the input's with the carrier swapped, so both runs differ ONLY in the bytes delivered."""
+    return json.dumps({
+        "factor": hang.get("factor"), "limit_s": hang.get("limit_s"),
+        "ceiling_s": hang.get("ceiling_s"), "input": setup + invoke,
+        "control": (setup + invoke).replace("./input.bin", "./control.bin"),
+        "verified_control_ms": hang.get("control_ms"),
+        "verified_limit_s": hang.get("verified_limit_s")}, indent=2).encode()
+
+
 #: How to tell, mechanically, that a reproducer worked -- per runtime. `exit` is the shell status
 #: to expect; `signal` means ">=128, the shell's convention for a signal-killed child"; `nonzero`
 #: means the runtime reports an uncaught fault and exits non-zero; `file` means the verdict is in
@@ -737,7 +854,15 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
           runtime: str = "native", main_class: str | None = None,
-          guard_page: str = "", exec_name: str = "") -> bytes:
+          guard_page: str = "", exec_name: str = "", hang: dict | None = None,
+          control_bytes: bytes | None = None, mem_cap_mb: int = 0) -> bytes:
+    """`hang` makes this a NON-TERMINATION bundle: {factor, limit_s, ceiling_s, control_ms,
+    verified_limit_s} and `control_bytes` (an input that terminates) are required together --
+    without a control there is no differential, and the bundle refuses rather than shipping a
+    reproducer whose only evidence is a timeout. `mem_cap_mb` replays under the address-space cap
+    an availability impact was measured under."""
+    if hang is not None and control_bytes is None:
+        raise ValueError("a non-termination bundle needs a control input that terminates")
     # A sanitizer-reported fault needs a different reproducer and a different success criterion
     # from a signal; the primitive is the only thing that knows which this is.
     sanitizer = str((primitive or {}).get("sanitizer_class") or "")
@@ -753,6 +878,28 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
                 "wasm_driver.js", pathlib.Path(_sb._wasm_driver_path()).read_bytes())
         except Exception:                                # noqa: BLE001 -- bundle without it
             observe.absorbed(_log, "shipping the bundle without the WASM driver")
+    # An argv element and an environment value are C strings: the kernel delivered the input
+    # only up to its first NUL, and that is what was verified. `$(cat)` would instead DROP the
+    # NULs and splice the rest together -- a different argument from the one that crashed -- so
+    # the bundle ships exactly the delivered bytes and says it did.
+    _nul_cut = mode in ("arg", "env") and b"\0" in (input_bytes or b"")
+    if _nul_cut:
+        input_bytes = bytes(input_bytes).split(b"\0", 1)[0]
+    if control_bytes is not None and mode in ("arg", "env"):
+        control_bytes = bytes(control_bytes).split(b"\0", 1)[0]
+    _nl = mode in ("arg", "env") and bytes(input_bytes or b"").endswith(b"\n")
+    if hang is not None:
+        if mode not in ("stdin", "file", "arg", "env"):
+            raise ValueError(f"a non-termination bundle cannot replay via {mode!r}")
+        extra_files = dict(extra_files or {})
+        # The control's command is the input's with the carrier file swapped, so it is read
+        # the exact-preserving way whenever EITHER input needs it.
+        _hs, _hi = _setup_and_invoke(mode, argv, run_cmd, runtime, main_class, sanitizer,
+                                     guard_page, exec_name, mem_cap_mb,
+                                     _nl or bytes(control_bytes).endswith(b"\n"))
+        extra_files["hang_check.py"] = _HANG_CHECK
+        extra_files["hang.json"] = _hang_spec(hang, _hs, _hi)
+        extra_files["control.bin"] = bytes(control_bytes)
     if mode == "prompt":
         # A prompt-protocol crash cannot be a `< input.bin` one-liner: delivered in bulk the
         # whole file lands in field one and field two reaches EOF, so the reproducer the operator
@@ -829,10 +976,26 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
     if mode == "prompt":
         files += ["replay_prompt.py - delivers input.bin one field per prompt, which is how the "
                   "crash was found: fed in bulk, field one swallows the whole file"]
+    if hang is not None:
+        files += ["control.bin - an input that TERMINATES under the same command line: the "
+                  "non-termination is only a finding next to it",
+                  "hang_check.py / hang.json - runs control.bin then input.bin with the limits "
+                  "and kills each run's whole process group on expiry"]
     files += ["runner.sh   - runs the reproducer for you",
               "meta.json   - machine-readable details (target hash, arch, offset, tool)",
               "PRIMITIVE.txt / stderr.txt - the primitive description and captured diagnostics"]
-    what_success = ("the process is hijacked to the attacker-chosen code (you'll see its "
+    what_success = (f"runner.sh prints REPRODUCED and exits 0: control.bin terminates and "
+                    f"input.bin is still running at {(hang or {}).get('factor')}x the control's "
+                    f"runtime (floor {(hang or {}).get('limit_s')}s), then is killed"
+                    if hang is not None
+                    else f"the process exhausts its {mem_cap_mb} MB budget and terminates "
+                         f"abnormally (runner.sh applies the cap; a non-zero status)"
+                    if mem_cap_mb
+                    # A caller-stated verdict (the LSan amplification bundle) says what success
+                    # looks like better than "dies with resource-exhaustion", which is no signal.
+                    else str((meta.get("verdict") or {}).get("note"))
+                    if isinstance(meta.get("verdict"), dict) and meta["verdict"].get("note")
+                    else "the process is hijacked to the attacker-chosen code (you'll see its "
                     "marker output)" if level == "L3"
                     else f"the {sanitizer} report appears on stderr and the process aborts "
                          f"(exit 134)" if sanitizer
@@ -872,7 +1035,8 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
              _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
                      sanitizer=sanitizer, guard_page=guard_page, exec_name=exec_name,
                      retries=int((primitive or {}).get("retries") or 0) if _race else 0,
-                     marker=_race_marker(primitive) if _race else ""), mode=0o755)
+                     marker=_race_marker(primitive) if _race else "", hang=hang,
+                     mem_cap_mb=mem_cap_mb, trailing_newline=_nl), mode=0o755)
         # LABEL THE BINARY THIS BUNDLE ACTUALLY SHIPS. `meta["target_sha256"]` is written by the
         # caller and names the INGESTED target, which is no longer always the binary exploited:
         # for a source drop the ingested target is the ASan+UBSan build and the chain is built
@@ -891,7 +1055,25 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         # `_bundle_reproduces`, required >=128 and would have called a perfectly good JVM
         # reproducer broken.
         _m["runtime"] = runtime
-        _m["verdict"] = _VERDICT_BY_RUNTIME.get(runtime, _VERDICT_BY_RUNTIME["native"])
+        # A caller that knows better says so: an availability PoC succeeds by a non-zero exit
+        # under its cap, a non-termination by runner.sh's own exit 0. Overwriting those with the
+        # native "128+signum" told every mechanical consumer to expect a signal that a correct
+        # reproducer never raises.
+        _given = meta.get("verdict")
+        _m["verdict"] = (dict(_given) if isinstance(_given, dict) and _given.get("exit")
+                         else _VERDICT_BY_RUNTIME.get(runtime, _VERDICT_BY_RUNTIME["native"]))
+        if hang is not None:
+            _m["verdict"] = {"exit": "zero", "script": "runner.sh",
+                             "note": "runner.sh exits 0 only when control.bin terminated and "
+                                     "input.bin was still running at the limit; 1 when "
+                                     "input.bin terminated; 2 when inconclusive"}
+            _m["hang"] = dict(hang)
+        if mem_cap_mb:
+            _m["mem_cap_mb"] = int(mem_cap_mb)
+        if _nul_cut:
+            _m["input_truncated_at_nul"] = ("input.bin holds the bytes before the first NUL: an "
+                                            f"{mode} value is a C string, so that is all the "
+                                            "target ever received")
         if _m.get("target_sha256") and _m["target_sha256"] != _shipped:
             _m["exploited_build"] = ("not the ingested image: this bundle's target.bin is an "
                                      "uninstrumented build of the same program, which is where "

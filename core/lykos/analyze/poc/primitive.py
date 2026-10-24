@@ -417,10 +417,23 @@ def _first_reg_in_brackets(operand):
     return None
 
 
-def parse_mem_access(disasm: str):
+#: The ISAs whose objdump output parse_mem_access understands: Intel-syntax x86. Anything else
+#: is NOT parsed -- an AArch64 `str w1, [x0]` has the store's SOURCE first (the opposite operand
+#: order), and an ARM `ldr r0, [r9]` names r9, which _SUBREG maps to the x86 container `r9`, so
+#: the same text would come back as a confident, wrong {base, value}.
+_MEM_ACCESS_ARCHES = frozenset({"x86-64", "x86", "i386", "i686", "amd64", "x86_64"})
+
+
+def parse_mem_access(disasm: str, arch: str | None = "x86-64"):
     """From an Intel-syntax instruction, return {is_write, base, value} for its memory operand,
     or None if it does not dereference memory. `base` is the address register (64-bit name),
-    `value` the source register for a store (else None)."""
+    `value` the source register for a store (else None).
+
+    `arch` gates it: for any ISA but x86 this returns None (unknown) rather than guessing from
+    Intel operand order and x86 register names. None for `arch` means the caller does not know
+    the ISA, which is answered the same way."""
+    if (arch or "").lower() not in _MEM_ACCESS_ARCHES:
+        return None
     if not disasm or "[" not in disasm:
         return None
     parts = disasm.split(None, 1)
@@ -435,7 +448,8 @@ def parse_mem_access(disasm: str):
 
 
 def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4,
-                             endian: str = "little", word: int = 8):
+                             endian: str = "little", word: int = 8,
+                             arch: str | None = "x86-64"):
     """Classify an attacker-controlled memory access at the fault: write-what-where (address
     and stored value both controlled), controlled-write (address only), or controlled-read
     (arbitrary read address). Returns a primitive dict or None.
@@ -444,10 +458,11 @@ def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4,
     controlled address raises #GP, for which the kernel reports si_addr as 0, so the register
     value is the reliable signal. `word`/`endian` describe the TARGET so the register bytes are
     matched in the cyclic pattern in its width and byte order (a 32-bit target's address
-    register is 4 bytes, not 8)."""
+    register is 4 bytes, not 8). `arch` is the target ISA: the operand parse is x86-only, so
+    a non-x86 fault yields None here (no claim) instead of a mis-parsed one."""
     if not disasm:
         return None
-    acc = parse_mem_access(disasm)
+    acc = parse_mem_access(disasm, arch)
     if acc is None or not acc["base"]:
         return None
     regs = cap.get("regs") or {}

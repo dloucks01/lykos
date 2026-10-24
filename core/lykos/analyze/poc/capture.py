@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -143,9 +144,21 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
     the L2 primitive's pc-based offset recovery and marker confirmation work cross-arch. No
     ptrace helper and no bwrap (qemu is launched directly)."""
     from ..debug import qemu_gdb
-    work = Path(tempfile.mkdtemp(prefix="lykos-qemucap-"))
 
     def capture(data: bytes, breakpoints=None) -> dict:
+        # The scratch dir is per CALL and removed when the call returns. It used to be made once
+        # per factory and never removed, and the exploit stage builds a fresh emulated capture for
+        # every arch candidate -- a leaked /tmp dir (holding a copy of the input) per attempt.
+        # Only the file channel needs one; qemu_gdb.capture is synchronous, so nothing reads
+        # input.bin after it returns.
+        work = Path(tempfile.mkdtemp(prefix="lykos-qemucap-")) if mode == "file" else None
+        try:
+            return _qemu_capture_once(qemu_gdb, work, data, breakpoints)
+        finally:
+            if work is not None:
+                shutil.rmtree(work, ignore_errors=True)
+
+    def _qemu_capture_once(qemu_gdb, work, data, breakpoints):
         argv, stdin = _sub_out(list(base_argv), work), b""
         if mode == "stdin":
             stdin = data
