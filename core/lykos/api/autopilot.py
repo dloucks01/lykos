@@ -31,6 +31,11 @@ class AutopilotMixin:
         the stages understand; anything else (incl. "auto") is dropped so discovery runs."""
         import shlex
         out = dict(over)
+        # Server-side PATHS are a CLI-only channel (`--seed FILE`). From a browser they would let
+        # a request name any file the server can read and have it copied into the case as a seed;
+        # the web path is `seed_shas` (seeds uploaded into THIS case, resolved in _start_autopilot).
+        out.pop("seed_files", None)
+        out.pop("seed_dir", None)
         av = out.get("argv")
         if isinstance(av, str):
             try:
@@ -57,6 +62,15 @@ class AutopilotMixin:
             in_case = [t.id for t in s.targets.list_by_case(cid)]
         finally:
             s.close()
+        # Operator seeds (the GUI's `--seed`): hashes of seeds uploaded into THIS case, resolved to
+        # their case-store paths here, before the run starts -- an unknown hash is refused, not
+        # silently dropped (a run the operator seeded must not quietly run unseeded).
+        _over = body.get("overrides") if isinstance(body.get("overrides"), dict) else {}
+        seed_paths = None
+        if _over.get("seed_shas"):
+            seed_paths, err = self._resolve_seed_shas(cid, _over.get("seed_shas"))
+            if err:
+                return self._json({"error": err}, 400)
         target_ids = body.get("target_ids")
         if target_ids:
             # A string here was iterated per CHARACTER into "target ids", and an id from ANOTHER
@@ -92,6 +106,11 @@ class AutopilotMixin:
             over = body.get("overrides") if isinstance(body.get("overrides"), dict) else None
             if over:
                 over = self._normalize_overrides(over)
+                over.pop("seed_shas", None)
+            if seed_paths:
+                over = dict(over or {})
+                over["seed_files"] = seed_paths
+                status["seeds"] = len(seed_paths)
             converge = bool(body.get("converge"))
             # Stages the operator switched OFF for this run (GUI checkboxes). Restricted to a safe
             # allowlist so a malformed request cannot skip triage/disassembly and hollow out the run;

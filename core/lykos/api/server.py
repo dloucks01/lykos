@@ -26,6 +26,7 @@ from ..jobs import JobConfig, WorkerPool
 from . import ws
 from .autopilot import AutopilotMixin
 from .endpoints import EndpointsMixin
+from .ops import OpsMixin
 from .serializers import (
     _call_edge,
     _case,
@@ -151,8 +152,11 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_FIND,
     _CASE_ID,
     _CASE_REPORT,
+    _CASE_RUN_SIGNALS,
     _CASE_RUNS,
     _CASE_SCORECARD,
+    _CASE_SEED_ID,
+    _CASE_SEEDS,
     _CASE_SYSMAP,
     _CASE_TARGETS,
     _CASE_VERIFS,
@@ -166,6 +170,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _TARGET_ADVICE,
     _TARGET_CAPS,
     _TARGET_CG,
+    _TARGET_CRASH_TRIAGE,
     _TARGET_DYN,
     _TARGET_FIND,
     _TARGET_FUNCS,
@@ -182,7 +187,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
 _log = logging.getLogger(__name__)
 
 
-class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
+class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # Socket timeout: a client that opens a connection and then dribbles (or never sends) its
@@ -415,6 +420,19 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
                 return
             if path == "/health":
                 return self._json({"status": "ok"})
+            if path == "/version":
+                return self._get_version()
+            if path == "/doctor":
+                return self._get_doctor(qs)
+            m = _CASE_RUN_SIGNALS.match(path)
+            if m:
+                return self._get_run_signals(m.group(1))
+            m = _TARGET_CRASH_TRIAGE.match(path)
+            if m:
+                return self._get_crash_triage(m.group(1))
+            m = _CASE_SEEDS.match(path)
+            if m:
+                return self._get_seeds(m.group(1))
             if path == "/cases":
                 s = self._store()
                 try:
@@ -628,6 +646,9 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _CASE_TARGETS.match(path)
             if m:
                 return self._upload_target(m.group(1))
+            m = _CASE_SEEDS.match(path)
+            if m:
+                return self._upload_seed(m.group(1))
             if path == "/runs":
                 return self._create_run()
             m = _RUN_CANCEL.match(path)
@@ -680,6 +701,9 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _TARGET_ID.match(path)
             if m:
                 return self._delete_target(m.group(1))
+            m = _CASE_SEED_ID.match(path)
+            if m:
+                return self._delete_seed(m.group(1), m.group(2).lower())
             self._json({"error": "not found"}, 404, close=True)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)

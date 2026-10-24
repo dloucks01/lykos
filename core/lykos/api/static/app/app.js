@@ -7,9 +7,10 @@ import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import { api, waitForRun } from "./api.js";
 import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
-import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction } from "./util.js";
+import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction, failedTargets } from "./util.js";
 import {
   html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview, CurationFilter,
+  RunSignalsStrip, DoctorPanel, SeedsField, BuildFoot,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -52,8 +53,16 @@ function eventToLog(ev) {
 // so its log reads step by step like the interactive one. The plan panel shows the live/current
 // state, so here we log only the transitions that COMPLETE a step (done/skipped/error/cancelled),
 // carrying the "what it found" detail; the noisy per-exec progress stays out of the log.
-function bgEventToLog(ev) {
+function bgEventToLog(ev, names) {
   const p = ev.payload || {};
+  const nm = (id) => (names && names.get(id)) || (id ? String(id).slice(0, 8) : "a target");
+  if (ev.type === "autopilot.target_error") {
+    // A target whose analysis ABORTED is a failure, not a quiet gap in the results.
+    return { tone: "bad", text: `${nm(p.target_id)}: analysis aborted${p.stage ? ` in ${p.stage}` : ""} — ${p.error || "error"}. The remaining targets continue; this one's results are incomplete.` };
+  }
+  if (ev.type === "autopilot.error") {
+    return { tone: "bad", text: `Background run stopped with an error: ${p.error || "unknown"}` };
+  }
   if (ev.type === "autopilot.stage") {
     if (!p.state || p.state === "running") return null;
     // Report the stage outcome HONESTLY. A stage that DECLINED (ran and could not do its work --
@@ -66,6 +75,13 @@ function bgEventToLog(ev) {
              detail: p.detail || null, status };
   }
   if (ev.type === "autopilot.done") {
+    const failed = Array.isArray(p.failed_targets) ? p.failed_targets : [];
+    if (p.target_errors || failed.length) {
+      // NOT a clean "done": say how many targets failed, and which.
+      const n = p.target_errors || failed.length;
+      return { tone: "bad",
+               text: `Background run finished — ${p.outcome || "done"}, but ${n} target${n === 1 ? "" : "s"} FAILED${failed.length ? `: ${failed.map(nm).join(", ")}` : ""}.` };
+    }
     return { tone: p.outcome === "poc" ? "ok" : "info",
              text: `Background run finished — ${p.outcome || "done"}.` };
   }
@@ -200,6 +216,12 @@ function App() {
   const [invChosen, setInvChosen] = useState(null);   // auto-discovered invocation (R2: "driving as")
   const [curFilter, setCurFilter] = useState(loadCurFilter); // findings-list operator-triage filter
   const [cgFocus, setCgFocus] = useState(null);       // {targetId, addr, title}: finding shown in the call graph
+  const [runSignals, setRunSignals] = useState(null); // honesty signals: failed targets, degraded sandbox, ...
+  const [triageByT, setTriageByT] = useState({});     // targetId -> crash triage (grouped, ranked)
+  const [seeds, setSeeds] = useState([]);             // operator seed files stored in the case
+  const [seedBusy, setSeedBusy] = useState(false);
+  const [doctor, setDoctor] = useState(null);         // engine readiness on this host
+  const [buildInfo, setBuildInfo] = useState(null);   // which build is serving (footer)
   useEffect(() => { try { localStorage.setItem(CURFILTER_KEY, curFilter); } catch {} }, [curFilter]);
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
@@ -227,6 +249,7 @@ function App() {
   // -- so every tick re-read PoCs for zero targets and wiped them (and the system map) from view.
   const targetsRef = useRef(targets);
   targetsRef.current = targets;
+  const activeTidRef = useRef(null);   // the focused target, for the poller's crash-list refresh
   const curLocal = useRef(new Map());  // finding id -> {value, at}: curations saved, not yet re-read
 
   // Everything that belongs to ONE case. Switching case (reopen / new upload / New analysis) must
@@ -238,6 +261,7 @@ function App() {
     setOpenLog(null); setFuzzLive(null); setFuzzState(null); setInvChosen(null); setBgActivity(null);
     setConsoleLines([]); consoleSeen.current = new Set();
     setActiveTid(null); setTab("findings"); setViz(null); setCgFocus(null);
+    setRunSignals(null); setTriageByT({}); setSeeds([]);
     setCodeFn(null); setEvidence(null); setFuncBrowse(null);
     setDisasmFn(null); setDisasmSel({}); setDiffVerify(null); setPatchDiff(null); setHarnessRun(null);
     fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
@@ -371,7 +395,23 @@ function App() {
   useEffect(() => {
     api.health().then((h) => setHealth(h && h.status)).catch(() => setHealth("down"));
     loadRecent();
+    api.version().then(setBuildInfo).catch(() => setBuildInfo(null));
   }, [loadRecent]);
+
+  // Engine readiness (doctor). The server probes in the background; poll while it does, bounded.
+  const doctorPoll = useRef(0);
+  const loadDoctor = useCallback(async (refresh = false) => {
+    const token = ++doctorPoll.current;
+    for (let i = 0; i < 120; i++) {
+      let d;
+      try { d = await api.doctor(refresh && i === 0); } catch (e) { d = { state: "error", error: e.message || String(e) }; }
+      if (token !== doctorPoll.current) return;
+      setDoctor(d);
+      if (!d || d.state !== "probing") return;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }, []);
+  useEffect(() => { loadDoctor(false); }, [loadDoctor]);
 
   // Keyboard-first modal behaviour, for the three overlays app.js owns (code view, evidence
   // inspector, function browser). Escape closes the top-most open one; when a modal opens focus
@@ -452,6 +492,14 @@ function App() {
     setPocs((psArrays || []).flat());
     setSysmap(sm);
     api.attemptLogs(id).then((l) => setAttemptLogs(Array.isArray(l) ? l : [])).catch(() => {});
+    // Honesty signals (incremental server-side, cheap to poll) and the focused target's crash
+    // rows + triage, which used to be fetched once and then go stale for the rest of a run.
+    api.runSignals(id).then((rs) => setRunSignals(rs || null)).catch(() => {});
+    const at = activeTidRef.current || ((ts || [])[0] && ts[0].id);
+    if (at) {
+      api.dynresults(at).then((ds) => setDynByT((c) => ({ ...c, [at]: ds || [] }))).catch(() => {});
+      api.crashTriage(at).then((tr) => setTriageByT((c) => ({ ...c, [at]: tr || null }))).catch(() => {});
+    }
   }, [caseId, targets]);
 
   // Poll the server-side background Autopilot for a case. It keeps running even if this tab is
@@ -532,7 +580,7 @@ function App() {
               pushConsole(ev.id, { cmd: fuzzSummary(ev.type, ev.payload || {}), note: ev.type });
               continue;
             }
-            const row = bgEventToLog(ev);
+            const row = bgEventToLog(ev, new Map((targetsRef.current || []).map((t) => [t.id, t.filename])));
             if (row) { pushLog(row); setBgActivity(null); }
           }
         }
@@ -637,6 +685,8 @@ function App() {
       setSysmap(sm);
       setVerifications(verifs || {});
       setScorecard((cards && cards.cards) || []);
+      api.runSignals(cid).then((rs) => setRunSignals(rs || null)).catch(() => {});
+      api.seeds(cid).then((r) => setSeeds((r && r.seeds) || [])).catch(() => {});
       // Reopened case: recover the fuzzing-health verdict from the latest scorecard card (it lives
       // in the live event stream otherwise, which a reopen has no access to).
       const _fh = ((cards && cards.cards) || []).map((c) => c && c.fuzz_health).filter(Boolean);
@@ -680,6 +730,8 @@ function App() {
       // Deep seed discovery: let the autopilot synthesize parser-buffer seeds for daemon targets
       // whose entry it cannot seed (candidate-tier). Normal auto-seeding runs either way.
       if (deepSeed) overrides.deep_seed = true;
+      // Operator seed files (CLI --seed): by hash; the server resolves them to the case store.
+      if (seeds.length) overrides.seed_shas = seeds.map((x) => x.sha256);
       // Per-stage on/off. Each unchecked engine is skipped for this run; the server validates
       // against a safe allowlist (never triage/disassembly). The rest of the pipeline is unaffected.
       const skipStages = [];
@@ -693,7 +745,28 @@ function App() {
       pollBackground(caseId);
     } catch (e) { setError(e.message || String(e)); }
   }, [caseId, targets, pollBackground, budgetMin, invArgv, invMode, converge, blackBox,
-      covFuzz, dirFuzz, concolicOn, libfuzzerOn, sysroot, deepSeed]);
+      covFuzz, dirFuzz, concolicOn, libfuzzerOn, sysroot, deepSeed, seeds]);
+
+  // Seed upload / removal (stored in the case; one request per file, each capped at 1 MiB).
+  const addSeeds = useCallback(async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length || !caseId) return;
+    setSeedBusy(true);
+    try {
+      for (const f of files) {
+        try { await api.uploadSeed(caseId, f); }
+        catch (e) { setError(`seed ${f.name}: ${e.message || e}`); }
+      }
+      const r = await api.seeds(caseId).catch(() => null);
+      if (r) setSeeds(r.seeds || []);
+    } finally { setSeedBusy(false); }
+  }, [caseId]);
+  const removeSeed = useCallback(async (sha) => {
+    if (!caseId) return;
+    try { await api.deleteSeed(caseId, sha); } catch (e) { setError(`could not remove the seed: ${e.message || e}`); }
+    const r = await api.seeds(caseId).catch(() => null);
+    if (r) setSeeds(r.seeds || []);
+  }, [caseId]);
 
 
   // Upload one or more files. `append` adds to the current case; otherwise it starts fresh.
@@ -874,6 +947,13 @@ function App() {
     }
   }, []);
 
+  // Crash triage -> the finding a crash group belongs to, in the evidence inspector.
+  const openFindingById = useCallback(async (fid) => {
+    const f = findings.find((x) => x.id === fid) || await api.getFinding(fid).catch(() => null);
+    if (f) setEvidence({ finding: f, focus: null });
+    else setError("Could not load that finding.");
+  }, [findings]);
+
   // Cross-link (doc 49 2b): a finding -> its function's node in the target's call graph.
   const showInGraph = useCallback((finding) => {
     setActiveTid(finding.target_id);
@@ -965,7 +1045,9 @@ function App() {
     if (tab === "functions" && !cgByT[_at]) api.callgraph(_at).then((cg) => setCgByT((c) => ({ ...c, [_at]: cg || [] }))).catch(() => setCgByT((c) => ({ ...c, [_at]: [] })));
     if (tab === "strings" && !stringsByT[_at]) api.strings(_at, { limit: 2000 }).then((ss) => setStringsByT((c) => ({ ...c, [_at]: (ss && ss.items) || (Array.isArray(ss) ? ss : []) }))).catch(() => setStringsByT((c) => ({ ...c, [_at]: [] })));
     if (!dynByT[_at]) api.dynresults(_at).then((ds) => setDynByT((c) => ({ ...c, [_at]: ds || [] }))).catch(() => setDynByT((c) => ({ ...c, [_at]: [] })));
-  }, [tab, _at, funcsByT, cgByT, stringsByT, dynByT]);
+    if (tab === "crashes" && !(_at in triageByT)) api.crashTriage(_at).then((tr) => setTriageByT((c) => ({ ...c, [_at]: tr || null }))).catch(() => setTriageByT((c) => ({ ...c, [_at]: null })));
+  }, [tab, _at, funcsByT, cgByT, stringsByT, dynByT, triageByT]);
+  activeTidRef.current = _at || null;
 
   const ranked = dedupeFindings(rankFindings(findings));
   const topDemoId = ranked.find((f) => f.state === "poc-backed")?.id;
@@ -1018,7 +1100,9 @@ function App() {
     || activeRanked.find((f) => f.state === "poc-backed") || null;
   // Per-target verdict dot for the rail.
   const dotClass = (v) => v && v.status === "demonstrated" ? "d-crit" : v && v.status === "potential" ? "d-warn" : v && v.crashed ? "d-warn" : "d-none";
-  const lvlTag = (v) => v && v.level ? `L${v.level}` : v && v.crashed ? "crash" : "—";
+  const lvlTag = (v) => v && v.level ? `L${v.level}` : v && v.candidateLevel ? `(L${v.candidateLevel})` : v && v.crashed ? "crash" : "—";
+  // Targets whose analysis ABORTED this run: shown as failed in the rail, never as a quiet "—".
+  const failedMap = failedTargets(runSignals, bg);
   // The run controls (used in the rail): background running / resume / run / stop.
   const runControls = html`
     ${bg && bg.running ? html`
@@ -1108,6 +1192,7 @@ function App() {
           <option value="arg">first arg</option>
           <option value="env">env var</option>
         </select>
+        <${SeedsField} seeds=${seeds} busy=${seedBusy} onAdd=${addSeeds} onRemove=${removeSeed} />
       </fieldset>
       <button class="btn ghost small" onClick=${onAutopilot}
               title="run the stages from this tab instead: finer per-stage feedback, but a shorter pipeline and no scorecard — closing the tab stops it">
@@ -1145,7 +1230,7 @@ function App() {
     functions: { label: "Functions & call graph", n: activeFuncs ? activeFuncs.length : undefined },
     disasm: { label: "Disassembly" },
     strings: { label: "Strings", n: activeStrings ? activeStrings.length : undefined },
-    crashes: { label: "Crashes", n: activeCrashes.length },
+    crashes: { label: "Crashes", n: (_atid && triageByT[_atid] && triageByT[_atid].distinct) || activeCrashes.length },
     coverage: { label: "Coverage" },
     heap: { label: "Heap", n: heapFindings.length },
     taint: { label: "Taint", n: taintFindings.length },
@@ -1190,6 +1275,7 @@ function App() {
           <section>
             <${DropZone} onFiles=${(fl) => onFiles(fl, false)} busy=${uploading} />
             ${uploading ? html`<div class="center"><${Spinner} label="Uploading and triaging…" /></div>` : null}
+            <${DoctorPanel} doctor=${doctor} onRefresh=${() => loadDoctor(true)} compact=${true} />
             ${recentCases.length ? html`
               <div class="card recent">
                 <div class="recent-head">Recent analyses</div>
@@ -1215,7 +1301,10 @@ function App() {
                     onClick=${() => { setActiveTid(t.id); setTab("findings"); setViz(null); }}>
                     <span class=${`rail-dot ${dotClass(v)}`}></span>
                     <span class="rail-tname">${t.filename}</span>
-                    <span class="rail-tlvl">${lvlTag(v)}</span>
+                    ${failedMap.has(t.id) ? html`<span class="rail-tlvl rail-failed"
+                        title=${(() => { const e = failedMap.get(t.id) || {}; return `analysis aborted${e.stage ? ` in ${e.stage}` : ""}${e.error ? `: ${e.error}` : ""} — results for this target are incomplete`; })()}>failed</span>`
+                      : html`<span class=${`rail-tlvl${v && !v.level && v.candidateLevel ? " rail-cand" : ""}`}
+                        title=${v && !v.level && v.candidateLevel ? `candidate L${v.candidateLevel}: a PoC recipe exists but nothing verified it by execution` : ""}>${lvlTag(v)}</span>`}
                     <button class="rail-rm" title="Remove this file" aria-label=${`Remove ${t.filename}`}
                       disabled=${running || (bg && bg.running)}
                       onClick=${(e) => { e.stopPropagation(); removeTarget(t.id); }}>✕</button>
@@ -1258,6 +1347,9 @@ function App() {
                  full telemetry card lives in the Console tab, so the same panel is not drawn twice. -->
             <${FuzzConsole} live=${fuzzLive} state=${fuzzState} compact=${true} />
             ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
+            <!-- The run's honesty signals (failed targets, degraded sandbox, ranked taint, tiered
+                 recovery, capped crashes, hangs, lease renewals): compact chips, every tab. -->
+            <${RunSignalsStrip} signals=${runSignals} bg=${bg} targets=${targets} />
             <${TargetBar} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
             ${multi ? (() => {
               const dem = verdicts.filter((v) => v.status === "demonstrated").length;
@@ -1372,7 +1464,9 @@ function App() {
             ` : tab === "strings" ? html`
               <div class="wb-panel"><${StringsPanel} strings=${activeStrings} /></div>
             ` : tab === "crashes" ? html`
-              <div class="wb-panel"><${CrashesPanel} crashes=${_atid ? dynByT[_atid] : null} artifactUrl=${api.artifactUrl} /></div>
+              <div class="wb-panel"><${CrashesPanel} crashes=${_atid ? dynByT[_atid] : null}
+                triage=${_atid ? triageByT[_atid] : undefined} artifactUrl=${api.artifactUrl}
+                onOpenFinding=${openFindingById} /></div>
             ` : tab === "coverage" ? html`
               <div class="wb-panel"><${CoveragePanel} coverage=${coverage} targets=${activeTarget ? [activeTarget] : targets} onDrill=${browseFunctions} /></div>
             ` : tab === "heap" ? html`
@@ -1412,6 +1506,7 @@ function App() {
                 <${AttemptLogsList} logs=${attemptLogs} onOpen=${(sha, engine) => setOpenLog({ sha, engine })} />
                 <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
                 <${UnavailablePanel} items=${unavailable} />
+                <${DoctorPanel} doctor=${doctor} onRefresh=${() => loadDoctor(true)} />
               </div>
             ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}
           </main>
@@ -1432,6 +1527,7 @@ function App() {
 
       ${funcBrowse ? html`<${FunctionsModal} name=${funcBrowse.name} functions=${funcBrowse.functions}
         onOpen=${(fn) => openFunction(fn, funcBrowse.targetId)} onClose=${() => setFuncBrowse(null)} />` : null}
+      <${BuildFoot} info=${buildInfo} />
     </div>`;
 }
 

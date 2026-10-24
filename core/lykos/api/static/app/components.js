@@ -8,6 +8,7 @@ import htm from "htm";
 import {
   STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel, fmtElapsed,
   SEV_ORDER, maxPocLevel, histogram, CURATION_STATUSES, CURATION_LABEL, CURATION_FILTERS,
+  runSignalChips,
 } from "./util.js";
 
 const html = htm.bind(h);
@@ -1311,9 +1312,10 @@ export function ShellVerdict({ verdict, artifactUrl }) {
           : `${v.staticCount} static finding${v.staticCount === 1 ? "" : "s"}${v.coverage != null ? `, ${v.coverage}% covered` : ""}`}</div>
       </div>
       <div class="vv-right">
-        <div class="vv-mini-ladder" title="how far the exploit chain got">
+        <div class="vv-mini-ladder" title="how far the exploit chain got (verified PoCs only)">
           ${[1, 2, 3].map((n) => html`${n > 1 ? html`<span class=${`vd-arrow${v.level >= n ? " filled" : ""}`}>▸</span>` : null}<span class=${`vd-rung${v.level >= n ? " filled" : ""}`} key=${n}>L${n}</span>`)}
         </div>
+        ${v.candidateLevel ? html`<div class="vv-cand" title="a PoC/exploit recipe for this level exists but was not verified by execution here">candidate L${v.candidateLevel} · not executed</div>` : null}
         ${demo && v.bundlePoc && v.bundlePoc.bundle_sha
           ? html`<a class="btn small" href=${artifactUrl(v.bundlePoc.bundle_sha)} download>⬇ PoC bundle${v.bundlePoc.verified ? " (verified)" : ""}</a>` : null}
       </div>
@@ -1676,13 +1678,52 @@ export function DiffPanel({ targets, findings, onVerify, verify, onPatchDiff, pa
     </div>`;
 }
 
-export function CrashesPanel({ crashes, artifactUrl }) {
+// The crash TRIAGE view (roadmap P1). A run can record hundreds of crashing inputs that are a
+// handful of bugs; the server groups them with the prove loop's own bucket key (sanitizer defect
+// key / fault PC / signal+channel) and ranks the groups by the best VERIFIED level, then
+// exploitability (GET /targets/<id>/crash-triage). One row per root cause: how many inputs hit it,
+// what the run made of it, and a link to its finding and PoC. An unverified PoC level is shown as a
+// candidate, never as the group's level. The raw per-input list stays one click away.
+const _EXP_CLASS = { EXPLOITABLE: "exp-hi", PROBABLY_EXPLOITABLE: "exp-hi", UNKNOWN: "exp-mid",
+                     PROBABLY_NOT_EXPLOITABLE: "exp-lo", NOT_EXPLOITABLE: "exp-lo" };
+function CrashGroupRow({ g, artifactUrl, onOpenFinding }) {
+  const where = g.defect_key ? g.defect_key : g.fault_pc ? g.fault_pc
+    : `no fault PC · ${g.channel}`;
+  const ex = g.exploitability;
+  const f = (g.findings || [])[0];
+  return html`
+    <div class="ct-row">
+      <span class="ct-rank">#${g.rank}</span>
+      <span class="ct-lvl">${g.best_level
+        ? html`<span class="ct-lvl-v" title="verified PoC level">L${g.best_level}</span>`
+        : g.candidate_level
+          ? html`<span class="ct-lvl-c" title="an unverified PoC exists for this level — not executed/confirmed">cand. L${g.candidate_level}</span>`
+          : html`<span class="ct-lvl-n" title="no PoC built from this crash yet">—</span>`}</span>
+      <span class="ct-what">
+        <span class="crash-sig">${g.signal}</span>
+        <span class="ct-where" title=${g.resolved ? "the root-cause bucket" : "the fault PC could not be read (hijacked return / emulated target): grouped by signal and channel, may hold more than one defect"}>${where}</span>
+        ${g.resolved ? null : html`<span class="ct-unres">unresolved</span>`}
+      </span>
+      <span class="ct-count" title=${`${g.count} crashing execution(s), ${g.input_count} distinct input(s)`}>×${g.count}</span>
+      <span class="ct-exp">${ex && ex.rating
+        ? html`<span class=${`exp ${_EXP_CLASS[ex.rating] || "exp-mid"}`} title=${ex.why || ""}>${ex.rating.replace(/_/g, " ").toLowerCase()} ${ex.score != null ? `${ex.score}` : ""}</span>` : null}</span>
+      <span class="ct-links">
+        ${f && onOpenFinding ? html`<button class="btn xsmall ghost" title=${`${f.cwe || ""} ${f.title || ""} (${f.state})`}
+            onClick=${() => onOpenFinding(f.id)}>finding</button>` : null}
+        ${g.poc && g.poc.bundle_sha ? html`<a class="btn xsmall ghost" href=${artifactUrl(g.poc.bundle_sha)} download
+            title=${`verified ${g.poc.level || ""} PoC bundle`}>⬇ PoC</a>` : null}
+        ${g.representative ? html`<a class="btn xsmall ghost" href=${artifactUrl(g.representative)} download
+            title="the representative crashing input">⬇ input</a>` : null}
+      </span>
+    </div>`;
+}
+
+export function CrashesPanel({ crashes, triage, artifactUrl, onOpenFinding }) {
   if (!crashes) return html`<div class="wb-soon"><${Spinner} label="Loading crashes…" /></div>`;
   const c = (crashes || []).filter((x) => x.crashed);
   if (!c.length) return html`<div class="wb-soon">No reproduced crashes for this target.</div>`;
-  return html`
-    <div class="fnp">
-      <div class="fnp-hint">${c.length} reproduced crash${c.length === 1 ? "" : "es"}</div>
+  const groups = (triage && triage.groups) || null;
+  const rawList = html`
       <div class="crash-list">
         ${c.map((x, i) => html`
           <div class="crash-row" key=${i}>
@@ -1691,8 +1732,123 @@ export function CrashesPanel({ crashes, artifactUrl }) {
             <span class="crash-mode">${x.input_mode || "stdin"}${x.argv && x.argv.length ? " · " + x.argv.join(" ") : ""}${x.isolation ? " · " + x.isolation : ""}</span>
             ${x.input_sha ? html`<a class="btn small ghost" href=${artifactUrl(x.input_sha)} download>⬇ input</a>` : html`<span></span>`}
           </div>`)}
+      </div>`;
+  if (!groups) {
+    return html`<div class="fnp"><div class="fnp-hint">${c.length} reproduced crash${c.length === 1 ? "" : "es"}${triage === undefined ? " · grouping…" : ""}</div>${rawList}</div>`;
+  }
+  return html`
+    <div class="fnp">
+      <div class="fnp-hint">
+        <b>${groups.length}</b> distinct root cause${groups.length === 1 ? "" : "s"} from ${triage.crashes} crashing execution${triage.crashes === 1 ? "" : "s"} —
+        ranked by verified level, then exploitability.
+        ${triage.over_prove_cap ? html` <span class="ct-cap">The autopilot proves at most ${triage.prove_cap} distinct crashes per target; an unlevelled group may simply not have been worked on.</span>` : null}
       </div>
+      <div class="ct-list">
+        ${groups.map((g) => html`<${CrashGroupRow} key=${g.rank} g=${g} artifactUrl=${artifactUrl} onOpenFinding=${onOpenFinding} />`)}
+      </div>
+      <details class="ct-raw">
+        <summary class="btn xsmall ghost ct-raw-toggle">all ${c.length} crashing input${c.length === 1 ? "" : "s"}</summary>
+        ${rawList}
+      </details>
     </div>`;
+}
+
+// The run's honesty signals as one compact strip under the run bar (visible on every tab): a
+// failed target, a degraded sandbox, ranked taint, tiered recovery, capped crashes, hangs, lease
+// renewals. Chips only -- the explanation is one click away in a <details>, so a clean run shows
+// nothing and a weak one is noticed without a wall of text.
+export function RunSignalsStrip({ signals, bg, targets }) {
+  const chips = runSignalChips(signals, bg, targets);
+  if (!chips.length) return null;
+  const worst = chips.some((c) => c.tone === "bad") ? "bad" : chips.some((c) => c.tone === "warn") ? "warn" : "info";
+  return html`
+    <details class=${`rsig rsig-${worst}`}>
+      <summary>
+        <span class="rsig-lbl">this run</span>
+        ${chips.map((c) => html`<span key=${c.key} class=${`rsig-chip rsig-${c.tone}`}
+          title=${(c.detail || []).join("\n")}>${c.label}</span>`)}
+        <span class="rsig-more">details</span>
+      </summary>
+      <ul class="rsig-detail">
+        ${chips.map((c) => (c.detail || []).map((d, i) => html`<li key=${`${c.key}-${i}`} class=${`rsig-${c.tone}`}>${d}</li>`))}
+      </ul>
+    </details>`;
+}
+
+// Engine readiness on THIS host (GET /doctor = `lykos doctor`): which engines can run before the
+// operator spends a 20-minute budget finding out. Compact: one summary line, the missing engines
+// as chips, the full table behind a toggle.
+const _TIER_ORDER = ["required", "recommended", "optional"];
+export function DoctorPanel({ doctor, onRefresh, compact }) {
+  if (!doctor) return null;
+  const tools = doctor.tools || [];
+  const probing = doctor.state === "probing";
+  if (!tools.length) {
+    return html`<div class="card doctor"><div class="doctor-head">
+      ${probing ? html`<${Spinner} label="Checking which engines work on this machine…" />`
+        : html`<span>Engine check unavailable${doctor.error ? ` — ${doctor.error}` : ""}</span>`}
+      ${!probing && onRefresh ? html`<button class="btn xsmall ghost" onClick=${onRefresh}>retry</button>` : null}</div></div>`;
+  }
+  const missing = tools.filter((t) => !t.present);
+  const req = missing.filter((t) => t.tier === "required");
+  const tone = req.length ? "bad" : missing.some((t) => t.tier === "recommended") ? "warn" : "ok";
+  return html`
+    <div class=${`card doctor doctor-${tone}`}>
+      <div class="doctor-head">
+        <span class="doctor-title">Engines on this machine</span>
+        <span class=${`doctor-sum doctor-${tone}`}>${doctor.present}/${doctor.total} ready${req.length ? ` · ${req.length} REQUIRED missing` : ""}</span>
+        ${probing ? html`<${Spinner} label="re-checking…" />` : null}
+        <span class="doctor-acts">
+          ${onRefresh && !probing ? html`<button class="btn xsmall ghost" title="probe every engine again" onClick=${onRefresh}>re-check</button>` : null}
+        </span>
+      </div>
+      ${missing.length ? html`<div class="doctor-miss">
+        ${missing.map((t) => html`<span key=${t.key} class=${`doctor-chip tier-${t.tier}`}
+          title=${`${t.title}\nwithout it: ${t.without}\ninstall: ${t.install}`}>${t.title.replace(/\s*\(.*$/, "").replace(/\s+--.*$/, "")}</span>`)}
+      </div>` : html`<div class="doctor-miss doctor-ok">every engine probed OK</div>`}
+      ${!compact && doctor.toolchain ? html`<div class="doctor-tc">${doctor.toolchain}</div>` : null}
+      <details class="doctor-more"><summary>every engine</summary>
+      <table class="doctor-table"><tbody>
+        ${_TIER_ORDER.flatMap((tier) => tools.filter((t) => t.tier === tier).map((t) => html`
+          <tr key=${t.key} class=${t.present ? "dt-ok" : "dt-miss"}>
+            <td class="dt-mark">${t.present ? "✓" : "✕"}</td>
+            <td class="dt-name">${t.title}<span class="dt-tier">${tier}</span></td>
+            <td class="dt-info">${t.present ? (t.found || "") : html`<span>${t.without}</span><br /><code>${t.install}</code>`}</td>
+          </tr>`))}
+      </tbody></table></details>
+    </div>`;
+}
+
+// Operator seed files (the CLI's `--seed`): real example inputs -- a config, a sample document, a
+// known reproducer -- uploaded into the case and handed to the fuzzers. Without them a structured
+// parser is rarely reached in a 20-minute budget.
+export function SeedsField({ seeds, onAdd, onRemove, busy }) {
+  const list = seeds || [];
+  return html`
+    <span class="seeds-field" title="Seed files: real example inputs (a config, a sample document, a known-crashing input) the fuzzers start from — the same as the CLI's --seed. Stored in this case, max 1 MiB each.">
+      <label class=${`btn xsmall ghost seed-add${busy ? " busy" : ""}`}>${busy ? "uploading…" : "+ seeds"}
+        <input type="file" multiple disabled=${busy} style="display:none" aria-label="add seed files"
+          onChange=${(e) => { const fl = e.target.files; if (fl && fl.length) onAdd(fl); e.target.value = ""; }} /></label>
+      ${list.map((s) => html`<span key=${s.sha256} class="seed-chip" title=${`${s.name} · ${s.size} bytes · ${s.sha256.slice(0, 12)}`}>
+        ${s.name}<button type="button" class="seed-rm" aria-label=${`remove seed ${s.name}`}
+          onClick=${() => onRemove(s.sha256)}>✕</button></span>`)}
+    </span>`;
+}
+
+// Which build is serving the GUI (GET /version), so a stale air-gap disc is noticeable.
+export function BuildFoot({ info }) {
+  if (!info) return null;
+  const bits = [];
+  if (info.built) bits.push(`commit date ${String(info.built).slice(0, 10)}`);
+  if (info.toolchain_built) bits.push(`toolchain ${String(info.toolchain_built).slice(0, 10)}`);
+  const tip = [`version ${info.version || "?"}`, info.commit ? `commit ${info.commit}` : "no commit recorded",
+    info.branch ? `branch ${info.branch}` : null, info.source ? `from ${info.source}` : null,
+    info.code_mtime ? `newest source file ${info.code_mtime}` : null].filter(Boolean).join("\n");
+  return html`<footer class="build-foot" title=${tip}>
+    <span>${info.display || `lykos ${info.version || ""}`}</span>
+    ${bits.length ? html`<span class="bf-sub">${bits.join(" · ")}</span>` : null}
+    ${info.source === "none" ? html`<span class="bf-warn">no commit stamp — build unidentified</span>` : null}
+  </footer>`;
 }
 
 

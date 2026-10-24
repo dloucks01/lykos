@@ -960,6 +960,90 @@
     .verdict-chip { flex: 1 1 auto; justify-content: space-between; }
     .vchip-name { max-width: none; }
   }
+
+  /* ---- run honesty strip (failed targets, degraded sandbox, ranked taint, tiered recovery, ...) */
+  .rsig { margin: 6px 0 2px; font-size: .78rem; border: 1px solid var(--line); border-radius: 8px;
+          background: var(--panel); }
+  .rsig.rsig-bad { border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+  .rsig.rsig-warn { border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .rsig > summary { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 5px 8px;
+                    cursor: pointer; list-style: none; }
+  .rsig > summary::-webkit-details-marker { display: none; }
+  .rsig-lbl { color: var(--faint); text-transform: uppercase; letter-spacing: .04em; font-size: .66rem; }
+  .rsig-chip { border-radius: 10px; padding: 1px 8px; border: 1px solid var(--line); white-space: nowrap;
+               max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .rsig-chip.rsig-bad { color: var(--bad); font-weight: 700;
+                        background: color-mix(in srgb, var(--bad) 12%, transparent);
+                        border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+  .rsig-chip.rsig-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .rsig-chip.rsig-info { color: var(--muted); }
+  .rsig-more { margin-left: auto; color: var(--faint); font-size: .7rem; }
+  .rsig[open] .rsig-more { color: var(--accent-2); }
+  .rsig-detail { margin: 0; padding: 4px 12px 8px 26px; color: var(--muted); line-height: 1.45; }
+  .rsig-detail li.rsig-bad { color: var(--bad); }
+  .rail-tlvl.rail-failed { color: var(--bad); font-weight: 700; }
+  .rail-tlvl.rail-cand { color: var(--faint); }
+  .vv-cand { font-size: .7rem; color: var(--faint); margin-top: 4px; text-align: right; }
+
+  /* ---- crash triage */
+  .ct-list { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .ct-row { display: grid; grid-template-columns: 34px 64px minmax(0, 1fr) 54px 150px auto; gap: 10px;
+            align-items: center; padding: 7px 10px; border-bottom: 1px solid var(--line); font-size: .8rem; }
+  .ct-row:last-child { border-bottom: none; }
+  .ct-rank { color: var(--faint); font-family: var(--mono); font-size: .74rem; }
+  .ct-lvl-v { font-family: var(--mono); font-weight: 700; color: var(--bad); }
+  .ct-lvl-c { font-family: var(--mono); font-size: .72rem; color: var(--faint); }
+  .ct-lvl-n { color: var(--faint); }
+  .ct-what { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .ct-where { font-family: var(--mono); font-size: .76rem; color: var(--muted); overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; }
+  .ct-unres { font-size: .66rem; color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+              border-radius: 8px; padding: 0 6px; }
+  .ct-count { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); text-align: right; }
+  .ct-exp .exp { font-size: .72rem; border-radius: 8px; padding: 1px 6px; border: 1px solid var(--line); }
+  .ct-exp .exp-hi { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+  .ct-exp .exp-mid { color: var(--warn); }
+  .ct-exp .exp-lo { color: var(--muted); }
+  .ct-links { display: inline-flex; gap: 4px; justify-content: flex-end; }
+  .ct-cap { color: var(--warn); }
+  .ct-raw { margin-top: 8px; }
+  .ct-raw > summary { list-style: none; cursor: pointer; margin-bottom: 6px; }
+  .ct-raw > summary::-webkit-details-marker { display: none; }
+  .ct-raw > summary::before { content: "▸ "; } .ct-raw[open] > summary::before { content: "▾ "; }
+  .doctor-more { margin-top: 6px; font-size: .74rem; }
+  .doctor-more > summary { cursor: pointer; color: var(--muted); }
+  .seed-add { cursor: pointer; } .seed-add.busy { opacity: .6; cursor: progress; }
+
+  /* ---- engine readiness (doctor) */
+  .doctor { padding: 10px 12px; margin-top: 12px; }
+  .doctor-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: .84rem; }
+  .doctor-title { font-weight: 600; }
+  .doctor-sum { font-size: .78rem; }
+  .doctor-sum.doctor-ok { color: var(--ok); } .doctor-sum.doctor-warn { color: var(--warn); }
+  .doctor-sum.doctor-bad { color: var(--bad); font-weight: 700; }
+  .doctor-acts { margin-left: auto; display: inline-flex; gap: 6px; }
+  .doctor-miss { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; font-size: .74rem; }
+  .doctor-miss.doctor-ok { color: var(--ok); }
+  .doctor-chip { border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; color: var(--muted); }
+  .doctor-chip.tier-required { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, transparent); font-weight: 700; }
+  .doctor-chip.tier-recommended { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .doctor-tc { margin-top: 6px; font-size: .72rem; color: var(--faint); font-family: var(--mono); }
+  .doctor-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: .76rem; }
+  .doctor-table td { border-top: 1px solid var(--line); padding: 4px 6px; vertical-align: top; }
+  .doctor-table .dt-mark { width: 1.4em; } .dt-ok .dt-mark { color: var(--ok); } .dt-miss .dt-mark { color: var(--bad); }
+  .doctor-table .dt-name { white-space: nowrap; } .dt-tier { margin-left: 6px; color: var(--faint); font-size: .66rem; }
+  .doctor-table .dt-info { color: var(--muted); } .doctor-table code { font-size: .7rem; }
+
+  /* ---- operator seeds + build footer */
+  .seeds-field { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+  .seed-chip { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: .72rem;
+               border: 1px solid var(--line); border-radius: 10px; padding: 0 3px 0 8px; max-width: 14em;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .seed-rm { background: none; border: none; color: var(--faint); cursor: pointer; font-size: .7rem; padding: 0 3px; }
+  .seed-rm:hover { color: var(--bad); }
+  .build-foot { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; padding: 10px 16px 14px;
+                font-size: .7rem; color: var(--faint); font-family: var(--mono); }
+  .build-foot .bf-warn { color: var(--warn); }
 </style>
 <script type="importmap">
 {

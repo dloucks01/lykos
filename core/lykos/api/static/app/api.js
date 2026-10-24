@@ -165,6 +165,30 @@ export const api = {
     return _req("GET", `/artifacts/${sha}/attempts?${q}`);
   },
   attemptLogs: (caseId) => _req("GET", `/cases/${caseId}/attempt-logs`),
+
+  // The run's honesty signals (failed targets, degraded sandbox, ranked taint, tiered recovery,
+  // capped crashes, hangs, lease renewals), read from the event log so a reopened case keeps them.
+  runSignals: (caseId) => _req("GET", `/cases/${caseId}/run-signals`),
+  // Crashes grouped by root cause and ranked by verified level / exploitability.
+  crashTriage: (targetId) => _req("GET", `/targets/${targetId}/crash-triage`),
+
+  // Operator seed files (the CLI's --seed): uploaded into the case, passed to the autopilot by
+  // hash as overrides.seed_shas and resolved server-side.
+  seeds: (caseId) => _req("GET", `/cases/${caseId}/seeds`),
+  uploadSeed: (caseId, file) => _req("POST", `/cases/${caseId}/seeds`, {
+    body: file,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Filename": (file && file.name) || "seed.bin",
+    },
+  }),
+  deleteSeed: (caseId, sha) => _req("DELETE", `/cases/${caseId}/seeds/${sha}`),
+
+  // Engine readiness on this host (`lykos doctor`); probes run server-side in the background,
+  // so the first call answers {state: "probing"} and the caller polls.
+  doctor: (refresh = false) => _req("GET", `/doctor${refresh ? "?refresh=1" : ""}`),
+  // Which build is serving (commit / stamp / code date), for the footer.
+  version: () => _req("GET", "/version"),
 };
 
 // Poll a run until it reaches a terminal status. Resolves with the final run record.

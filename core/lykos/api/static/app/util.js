@@ -283,13 +283,19 @@ export function verdictForTarget(target, findings, pocs, coverage) {
   const status = worstDemo ? "demonstrated" : worstPot ? "potential" : "none";
   // A PoC belongs to a target through the finding it proves.
   const tPocs = (pocs || []).filter((p) => p.finding_id && findingIds.has(p.finding_id));
-  const level = tPocs.reduce((m, p) => Math.max(m, pocLevel(p)), 0);
+  // The level the chain REACHED counts verified PoCs only. A static recipe / unverified bundle
+  // carries a level too (what it would reach), and counting it filled the L-ladder and printed
+  // "L3" in the target rail for an exploit nothing had run -- the overstatement the reports
+  // already refuse. The unverified best is kept apart as `candidateLevel`, shown as a candidate.
+  const level = tPocs.filter((p) => p.verified).reduce((m, p) => Math.max(m, pocLevel(p)), 0);
+  const candTop = tPocs.filter((p) => !p.verified).reduce((m, p) => Math.max(m, pocLevel(p)), 0);
+  const candidateLevel = candTop > level ? candTop : 0;
   const bundlePoc = tPocs.find((p) => p.verified && p.bundle_sha) || tPocs.find((p) => p.bundle_sha) || null;
   const inputPoc = tPocs.find((p) => p.input_sha) || null;
   const crashed = tFindings.some((f) => f.state === "poc-backed") || !!worstDemo || !!inputPoc;
   const staticCount = tFindings.filter((f) => f.state !== "poc-backed").length;
   const cov = coverage && coverage[tid] && coverage[tid].pct != null ? coverage[tid].pct : null;
-  return { target, headline, status, level, crashed, staticCount, coverage: cov,
+  return { target, headline, status, level, candidateLevel, crashed, staticCount, coverage: cov,
     bundlePoc, inputPoc };
 }
 
@@ -406,4 +412,97 @@ export function containingFunction(functions, addr) {
     if (f.size > 0 && s <= a && a < s + f.size && (!best || s > num(best.addr))) best = f;
   }
   return best;
+}
+
+// --- Run honesty signals (GET /cases/<id>/run-signals + the live background status) -------------
+// Every way a run can be weaker than it looks, as compact chips for the run header: a target whose
+// analysis ABORTED (failed, never quietly absent), a sandbox that ran rlimits-only, taint that saw
+// only the ranked top-N of the reachable functions, a large binary recovered at a shallower tier,
+// a crash list longer than the prove loop takes, inputs that hang the target (CWE-835), and leases
+// renewed under DB write contention. Pure, so the honesty rules are unit-tested.
+
+// The target ids whose analysis aborted: the server's signals (event log, survives a reopen) united
+// with the live background status (in memory, appears the moment it happens).
+export function failedTargets(signals, bg) {
+  const out = new Map();
+  for (const e of (signals && signals.target_errors) || []) {
+    if (e && e.target_id && !out.has(e.target_id)) out.set(e.target_id, e);
+  }
+  for (const id of (signals && signals.failed_targets) || []) {
+    if (id && !out.has(id)) out.set(id, { target_id: id });
+  }
+  for (const e of (bg && bg.target_errors) || []) {
+    if (e && e.target_id && !out.has(e.target_id)) out.set(e.target_id, e);
+  }
+  return out;
+}
+
+const _ENGINE_NAME = { coverage: "coverage", net_fuzz: "network", env_fuzz: "env-var",
+  fuzz: "black-box", directed: "directed", harness: "harness" };
+
+export function runSignalChips(signals, bg, targets) {
+  const sig = signals || {};
+  const names = new Map((targets || []).map((t) => [t.id, t.filename]));
+  const multi = (targets || []).length > 1;
+  const nm = (id, fallback) => names.get(id) || fallback || (id ? String(id).slice(0, 8) : "target");
+  const pre = (id, fb) => (multi ? `${nm(id, fb)}: ` : "");
+  const chips = [];
+  const failed = failedTargets(sig, bg);
+  if (failed.size) {
+    const list = [...failed.values()];
+    chips.push({ key: "failed", tone: "bad",
+      label: `✕ ${list.length} target${list.length === 1 ? "" : "s"} FAILED`,
+      detail: list.map((e) => `${nm(e.target_id, e.filename)}: analysis aborted${e.stage ? ` in ${e.stage}` : ""}${e.error ? ` — ${e.error}` : ""}; its results are incomplete (the other targets were still analysed)`) });
+  }
+  const oc = sig.outcome || null;
+  if (oc && oc.outcome === "error") {
+    chips.push({ key: "run-error", tone: "bad", label: "✕ run errored",
+      detail: [`the autopilot stopped with an error: ${oc.error || "no message"} — results are partial`] });
+  }
+  const iso = sig.isolation || [];
+  if (iso.length) {
+    const engines = [...new Set(iso.map((i) => _ENGINE_NAME[i.engine] || i.engine))];
+    chips.push({ key: "iso", tone: "warn",
+      label: `sandbox degraded: ${[...new Set(iso.map((i) => i.isolation))].join("/")} (${engines.join(", ")})`,
+      detail: iso.map((i) => `${_ENGINE_NAME[i.engine] || i.engine}: ${i.isolation}${i.note ? ` — ${i.note}` : ""}`) });
+  }
+  for (const r of sig.recovery || []) {
+    if (r.recovery_failed) {
+      chips.push({ key: `rec-${r.target_id}`, tone: "bad", label: `${pre(r.target_id, r.filename)}recovery FAILED`,
+        detail: [r.note || "the disassembler produced no program — every function-keyed detector saw nothing"] });
+    } else {
+      const n = (r.degradations || []).length;
+      const fns = r.total_functions && r.functions != null && r.functions < r.total_functions
+        ? `${r.functions}/${r.total_functions} functions` : null;
+      chips.push({ key: `rec-${r.target_id}`, tone: "warn",
+        label: `${pre(r.target_id, r.filename)}large binary: ${r.analysis_tier ? `tier ${r.analysis_tier}` : "partial recovery"}${fns ? ` · ${fns}` : ""}${n ? ` · ${n} degradation${n === 1 ? "" : "s"}` : ""}`,
+        detail: (r.degradations && r.degradations.length ? r.degradations : [r.note || "recovery was partial"]) });
+    }
+  }
+  for (const t of sig.taint || []) {
+    const reach = (t.total != null && t.unreachable != null) ? t.total - t.unreachable : null;
+    const loss = (t.skipped_reachable || 0) > 0;
+    chips.push({ key: `taint-${t.target_id}`, tone: loss ? "warn" : "info",
+      label: `${pre(t.target_id, t.filename)}taint: ${loss
+        ? `analysed ${t.analyzed} of ${reach != null ? reach : (t.analyzed || 0) + t.skipped_reachable} reachable functions`
+        : `ranked ${t.analyzed}/${t.total} functions, none reachable left out`}`,
+      detail: [t.note || ""].filter(Boolean) });
+  }
+  for (const c of sig.crashes_capped || []) {
+    chips.push({ key: `cap-${c.target_id}`, tone: "warn",
+      label: `${pre(c.target_id, c.filename)}proving ${c.proving} of ${c.distinct} distinct crashes`,
+      detail: [`the prove loop takes at most ${c.proving} distinct crashes; ${c.distinct - c.proving} were not worked on — that is not "not exploitable" (see the Crashes tab)`] });
+  }
+  const hangs = sig.hangs || [];
+  if (hangs.length) {
+    chips.push({ key: "hangs", tone: "warn",
+      label: `${hangs.length} hang/DoS input${hangs.length === 1 ? "" : "s"} (CWE-835)`,
+      detail: hangs.map((h) => `${multi ? `${nm(h.target_id, h.filename)}: ` : ""}input ${String(h.input_sha || "").slice(0, 12)} via ${h.mode || "?"} did not terminate${h.timeout ? ` within ${h.timeout}s` : ""} (${_ENGINE_NAME[h.engine] || h.engine})`) });
+  }
+  if (sig.lease_renewed && sig.lease_renewed.count) {
+    chips.push({ key: "lease", tone: "info",
+      label: `lease renewed ×${sig.lease_renewed.count}`,
+      detail: ["the database was under write contention, so a working stage's heartbeat was late; its lease was renewed instead of the stage being killed — expect slower progress, not lost work"] });
+  }
+  return chips;
 }

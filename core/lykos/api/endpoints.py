@@ -51,6 +51,42 @@ _INMEM_LIMIT = 16 << 20
 _SELF_CONTAINED_ARCHIVES = (".jar", ".war", ".ear", ".aar", ".apk")
 
 
+#: Ceilings on what an uploaded BUNDLE may expand to. The upload itself is capped at the 1 GiB
+#: request ceiling, but a zip/tar can declare far more than it carries (a zip bomb: a few MB that
+#: inflates to many GB, or millions of empty members), and extraction ran with no bound at all --
+#: filling the server's temp disk or pinning a request thread. Twice the request ceiling covers a
+#: real firmware/challenge bundle with room to spare; 20,000 members covers a large rootfs.
+_MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_BUNDLE_MEMBERS = 20_000
+
+
+class BundleRejected(Exception):
+    """An archive upload that would exceed the expansion ceilings. Carries the HTTP status."""
+
+    def __init__(self, msg: str, status: int = 413):
+        super().__init__(msg)
+        self.status = status
+
+
+def _check_bundle_budget(sizes, what: str) -> None:
+    """Refuse an archive whose declared members exceed the ceilings, BEFORE writing anything.
+
+    The declared sizes are binding: zipfile stops a member at its declared `file_size` (and fails
+    its CRC when the data disagrees) and tarfile copies exactly the header's size, so their sum is
+    what extraction can write."""
+    n = total = 0
+    for sz in sizes:
+        n += 1
+        total += max(0, int(sz or 0))
+        if n > _MAX_BUNDLE_MEMBERS:
+            raise BundleRejected(f"{what} has more than {_MAX_BUNDLE_MEMBERS} members; refusing "
+                                 "to extract it (upload the binary and its libraries directly, "
+                                 "or a smaller archive)", 400)
+        if total > _MAX_BUNDLE_BYTES:
+            raise BundleRejected(f"{what} expands to more than {_MAX_BUNDLE_BYTES >> 30} GiB; "
+                                 "refusing to extract it", 413)
+
+
 def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
     """If `upload` is a zip/tar archive (a zipped challenge bundle), extract it SAFELY to a temp
     directory and return that dir for ingest() to treat as a bundle; otherwise return None. Path
@@ -64,16 +100,27 @@ def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
     try:
         if zipfile.is_zipfile(upload):
             with zipfile.ZipFile(upload) as z:
-                for m in z.namelist():
+                infos = z.infolist()
+                _check_bundle_budget((i.file_size for i in infos), "the zip archive")
+                for info in infos:
+                    m = info.filename
                     mp = Path(m)
                     if m.endswith("/") or mp.is_absolute() or ".." in mp.parts:
                         continue
-                    z.extract(m, dest)
+                    z.extract(info, dest)
             return dest if any(dest.rglob("*")) else None
         if tarfile.is_tarfile(upload):
             with tarfile.open(upload) as tf:
+                # getmembers() reads headers only (a compressed tar is streamed through, never
+                # written), so the budget is checked before a byte lands on disk.
+                members = tf.getmembers()
+                _check_bundle_budget((m.size if m.isfile() else 0 for m in members),
+                                     "the tar archive")
                 tf.extractall(dest, filter="data")   # 'data' filter blocks traversal/special files
             return dest if any(dest.rglob("*")) else None
+    except BundleRejected:
+        raise                                        # an over-ceiling archive is refused, not
+                                                     # silently ingested as one opaque file
     except Exception:                                # noqa: BLE001 -- a bad archive falls back to
         pass                                         # ingesting the upload as a single file
     return None
@@ -934,7 +981,10 @@ class EndpointsMixin:
                 # A challenge is often a BUNDLE: binary + its patched loader + libc (+ flag),
                 # zipped up. Extract it and ingest the DIRECTORY so ingest() finds the main binary
                 # and keeps the loader/libc as deps -- otherwise the binary can't run in analysis.
-                bundle = _maybe_extract_bundle(upload, tdp, safe_name)
+                try:
+                    bundle = _maybe_extract_bundle(upload, tdp, safe_name)
+                except BundleRejected as e:
+                    return self._json({"error": str(e)}, e.status)
                 try:
                     if bundle is not None:
                         target = ingest(s, cid, bundle)     # dir -> main binary + companion deps

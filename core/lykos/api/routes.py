@@ -49,6 +49,11 @@ _CASE_AUTOPILOT = re.compile(r"^/cases/([^/]+)/autopilot$")
 _CASE_AUTOPILOT_CANCEL = re.compile(r"^/cases/([^/]+)/autopilot/cancel$")
 _CASE_AUTOPILOT_PAUSE = re.compile(r"^/cases/([^/]+)/autopilot/pause$")
 _CASE_AUTOPILOT_RESUME = re.compile(r"^/cases/([^/]+)/autopilot/resume$")
+# Run honesty signals, crash triage, operator seeds (CLI --seed parity) -- see api/ops.py.
+_CASE_RUN_SIGNALS = re.compile(r"^/cases/([^/]+)/run-signals$")
+_TARGET_CRASH_TRIAGE = re.compile(r"^/targets/([^/]+)/crash-triage$")
+_CASE_SEEDS = re.compile(r"^/cases/([^/]+)/seeds$")
+_CASE_SEED_ID = re.compile(r"^/cases/([^/]+)/seeds/([0-9a-fA-F]{64})$")
 
 # Assets the SPA loads after index.html: the vendored ESM runtime and the app modules. Only these
 # subtrees are served, and only plain web asset types -- nothing else under the package is
