@@ -33,14 +33,21 @@ TOOL = "concolic"
 TOOL_VERSION = "concolic-1"
 
 
-def _gather_seeds(conn, target_id, limit=16):
-    seen, out = set(), []
-    for d in DynResultDAO(conn).list_by_target(target_id):
-        if d.input_sha and d.input_sha not in seen:
-            seen.add(d.input_sha)
-            out.append(d.input_sha)
-        if len(out) >= limit:
-            break
+def _gather_seeds(conn, target_id, limit=16, ctx=None):
+    """Recorded inputs to seed the solver with, newest first -- every known HANG input left out.
+
+    A seed is executed concretely (symqemu traces it; the replay re-runs what it generates), so an
+    input recorded as a timeout -- a dyn_result row that timed out, libFuzzer's `timeout`
+    artifact, the input of a re-verified CWE-835 hang -- costs a full timeout per use and traces
+    a path that never ends. Skipped, and counted on `concolic.seeds` so the omission is visible."""
+    from ..fuzz.stage import replayable_input_shas
+    out, skipped = replayable_input_shas(conn, target_id, limit)
+    if skipped and ctx is not None:
+        try:
+            ctx.emit("concolic.seeds", payload={"used": len(out), "skipped_hangs": skipped,
+                     "why": "inputs recorded as timeouts/hangs are not replayed as seeds"})
+        except Exception:                                # noqa: BLE001 -- advisory
+            pass
     return out
 
 
@@ -170,6 +177,9 @@ def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout, base_ar
                   # flags and reads as "did not fault"
                   input_mode=mode, argv=list(base_argv), exit_code=r.exit_code, signal=r.signal,
                   signal_name=r.signal_name, crashed=r.crashed, isolation=r.isolation,
+                  # recorded, so a generated input that HANGS the target is never replayed as a
+                  # seed by the next pass (or by mem_oracle's probes) -- see `_gather_seeds`
+                  timed_out=bool(getattr(r, "timed_out", False)),
                   duration_ms=r.duration_ms,
                   note="concolic-generated" + (f"; reached {g['reached']}"
                                                if g.get("reached") else ""))
@@ -256,7 +266,7 @@ def _run_angr(ctx, target, exe, mode, p, py, base_argv=()):
             if a and a not in targets:
                 targets.append(a)
         targets = targets[: int(p.get("max_targets", 8))]
-    seed_shas = _gather_seeds(ctx.conn, target.id)
+    seed_shas = _gather_seeds(ctx.conn, target.id, ctx=ctx)
     seeds_b64 = [base64.b64encode(ctx.content.get_bytes(s)).decode() for s in seed_shas]
     seeds_b64 += list(p.get("seeds", []))
     spec = {"binary": str(exe), "input_mode": mode, "input_size": input_size,
@@ -286,7 +296,7 @@ def _run_angr(ctx, target, exe, mode, p, py, base_argv=()):
 
 def _run_symqemu(ctx, target, exe, mode, base_argv, p, sq):
     max_seconds = int(p.get("max_seconds", 120))
-    seed_shas = _gather_seeds(ctx.conn, target.id)
+    seed_shas = _gather_seeds(ctx.conn, target.id, ctx=ctx)
     seeds = [ctx.content.get_bytes(s) for s in seed_shas]
     seeds += [base64.b64decode(x) for x in p.get("seeds", [])]
     ctx.emit("concolic.start", payload={"backend": "symqemu", "seeds": len(seeds),

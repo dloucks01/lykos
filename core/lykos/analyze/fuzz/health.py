@@ -39,6 +39,8 @@ ERROR = "error"           # the stage raised
 OK = "ok"                 # really executed the target (execs > 0, coverage where instrumented)
 DECLINED = "declined"     # not applicable to this target (e.g. net_fuzz on a non-server) -- not a fault
 NO_GAIN = "no_gain"       # ran fine, but reached nothing its seeds had not already reached, no crash
+STALLED = "stalled"       # its executions stopped completing (every one timed out, nothing new) and it
+                          # ended itself early -- a wedged target, not a finished campaign
 SKIPPED = "skipped"       # no budget left / not reached
 NOT_RUN = "not_run"       # in the plan but no state yet
 
@@ -83,10 +85,25 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
 
     if not execs and att.get("attempts"):
         execs = int(att["attempts"])
+    # Did the campaign END ITSELF before its budget (fuzz/stage.py's plateau / stall monitors)?
+    # The terminal `.done` is authoritative -- a multi-channel stage emits one per channel and the
+    # last one says how the engine finished; the bare event is the fallback while it is running.
+    if done:
+        stopped = done.get("stopped")
+    else:
+        stopped = ("stalled" if "stalled" in evs else "converged" if "converged" in evs else None)
+    stop_ev = evs.get(stopped) if stopped else None
+    stop_note = (done.get("stop_reason") or (stop_ev or {}).get("note")) if stopped else None
+    returned = done.get("budget_returned_s")
+    if returned is None and stop_ev:
+        returned = stop_ev.get("budget_returned_s")
 
     def mk(status, reason):
         e = {"engine": stage, "status": status, "reason": reason,
              "execs": execs, "coverage": coverage}
+        if stopped:
+            e["stopped"] = stopped
+            e["budget_returned_s"] = returned
         if att:
             e["outcomes"] = att.get("counts")
             e["attempt_verdict"] = att.get("verdict")
@@ -125,6 +142,18 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
     #  * the attempt log says it was an error loop: (almost) no attempt reached the program.
     if att.get("verdict") == "erroring":
         return mk(FAILED, att.get("verdict_note") or "no attempt reached the program")
+    found = (_int(done.get("crashes")) or _int(done.get("unique")) or _int(done.get("confirmed"))
+             or (1 if done.get("crashed") else 0)
+             # a re-verified hang (CWE-835) is a finding too, not "found nothing"
+             or (1 if done.get("hang_input") else 0) or 0)
+    #  * it ended itself because its executions stopped completing. With a find before the stall
+    #    the campaign did its job and then hit a wall; without one it is a wedged target, which is
+    #    neither a clean pass nor a broken engine -- say which, with the evidence.
+    if stopped == "stalled":
+        why = stop_note or "every execution timed out with nothing new reached"
+        if found:
+            return mk(OK, f"found {found} crash(es)/hang(s) before it stalled: {why}")
+        return mk(STALLED, why)
     if "noprogress" in evs:
         return mk(NOPROGRESS, (evs["noprogress"].get("note")
                                or "ran but reached almost no code -- likely needs a config/"
@@ -137,18 +166,20 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
         # Ran -- but did it EARN its time? A campaign that reached nothing its seeds had not
         # already reached and found no crash executed the target without testing anything new.
         val = att.get("value") or {}
-        found = (_int(done.get("crashes")) or _int(done.get("unique")) or _int(done.get("confirmed"))
-                 or (1 if done.get("crashed") else 0)
-                 # a re-verified hang (CWE-835) is a finding too, not "found nothing"
-                 or (1 if done.get("hang_input") else 0) or 0)
+        # A CONVERGED campaign is a finished one: it stopped because coverage plateaued, and
+        # handed the rest of its ceiling back. Said in the reason either way, so "ran 40 minutes
+        # of a 6-hour ceiling" reads as the plateau it was, not as a cut-short run.
+        conv = (f"converged: {stop_note}" if stopped == "converged" and stop_note
+                else "converged (coverage plateaued)" if stopped == "converged" else None)
         if val.get("unit") in ("blocks", "behaviours", "edges") and val.get("gained") == 0 \
                 and not found:
             return mk(NO_GAIN, (f"ran {execs:,} attempts but reached nothing beyond what its "
                                 f"seeds reached ({val.get('seed_coverage', 0)} {val['unit']}) and "
-                                f"found no crash -- the mutations added no coverage"))
+                                f"found no crash -- the mutations added no coverage"
+                                + (f"; {conv}" if conv else "")))
         if att.get("verdict") == "crashing_all":
             return mk(OK, att.get("verdict_note"))
-        return mk(OK, None)
+        return mk(OK, conv)
     # `done` with no abort/starved/noprogress signal and no recorded execs is AMBIGUOUS, not a
     # failure: a solver (concolic) reports no exec count by nature, and on a short or budget-cut run
     # a fuzzer's terminal `.done` (which carries its execs) may not have settled before this summary
@@ -187,7 +218,7 @@ def summarize(plan: list, events: list) -> dict:
     no_gain = [e for e in engines if e["status"] == NO_GAIN]
     failed = [e for e in engines if e["status"] in (FAILED, ERROR)]
     reachable = [e for e in engines
-                 if e["status"] in (OK, NO_GAIN, NOPROGRESS, STARVED, FAILED, ERROR)]
+                 if e["status"] in (OK, NO_GAIN, NOPROGRESS, STARVED, STALLED, FAILED, ERROR)]
     if not ran_ok and no_gain:
         verdict = "idle"
         note = (f"{len(no_gain)} engine(s) executed the target but none reached any code beyond "

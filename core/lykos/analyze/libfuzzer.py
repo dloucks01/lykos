@@ -10,6 +10,7 @@ each crash with its sanitizer report -- a confirmed finding with a source file:l
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -17,6 +18,8 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 _C_EXT = {".c"}
 _CXX_EXT = {".cc", ".cpp", ".cxx", ".c++", ".C"}
@@ -1591,15 +1594,39 @@ def _run_group(argv, *, timeout: float, cwd=None, env=None):
     return subprocess.CompletedProcess(argv, p.returncode, out, err)
 
 
-def ensure_configured(root, *, timeout: int = 300) -> bool:
+def _configure_confinement(root: Path) -> list:
+    """bwrap prefix for running the project's `configure`, or [] when bwrap is unusable.
+
+    `configure` is the project's OWN shell script -- untrusted code -- and it ran on this host
+    with the server's full privileges while the build step beside it (source_project) was
+    confined. Same confinement as that build step: read-only root with the secret dirs masked,
+    no network, a fresh /tmp, and only the project tree writable (configure writes its generated
+    headers, config.status and config.log there and nowhere else). Opt out with
+    LYKOS_BUILD_UNCONFINED=1, as for the build."""
+    if os.environ.get("LYKOS_BUILD_UNCONFINED") == "1":
+        return []
+    try:
+        from .dynamic import sandbox
+        return sandbox.isolate_prefix(str(root), net=False, rw_binds=[str(root)],
+                                      chdir=str(root))
+    except Exception:                                     # noqa: BLE001 -- best-effort containment
+        return []
+
+
+def ensure_configured(root, *, timeout: int = 300, report: dict | None = None) -> bool:
     """Run the project's own `configure` when a header it generates is missing.
 
     Detected from the templates the tree ships (`*.h.in`): if a template's generated header is
     absent, the tree has not been configured. Best-effort and quiet -- a project with no
     `configure`, or one whose configure fails, is simply built as-is and the compiler reports
     whatever is actually wrong.
+
+    CONFINED like the build step (see `_configure_confinement`) and run in its own process
+    group, so a timeout takes every test program it forked. `report`, when given, is filled with
+    {"ran", "confined", "rc"} so the caller can say when it ran UNCONFINED (bwrap unusable) --
+    degradation is reported, never silent.
     """
-    root = Path(root)
+    root = Path(root).resolve()
     conf = root / "configure"
     if not conf.is_file():
         return False
@@ -1611,7 +1638,18 @@ def ensure_configured(root, *, timeout: int = 300) -> bool:
                 break
         if not missing:
             return False
-        _run_group(["sh", "./configure", "--disable-shared"], cwd=str(root), timeout=timeout)
+        confine = _configure_confinement(root)
+        env = dict(os.environ)
+        if confine:
+            env["CCACHE_DISABLE"] = "1"  # a ccache'd compiler would fail writing ~/.ccache (ro)
+        else:
+            _log.warning("libfuzzer: running %s/configure UNCONFINED (bwrap unusable)", root)
+        if report is not None:
+            report.update({"ran": True, "confined": bool(confine), "rc": None})
+        r = _run_group(confine + ["sh", "./configure", "--disable-shared"], cwd=str(root),
+                       timeout=timeout, env=env)
+        if report is not None:
+            report["rc"] = r.returncode
         return True
     except (OSError, subprocess.SubprocessError):
         return False

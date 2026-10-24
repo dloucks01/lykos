@@ -11,9 +11,10 @@ dynamically-linked target). Cross-arch via a per-arch shim under qemu is future 
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
+import re
+import secrets
 import subprocess
 import tempfile
 from pathlib import Path
@@ -66,6 +67,58 @@ def _build_shim(workdir: Path):
     return so if r.returncode == 0 and so.exists() else None
 
 
+def _open_report():
+    """A report channel the target cannot reach by PATH: a file in a fresh private directory
+    OUTSIDE the target's (writable) workdir -- under the sandbox's tmpfs /tmp it does not exist at
+    all -- handed to the shim as an inherited WRITE descriptor. The file is then made write-only
+    (0200) and its directory search-only (0100), so a target that recovers the path from
+    /proc/self/fd can neither read the report back (and lift the nonce from a genuine line) nor
+    create anything beside it. Returns (dir, write_fd, read_fd)."""
+    d = Path(tempfile.mkdtemp(prefix="lykos-heaprep-"))
+    path = d / "heap.jsonl"
+    wfd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_EXCL, 0o600)
+    rfd = os.open(path, os.O_RDONLY)
+    os.chmod(path, 0o200)
+    os.chmod(d, 0o100)
+    return d, wfd, rfd
+
+
+def _read_fd(fd: int, cap: int = 4 << 20) -> bytes:
+    out = bytearray()
+    while len(out) < cap:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
+
+
+#: One authenticated shim line. Matched ANYWHERE in the stream rather than per line: a target that
+#: writes a partial line to the report descriptor must not be able to glue a genuine line onto its
+#: own junk and so suppress it.
+_ERR_RE = re.compile(rb'\{"error":"([a-z-]{1,32})","addr":"0x([0-9a-f]{1,16})","size":([0-9]{1,20}),'
+                     rb'"func":"([a-z_]{0,16})","n":"([0-9a-f]{1,64})"\}')
+_LOADED_RE = re.compile(rb'\{"loaded":1,"n":"([0-9a-f]{1,64})"\}')
+
+
+def parse_report(raw: bytes, nonce: str) -> tuple:
+    """(loaded, errors, forged) from the raw report bytes: only lines carrying THIS run's nonce
+    count. `forged` counts heap-error-shaped lines that did not -- written by the target, not the
+    shim -- which are ignored and reported as such."""
+    n = nonce.encode()
+    loaded = any(m.group(1) == n for m in _LOADED_RE.finditer(raw or b""))
+    errors, forged = [], 0
+    for m in _ERR_RE.finditer(raw or b""):
+        if m.group(5) != n:
+            forged += 1
+            continue
+        errors.append({"error": m.group(1).decode(), "addr": "0x" + m.group(2).decode(),
+                       "size": int(m.group(3)), "func": m.group(4).decode()})
+    # an error-looking object with NO nonce field at all is a forgery too
+    forged += max(0, (raw or b"").count(b'"error"') - len(errors) - forged)
+    return loaded, errors, forged
+
+
 def heap_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -88,6 +141,7 @@ def heap_stage(ctx) -> dict:
     # mask the case store inside the sandbox; the target is copied out to workdir before it runs.
     sandbox.protect_dir(getattr(ctx.content, "root", None))
     workdir = Path(tempfile.mkdtemp(prefix="lykos-heap-"))
+    report_fds: list = []                    # [dir, write fd, read fd] once opened; closed in finally
     try:
         so = _build_shim(workdir)
         if not so:
@@ -99,6 +153,18 @@ def heap_stage(ctx) -> dict:
         exe = workdir / "target.bin"
         ctx.content.stage_target(target, exe.parent, exe.name)
         os.chmod(exe, 0o755)
+        # LD_PRELOAD is read by the dynamic loader, so a statically linked target never loads the
+        # shim -- and would be handed the run's nonce in its environment, unerased. Decided from
+        # the ELF itself (no PT_INTERP) BEFORE anything runs: nothing was checked, which is not
+        # the same as nothing found.
+        if not sandbox._interp_of(exe):
+            note = ("this target is statically linked, so the LD_PRELOAD guard-page allocator "
+                    "cannot load into it -- nothing was checked, which is not the same as nothing "
+                    "found. Use a dynamically-linked build.")
+            ctx.emit("heap.done", payload={"ok": False, "applicable": False, "errors": 0,
+                     "findings": 0, "kinds": [], "note": note})
+            ctx.progress(pct=100, msg="heap check did not run: statically linked target")
+            return {"metrics": {"applicable": False}}
 
         mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
         argv = list(p.get("argv") or [])
@@ -110,11 +176,29 @@ def heap_stage(ctx) -> dict:
             (workdir / "input.bin").write_bytes(data)
             run_argv = place(argv, str(workdir / "input.bin"))
 
-        report = workdir / "heap.json"
-        # Minimal env for hostile code: the shim needs LD_PRELOAD + its report path; the host
-        # environment is NOT forwarded (it can carry credentials/tokens). Keep only locale so
-        # locale-sensitive parsing behaves as it would natively.
-        env = {"LD_PRELOAD": str(so), "LYKOS_HEAP_REPORT": str(report),
+        # The REPORT IS EVIDENCE, and it used to live in the workdir the target can write: any
+        # target could append `{"error":"use-after-free",...}` and have a critical CWE-416 filed
+        # against itself (or bury a real one). Now: an inherited descriptor to a file outside
+        # anything the target can reach by path, and a per-run nonce only the shim in the
+        # target's process reads, before main() -- a line without it is ignored (see
+        # `parse_report`).
+        nonce = secrets.token_hex(16)
+        repdir, wfd, rfd = _open_report()
+        report_fds[:] = [repdir, wfd, rfd]
+        # The nonce goes over a PIPE, never the environment: bwrap's init (pid 1 of the sandbox)
+        # keeps the environment it was started with, and the target can read /proc/1/environ.
+        # The shim's read consumes the pipe, so afterwards the nonce exists only inside the shim.
+        nr, nw = os.pipe()
+        os.write(nw, nonce.encode())
+        os.close(nw)
+        report_fds.append(nr)
+        # Minimal env for hostile code: the shim needs LD_PRELOAD + its report fd + the nonce;
+        # the host environment is NOT forwarded (it can carry credentials/tokens). Keep only
+        # locale so locale-sensitive parsing behaves as it would natively.
+        # LYKOS_HEAP_TARGET: only the target's own process takes the nonce, never a launcher the
+        # sandbox execs it through (setarch), which loads the shim too.
+        env = {"LD_PRELOAD": str(so), "LYKOS_HEAP_FD": str(wfd), "LYKOS_HEAP_NONCE_FD": str(nr),
+               "LYKOS_HEAP_TARGET": os.path.realpath(exe),
                "PATH": "/usr/bin:/bin", "HOME": "/tmp"}
         for k in ("LANG", "LC_ALL", "LC_CTYPE", "TZ"):
             if k in os.environ:
@@ -126,7 +210,7 @@ def heap_stage(ctx) -> dict:
         # Detonate the (hostile) target with real containment: bwrap read-only root with
         # /home,/root masked (net unshared -- the shim needs no network) + rlimits so a fork
         # bomb / disk fill / runaway CPU cannot take the host down. The workdir holds the target,
-        # the shim .so, the input and the shim's JSON report, so it is bound WRITABLE. On timeout
+        # the shim .so and the input, and is bound WRITABLE (the report is NOT in it). On timeout
         # run_reaped kills the whole process group / namespace, so no forked child is orphaned.
         # AS is deliberately NOT capped: the guard-page allocator maps a guard region per
         # allocation, and an address-space ceiling would make its mmaps fail and mask real bugs.
@@ -135,7 +219,7 @@ def heap_stage(ctx) -> dict:
         timed_out = False
         try:
             sandbox.run_reaped(cmd, input=stdin, capture_output=True, timeout=timeout,
-                               env=env, cwd=str(workdir),
+                               env=env, cwd=str(workdir), pass_fds=(wfd, nr),
                                preexec_fn=sandbox._rlimits(2048, int(timeout) + 5, set_as=False))
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -150,11 +234,20 @@ def heap_stage(ctx) -> dict:
             ctx.emit("heap.done", payload={"ok": False, "applicable": False, "note": note})
             return {}
 
-        # The shim's constructor opens (O_CREAT) the report the instant it loads, so the report's
-        # ABSENCE proves the shim never loaded -- the target did not execute under instrumentation
-        # (statically linked, or it failed to exec inside the sandbox). That is NOT a clean bill
-        # of health: nothing was checked, which is not the same as nothing found.
-        if not report.exists():
+        os.close(wfd)
+        report_fds[1] = None
+        raw = _read_fd(rfd)
+        loaded, errors, forged = parse_report(raw, nonce)
+        if forged:
+            ctx.emit("heap.forged", level="warn", payload={
+                "lines": forged, "note": (
+                    f"{forged} heap-error line(s) in the report did not carry this run's nonce -- "
+                    f"written by the target, not by the guard-page allocator -- and were ignored")})
+        # The shim's constructor writes an authenticated `loaded` line the instant it loads, so
+        # its ABSENCE proves the shim never loaded -- the target did not execute under
+        # instrumentation (it failed to exec inside the sandbox). That is NOT a clean bill of
+        # health: nothing was checked, which is not the same as nothing found.
+        if not loaded:
             static = (target.linking or "").lower() == "static"
             note = ("this target is statically linked, so the LD_PRELOAD guard-page allocator "
                     "never loaded -- nothing was checked, which is not the same as nothing "
@@ -166,16 +259,6 @@ def heap_stage(ctx) -> dict:
                      "findings": 0, "kinds": [], "note": note})
             ctx.progress(pct=100, msg="heap check did not run: instrumentation never loaded")
             return {"metrics": {"applicable": False}}
-
-        errors = []
-        for line in report.read_text("latin-1").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                errors.append(json.loads(line))
-            except ValueError:
-                pass
 
         fd = FindingDAO(ctx.conn)
         seen, findings = set(), 0
@@ -198,8 +281,8 @@ def heap_stage(ctx) -> dict:
                 "dedup_key": key, "state": "corroborated", "confidence": 0.9})
             findings += 1
 
-        # The report exists, so the shim loaded and the target DID run under instrumentation.
-        # (The "statically linked / never loaded" case is handled above by report absence.)
+        # The authenticated `loaded` line is there, so the shim loaded and the target DID run
+        # under instrumentation. (The "never loaded" case is handled above.)
         note = None
         if timed_out:
             note = ("the target was still running when the timeout expired; the heap inventory "
@@ -208,12 +291,29 @@ def heap_stage(ctx) -> dict:
             note = "no heap errors observed on this input (try other inputs)"
         ctx.emit("heap.done", payload={"ok": True, "errors": len(errors), "findings": findings,
                  "kinds": sorted({e.get("error") for e in errors if e.get("error") in _MAP}),
-                 "timed_out": timed_out, "note": note})
+                 "timed_out": timed_out, "forged_ignored": forged, "note": note})
         ctx.progress(pct=100, msg=f"{len(errors)} heap error(s), {findings} finding(s)")
         return {}
     finally:
         import shutil
+        if report_fds:
+            _close_report(*report_fds)
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _close_report(repdir, wfd, rfd, *more) -> None:
+    import shutil
+    for fd in (wfd, rfd, *more):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        os.chmod(repdir, 0o700)
+    except OSError:
+        pass
+    shutil.rmtree(repdir, ignore_errors=True)
 
 
 def register() -> None:

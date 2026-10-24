@@ -441,6 +441,9 @@ def directed_stage(ctx) -> dict:
     summary = {"backend": "directed", "execs": st.get("execs", 0), "crashes": st.get("crashes", 0),
                "directed": bool(plan["directed"]),
                "top_target": _target_label(plan["targets"]) if plan["directed"] else None,
+               # "converged" / "stalled" when the campaign ended itself before its budget
+               "stopped": st.get("stopped"),
+               "budget_returned_s": st.get("budget_returned_s"),
                "coverage": {"kind": "block", "blocks_hit": hit, "blocks_known": known,
                             "pct": round(100.0 * hit / known, 1) if known else None}}
     sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))

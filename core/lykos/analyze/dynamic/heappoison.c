@@ -9,8 +9,16 @@
  *   - double free / wild free: caught in free() via a per-allocation header magic.
  *   - memory leak           : live allocations at exit are reported.
  *
- * Findings are written as one JSON line each to $LYKOS_HEAP_REPORT (async-signal-safe write in
- * the fault handler). On a faulting bug we report and _exit(86); double/wild free and leaks are
+ * Findings are written as one JSON line each to the inherited descriptor $LYKOS_HEAP_FD (or, for
+ * a standalone build, the file $LYKOS_HEAP_REPORT), async-signal-safe in the fault handler.
+ * AUTHENTICATED: every line carries the per-run nonce, which the constructor of the TARGET's
+ * process ($LYKOS_HEAP_TARGET) reads off a pipe ($LYKOS_HEAP_NONCE_FD) -- consuming it -- before
+ * the program's own constructors and main() run, so a hostile target that writes heap-error
+ * lines of its own (to the report, to any descriptor) cannot make them count. A
+ * `{"loaded":1,"n":...}` line proves the shim loaded. (Code that runs BEFORE preloaded
+ * constructors -- an executable's DT_PREINIT_ARRAY -- or that scans its own memory for the
+ * shim's copy could still recover it: an in-process shim cannot be authenticated against code in
+ * its own address space. This closes the cheap forgeries, not that one.) On a faulting bug we report and _exit(86); double/wild free and leaks are
  * reported without aborting. Falls back to the real allocator when mmap fails or for huge sizes,
  * so it degrades safely on real programs. Build: cc -shared -fPIC -O2 heappoison.c -o heappoison.so -ldl
  */
@@ -37,6 +45,7 @@ static struct region g_tab[MAX_TRACK];
 static size_t g_n;
 static void *g_quar[QUARANTINE]; static size_t g_quar_head, g_quar_count;
 static int g_fd = -1;
+static char g_nonce[65]; static int g_nlen;   /* the run's nonce, held only here once erased */
 static volatile int g_lock;
 
 static void *(*real_malloc)(size_t);
@@ -68,8 +77,85 @@ static void emit(const char *kind, unsigned long addr, unsigned long size, const
     while (c) b[p++] = dc[--c];
     const char *f = ",\"func\":\""; while (*f) b[p++] = *f++;
     while (*fn) b[p++] = *fn++;
+    b[p++] = '"';
+    const char *n = ",\"n\":\""; while (*n) b[p++] = *n++;
+    for (int i = 0; i < g_nlen; i++) b[p++] = g_nonce[i];
     b[p++] = '"'; b[p++] = '}'; b[p++] = '\n';
     (void)!write(g_fd, b, p);
+}
+
+static void emit_loaded(void)
+{
+    if (g_fd < 0) return;
+    char b[128]; int p = 0;
+    const char *pre = "{\"loaded\":1,\"n\":\"";
+    while (*pre) b[p++] = *pre++;
+    for (int i = 0; i < g_nlen; i++) b[p++] = g_nonce[i];
+    b[p++] = '"'; b[p++] = '}'; b[p++] = '\n';
+    (void)!write(g_fd, b, p);
+}
+
+/* Take the nonce and the report descriptor out of the environment: copy the nonce into the shim,
+ * zero its bytes IN PLACE (that memory is what /proc/self/environ reads back), and unset both so
+ * neither the program nor anything it executes can read them. */
+static void take_env(void)
+{
+    extern char **environ;
+    /* Only the TARGET takes them. The sandbox may exec it through a launcher (setarch -R) that
+     * loads this shim too; a launcher that consumed the nonce would leave the target with none.
+     * $LYKOS_HEAP_TARGET names the program; anything else stays silent and passes the env on. */
+    const char *want = getenv("LYKOS_HEAP_TARGET");
+    if (want && *want) {
+        char self[4096];
+        ssize_t k = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (k <= 0) return;
+        self[k] = 0;
+        if (strcmp(self, want)) return;
+    }
+    const char *fd = getenv("LYKOS_HEAP_FD");
+    if (fd && *fd) {
+        g_fd = atoi(fd);
+        fcntl(g_fd, F_SETFD, FD_CLOEXEC);
+    } else {
+        const char *rp = getenv("LYKOS_HEAP_REPORT");
+        if (rp) g_fd = open(rp, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    }
+    /* The nonce arrives on a PIPE ($LYKOS_HEAP_NONCE_FD), not in the environment: a sandbox's
+     * init process keeps the environment it was started with, and /proc/1/environ is readable
+     * from inside the sandbox. Reading the pipe CONSUMES it, so once this has run the nonce exists
+     * only in this shim. $LYKOS_HEAP_NONCE is the fallback for a standalone run. */
+    char nb[65]; int nn = 0;
+    const char *nfd = getenv("LYKOS_HEAP_NONCE_FD");
+    const char *n = getenv("LYKOS_HEAP_NONCE");
+    if (nfd && *nfd) {
+        int f = atoi(nfd);
+        while (nn < 64) {
+            ssize_t k = read(f, nb + nn, 64 - nn);
+            if (k <= 0) break;
+            nn += (int)k;
+        }
+        close(f);
+        nb[nn] = 0;
+        n = nb;
+    }
+    g_nlen = 0;
+    if (n) {
+        while (n[g_nlen] && g_nlen < 64) {
+            char c = n[g_nlen];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) break;   /* hex only */
+            g_nonce[g_nlen] = c; g_nlen++;
+        }
+    }
+    for (char **e = environ; e && *e; e++) {
+        if (!strncmp(*e, "LYKOS_HEAP_NONCE=", 17) || !strncmp(*e, "LYKOS_HEAP_FD=", 14)) {
+            char *v = strchr(*e, '=') + 1;
+            memset(v, 0, strlen(v));
+        }
+    }
+    unsetenv("LYKOS_HEAP_NONCE");
+    unsetenv("LYKOS_HEAP_NONCE_FD");
+    unsetenv("LYKOS_HEAP_FD");
+    unsetenv("LYKOS_HEAP_TARGET");
 }
 
 /* bootstrap arena: dlsym() may call calloc before real_malloc is resolved (re-entrancy) */
@@ -88,8 +174,6 @@ static void init(void)
     real_free    = dlsym(RTLD_NEXT, "free");
     real_calloc  = dlsym(RTLD_NEXT, "calloc");
     real_realloc = dlsym(RTLD_NEXT, "realloc");
-    const char *rp = getenv("LYKOS_HEAP_REPORT");
-    if (rp) g_fd = open(rp, O_WRONLY | O_CREAT | O_APPEND, 0644);
 }
 
 static struct region *find(void *p)   /* region whose mapping contains p */
@@ -126,6 +210,11 @@ static void handler(int sig, siginfo_t *si, void *uc)
 __attribute__((constructor)) static void setup(void)
 {
     if (!real_malloc) init();
+    /* here, not in init(): init() can run re-entrantly inside the very first malloc, possibly
+     * under a libc lock that unsetenv would take again. A preloaded library's constructor runs
+     * before the program's own constructors and main(). */
+    take_env();
+    emit_loaded();
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = handler; sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);

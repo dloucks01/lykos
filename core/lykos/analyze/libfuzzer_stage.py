@@ -252,6 +252,9 @@ def _file_crash(ctx, target, fd, cr, *, harness_sha, harness_desc, entry, seen) 
         DynResultDAO(ctx.conn).insert(
             target.id, target.case_id, input_sha=input_sha, input_mode="file",
             argv=["@@"], crashed=faulted,
+            # A `timeout-` artifact IS a hang: flagged so the stages that replay recorded inputs
+            # (concolic seeds, mem_oracle probes) skip it instead of paying a timeout per replay.
+            timed_out=(kind == "timeout" and not faulted),
             # The sanitizer CLASS, not a made-up signal: this fault was reported by ASan,
             # not delivered by the kernel, and `build_poc` records the same string when it
             # replays -- so defaulting to "SIGSEGV" here made a correct replay look like it
@@ -404,7 +407,16 @@ def libfuzzer_stage(ctx) -> dict:
         # see only the internal API it is now required to ignore. The build has always
         # configured; it did it AFTER the door was chosen, which is one step too late. Cheap
         # when the tree is already configured, which in the pipeline it is.
-        LF.ensure_configured(src)
+        _conf: dict = {}
+        LF.ensure_configured(src, report=_conf)
+        if _conf.get("ran"):
+            # the project's own configure is untrusted code: say how contained it was, and
+            # LOUDLY when it was not (bwrap unusable on this host)
+            ctx.emit("libfuzzer.configure", level=("info" if _conf.get("confined") else "warn"),
+                     payload={"confined": bool(_conf.get("confined")), "rc": _conf.get("rc"),
+                              "note": (None if _conf.get("confined") else
+                                       "configure ran UNCONFINED: bwrap is unusable here, so the "
+                                       "project's own script ran with this host's privileges")})
         plan = LF.plan_harnesses(src, limit=max(first + width, LF.MAX_HARNESSES))
         window = plan[first:first + width]
     if not window:

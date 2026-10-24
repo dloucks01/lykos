@@ -42,7 +42,7 @@ program is.
 """
 from __future__ import annotations
 
-from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
+from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import substrate
 from ..poc.capture import how_to_feed
@@ -82,14 +82,15 @@ def _probe_inputs(conn, target) -> list:
     fallback and is not a weak one -- a program whose uninitialised read is on its default path
     discloses on the very first execution, and reads no input at all.
     """
-    out: list = []
+    # A HANG input is never a probe: memcheck runs 10-30x slower than a bare execution, so an
+    # input recorded as a timeout (a timed-out dyn_result row, libFuzzer's `timeout` artifact, a
+    # re-verified CWE-835 hang) spends the stage's whole slice inside one run that never ends,
+    # and the inputs behind it are never examined.
     try:
-        for d in DynResultDAO(conn).list_by_target(target.id):
-            if d.input_sha and d.input_sha not in out:
-                out.append(d.input_sha)
+        from ..fuzz.stage import replayable_input_shas
+        return replayable_input_shas(conn, target.id, _MAX_RUNS)[0]
     except Exception:                                    # noqa: BLE001 -- probes are advisory
-        pass
-    return out[:_MAX_RUNS]
+        return []
 
 
 #: What a disclosure of residue is WORTH. memcheck proves undefined bytes reached a write syscall

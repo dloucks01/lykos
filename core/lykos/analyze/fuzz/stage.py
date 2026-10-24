@@ -19,6 +19,7 @@ import random
 import re
 import time
 from pathlib import Path
+from typing import Optional
 
 from ... import observe
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
@@ -1027,6 +1028,131 @@ def _not_run_reason(isolation, note: str = "") -> str:
 #: Attempts after which a campaign where NONE reached the program stops (an error loop).
 _ERROR_LOOP_SAMPLE = 64
 
+#: CONVERGENCE STOP (doc 47 U1). Under run-to-convergence (`params.converge`) the budget is a
+#: safety CEILING -- six hours by default -- and the operator's intent is "keep going until it
+#: stops finding things". AFL has its own plateau signal (AFL_EXIT_WHEN_DONE); the blind and
+#: directed campaigns had none, so they burned the whole ceiling long after coverage stopped
+#: moving. A campaign has CONVERGED when nothing new -- no coverage unit (blocks when the coverage
+#: channel answers, behaviours otherwise: the same novelty that drives the corpus), no closer
+#: approach to a directed sink, no new crash bucket, no hang -- has been found for a window that
+#: scales with the run: at least `_PLATEAU_MIN_EXECS` executions AND `_PLATEAU_MIN_S` seconds,
+#: and at least `_PLATEAU_FRAC` of everything the campaign has done so far in BOTH. So the idle
+#: tail must be as long as the productive head: a campaign whose last find was at 40 minutes
+#: runs to at least 80. Only after seed calibration (verbatim seeds are not search), and only
+#: under `converge`: a time-boxed run keeps its slice, because there the operator asked for it.
+_PLATEAU_MIN_EXECS = 1000
+_PLATEAU_MIN_S = 60.0
+_PLATEAU_FRAC = 0.5
+
+#: STALL AUTO-SKIP. A campaign whose executions have stopped COMPLETING -- every one runs into the
+#: per-execution limit, reaches nothing new and crashes nothing -- is a wedged target (it waits on
+#: a peer or a prompt it never gets, or every input now hangs), and the rest of its slice would buy
+#: more of the same. It ends itself with `stalled` after a grace window of at least
+#: `_STALL_MIN_ATTEMPTS` consecutive such executions AND `_stall_grace_s` seconds of them. ANY
+#: execution that completes (exits, faults), any new coverage or behaviour, and any crash resets the
+#: window, so a slow-but-progressing target -- one that takes 1.9 s of a 2 s limit, or one whose
+#: timeouts still reach new blocks -- never trips it. Off for a target whose BASELINE never
+#: terminates (a server/menu loop the orchestrator already runs under a short per-exec timeout): a
+#: timeout is how every execution of it ends, not a sign it is wedged.
+_STALL_MIN_ATTEMPTS = 32
+_STALL_MIN_S = 30.0
+_STALL_TIMEOUT_MULT = 15         # ... and at least this many per-execution timeouts' worth
+_STALL_SHARE = 0.05              # ... and this share of the campaign's slice,
+_STALL_SHARE_CAP_S = 300.0       # ... capped, so a 6-hour ceiling waits 5 minutes, not 18
+#: Batch size after a batch that mostly timed out (see the loop): small enough that neither the
+#: deadline nor the stall check waits on 64 back-to-back timeouts.
+_TIMEOUT_BATCH = 8
+
+
+def _plateau_window(execs: int, elapsed: float) -> tuple:
+    """(idle executions, idle seconds) the campaign must go without a find to have converged."""
+    return (max(_PLATEAU_MIN_EXECS, int(_PLATEAU_FRAC * max(0, execs))),
+            max(_PLATEAU_MIN_S, _PLATEAU_FRAC * max(0.0, elapsed)))
+
+
+def _plateaued(execs: int, elapsed: float, gain_exec: int, gain_s: float) -> bool:
+    """Has the campaign found nothing new since (`gain_exec`, `gain_s`) for long enough?"""
+    need_e, need_s = _plateau_window(execs, elapsed)
+    return (execs - gain_exec) >= need_e and (elapsed - gain_s) >= need_s
+
+
+def _stall_grace_s(exec_timeout: float, max_seconds: float) -> float:
+    return max(_STALL_MIN_S, _STALL_TIMEOUT_MULT * float(exec_timeout or 0),
+               min(_STALL_SHARE_CAP_S, _STALL_SHARE * float(max_seconds or 0)))
+
+
+def _stalled(streak: int, streak_s: float, exec_timeout: float, max_seconds: float) -> bool:
+    """`streak` consecutive executions, spanning `streak_s` seconds, that all timed out with
+    nothing new reached and nothing crashed: past the grace window?"""
+    return (streak >= _STALL_MIN_ATTEMPTS
+            and streak_s >= _stall_grace_s(exec_timeout, max_seconds))
+
+
+def _baseline_nonterm(conn, target_id) -> bool:
+    """Did the target's own baseline execution (no fuzz input) fail to terminate? The same test
+    the orchestrator uses to shorten the per-exec timeout for such a target."""
+    try:
+        rows = DynResultDAO(conn).list_by_target(target_id)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return False
+    base = [r for r in rows if (r.input_mode or "none") == "none"]
+    return bool(base) and all(getattr(r, "timed_out", False) for r in base)
+
+
+def hang_input_shas(conn, target_id) -> set:
+    """Every recorded input of this target that is KNOWN to hang it: a dyn_result row that timed
+    out (any stage, and libFuzzer's `timeout` artifacts, recorded before `timed_out` was set on
+    them, by their signal name), plus the input of every non-termination finding (CWE-835 /
+    CWE-400 hang evidence), which `_file_hang` deliberately records WITHOUT a dyn_result row.
+
+    Stages that seed or probe themselves from recorded inputs (concolic's `_gather_seeds`,
+    mem_oracle's `_probe_inputs`) skip these: a hang input costs each of them a full timeout per
+    replay, and buys nothing a terminating input would not."""
+    out: set = set()
+    try:
+        for d in DynResultDAO(conn).list_by_target(target_id):
+            if d.input_sha and not d.crashed and (
+                    getattr(d, "timed_out", False)
+                    or (d.signal_name or "").lower() in ("timeout", "hang")):
+                out.add(d.input_sha)
+    except Exception:                                    # noqa: BLE001 -- advisory filter
+        observe.absorbed(_log, "no dyn_result hang filter")
+    try:
+        for f in FindingDAO(conn).list_by_target(target_id):
+            dk = f.dedup_key or ""
+            if f.cwe != "CWE-835" and ":hang:" not in dk and ":timeout" not in dk:
+                continue
+            for ev in (f.evidence or []):
+                sha = ev.get("input_sha") if isinstance(ev, dict) else None
+                if sha:
+                    out.add(sha)
+    except Exception:                                    # noqa: BLE001 -- advisory filter
+        observe.absorbed(_log, "no finding hang filter")
+    return out
+
+
+def replayable_input_shas(conn, target_id, limit: int) -> list:
+    """Distinct recorded inputs of this target, newest first, with every known HANG input left
+    out (see `hang_input_shas`), up to `limit`. Returns (shas, skipped_hangs)."""
+    hangs = hang_input_shas(conn, target_id)
+    seen, out, skipped = set(), [], 0
+    try:
+        rows = DynResultDAO(conn).list_by_target(target_id)
+    except Exception:                                    # noqa: BLE001
+        rows = []
+    for d in rows:
+        s = d.input_sha
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        if s in hangs:
+            skipped += 1
+            continue
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out, skipped
+
 #: HANG / DoS CAPTURE (doc 47 P7). An input on which the target never terminates is a finding in
 #: its own right -- an availability defect (CWE-835 infinite loop / CWE-400 unbounded consumption)
 #: -- and it used to be discarded as just another timed-out execution. Filing one is held to the
@@ -1085,7 +1211,7 @@ def _verify_hang(exe, mode, workfile, exec_timeout, target, cand, control, alog=
 
 
 def _file_hang(ctx, target, fd, *, mode, data, prefix, hang, control, exec_timeout,
-               detector, event_prefix) -> str:
+               detector, event_prefix, control_data: Optional[bytes] = None) -> str:
     """Record a re-verified hang as a CWE-835 finding carrying its input artifact.
 
     Deliberately NO dyn_result row: several stages seed themselves from every recorded input
@@ -1094,6 +1220,15 @@ def _file_hang(ctx, target, fd, *, mode, data, prefix, hang, control, exec_timeo
     which is everything a replay needs."""
     t = _hang_timeout(exec_timeout)
     input_sha = ctx.put_artifact("fuzz-hang-input", data=data)
+    # The benign CONTROL that exited under the same long limit: the other half of the
+    # differential, stored so poc/dos.hang_poc re-verifies against the SAME control rather than a
+    # guessed b"" / b"\n" the target might itself hang on.
+    control_sha = None
+    if control_data is not None:
+        try:
+            control_sha = ctx.put_artifact("fuzz-hang-control", data=bytes(control_data))
+        except Exception:                                # noqa: BLE001 -- evidence still filed
+            observe.absorbed(_log, "hang control not stored")
     detail = (f"input {input_sha[:12]} ({len(data)}B via {mode}) did not terminate within "
               f"{exec_timeout:g}s in the campaign and again within {t:g}s when re-run alone, "
               f"while a benign input exited in {control.duration_ms} ms under the same "
@@ -1106,7 +1241,7 @@ def _file_hang(ctx, target, fd, *, mode, data, prefix, hang, control, exec_timeo
         "function_addr": None, "site_addr": None,
         "evidence": [{"channel": "dynamic", "detail": detail,
                       "input_sha": input_sha, "input_mode": mode, "argv": list(prefix),
-                      "isolation": hang.isolation}]})
+                      "control_sha": control_sha, "isolation": hang.isolation}]})
     ctx.emit(f"{event_prefix}.hang", payload={"input_sha": input_sha, "mode": mode,
                                               "argv": list(prefix), "timeout": t,
                                               "control_ms": control.duration_ms})
@@ -1351,10 +1486,32 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     hang_sha = None
     _seeds = list(corpus)[:_CALIBRATE_CAP]
     replay: list = [(s, guard) for s in _seeds] + [(s, not guard) for s in _seeds]
+    # Convergence + stall monitors (see `_PLATEAU_*` / `_STALL_*`). `stopped` is why the loop
+    # ended early, when it did: "converged" or "stalled" -- either way the unused slice goes back
+    # to the case budget (it is wall-clock), and the stage's other channels.
+    _p = ctx.params or {}
+    converge = bool(_p.get("converge"))
+    stall_check = bool(_p.get("stall_check", True))
+    if stall_check and _baseline_nonterm(ctx.conn, target.id):
+        stall_check = False
+        ctx.emit(f"{event_prefix}.stall_check", payload={"enabled": False, "why": (
+            "the target's baseline never terminates, so a timeout is how its executions normally "
+            "end -- a run of them is not a wedged target")})
+    t_start = time.time()
+    stopped, stop_note, stop_payload = None, None, None
+    gain_exec, gain_t = 0, 0.0                   # last find: executions / seconds into the campaign
+    plateau_armed = False                        # set once seed calibration has finished
+    stall_streak, stall_s = 0, 0.0               # consecutive timed-out, gainless executions
+    last_batch_n, last_batch_timeouts = 0, 0     # the previous batch's size and its timeouts
     ctx.progress(msg=f"{event_prefix} campaign")
     last_emit = time.time()                      # live-console heartbeat, independent of exec count
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         calibrating = bool(replay)
+        if not calibrating and not plateau_armed:
+            # The idle clock starts when the SEARCH starts: calibration replays the seeds
+            # verbatim, and a seed that adds nothing is not a mutation that failed to.
+            plateau_armed = True
+            gain_exec, gain_t = max(gain_exec, execs), max(gain_t, time.time() - t_start)
         guard_eff = guard
         prefix: list = []
         base_ms = sorted(cheap_ms)[len(cheap_ms) // 2]
@@ -1376,6 +1533,13 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         risky = any(f not in flag_cost or _dear(flag_cost.get(f), base_ms) for f in prefix)
         run_argv = prefix + base_argv          # exploration first, the contract last
         want = min((_PROBE_N if risky else batch_n) if batchable else 1, max_execs - execs)
+        if batchable and last_batch_timeouts * 2 >= max(1, last_batch_n):
+            # The last batch was mostly TIMEOUTS: each input now costs the full per-exec limit,
+            # so a 64-input batch is 64 x exec_timeout (128 s at 2 s) that neither the deadline
+            # nor the stall check can interrupt. Batching only amortises the namespace setup,
+            # which is noise next to a timeout -- so shrink the batch to what the slice has left.
+            _fit = int(max(0.0, deadline - time.time()) / max(1e-3, float(exec_timeout or 0)))
+            want = max(1, min(want, _TIMEOUT_BATCH, _fit))
         if calibrating:
             # Verbatim seeds first, in corpus order (boundary-value configs lead), up to the
             # batch size -- never mutated, so a seed that crashes is caught as itself.
@@ -1424,6 +1588,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 kw["blocks"] = tuple(all_blocks - seen_blocks)
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
                               **kw)[1]]
+        last_batch_n = len(results)
+        last_batch_timeouts = sum(1 for r in results if r.timed_out and not r.crashed)
         for data, res in zip(inputs, results):
             # What gets RECORDED is the flag prefix, not the invocation: the workfile path
             # is scratch and means nothing to a later replay. A crash found under an option
@@ -1509,6 +1675,17 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 _new_units = 1 if new_behaviour else 0
             alog.record_result(data, res, phase=("seed" if calibrating else "mutate"),
                                argv=prefix, new=_new_units, kept=kept_this)
+            if novel or closer:
+                gain_exec, gain_t = execs, time.time() - t_start
+            # Stall window: only a timed-out execution that reached nothing new extends it;
+            # anything that completed, crashed, or found something resets it.
+            if (res.timed_out and not res.crashed and not (novel or closer)
+                    and not sandbox.did_not_run(res.isolation)):
+                stall_streak += 1
+                stall_s += (res.duration_ms / 1000.0 if res.duration_ms
+                            else float(exec_timeout or 0))
+            else:
+                stall_streak, stall_s = 0, 0.0
             if res.crashed:
                 crashes += 1
                 # A crash that does not happen again is not a finding. Some targets REWRITE
@@ -1545,6 +1722,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         corpus[rng.randrange(len(corpus))] = data
                 if bucket not in seen_sigs:
                     seen_sigs[bucket] = 1
+                    gain_exec, gain_t = execs, time.time() - t_start   # a new defect is a find
 
                     def _same(d, _sig=sig, _prefix=run_argv, _guard=guard_eff):
                         # Minimize under the SAME invocation the crash was found and confirmed
@@ -1604,7 +1782,9 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 try:
                     hang_sha = _file_hang(ctx, target, fd, mode=mode, data=_hd, prefix=_hp,
                                           hang=_v[0], control=_v[1], exec_timeout=exec_timeout,
-                                          detector=detector, event_prefix=event_prefix)
+                                          detector=detector, event_prefix=event_prefix,
+                                          control_data=hang_control[0])
+                    gain_exec, gain_t = execs, time.time() - t_start
                 except Exception:                    # noqa: BLE001 -- never break the campaign
                     observe.absorbed(_log, "hang not filed")
         # An ERROR LOOP: the program "ran" as far as the sandbox is concerned, but the loader refused
@@ -1634,6 +1814,45 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     "behaviours": 0, "corpus": len(corpus), "kept": 0, "execs_per_sec": 0,
                     "blocks_hit": 0, "blocks_known": len(all_blocks), "coverage": "none",
                     "did_not_run": True}
+        # Stall auto-skip, then the convergence stop (see `_STALL_*` / `_PLATEAU_*`).
+        _now = time.time()
+        if stall_check and _stalled(stall_streak, stall_s, exec_timeout, max_seconds):
+            stopped = "stalled"
+            stop_note = (f"the last {stall_streak:,} executions ({stall_s:.0f}s of them) all ran "
+                         f"into the {exec_timeout:g}s per-execution limit, reached nothing new "
+                         f"and crashed nothing -- the target is wedged (waiting on a peer, a "
+                         f"prompt or a channel it never gets, or every input now hangs), so the "
+                         f"campaign stopped instead of spending the rest of its slice on more of "
+                         f"the same")
+            stop_payload = {"reason": "stalled", "streak": stall_streak,
+                            "streak_s": round(stall_s, 1),
+                            "grace_s": round(_stall_grace_s(exec_timeout, max_seconds), 1),
+                            "exec_timeout": exec_timeout}
+        elif converge and plateau_armed and _plateaued(execs, _now - t_start, gain_exec, gain_t):
+            _we, _ws = _plateau_window(execs, _now - t_start)
+            _unit = "blocks" if (all_blocks and cover_reported) else "behaviours"
+            _cov = len(seen_blocks) if _unit == "blocks" else len(seen_behaviour)
+            stopped = "converged"
+            stop_note = (f"coverage plateaued at {_cov:,} {_unit}: nothing new (no {_unit[:-1]}, "
+                         f"no closer sink approach, no new crash or hang) for "
+                         f"{execs - gain_exec:,} executions / {_now - t_start - gain_t:.0f}s "
+                         f"since the last find at {gain_t:.0f}s -- converged, so the rest of the "
+                         f"ceiling goes back to the run")
+            stop_payload = {"reason": "plateau", "unit": _unit, "coverage": _cov,
+                            "last_gain_exec": gain_exec, "last_gain_s": round(gain_t, 1),
+                            "idle_execs": execs - gain_exec,
+                            "idle_s": round(_now - t_start - gain_t, 1),
+                            "window_execs": _we, "window_s": round(_ws, 1)}
+        if stopped:
+            stop_payload.update({"execs": execs, "elapsed": round(_now - t_start, 1),
+                                 "budget": round(max_seconds, 1),
+                                 "budget_returned_s": round(max(0.0, deadline - _now), 1),
+                                 "crashes": crashes, "unique": len(seen_sigs),
+                                 "note": stop_note})
+            ctx.emit(f"{event_prefix}.{stopped}", payload=stop_payload)
+            ctx.progress(msg=f"{event_prefix}: {stopped} -- "
+                             f"{stop_payload['budget_returned_s']:.0f}s of budget returned")
+            break
         # Progress heartbeat for the live console. Emit every 250 execs OR every 3 s, whichever
         # comes first -- the time floor matters because a SLOW campaign (a target that hits its
         # per-exec timeout on every input) reaches 250 execs only every few minutes, which is why
@@ -1650,7 +1869,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 "pct": min(100, round(100 * _elapsed / max(1e-3, max_seconds))),
                 "execs_per_sec": round(execs / _elapsed),
                 "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks),
-                "outcomes": alog.snapshot()})
+                "outcomes": alog.snapshot(),
+                # plateau / stall telemetry for the live view: when it last found something,
+                # and how many executions in a row have run into the limit with nothing new
+                "last_gain_s": round(gain_t, 1), "since_gain_execs": execs - gain_exec,
+                "timeout_streak": stall_streak, "converge": converge})
 
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     # An execution rate this low means the campaign barely ran, and "0 crashes" from 16
@@ -1693,6 +1916,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
              "execs_per_sec": round(execs / elapsed),
              "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks),
+             # Why the campaign ended before its budget, if it did ("converged" / "stalled"),
+             # and how much of its slice it handed back.
+             "stopped": stopped, "stop_reason": stop_note,
+             "budget_returned_s": (stop_payload or {}).get("budget_returned_s"),
              # distinguish "coverage armed and live", "armed but never reported" (a fixable
              # environment defect, not a clean campaign) and "no coverage available at all".
              "coverage": ("unavailable" if (coverage_armed and not cover_reported)
@@ -2194,7 +2421,11 @@ def fuzz_stage(ctx) -> dict:
             _rt_tokens = memoracle.runtime_tokens(
                 _tc_exe, (corpus[0] if corpus else b""),
                 mode=channels[0] if channels else "stdin",
-                base_argv=base_argv, host_arch=sandbox.host_arch(), target_arch=target.arch)
+                base_argv=base_argv, host_arch=sandbox.host_arch(), target_arch=target.arch,
+                # Bounded by the campaign's own per-exec limit: one execution, and libtokencap
+                # reports at EXIT, so a run killed at the limit yields nothing however long the
+                # limit was -- the 20 s default spent two-thirds of a 30 s slice on a wedged target.
+                timeout=min(20.0, max(5.0, 4.0 * exec_timeout)))
     except Exception:                                    # noqa: BLE001 -- the dictionary is advisory
         _rt_tokens = []
     if _rt_tokens:
@@ -2366,10 +2597,20 @@ def fuzz_stage(ctx) -> dict:
               "behaviours": 0}
     blocks_hit = 0            # the most blocks any one channel reached (coverage is per-run)
     blocks_known = 0
-    for ch in channels:
+    stage_deadline = time.time() + max_seconds
+    stopped_by: dict = {}
+    for i, ch in enumerate(channels):
         _kw = {"run_fn": _lin_run} if _lin_run is not None else {}
+        # A channel that converged or stalled early hands its unused slice to the channels after
+        # it rather than to nothing: the share is never LESS than the even split, and never more
+        # than what is left of the stage's own budget split over the channels still to run.
+        left = len(channels) - i
+        _secs, _execs = share_secs, share_execs
+        if i and stopped_by:
+            _secs = max(share_secs, (stage_deadline - time.time()) / left)
+            _execs = max(share_execs, (max_execs - totals["execs"]) // left)
         st = fuzz_campaign(ctx, target, corpus=list(corpus), dictionary=dictionary, mode=ch,
-                           max_execs=share_execs, max_seconds=share_secs,
+                           max_execs=_execs, max_seconds=_secs,
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
                            cover_blocks=blocks, cover_flags=flags, base_argv=base_argv,
@@ -2378,13 +2619,17 @@ def fuzz_stage(ctx) -> dict:
             totals[k] += st.get(k, 0)
         blocks_hit = max(blocks_hit, st.get("blocks_hit", 0))
         blocks_known = max(blocks_known, st.get("blocks_known", 0))
+        if st.get("stopped"):
+            stopped_by[ch] = st["stopped"]
         if st.get("crashes_reproducible"):
             break
-    ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals})
+    ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals,
+                                       "stopped": stopped_by or None})
     # Block coverage: how much of the recovered code the campaign actually reached. A parser
     # that fuzzed for a full budget but hit 3% of blocks never got past its length check.
     pct = round(100.0 * blocks_hit / blocks_known, 1) if blocks_known else None
     summary = {"backend": "blind", "execs": totals["execs"], "crashes": totals["crashes"],
+               "stopped": stopped_by or None,
                "coverage": {"kind": "block", "blocks_hit": blocks_hit,
                             "blocks_known": blocks_known, "pct": pct}}
     sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))
