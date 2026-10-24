@@ -83,10 +83,14 @@ def patch_diff_stage(ctx) -> dict:
         if addr is None:
             continue
         nc = c.get("new_callees") or []
+        kc, dc = c.get("new_consts") or [], c.get("dropped_consts") or []
         detail = (f"function '{c['name']}' changed between the baseline '{a.filename}' and this "
                   f"build: blocks {c['blocks'][0]}->{c['blocks'][1]}, instructions "
                   f"{c['insns'][0]}->{c['insns'][1]}, moved-score {c['moved']}"
                   + (f", new callees {', '.join(nc[:6])}" if nc else "")
+                  # an immediate-only edit (a bounds constant) is the classic silent fix: name it
+                  + (f", immediates {', '.join(dc[:6]) or '-'} -> {', '.join(kc[:6]) or '-'}"
+                     if (kc or dc) else "")
                   + ". A security patch -- and the vulnerability it fixes -- lives in the code that "
                     "changed between builds, so analysis is STEERED here (directed fuzzing / concolic "
                     "drive at this function). This is a LEAD, not a proven weakness.")

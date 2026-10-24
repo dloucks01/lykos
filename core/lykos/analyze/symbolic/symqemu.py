@@ -14,7 +14,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from ..fuzz.runner import place
+from ..fuzz.runner import _sub_output, place
 
 _ARCH_SUFFIX = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
                 "mips": "mips", "mipsel": "mipsel", "ppc": "ppc", "ppc64": "ppc64",
@@ -54,13 +54,12 @@ def run_once(symqemu: Path, target: Path, seed: bytes, out_dir: Path, *, mode: s
     libdir = str(Path(symqemu).resolve().parent)
     env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"]
                                        if env.get("LD_LIBRARY_PATH") else "")
-    argv = list(base_argv)
-    stdin = b""
+    # "@@out" (a converter's output path) -> the same relative scratch name the replay uses, not a
+    # literal "@@out" argument the target would choke on
+    argv = _sub_output([str(a) for a in base_argv or []], None)
     if mode == "file":
         env["SYMCC_INPUT_FILE"] = str(seed_file)
         argv = place(argv, str(seed_file))
-    else:                                              # stdin: SymCC treats stdin as symbolic
-        stdin = seed
     cmd = [str(symqemu), str(target)] + argv
     import subprocess
 
@@ -68,14 +67,18 @@ def run_once(symqemu: Path, target: Path, seed: bytes, out_dir: Path, *, mode: s
     # Bound memory + CPU so a legitimately runaway target under SymQEMU cannot exhaust the host.
     # (Full bwrap containment is out of scope for this trusted-operator deployment.)
     rlimit = sandbox._rlimits(2048, int(timeout) + 2, set_as=True)
-    if ctx is not None:
-        proc = ctx.run_subprocess(cmd, timeout=timeout, env=env,
-                                  stdin=subprocess.PIPE if stdin else None,
-                                  preexec_fn=rlimit)
+    # stdin mode (SymCC treats stdin as symbolic): feed the seed from its FILE. The ctx path used to
+    # pass stdin=PIPE and never write to it, so the target blocked on read() until the timeout and
+    # every stdin-mode seed generated nothing -- symqemu was silently a no-op for stdin targets.
+    # file mode keeps stdin at /dev/null (the input is the SYMCC_INPUT_FILE path in argv).
+    with open(seed_file if mode != "file" else os.devnull, "rb") as stdin:
+        if ctx is not None:
+            proc = ctx.run_subprocess(cmd, timeout=timeout, env=env, stdin=stdin,
+                                      preexec_fn=rlimit)
+            return proc.returncode
+        proc = subprocess.run(cmd, stdin=stdin, env=env, capture_output=True,
+                              timeout=timeout, check=False, preexec_fn=rlimit)
         return proc.returncode
-    proc = subprocess.run(cmd, input=stdin or None, env=env, capture_output=True,
-                          timeout=timeout, check=False, preexec_fn=rlimit)
-    return proc.returncode
 
 
 def harvest(out_dir: Path) -> list:

@@ -151,7 +151,16 @@ def vendored_python(prefix: Optional[Path]) -> Optional[Path]:
     """
     if not prefix:
         return None
-    for c in sorted(glob(str(prefix / "usr/bin/python3.[0-9]*")), reverse=True):
+    # Only a real interpreter name (python3.N): the glob also matches `python3.N-config` (a shell
+    # script from python3-dev) and `python3.Nm`, and a plain reverse string sort picks the -config
+    # script first and ranks 3.9 above 3.13. Pick the highest MINOR, numerically.
+    import re
+    cands = []
+    for c in glob(str(prefix / "usr/bin/python3.[0-9]*")):
+        m = re.fullmatch(r"python3\.(\d+)", Path(c).name)
+        if m:
+            cands.append((int(m.group(1)), c))
+    for _minor, c in sorted(cands, reverse=True):
         p = Path(c)
         if p.is_file() and os.access(c, os.X_OK):
             return p

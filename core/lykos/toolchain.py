@@ -42,7 +42,7 @@ class Tool:
     bundle: Optional[Callable[[], list]] = None
 
 
-def _v(cmd, *args, timeout=5):
+def _v(cmd, *args, timeout=5, env=None):
     """First line of a tool's own version output -- proof it RUNS, not just that it exists.
 
     A tool that is present but broken or ABI-incompatible typically exits non-zero and prints
@@ -55,16 +55,52 @@ def _v(cmd, *args, timeout=5):
     if not exe:
         return None
     try:
-        r = subprocess.run([exe, *args], capture_output=True, timeout=timeout)
+        r = subprocess.run([exe, *args], capture_output=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     out = (r.stdout or b"") + (r.stderr or b"")
-    line = out.decode("utf-8", "replace").strip().splitlines()
+    text = out.decode("utf-8", "replace")
+    if _did_not_run(r.returncode, text):
+        # The loader/kernel refused it (missing .so, bad interpreter, corrupt ELF) or it died on
+        # a signal. Its first stderr line is the loader's complaint, NOT a version banner --
+        # returning it would print a broken engine as "[ok]" in doctor.
+        return None
+    line = text.strip().splitlines()
     if line:
         return line[0][:90]
     # No output: only trust it if it exited cleanly (some tools print nothing on --version but
     # a non-zero exit with no output means it did not really run).
     return exe if r.returncode == 0 else None
+
+
+# Text the dynamic loader / kernel / shell prints when a binary could not even START. A tool whose
+# probe output contains one of these did not run, whatever it printed after.
+_LOADER_FAILURES = (
+    "error while loading shared libraries",
+    "cannot open shared object file",
+    "cannot execute binary file",
+    "exec format error",
+    "no such file or directory",           # e.g. a missing PT_INTERP: `bad ELF interpreter`
+    "bad elf interpreter",
+    "symbol lookup error",
+    "version `glibc_",                     # "version `GLIBC_2.38' not found"
+    "segmentation fault",
+    "illegal instruction",
+    "cannot be preloaded",                 # ld.so rejected an LD_PRELOAD object (rc stays 0!)
+)
+
+
+def _did_not_run(rc, text: str) -> bool:
+    """True when a probe's exit status / output proves the tool never really ran.
+
+    126/127 are the exec-failure statuses (ld.so exits 127 on a missing library); a negative rc is
+    death by signal (a relink-corrupted binary SIGSEGVs before printing anything). A clean, non-zero
+    exit with a banner (`afl-fuzz -h` exits 1) is NOT a failure -- only the loader's own wording is.
+    """
+    if rc is None or rc < 0 or rc in (126, 127):
+        return True
+    low = (text or "").lower()
+    return any(m in low for m in _LOADER_FAILURES)
 
 
 def _probe_python():
@@ -135,9 +171,13 @@ def _probe_gdb():
 
 
 def _probe_afl():
+    # `afl-fuzz -h` exits 1 with its usage text when it runs; a loader failure (missing .so after a
+    # bad relink) is caught by _v, so a present-but-broken afl-fuzz is no longer reported "ok".
     from .analyze.fuzz.aflpp import locate_afl
     p = locate_afl()
-    return str(p) if p else None
+    if not p:
+        return None
+    return str(p) if _v(p, "-h") else None
 
 
 def _probe_clang():
@@ -186,8 +226,11 @@ def _qemu_suffixes() -> tuple:
 
 
 def _probe_qemu():
+    # Each emulator must print its own `qemu-<arch> version` banner: a relink once corrupted the
+    # static-PIE qemu-user binaries, which still existed on PATH but SIGSEGV'd on start.
     suffixes = _qemu_suffixes()
-    found = [a for a in suffixes if shutil.which(f"qemu-{a}")]
+    found = [a for a in suffixes if shutil.which(f"qemu-{a}")
+             and "version" in (_v(f"qemu-{a}", "--version") or "").lower()]
     return f"{len(found)}/{len(suffixes)}: {' '.join(found)}" if found else None
 
 
@@ -226,9 +269,47 @@ def _probe_unicorn():
 
 
 def _probe_symqemu():
+    """SymQEMU must RUN, not merely exist: the bundle once shipped a symqemu whose vendored SymCC
+    runtime / libglib could not be loaded, and an existence-only probe printed it "[ok]" while the
+    concolic stage then failed on every seed. Two bounded checks, both with the SAME environment
+    `symqemu.run_once` gives it (the runtime dir on LD_LIBRARY_PATH):
+
+      1. `--version` -- the loader resolves libSymCCRtShared + libglib and qemu prints its banner;
+      2. for a host-arch emulator, run the host's own `true` under it with a scratch
+         SYMCC_OUTPUT_DIR -- proves the SymCC runtime initialises and the guest runs to exit 0.
+    """
+    import os
+    import platform
+    import tempfile
+    from pathlib import Path
+
     from .analyze.symbolic.symqemu import locate_symqemu
     p = locate_symqemu()
-    return str(p) if p else None
+    if not p:
+        return None
+    p = Path(p)
+    env = dict(os.environ)
+    libdir = str(p.resolve().parent)
+    env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"]
+                                       if env.get("LD_LIBRARY_PATH") else "")
+    banner = _v(p, "--version", timeout=10, env=env)
+    if not banner or "version" not in banner.lower():
+        return None
+    host = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64",
+            "arm64": "aarch64"}.get(platform.machine().lower())
+    true = shutil.which("true")
+    if host and true and p.name == f"symqemu-{host}":
+        with tempfile.TemporaryDirectory(prefix="lykos-symqemu-probe-") as out:
+            env["SYMCC_OUTPUT_DIR"] = out
+            try:
+                r = subprocess.run([str(p), true], capture_output=True, timeout=20, env=env,
+                                   stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            text = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+            if r.returncode != 0 or _did_not_run(r.returncode, text):
+                return None
+    return f"{banner} ({p})"
 
 
 def _probe_cc():
@@ -289,7 +370,7 @@ def _probe_cross_cc():
         want = cross_compilers() + ["x86_64-w64-mingw32-gcc"]
     except Exception:                                   # noqa: BLE001
         want = ["x86_64-w64-mingw32-gcc"]
-    found = [t for t in want if shutil.which(t)]
+    found = [t for t in want if shutil.which(t) and _v(t, "--version")]
     if not found:
         return None
     return f"{len(found)}/{len(want)}: " + " ".join(t.replace("-linux-gnu", "").replace(
@@ -310,10 +391,29 @@ def _probe_valgrind():
     return _v(vg, "--version") if vg else None
 
 
+def _preloads(lib) -> bool:
+    """True when the host loader accepts `lib` as an LD_PRELOAD into the host's `true`. ld.so
+    REJECTS a missing/corrupt/foreign-arch preload object with a warning but still exits 0 -- so
+    the stderr text, not the rc, is the evidence. That is exactly how a broken libdislocator would
+    otherwise run every 'guarded' execution unguarded while doctor said ok."""
+    import os
+    true = shutil.which("true")
+    if not true:
+        return True                                  # cannot test; do not invent a failure
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(lib)
+    try:
+        r = subprocess.run([true], capture_output=True, timeout=5, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    text = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+    return r.returncode == 0 and not _did_not_run(r.returncode, text)
+
+
 def _probe_dislocator():
     from .analyze.dynamic.memoracle import dislocator_lib
     p = dislocator_lib()
-    return str(p) if p else None
+    return str(p) if p and _preloads(p) else None
 
 
 def _probe_qasan():
@@ -324,7 +424,11 @@ def _probe_qasan():
 
 def _probe_weggli():
     from .analyze.weggli import weggli_bin
-    return weggli_bin() or None
+    w = weggli_bin()
+    if not w:
+        return None
+    ver = _v(w, "--version")
+    return f"{ver} ({w})" if ver else None
 
 
 TOOLS: tuple = (

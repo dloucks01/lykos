@@ -24,7 +24,7 @@ from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from ..fuzz.directed import select_targets
-from ..fuzz.runner import invocation
+from ..fuzz.runner import _sub_output, invocation
 from ..poc.capture import how_to_feed
 from . import concolic, symqemu
 
@@ -126,11 +126,16 @@ def _certificate(ctx, *, sink_addr, input_sha, input_len, mode, base_argv, meta)
     """Store a replayable REACHABILITY CERTIFICATE (T3): the concrete input, in the program's real
     invocation terms, that drives execution from the modeled entry to a flagged sink. Returns its
     content sha so the finding evidence can cite it."""
+    explored = (meta or {}).get("argv")
     cert = {
         "kind": "reachability-certificate",
         "sink_addr": sink_addr,
         "input_mode": mode,                                  # stdin | file | arg
-        "argv": list(base_argv),                             # the real invocation shape (@@ = input)
+        # The invocation the model ACTUALLY explored (@@ = input). Only that argv is certified: a
+        # cert naming flags the exploration never saw would vouch for a path nobody explored. When
+        # the backend did not report it, keep the replay shape but SAY it was not the explored one.
+        "argv": list(explored) if explored is not None else list(base_argv),
+        "argv_explored": explored is not None,
         "input_sha": input_sha,                              # the concrete reaching input (artifact)
         "input_len": input_len,
         "angr_version": (meta or {}).get("angr_version"),
@@ -160,7 +165,10 @@ def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout, base_ar
                         endianness=target.endianness, bits=target.bits)
         input_sha = ctx.put_artifact("concolic-input", data=data)
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
-                  input_mode=mode, argv=[], exit_code=r.exit_code, signal=r.signal,
+                  # the invocation prefix it ran under (`-c @@`), as the dynamic stage records it:
+                  # a crash stored with argv=[] is replayed by root_cause/build_poc WITHOUT the
+                  # flags and reads as "did not fault"
+                  input_mode=mode, argv=list(base_argv), exit_code=r.exit_code, signal=r.signal,
                   signal_name=r.signal_name, crashed=r.crashed, isolation=r.isolation,
                   duration_ms=r.duration_ms,
                   note="concolic-generated" + (f"; reached {g['reached']}"
@@ -235,7 +243,7 @@ def _frame_sized_input(ctx, target, fallback=64, cap=4096):
         return fallback
 
 
-def _run_angr(ctx, target, exe, mode, p, py):
+def _run_angr(ctx, target, exe, mode, p, py, base_argv=()):
     input_size = int(p["input_size"]) if p.get("input_size") else _frame_sized_input(ctx, target)
     max_seconds = int(p.get("max_seconds", 120))
     if p.get("targets"):
@@ -256,13 +264,18 @@ def _run_angr(ctx, target, exe, mode, p, py):
             "num_find": int(p.get("num_find", 6)), "max_states": int(p.get("max_states", 800)),
             # arch hints let the driver fall back to angr's raw 'blob' loader when CLE cannot
             # identify the format (firmware / headerless dumps), instead of failing the stage.
-            "arch": target.arch, "bits": target.bits}
+            "arch": target.arch, "bits": target.bits,
+            # the operator's flags (`-c @@`): explore the SAME invocation the replay runs, so a
+            # flag-gated path is explorable and the certificate's argv is the one explored.
+            # "@@out" (converter output) becomes the same relative scratch name the replay uses.
+            "argv": _sub_output([str(a) for a in base_argv or []], None)}
     ctx.emit("concolic.start", payload={"backend": "angr", "targets": targets,
                                         "seeds": len(seeds_b64), "mode": mode})
     ctx.progress(msg=f"angr exploration toward {len(targets)} target(s)")
     res = concolic.run_explore(py, spec, ctx=ctx, timeout=max_seconds)
     meta = {"drained": bool(res.get("drained")), "cutoff": bool(res.get("cutoff")),
-            "targets": targets, "angr_version": res.get("angr_version")}
+            "targets": targets, "angr_version": res.get("angr_version"),
+            "argv": (list(res["argv"]) if isinstance(res.get("argv"), list) else None)}
     ctx.emit("concolic.explored", payload={"backend": "angr",
              "reached": res.get("reached_targets", []),
              "generated": len(res.get("generated", [])),
@@ -289,7 +302,8 @@ def _run_symqemu(ctx, target, exe, mode, base_argv, p, sq):
              "generated": len(generated), "reached": []})
     # symqemu is a branch-flipping corpus generator, not an exhaustive explorer: it NEVER licenses
     # an unreachable claim (drained=False) -- so a sink it did not reach stays untouched.
-    return generated, [], {"drained": False, "cutoff": True, "targets": [], "angr_version": None}
+    return generated, [], {"drained": False, "cutoff": True, "targets": [], "angr_version": None,
+                           "argv": list(base_argv)}
 
 
 def concolic_stage(ctx) -> dict:
@@ -325,7 +339,7 @@ def concolic_stage(ctx) -> dict:
     meta = {"drained": False, "cutoff": True, "targets": [], "angr_version": None}
     try:
         if backend == "angr":
-            generated, reached, meta = _run_angr(ctx, target, exe, mode, p, py)
+            generated, reached, meta = _run_angr(ctx, target, exe, mode, p, py, base_argv)
         else:
             generated, reached, meta = _run_symqemu(ctx, target, exe, mode, base_argv, p, sq)
     except Exception as e:                                   # noqa: BLE001

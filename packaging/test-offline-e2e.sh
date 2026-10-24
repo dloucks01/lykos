@@ -12,7 +12,12 @@
 # failure). This gate FUNCTIONALLY exercises each lane and FAILS if any is broken, so a degraded
 # bundle cannot ship. Nothing is dropped: every capability must work, not merely be present.
 #
-#   packaging/test-offline-e2e.sh [dist/lykos-offline-*.tar.xz]
+#   packaging/test-offline-e2e.sh [dist/lykos-offline-*.tar.xz | *.tar.xz.part-00 | *.EXTRACT.sh]
+#
+# A large (real-engagement) bundle ships SPLIT into optical-media volumes (*.tar.xz.part-NN) with a
+# .sha256 and an .EXTRACT.sh. The gate accepts any of those files (or picks the newest package in
+# dist/), checks every volume is present, and extracts through the SHIPPED .EXTRACT.sh when there is
+# one -- verifying the checksums and reassembling exactly the way the operator will on the laptop.
 #
 # Env: BASE=<image> (default kalilinux/kali-rolling:latest). RT=podman|docker. BUDGET=<s> (480).
 set -euo pipefail
@@ -25,9 +30,37 @@ die(){ echo "E2E GATE FAIL: $*" >&2; exit 1; }
 [ -n "$RT" ] || die "need podman or docker"
 command -v gcc >/dev/null 2>&1 || die "need gcc on the BUILD host to compile the test targets"
 
-ART="${1:-$(ls -1t "$ROOT"/dist/lykos-offline-*.tar.xz 2>/dev/null | head -1)}"
-[ -n "$ART" ] && [ -f "$ART" ] || die "no offline .tar.xz (build with packaging/make-runnable.sh)"
+ART="${1:-$(ls -1t "$ROOT"/dist/lykos-offline-*.tar.xz "$ROOT"/dist/lykos-offline-*.tar.xz.part-00 \
+              2>/dev/null | head -1)}"
+[ -n "$ART" ] && [ -f "$ART" ] || die "no offline package (.tar.xz or .tar.xz.part-00) -- build with packaging/make-runnable.sh"
 command -v xz >/dev/null 2>&1 || die "need xz on the build host to extract the package"
+# Resolve the package BASE name from whichever of its files was named, then find its volumes.
+PDIR="$(cd "$(dirname "$ART")" && pwd)"; PNAME="$(basename "$ART")"
+case "$PNAME" in
+  *.tar.xz.part-*) PBASE="${PNAME%.tar.xz.part-*}" ;;
+  *.tar.xz)        PBASE="${PNAME%.tar.xz}" ;;
+  *.EXTRACT.sh)    PBASE="${PNAME%.EXTRACT.sh}" ;;
+  *.sha256)        PBASE="${PNAME%.sha256}" ;;
+  *) die "$PNAME is not an offline package file (.tar.xz, .tar.xz.part-NN, .EXTRACT.sh, .sha256)" ;;
+esac
+PARTS=()
+for _p in "$PDIR/$PBASE".tar.xz.part-*; do [ -f "$_p" ] && PARTS+=("$_p"); done
+if [ -f "$PDIR/$PBASE.tar.xz" ]; then
+  PKIND="single archive"
+elif [ "${#PARTS[@]}" -gt 0 ]; then
+  # `split -d -a 2` numbers volumes 00,01,...: a gap means a volume was not copied off its disc,
+  # and xz would only fail deep into a multi-GB stream -- say which one is missing up front.
+  _i=0
+  for _p in "${PARTS[@]}"; do
+    _want="$(printf '%s/%s.tar.xz.part-%02d' "$PDIR" "$PBASE" "$_i")"
+    [ "$_p" = "$_want" ] || die "split package is missing volume $(basename "$_want") (have: $(basename -a "${PARTS[@]}" | tr '\n' ' '))"
+    _i=$((_i + 1))
+  done
+  PKIND="SPLIT into ${#PARTS[@]} volume(s)"
+else
+  die "no archive or volumes for $PBASE in $PDIR"
+fi
+say "package $PBASE -- $PKIND"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/scratch"; chmod 777 "$T/scratch"
@@ -61,7 +94,19 @@ if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
 else : > "$T/a64"; fi
 
 say "extracting the package (writable -- the laptop extracts to a writable dir; doctor self-relinks)"
-mkdir -p "$T/ex"; xz -dc "$ART" | tar -x -C "$T/ex"
+mkdir -p "$T/ex"
+if [ -f "$PDIR/$PBASE.EXTRACT.sh" ] && [ -f "$PDIR/$PBASE.sha256" ]; then
+  # The operator's path: every volume + .sha256 + .EXTRACT.sh in one dir, `sh X.EXTRACT.sh`. Link
+  # them into the scratch dir (no multi-GB copy) so the script extracts THERE, verifying checksums
+  # and reassembling the volumes exactly as on the laptop -- a broken EXTRACT.sh fails the gate too.
+  for _f in "$PDIR/$PBASE".*; do ln -s "$_f" "$T/ex/$(basename "$_f")"; done
+  ( cd "$T/ex" && sh "./$PBASE.EXTRACT.sh" ) || die "the shipped $PBASE.EXTRACT.sh failed (checksum mismatch or a corrupt volume?)"
+  find "$T/ex" -maxdepth 1 -type l -name "$PBASE.*" -delete
+elif [ -f "$PDIR/$PBASE.tar.xz" ]; then
+  xz -dc "$PDIR/$PBASE.tar.xz" | tar -x -C "$T/ex" || die "could not extract $PBASE.tar.xz"
+else
+  cat "${PARTS[@]}" | xz -dc | tar -x -C "$T/ex" || die "could not reassemble/extract the split volumes"
+fi
 RD="$(dirname "$(find "$T/ex" -maxdepth 2 -name lykos -type f | head -1)")"
 [ -n "$RD" ] && [ -d "$RD" ] || die "extracted package has no lykos/ launcher dir"
 

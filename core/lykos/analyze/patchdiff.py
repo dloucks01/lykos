@@ -6,12 +6,14 @@ operator's real question in firmware work: does this target already carry the fi
 exposed? Fully deterministic: functions are matched by name when symbols survive (common for
 libraries and many firmware images), else by a structural fingerprint, and a matched pair whose
 fingerprint differs is a changed function. The fingerprint is layout/address independent -- CFG
-shape (block + edge counts) plus the instruction-mnemonic histogram -- so recompilation noise
-(different addresses, register allocation) does not read as a change, but a real edit does.
+shape (block + edge counts), the instruction-mnemonic histogram, the callee set and the SMALL
+non-address immediates -- so recompilation noise (different addresses, register allocation) does
+not read as a change, but a real edit (including an immediate-only bounds fix) does.
 """
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import Counter
 
 
@@ -20,6 +22,57 @@ def _mnem(text) -> str:
     if not t:
         return ""
     return t.replace("\t", " ").split(" ", 1)[0]
+
+
+# ---- operand constants ------------------------------------------------------------------------
+# The mnemonic histogram is blind to an IMMEDIATE-only patch -- the classic bounds fix
+# `cmp eax, 0x40` -> `cmp eax, 0x20` keeps every mnemonic -- so the patched function hashed
+# "unchanged" and the one function the diff exists to localise vanished. We therefore also hash the
+# multiset of SMALL immediate operands, while keeping the fingerprint layout-independent: everything
+# that can encode an ADDRESS is excluded, so relinking/rebasing still does not read as a change:
+#   * branch/call targets (the callee set already covers calls);
+#   * memory operands -- `[rip + 0x2edf]`, `[rbp - 0x40]`, `0x10(sp)` (displacements move with
+#     layout and frame allocation);
+#   * address-forming instructions (adrp/auipc/lui/addis/sethi/movw/movt...) AND the instruction
+#     that completes the pair (`add x0, x0, #0x8c8` after an adrp is an address's low bits);
+#   * any immediate >= 0x10000 (an absolute address in a non-PIE image, a pointer, a hash seed).
+# What survives is the stuff security patches edit: bounds, sizes, shift counts, flag masks.
+_BRANCH = re.compile(
+    r"^(j[a-z]*|call[a-z]*|loop[a-z]*|b|bl|blx|bx|blr|br|bal|bc[a-z]*|bctr[a-z]*|cbn?z|tbn?z"
+    r"|b\.?(eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al|eqz|nez|gez|ltz|lez|gtz|ltu|geu|a)"
+    r"(\.[wn])?|b(eq|ne|lt|ge|gt|le)[a-z]*)$")
+_ADDR_FORMING = frozenset({"adrp", "adr", "auipc", "lui", "addis", "lis", "sethi", "movw", "movt",
+                           "la", "dla"})
+_MEM = re.compile(r"\[[^\]]*\]|\S*\([^)]*\)")            # [..] and disp(reg) memory operands
+_NUM = re.compile(r"(?<![\w.$])[#$]?(-?)(0x[0-9a-f]+|\d+)(?![\w.])", re.I)
+_SMALL = 0x10000
+
+
+def _consts(blocks) -> Counter:
+    """The multiset of small, non-address immediate operands in a function body (see above)."""
+    out: Counter = Counter()
+    for b in blocks:
+        after_addr = False
+        for ins in (b.get("instructions") or []):
+            text = (ins.get("text") or ins.get("disasm") or "").replace("\t", " ").strip()
+            if not text:
+                continue
+            mnem, _, ops = text.partition(" ")
+            ops = ops.split(";", 1)[0]                     # drop a disassembler comment
+            m = mnem.lower()
+            if after_addr or m in _ADDR_FORMING or _BRANCH.match(m):
+                after_addr = m in _ADDR_FORMING
+                continue
+            after_addr = False
+            for sign, num in _NUM.findall(_MEM.sub(" ", ops)):
+                try:
+                    v = int(num, 16) if num.lower().startswith("0x") else int(num)
+                except ValueError:
+                    continue
+                if v >= _SMALL:
+                    continue                            # address-like: layout, not semantics
+                out[f"{m}:{'-' if sign else ''}{v:#x}"] += 1
+    return out
 
 
 def function_fingerprint(fn: dict) -> dict:
@@ -38,18 +91,21 @@ def function_fingerprint(fn: dict) -> dict:
     callees = tuple(sorted({(c.get("dst_name") or c.get("name") or "")
                             for c in (fn.get("calls") or [])
                             if (c.get("dst_name") or c.get("name"))}))
+    consts = _consts(blocks)
     h = hashlib.sha1()
     h.update(f"{len(blocks)}|{edges}|".encode())
     for k, v in sorted(hist.items()):
         h.update(f"{k}:{v};".encode())
+    # immediate operands (layout-independent subset) -- catches a `cmp 64->32` bounds fix
+    h.update(("|consts:" + ";".join(f"{k}={v}" for k, v in sorted(consts.items()))).encode())
     # Fold the CALLEE SET into the hash (it was computed but ignored): a security patch that swaps a
     # call target -- strcpy -> a bounded wrapper, memcpy -> a checked copy -- leaves the `call`
     # mnemonic unchanged, so without this the patched function hashed identical and read "unchanged",
-    # hiding exactly the function the diff exists to localize. (Operand/immediate-only edits, e.g.
-    # cmp 64->32, still collapse -- a known fingerprint limitation; variant.similarity catches those.)
+    # hiding exactly the function the diff exists to localize.
     h.update(("|callees:" + ",".join(callees)).encode())
     return {"name": fn.get("name"), "addr": fn.get("addr"), "blocks": len(blocks),
-            "edges": edges, "ninsn": ninsn, "callees": callees, "hash": h.hexdigest()}
+            "edges": edges, "ninsn": ninsn, "callees": callees, "consts": dict(consts),
+            "hash": h.hexdigest()}
 
 
 def _real_name(n) -> bool:
@@ -76,13 +132,18 @@ def diff(funcs_a: list, funcs_b: list) -> dict:
         if fa["hash"] == fb["hash"]:
             unchanged += 1
         else:
+            ca, cb = Counter(fa.get("consts") or {}), Counter(fb.get("consts") or {})
+            new_c, old_c = cb - ca, ca - cb
             moved = abs(fa["ninsn"] - fb["ninsn"]) + abs(fa["blocks"] - fb["blocks"]) \
-                + len(set(fa["callees"]) ^ set(fb["callees"]))
+                + len(set(fa["callees"]) ^ set(fb["callees"])) \
+                + sum(new_c.values()) + sum(old_c.values())
             changed.append({
                 "name": name, "old_addr": fa["addr"], "new_addr": fb["addr"],
                 "blocks": [fa["blocks"], fb["blocks"]], "insns": [fa["ninsn"], fb["ninsn"]],
                 "new_callees": sorted(set(fb["callees"]) - set(fa["callees"])),
                 "dropped_callees": sorted(set(fa["callees"]) - set(fb["callees"])),
+                # immediate operands that appeared / disappeared ("cmp:0x20" / "cmp:0x40")
+                "new_consts": sorted(new_c), "dropped_consts": sorted(old_c),
                 "moved": moved})
     changed.sort(key=lambda c: -c["moved"])
     # named functions that appear or disappear entirely

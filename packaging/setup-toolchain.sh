@@ -163,7 +163,7 @@ if [ -n "$(ls -A "$HERE/venvs" 2>/dev/null)" ]; then
     # python only when the bundle carries none. vendorenv also repoints venvs to the vendored
     # interpreter at RUN time, so this keeps the two consistent rather than at odds.
     if [ -f "$DEST/$name/pyvenv.cfg" ]; then
-      _vpy="$(ls -d "$DEST"/toolchain/usr/bin/python3.[0-9]* 2>/dev/null | sort -V | tail -1)"
+      _vpy="$(ls -d "$DEST"/toolchain/usr/bin/python3.[0-9]* 2>/dev/null | grep -E "/python3\.[0-9]+$" | sort -V | tail -1)"
       [ -n "$_vpy" ] || _vpy="$DEST/toolchain/usr/bin/python3"
       if [ -x "$_vpy" ]; then _vhome="$(dirname "$_vpy")"; else _vhome="$(dirname "$(command -v python3)")"; fi
       sed -i "s|^home = .*|home = $_vhome|" "$DEST/$name/pyvenv.cfg"

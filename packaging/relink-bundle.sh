@@ -17,6 +17,9 @@
 #
 # Idempotent: it records the absolute root it relinked for in a stamp. A second run is a no-op;
 # if the folder was MOVED (the stamped root no longer matches), it relinks again for the new path.
+# A re-relink is MOVE-SAFE: a tool already fronted by a loader-wrapper (gcc's cc1 -- see pass 2) is
+# RE-POINTED at the new root, never wrapped a second time; rpaths are rebuilt (stale old-root
+# entries dropped, not stacked); and debris from an interrupted run (*.relinktmp) is cleared first.
 set -eu
 
 # ---- locate the vendor tree (arg 1, or next to this script, or $LYKOS_VENDOR) ----
@@ -67,9 +70,20 @@ done
 
 # ---- idempotency stamp: skip when already relinked for THIS absolute root ----
 ROOT=$(CDPATH= cd -- "$VENDOR" && pwd)
+# Compare against the ABSOLUTE loader path -- the same value written to the stamp below. Comparing
+# the raw "$LD" (relative whenever vendor/ was passed as a relative path) never matched, so every
+# launch re-relinked the whole bundle in place.
+LDREAL=$(CDPATH= cd -- "$(dirname "$LD")" && pwd)/$(basename "$LD")
 STAMP="$TC/.relink/relinked-for"
-if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$ROOT::$LD" ]; then
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$ROOT::$LDREAL" ]; then
   exit 0
+fi
+# The root a PREVIOUS relink baked into rpaths/wrappers (the folder has since moved), so its now-dead
+# entries are dropped rather than stacked in front of the original rpath on every move.
+OLDROOT=""
+if [ -f "$STAMP" ]; then
+  OLDROOT=$(sed -n '1s/::.*$//p' "$STAMP" 2>/dev/null || true)
+  [ "$OLDROOT" = "$ROOT" ] && OLDROOT=""
 fi
 
 # ---- the absolute bundle library directories every patched ELF gets as rpath ----
@@ -88,8 +102,41 @@ done
 # bundle rpath -- without this, symqemu-x86_64 died offline with "libSymCCRtShared.so / libglib-2.0
 # cannot open shared object file" and symbolic-qemu was silently unavailable on the laptop.
 
-LDREAL=$(CDPATH= cd -- "$(dirname "$LD")" && pwd)/$(basename "$LD")
 mkdir -p "$TC/.relink"
+
+# _rpath CUR -> the rpath to set: the bundle RPATH first, then CUR's entries that are neither already
+# in RPATH nor under the OLD (pre-move) root. Rebuilding (instead of prefixing) keeps a re-relink
+# after a move from accumulating P1:P0:... dead entries -- and keeps the result stable, so a second
+# run on the same root changes nothing.
+_rpath() {
+  _out="$RPATH"
+  _rest="$1"
+  while [ -n "$_rest" ]; do
+    case "$_rest" in *:*) _e=${_rest%%:*}; _rest=${_rest#*:} ;; *) _e=$_rest; _rest="" ;; esac
+    [ -n "$_e" ] || continue
+    case ":$_out:" in *":$_e:"*) continue ;; esac
+    if [ -n "$OLDROOT" ]; then
+      case "$_e" in "$OLDROOT"|"$OLDROOT"/*) continue ;; esac
+    fi
+    _out="$_out:$_e"
+  done
+  printf '%s' "$_out"
+}
+
+# _write_wrapper F -- front the pristine "$F.real" with a loader-wrapper (bundle loader + libs).
+WRAPMARK='# lykos loader-wrapper:'
+_write_wrapper() {
+  { printf '#!/bin/sh\n'
+    printf '%s patchelf corrupts this binary (0.19.1 large-ELF bug), so the\n' "$WRAPMARK"
+    printf '# PRISTINE copy beside it is run through the bundle loader with the bundle library path.\n'
+    printf 'exec "%s" --library-path "%s" "%s.real" "$@"\n' "$LDREAL" "$RPATH" "$1"
+  } > "$1.wraptmp" && chmod 0755 "$1.wraptmp" && mv -f "$1.wraptmp" "$1"
+}
+_is_wrapper() {  # $1 is a loader-wrapper this script wrote (small text file carrying the marker)
+  [ -f "$1" ] || return 1
+  [ "$(od -An -N2 -c "$1" 2>/dev/null | tr -d ' \n')" = "#!" ] || return 1
+  grep -q "^$WRAPMARK" "$1" 2>/dev/null
+}
 
 # Make the loader reachable at its STANDARD interpreter path under the toolchain root. The bundle's
 # gcc/clang are relocated with `--sysroot=<toolchain>` (see the compiler wrappers), and ld then
@@ -99,6 +146,10 @@ mkdir -p "$TC/.relink"
 # loader so compiling uploaded source / PoC harnesses / libFuzzer targets works offline.
 _lbn=$(basename "$LDREAL")
 for _ldir in "$TC/lib64" "$TC/lib"; do
+  # never replace the REAL loader with a link to itself (it may live in lib64/ or lib/ itself, or
+  # reach it through a usrmerge symlink); a stale link from before a move IS replaced.
+  [ -e "$_ldir/$_lbn" ] && [ ! -L "$_ldir/$_lbn" ] && continue
+  [ -e "$_ldir/$_lbn" ] && [ "$_ldir/$_lbn" -ef "$LDREAL" ] && continue
   mkdir -p "$_ldir" 2>/dev/null && ln -sf "$LDREAL" "$_ldir/$_lbn" 2>/dev/null || true
 done
 
@@ -131,17 +182,45 @@ _elf() {  # shared skip-checks: prints nothing, returns 0 if $1 is a bundle ELF 
   return 0
 }
 
+# ---- pass 0: debris from an interrupted run, and RE-POINT existing loader-wrappers ----
+# A *.relinktmp is a half-patched copy (the run died mid-patch): it is not a tool, and walking it as
+# one would wrap/patch garbage. A `X.real` beside a lykos loader-wrapper `X` is a PRISTINE binary
+# that patchelf is known to corrupt: on a re-relink (the folder MOVED) the old wrapper names the OLD
+# root's loader + paths and is dead. It must be REWRITTEN for the new root -- NOT patched again,
+# which would corrupt it, and NOT wrapped again (X.real.real), which left X pointing at a path that
+# no longer exists: gcc's cc1 then failed and the bundle could not compile offline after a move.
+# A `X.real` whose wrapper never got written (interrupted between the mv and the write) is
+# re-wrapped too.
+find "$@" -type f -name '*.relinktmp' 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+find "$@" -type f -name '*.wraptmp' 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+# HEAL a bundle an older relink already damaged on a move: X (wrapper, dead root) -> X.real (a 2nd
+# wrapper) -> X.real.real (the pristine ELF). Restore the pristine binary to X.real; the loop below
+# then rewrites X for this root.
+find "$@" -type f -name '*.real.real' 2>/dev/null | while IFS= read -r r2; do
+  _elf "$r2" || continue
+  mid=${r2%.real}
+  top=${mid%.real}
+  if _is_wrapper "$mid" && { [ ! -e "$top" ] || _is_wrapper "$top"; }; then
+    mv -f "$r2" "$mid"
+  fi
+done
+find "$@" -type f -name '*.real' 2>/dev/null | while IFS= read -r r; do
+  _elf "$r" || continue
+  w=${r%.real}
+  if [ ! -e "$w" ] || _is_wrapper "$w"; then
+    _write_wrapper "$w"
+    printf 'x' >> "$TC/.relink/.count"
+  fi
+done
+
 # ---- pass 1: shared libraries (no interpreter, but NEEDED libs) -> rpath in place ----
 find "$@" -type f 2>/dev/null | while IFS= read -r f; do
   _elf "$f" || continue
   "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1 && continue       # has interp -> exe (pass 2)
   [ -z "$("$PATCHELF" --print-needed "$f" 2>/dev/null)" ] && continue    # no needed -> static, skip
   cur=$("$PATCHELF" --print-rpath "$f" 2>/dev/null || true)
-  case "$cur" in
-    "$RPATH"|"$RPATH":*) ;;
-    "") "$PATCHELF" --set-rpath "$RPATH" "$f" 2>/dev/null || true ;;
-    *)  "$PATCHELF" --set-rpath "$RPATH:$cur" "$f" 2>/dev/null || true ;;
-  esac
+  want=$(_rpath "$cur")
+  [ "$cur" = "$want" ] || "$PATCHELF" --set-rpath "$want" "$f" 2>/dev/null || true
   printf 'x' >> "$TC/.relink/.count"
 done
 
@@ -152,26 +231,19 @@ done
 find "$@" -type f 2>/dev/null | while IFS= read -r f; do
   _elf "$f" || continue
   "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1 || continue        # no interp -> not an exe
+  case "$f" in *.real) _is_wrapper "${f%.real}" && continue ;; esac      # pristine; pass 0 re-pointed it
   tmp="$f.relinktmp"
   if cp -p "$f" "$tmp" 2>/dev/null; then
     "$PATCHELF" --set-interpreter "$LDREAL" "$tmp" 2>/dev/null || true
     curx=$("$PATCHELF" --print-rpath "$tmp" 2>/dev/null || true)
-    case "$curx" in
-      "$RPATH"|"$RPATH":*) ;;
-      "") "$PATCHELF" --set-rpath "$RPATH" "$tmp" 2>/dev/null || true ;;
-      *)  "$PATCHELF" --set-rpath "$RPATH:$curx" "$tmp" 2>/dev/null || true ;;
-    esac
+    wantx=$(_rpath "$curx")
+    [ "$curx" = "$wantx" ] || "$PATCHELF" --set-rpath "$wantx" "$tmp" 2>/dev/null || true
     if "$LDREAL" --list "$tmp" >/dev/null 2>&1; then
       mv -f "$tmp" "$f"                             # patched binary is sound -- adopt it
     else
       rm -f "$tmp"                                  # patchelf corrupted it -- wrapper the pristine one
       mv -f "$f" "$f.real"
-      { printf '#!/bin/sh\n'
-        printf '# lykos loader-wrapper: patchelf corrupts this binary (0.19.1 large-ELF bug), so the\n'
-        printf '# PRISTINE copy beside it is run through the bundle loader with the bundle library path.\n'
-        printf 'exec "%s" --library-path "%s" "%s.real" "$@"\n' "$LDREAL" "$RPATH" "$f"
-      } > "$f"
-      chmod 0755 "$f"
+      _write_wrapper "$f"
     fi
   fi
   printf 'x' >> "$TC/.relink/.count"

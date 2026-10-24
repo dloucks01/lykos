@@ -15,10 +15,14 @@ spec.json:
   max_seconds  wall-clock budget
   max_states   cap on simultaneously-active states (state-explosion guard)
   num_find     stop after this many target-reaching states
+  argv         the operator's argument prefix (argv[1:]); "@@" marks where the input goes, else
+               the input carrier is appended (arg/file modes). Echoed back as `argv` so the
+               reachability certificate records the invocation angr ACTUALLY explored.
 
 out.json:
   ok, angr_version, generated:[{input_b64, reached, from_seed}], reached_targets:[...],
   stats:{...}, note, error
+  argv      the argv[1:] angr's initial states were built with, input carrier written as "@@"
   drained   True iff the search hit a natural fixpoint (no active/deferred/spilled/errored
             states left) -- the only condition under which "did not reach target X" licenses an
             UNREACHABLE claim for X (T3 reachability certificate).
@@ -56,6 +60,41 @@ _ARCH = {
     "ppc": "PPC32", "powerpc": "PPC32", "ppc64": "PPC64",
     "riscv": "RISCV64", "riscv64": "RISCV64", "sparc": "SPARC",
 }
+
+
+_PLACEHOLDER = "@@"
+
+
+def _place(base, carrier):
+    """The core's `@@` rule (fuzz.runner.place), restated here because this driver runs in the angr
+    interpreter and cannot import lykos: the carrier replaces every `@@`, else it is appended."""
+    out = [str(a) for a in (base or [])]
+    if _PLACEHOLDER in out:
+        return [carrier if a == _PLACEHOLDER else a for a in out]
+    return out + [carrier]
+
+
+def build_args(base, mode, symbolic):
+    """(args[1:] for angr, the same shape with the input carrier written as "@@").
+
+    arg  -> the symbolic bitvector is the carrier;
+    file -> the symbolic file's path (/lykos_input);
+    stdin-> argv stays as given; a `@@` becomes /dev/stdin (the same rule the replay uses)."""
+    base = [str(a) for a in (base or [])]
+    if mode == "arg":
+        args = _place(base, symbolic)
+        shown = _place(base, _PLACEHOLDER)
+    elif mode == "file":
+        args = _place(base, "/lykos_input")
+        shown = _place(base, _PLACEHOLDER)
+    else:
+        if _PLACEHOLDER in base:
+            args = _place(base, "/dev/stdin")
+            shown = list(args)
+        else:
+            args = list(base)
+            shown = list(base)
+    return args, shown
 
 
 def _load_project(angr, spec, binary):
@@ -110,6 +149,9 @@ def main(spec_path, out_path):
         proj = _load_project(angr, spec, binary)
         symbytes = claripy.BVS("lykos_input", 8 * size)
         extras = {angr.options.LAZY_SOLVES}
+        # The operator's flags must reach the explored program too: exploring `prog <input>` and
+        # certifying `prog -c <input>` would be a certificate for an invocation never explored.
+        argv_tail, result["argv"] = build_args(spec.get("argv") or [], mode, symbytes)
 
         def _stdin_state():
             # The stdin SimFile model varies across angr versions -- a plain `SimFile` passed as
@@ -119,25 +161,26 @@ def main(spec_path, out_path):
             # (exploration still runs); only the explicit input binding is given up in the last
             # fallback, and `preconstrain` is already guarded. A lane that degrades beats a lane that
             # disappears.
+            args = [binary] + argv_tail
             try:
                 sf = angr.SimFile("stdin", content=symbytes, size=size)
-                return proj.factory.full_init_state(stdin=sf, add_options=extras)
+                return proj.factory.full_init_state(args=args, stdin=sf, add_options=extras)
             except Exception:                                # noqa: BLE001
                 pass
             try:
                 sfs = angr.SimFileStream(name="stdin", content=symbytes, size=size)
-                return proj.factory.full_init_state(stdin=sfs, add_options=extras)
+                return proj.factory.full_init_state(args=args, stdin=sfs, add_options=extras)
             except Exception:                                # noqa: BLE001
-                return proj.factory.full_init_state(add_options=extras)
+                return proj.factory.full_init_state(args=args, add_options=extras)
 
         def make_state(preconstrain=None):
             if mode == "arg":
                 st = proj.factory.full_init_state(
-                    args=[binary, symbytes], add_options=extras)
+                    args=[binary] + argv_tail, add_options=extras)
             elif mode == "file":
                 sf = angr.SimFile("lykos_input_file", content=symbytes, size=size)
                 st = proj.factory.full_init_state(
-                    args=[binary, "/lykos_input"], add_options=extras)
+                    args=[binary] + argv_tail, add_options=extras)
                 st.fs.insert("/lykos_input", sf)
             else:                                            # stdin
                 st = _stdin_state()
