@@ -154,6 +154,7 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
         return run_function(elf_bytes, func_addr, buf, arg_shape=arg_shape)
 
     seen_crash_sites: set = set()
+    exec_errors = 0
     t0 = time.time()
     # seed the corpus + coverage from the initial inputs, then from each dictionary constant placed
     # at the buffer's start (where a header magic/length field sits) -- a direct gate pass to try.
@@ -169,7 +170,16 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
            and len(fr.crashes) < max_crashes):
         data = (pending.pop() if pending
                 else _mutate(rng, rng.choice(corpus) if corpus else b"\x00" * 8, words))
-        r: HarnessResult = _drive(data)
+        try:
+            r: HarnessResult = _drive(data)
+        except Exception as e:                            # noqa: BLE001
+            # One input that breaks the EXECUTOR (an emulator/host error, not a target fault) must
+            # not abort the campaign: raising here discarded every crash already collected for
+            # this function. Counted and noted, never filed as a crash.
+            fr.execs += 1
+            exec_errors += 1
+            fr.note = f"executor error on {exec_errors} input(s); last: {e!r}"[:200]
+            continue
         fr.execs += 1
         new = r.blocks - fr.blocks
         if new:

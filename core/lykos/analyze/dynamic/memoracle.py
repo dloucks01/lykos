@@ -118,6 +118,34 @@ def dislocator_preload(base_env: Optional[dict], *, host_arch: str, target_arch:
     return env
 
 
+# ---------------------------------------------------------------- confinement
+
+def _confined(argv: list, exe, *, ro=(), rw=(), setenv: Optional[dict] = None) -> list:
+    """`argv` wrapped in the platform's bwrap prefix (read-only root, secrets masked, no network,
+    fresh /tmp, pid namespace) -- or `argv` unchanged when bwrap is unusable.
+
+    Both lanes below EXECUTE the untrusted target (one under libtokencap, one under memcheck) and
+    did so with a bare `subprocess.run`: full user privileges, network, the analyst's home
+    writable, and on timeout only the direct child killed. `setenv` is passed through bwrap's own
+    --setenv so a preload survives even a setuid bwrap (whose loader would strip LD_PRELOAD)."""
+    try:
+        from . import sandbox
+        exedir = str(Path(exe).resolve().parent)
+        pre = sandbox.isolate_prefix(exedir, net=False, ro_binds=[str(d) for d in ro],
+                                     rw_binds=[str(d) for d in rw], chdir=exedir)
+    except Exception:                                   # noqa: BLE001 -- containment best-effort
+        pre = []
+    if not pre:
+        return list(argv)
+    if setenv and "--" in pre:
+        cut = pre.index("--")
+        extra = []
+        for k, v in setenv.items():
+            extra += ["--setenv", k, v]
+        pre = pre[:cut] + extra + pre[cut:]
+    return pre + list(argv)
+
+
 # ---------------------------------------------------------------- runtime comparison tokens
 
 # libtokencap hooks the string/memory comparison functions and appends every constant a target
@@ -203,12 +231,15 @@ def runtime_tokens(exe, data: bytes, *, mode: str = "stdin", base_argv=(), timeo
             argv = [str(exe), data.split(b"\x00", 1)[0].decode("latin-1"),
                     *[str(a) for a in base_argv]]
         elif mode == "file":
-            fd, tmp = tempfile.mkstemp(prefix="lykos-tokcap-in-")
+            # inside the token dir, which the sandbox binds -- its own /tmp is a fresh tmpfs
+            fd, tmp = tempfile.mkstemp(prefix="lykos-tokcap-in-", dir=d)
             os.write(fd, data)
             os.close(fd)
             argv = [(tmp if a == "@@" else a) for a in argv] if "@@" in argv else argv + [tmp]
+        cmd = _confined(argv, exe, rw=[d], setenv={"LD_PRELOAD": env["LD_PRELOAD"],
+                                                   "AFL_TOKEN_FILE": str(out)})
         try:
-            subprocess.run(argv, input=stdin_data, capture_output=True, timeout=timeout, env=env)
+            subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=timeout, env=env)
         except (OSError, subprocess.SubprocessError):
             return []
         try:
@@ -350,6 +381,8 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
     exe = str(exe)
     import tempfile
     tmp = None
+    tmpdir = None
+    ro_dirs: list = []
     argv = [exe, *[str(a) for a in base_argv]]
     stdin_data = b""
     try:
@@ -359,10 +392,12 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
             argv = [exe, data.split(b"\x00", 1)[0].decode("latin-1")] + [str(a) for a in base_argv]
         elif mode == "file":
             if input_path is None:
-                fd, tmp = tempfile.mkstemp(prefix="lykos-vg-")
+                tmpdir = tempfile.mkdtemp(prefix="lykos-vg-")
+                fd, tmp = tempfile.mkstemp(prefix="lykos-vg-", dir=tmpdir)
                 os.write(fd, data)
                 os.close(fd)
                 input_path = tmp
+            ro_dirs.append(str(Path(input_path).resolve().parent))
             if "@@" in argv:
                 argv = [input_path if a == "@@" else a for a in argv]
             else:
@@ -371,9 +406,9 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
         # allocation"), which is the difference between "something was uninitialised" and a root
         # cause a reader can act on. It costs extra shadow state, which this triage lane can
         # afford; the fuzz loop never comes here.
-        cmd = [vg, "--error-exitcode=0", "--exit-on-first-error=no",
-               "--leak-check=summary", "--errors-for-leak-kinds=definite",
-               "--track-origins=yes", "-q", *argv]
+        cmd = _confined([vg, "--error-exitcode=0", "--exit-on-first-error=no",
+                         "--leak-check=summary", "--errors-for-leak-kinds=definite",
+                         "--track-origins=yes", "-q", *argv], exe, ro=ro_dirs)
         _t0 = time.time()
         try:
             r = subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=timeout)
@@ -398,3 +433,5 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
                 os.unlink(tmp)
             except OSError:
                 pass
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)

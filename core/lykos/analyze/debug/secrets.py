@@ -98,7 +98,9 @@ gdb.execute("set height 0")
 RAN, ERR = False, ""
 try:
     # args inline: `set args X` then `run < file` resets args to empty (gdb quirk) -> argv lost
-    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
+    # inferior output -> /dev/null: it shares gdb's stdout with the LYKOS_* result markers
+    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else "")
+                + " > /dev/null 2>&1")
     RAN = True            # the inferior actually executed (run returned no gdb.error)
 except gdb.error as _e:
     ERR = str(_e)         # never ran (exec-format / cannot-execute / ptrace-denied)
@@ -146,10 +148,15 @@ def run_extract(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20):
         out = proc.stdout.decode("latin-1", "ignore")
         hits = status = None
         for line in out.splitlines():
-            if line.startswith("LYKOS_CMP "):
-                hits = json.loads(line[len("LYKOS_CMP "):])
-            elif line.startswith("LYKOS_STATUS "):
-                status = json.loads(line[len("LYKOS_STATUS "):])
+            try:
+                if line.startswith("LYKOS_CMP "):
+                    hits = json.loads(line[len("LYKOS_CMP "):])
+                elif line.startswith("LYKOS_STATUS "):
+                    status = json.loads(line[len("LYKOS_STATUS "):])
+            except ValueError:
+                continue                  # a torn/garbled line is not a result
+        if not isinstance(hits, list) or not isinstance(status, dict):
+            hits = status = None
         if hits is None or status is None:
             return {"ok": False, "hits": [], "note": "gdb did not run to completion (no result "
                     "marker) -- the target could not be run; no comparisons were observed"}

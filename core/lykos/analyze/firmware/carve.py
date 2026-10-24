@@ -166,7 +166,14 @@ def _decompress(typ: str, blob: bytes) -> Optional[bytes]:
     return None
 
 
-def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0) -> list[dict]:
+# Total bytes ONE extract_components() call tree may decompress across every stream it tries. Each
+# stream is already capped at _MAX_DECOMPRESS, but a crafted image of thousands of gzip members (or
+# nested layers re-scanned at each depth) multiplied that cap into an unbounded CPU/RAM sink.
+_MAX_DECOMPRESS_TOTAL = 512 << 20
+
+
+def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0,
+                       _budget: Optional[list] = None) -> list[dict]:
     """Embeddable components to register as sub-targets: embedded ELFs and ELF payloads of
     gzip/xz/bzip2/zstd/raw-LZMA streams. Each: {offset, kind, filename, bytes, note}.
 
@@ -176,6 +183,8 @@ def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0
     hits = scan_signatures(data)
     out: list[dict] = []
     seen_ranges: list[tuple[int, int]] = []
+    budget = _budget if _budget is not None else [_MAX_DECOMPRESS_TOTAL]
+    view = memoryview(data)              # data[o:] per hit copied the whole image every time
 
     def _overlaps(o, sz):
         return any(o < e and o + sz > s for s, e in seen_ranges)
@@ -194,9 +203,13 @@ def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0
             out.append({"offset": o, "kind": "elf", "filename": f"carved_0x{o:x}.elf",
                         "bytes": data[o:o + sz], "note": f"embedded ELF ({sz} bytes)"})
         elif typ in ("gzip", "xz", "bzip2", "zstd"):
-            dec = _decompress(typ, data[o:])
+            if budget[0] <= 0:
+                _log.debug("extract_components: decompression budget exhausted at 0x%x", o)
+                continue
+            dec = _decompress(typ, view[o:])
             if not dec:
                 continue
+            budget[0] -= len(dec)
             if dec[:4] == b"\x7fELF":
                 esz = _elf_extent(dec, 0) or len(dec)
                 out.append({"offset": o, "kind": "elf",
@@ -208,7 +221,7 @@ def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0
                 # tar of ELFs, or another compression layer. Re-scan it -- the embedded ELFs are not
                 # visible as contiguous magic in the ORIGINAL (compressed) image.
                 for sub in extract_components(dec, max_components=max_components - len(out),
-                                              _depth=_depth + 1):
+                                              _depth=_depth + 1, _budget=budget):
                     sub["note"] = f"{typ} stream @ 0x{o:x} -> " + sub["note"]
                     sub["filename"] = f"carved_0x{o:x}_{typ}_" + sub["filename"]
                     out.append(sub)
@@ -217,7 +230,7 @@ def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0
     # Raw LZMA (.lzma / LZMA_ALONE) has no reliable magic, so it is NOT a SIGNATURE (a bare 0x5d
     # byte is far too common to report). Instead scan for its header shape and VALIDATE each
     # candidate by trial-decompression -- an embedded LZMA-compressed ELF is kept, noise is not.
-    for o, dec in _scan_raw_lzma(data):
+    for o, dec in _scan_raw_lzma(data, budget):
         if len(out) >= max_components or _overlaps(o, 1):
             continue
         esz = _elf_extent(dec, 0) or len(dec)
@@ -235,12 +248,14 @@ _LZMA_DICT_SIZES = {1 << k for k in range(16, 28)}      # 64 KiB .. 128 MiB, the
 _LZMA_MAX_TRIALS = 256
 
 
-def _scan_raw_lzma(data: bytes):
+def _scan_raw_lzma(data: bytes, budget: Optional[list] = None):
     """Yield (offset, decompressed_bytes) for every embedded raw-LZMA stream whose content is an
-    ELF. Bounded: at most _LZMA_MAX_TRIALS validations, each on a capped window."""
+    ELF. Bounded: at most _LZMA_MAX_TRIALS validations, each on a capped window, and the shared
+    decompression `budget` when one is given."""
     trials = 0
     start = 0
-    while trials < _LZMA_MAX_TRIALS:
+    view = memoryview(data)
+    while trials < _LZMA_MAX_TRIALS and (budget is None or budget[0] > 0):
         o = data.find(b"\x5d", start)
         if o < 0 or o + 13 > len(data):
             break
@@ -250,9 +265,11 @@ def _scan_raw_lzma(data: bytes):
             continue
         trials += 1
         try:
-            dec = _bounded(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE), data[o:])
+            dec = _bounded(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE), view[o:])
         except Exception:                               # noqa: BLE001
             continue
+        if budget is not None:
+            budget[0] -= len(dec)
         if dec and dec[:4] == b"\x7fELF":
             yield o, dec
 
@@ -267,6 +284,99 @@ _MAX_CARVE_DEPTH = 2           # how deep extract_components recurses into neste
 _MAX_FS_FILES = 1024
 _MAX_FS_FILE = 32 << 20        # skip any single extracted file larger than this
 _MAX_FS_TOTAL = 256 << 20      # stop walking once this many bytes have been read out
+
+
+# Bytes an external extractor may WRITE to disk for one filesystem. The walk below reads at most
+# _MAX_FS_TOTAL back, but the extractor itself was unbounded: SquashFS dedups blocks, so a few-KB
+# image can describe thousands of files that all reference the same data -- terabytes on disk.
+_MAX_FS_EXTRACT = 1 << 30
+# Total file bytes extract_filesystems() keeps in memory across ALL filesystems in one image (each
+# filesystem is capped at _MAX_FS_TOTAL; eight of them was 2 GiB of RAM).
+_MAX_FS_ALL = 512 << 20
+
+
+def _extractor_preexec():
+    """Child-side limits for an external extractor run on untrusted bytes: no single file it
+    writes can exceed _MAX_FS_FILE (+1, so an over-cap file is still recognisably over-cap and
+    skipped by the walk), and SIGXFSZ is ignored so hitting that limit fails the write instead of
+    killing the extractor mid-tree."""
+    import resource
+    import signal
+    try:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (_MAX_FS_FILE + 1, _MAX_FS_FILE + 1))
+    except (OSError, ValueError):
+        pass
+
+
+def _confine(td: str, cwd: Optional[str] = None) -> list:
+    """bwrap prefix that lets an extractor write ONLY inside `td` (read-only root, fresh /tmp, no
+    network, secrets masked). unsquashfs/cpio have a history of symlink-traversal CVEs
+    (CVE-2021-40153/41072, CVE-2015-1197) where a crafted image writes through a symlink it
+    created earlier; confined, such a write lands in a read-only or throwaway mount instead of the
+    analyst's home. [] when bwrap is unusable -- the run then relies on the extractor's own checks
+    plus the rlimit, and that is logged rather than silent."""
+    try:
+        from ..dynamic import sandbox
+        pre = sandbox.isolate_prefix(td, net=False, rw_binds=[td], chdir=cwd or td)
+    except Exception:                                   # noqa: BLE001 -- containment is best-effort
+        pre = []
+    if not pre:
+        _log.info("firmware extractor runs unconfined (bwrap unavailable); relying on the "
+                  "extractor's own traversal checks and a per-file size rlimit")
+    return pre
+
+
+def _run_extractor(cmd: list, td: str, *, cwd: Optional[str] = None, input=None,
+                   timeout: int = 180, capture: bool = False):
+    pre = _confine(td, cwd)
+    return subprocess.run(pre + cmd, input=input, cwd=cwd,
+                          stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+                          preexec_fn=_extractor_preexec)
+
+
+def _squashfs_plan(exe: str, img: str, td: str) -> Optional[list]:
+    """The regular files to extract from a SquashFS, chosen from its LISTING before anything is
+    written: [path-relative-to-root]. Files over _MAX_FS_FILE are left out (the walk skips them
+    anyway) and the selection stops at _MAX_FS_FILES / _MAX_FS_EXTRACT. Likely-executable paths
+    (bin/, sbin/, lib/, *.so*, cgi-bin, ...) are taken first so a truncated selection keeps the
+    binaries. None when the listing itself failed (caller falls back to a capped full extract)."""
+    import re as _re
+    try:
+        proc = _run_extractor([exe, "-lln", "-no-progress", img], td, timeout=120, capture=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    line_re = _re.compile(rb"^-\S{9}\s+\S+\s+(\d+)\s+\S+\s+\S+\s+(.+)$")
+    regs: list[tuple[str, int]] = []
+    for line in proc.stdout.splitlines():
+        m = line_re.match(line)
+        if not m:
+            continue
+        path = m.group(2).decode("utf-8", "surrogateescape")
+        # listed as "squashfs-root/<path>"; strip the synthetic root component
+        rel = path.split("/", 1)[1] if "/" in path else ""
+        size = int(m.group(1))
+        if not rel or size > _MAX_FS_FILE or "\n" in rel or " -> " in rel:
+            continue
+        regs.append((rel, size))
+
+    def _prio(item):
+        p = item[0].lower()
+        exe_like = (p.startswith(("bin/", "sbin/", "usr/bin/", "usr/sbin/", "lib/", "usr/lib/",
+                                  "www/cgi-bin/", "usr/libexec/")) or ".so" in p.rsplit("/", 1)[-1]
+                    or "/cgi-bin/" in p)
+        return 0 if exe_like else 1
+    regs.sort(key=_prio)
+    chosen, total = [], 0
+    for rel, size in regs:
+        if len(chosen) >= _MAX_FS_FILES or total + size > _MAX_FS_EXTRACT:
+            break
+        chosen.append(rel)
+        total += size
+    return chosen
 
 
 def _squashfs_size(data: bytes, o: int) -> Optional[int]:
@@ -321,10 +431,22 @@ def _unpack_squashfs(fs: bytes) -> list[dict]:
         dest = os.path.join(td, "root")        # must NOT pre-exist: unsquashfs creates it
         with open(img, "wb") as fh:
             fh.write(fs)
+        cmd = [exe, "-no-progress", "-force", "-no-xattrs", "-dest", dest, img]
+        plan = _squashfs_plan(exe, img, td)
+        if plan is not None:
+            if not plan:
+                return []
+            ef = os.path.join(td, "extract.list")
+            with open(ef, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                fh.write("\n".join(plan) + "\n")
+            cmd = [exe, "-no-progress", "-force", "-no-xattrs", "-no-wildcards",
+                   "-ef", ef, "-dest", dest, img]
         try:
-            subprocess.run([exe, "-no-progress", "-force", "-dest", dest, img],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=180, check=False)
+            _run_extractor(cmd, td, timeout=180)
+            if not os.path.isdir(dest) and "-no-wildcards" in cmd:
+                # an older unsquashfs (< 4.4) rejects -no-wildcards outright; the selection list
+                # still bounds what is written, wildcard matching only widens it within the list
+                _run_extractor([c for c in cmd if c != "-no-wildcards"], td, timeout=180)
         except (OSError, subprocess.TimeoutExpired):
             _log.debug("unsquashfs failed on carved SquashFS region", exc_info=True)
             return []
@@ -388,9 +510,8 @@ def _unpack_cpio(fs: bytes) -> list[dict]:
         dest = os.path.join(td, "root")
         os.makedirs(dest, exist_ok=True)
         try:
-            subprocess.run([exe, "-idm", "--no-absolute-filenames", "--quiet"],
-                           input=fs, cwd=dest, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=120, check=False)
+            _run_extractor([exe, "-idm", "--no-absolute-filenames", "--quiet"], td,
+                           cwd=dest, input=fs, timeout=120)
         except (OSError, subprocess.TimeoutExpired):
             _log.debug("cpio extraction failed", exc_info=True)
             return []
@@ -407,8 +528,9 @@ def extract_filesystems(data: bytes, *, max_filesystems: int = 8) -> list[dict]:
     seen: set[int] = set()
     hits = scan_signatures(data)
     n_fs = 0
+    kept = 0
     for h in hits:
-        if n_fs >= max_filesystems:
+        if n_fs >= max_filesystems or kept >= _MAX_FS_ALL:
             break
         o, typ = h["offset"], h["type"]
         if typ == "squashfs":
@@ -429,7 +551,7 @@ def extract_filesystems(data: bytes, *, max_filesystems: int = 8) -> list[dict]:
             if o in seen:
                 continue
             seen.add(o)
-            dec = _decompress(typ, data[o:])
+            dec = _decompress(typ, memoryview(data)[o:])
             if not (dec and dec[:6] in _CPIO_NEWC):
                 continue
             typ = f"{typ}+cpio"
@@ -440,6 +562,11 @@ def extract_filesystems(data: bytes, *, max_filesystems: int = 8) -> list[dict]:
             continue
         n_fs += 1
         for f in files:
+            if kept >= _MAX_FS_ALL:
+                _log.info("extract_filesystems: %d-byte in-memory cap reached; remaining files "
+                          "dropped", _MAX_FS_ALL)
+                break
+            kept += len(f["bytes"])
             out.append({"offset": o, "fs": typ, "path": f["path"],
                         "bytes": f["bytes"], "kind": f["kind"]})
     return out

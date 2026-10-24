@@ -142,6 +142,79 @@ def _elf_libraries(root: Path, since: float):
     return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
 
 
+def _build_confinement(root: Path, wrapdir: Path) -> list:
+    """bwrap prefix for running a project's build commands, or [] when bwrap is unusable (the
+    build then runs unconfined, as before; the build log says so). Opt out with
+    LYKOS_BUILD_UNCONFINED=1 for a project whose build legitimately needs to write elsewhere."""
+    if os.environ.get("LYKOS_BUILD_UNCONFINED") == "1":
+        return []
+    try:
+        from .dynamic import sandbox
+        return sandbox.isolate_prefix(str(root), net=False, rw_binds=[str(root), str(wrapdir)],
+                                      chdir=str(root))
+    except Exception:                                     # noqa: BLE001 -- best-effort containment
+        return []
+
+
+def _run_group(argv, *, cwd, env, timeout: float):
+    """(returncode, combined output) of one build command run in its OWN process group.
+
+    `subprocess.run(timeout=)` kills only the direct child: a timed-out `make -j` left its cc1 /
+    sub-make / configure-test grandchildren running, and anything a build script backgrounded
+    kept the output pipe open so the call blocked until the timeout even after `make` exited.
+    The whole group is killed on timeout AND after a normal exit (a build leaves no daemons)."""
+    import signal
+    try:
+        proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except OSError as e:
+        return 1, f"{argv[0]}: {e}"
+
+    def _killpg():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    import time as _time
+    timed_out = False
+    out = b""
+    deadline = _time.monotonic() + timeout
+    exited_at = None
+    try:
+        while True:
+            left = deadline - _time.monotonic()
+            if left <= 0:
+                timed_out = True
+                break
+            try:
+                out, _ = proc.communicate(timeout=min(1.0, left))
+                break
+            except subprocess.TimeoutExpired:
+                # the command itself finished but something it backgrounded still holds the
+                # output pipe: give it a short grace, then reap the group instead of waiting out
+                # the whole build budget on a daemon
+                if proc.poll() is not None:
+                    exited_at = exited_at or _time.monotonic()
+                    if _time.monotonic() - exited_at > 2.0:
+                        break
+        if proc.stdout and not out:
+            _killpg()
+            try:
+                out, _ = proc.communicate(timeout=10)
+            except (subprocess.TimeoutExpired, ValueError):
+                out = b""
+    finally:
+        _killpg()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    text = (out or b"").decode("utf-8", "replace")
+    if timed_out:
+        return 1, text + f"\n{argv[0]}: timed out after {timeout:.0f}s (process group killed)\n"
+    return proc.returncode, text
+
+
 def build_source_project(root, *, timeout: int = 300, total: int | None = None) -> dict:
     """Build the project rooted at `root` with sanitizers forced in. Returns
     {ok, system, binaries:[Path], primary:Path|None, compiler, log}. `binaries` is largest-first;
@@ -176,16 +249,19 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
     def _left() -> float:
         return max(0.0, deadline - time.time())
 
+    # A source project's Makefile / configure / CMakeLists is UNTRUSTED CODE that runs on this
+    # host. Confine every build command when bwrap is usable: read-only root with the secret
+    # dirs masked, no network, fresh /tmp, and only the project tree + the compiler-wrapper dir
+    # writable -- so a hostile build can produce binaries in its own tree and nothing else.
+    confine = _build_confinement(root, wrapdir)
+    if confine:
+        env["CCACHE_DISABLE"] = "1"      # a ccache'd compiler would fail writing ~/.ccache (ro)
+
     def _run(argv, cwd=root):
         slice_s = min(float(timeout), _left())
         if slice_s <= 1.0:
             return 1, f"{argv[0]}: skipped, the build budget is spent"
-        try:
-            r = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True,
-                               timeout=slice_s)
-            return r.returncode, (r.stdout or "") + (r.stderr or "")
-        except (OSError, subprocess.SubprocessError) as e:
-            return 1, f"{argv[0]}: {e}"
+        return _run_group(confine + list(argv), cwd=cwd, env=env, timeout=slice_s)
 
     # STATIC libraries, for both builders. A shared build of a library project produces tools that
     # are unrunnable here for two independent reasons, measured on libtiff 4.0.3 and expat 2.1.0:
@@ -375,6 +451,9 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
             if bins:
                 return {"ok": True, "system": system, "kind": kind, "binaries": bins,
                         "primary": bins[0], "compiler": Path(cc).name, "log": full_log[-4000:]}
+        if not confine:
+            full_log += ("\n== note: build ran UNCONFINED (bwrap unavailable) -- the project's "
+                         "build scripts executed with this user's full privileges ==\n")
         return {"ok": False, "system": system, "kind": "executable", "binaries": [],
                 "primary": None, "compiler": Path(cc).name, "log": full_log[-4000:]}
     finally:

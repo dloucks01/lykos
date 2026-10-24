@@ -166,7 +166,7 @@ def _parse_thin(data: bytes, base: int, endian: str, bits: int, info: MachoInfo)
         if cmdsize < 8 or off + cmdsize > len(data):
             info.errors.append("bad load-command size")
             break
-        _parse_lc(data, off, cmd, cmdsize, e, bits, info, libs)
+        _parse_lc(data, off, cmd, cmdsize, e, bits, info, libs, base)
         if cmd in (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_ID_DYLIB):
             has_dyld = True
         off += cmdsize
@@ -179,7 +179,7 @@ def _parse_thin(data: bytes, base: int, endian: str, bits: int, info: MachoInfo)
     return info
 
 
-def _parse_lc(data, off, cmd, cmdsize, e, bits, info, libs):
+def _parse_lc(data, off, cmd, cmdsize, e, bits, info, libs, base=0):
     """Dispatch one load command into the record. Each reader is bounds-checked and best-effort."""
     try:
         if cmd in (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_ID_DYLIB):
@@ -195,7 +195,7 @@ def _parse_lc(data, off, cmd, cmdsize, e, bits, info, libs):
         elif cmd in (LC_SEGMENT, LC_SEGMENT_64):
             _parse_segment(data, off, cmd, e, info)
         elif cmd == LC_SYMTAB:
-            _parse_symtab(data, off, e, bits, info)
+            _parse_symtab(data, off, e, bits, info, base)
         elif cmd == LC_MAIN and cmdsize >= 16:                        # entryoff+stacksize = 16 bytes
             (entryoff,) = struct.unpack_from(e + "Q", data, off + 8)   # file offset of entry
             info.entry = entryoff
@@ -236,11 +236,23 @@ def _parse_segment(data, off, cmd, e, info):
         info.sections.append({"name": f"{segname.strip()},{sect.strip()}", "size": None})
 
 
-def _parse_symtab(data, off, e, bits, info):
+def _demangle_c(name: str) -> str:
+    """Mach-O prefixes every C symbol with exactly ONE underscore. Stripping all of them turned
+    `___stack_chk_fail`/`___memcpy_chk` into `stack_chk_fail`/`memcpy_chk` -- names no sink or
+    hardening table knows, so a fortified call read as an unfortified one."""
+    return name[1:] if name.startswith("_") else name
+
+
+def _parse_symtab(data, off, e, bits, info, base=0):
     try:
         symoff, nsyms, stroff, strsize = struct.unpack_from(e + "IIII", data, off + 8)
     except struct.error:
         return
+    # symoff/stroff are offsets from the start of THIS Mach-O image -- in a universal binary that
+    # is the slice, not the file. Read relative to the file, a fat binary's import/export list was
+    # whatever bytes happened to sit at the same offset in the fat container.
+    symoff += base
+    stroff += base
     imported, exported = [], []
     nl_sz = 16 if bits == 64 else 12               # nlist_64 / nlist
     nsyms = min(nsyms, 200000)
@@ -260,9 +272,9 @@ def _parse_symtab(data, off, e, bits, info):
             continue
         n_type_field = n_type & 0x0e                # N_TYPE
         if (n_type & 0x01) and n_type_field == 0x00:   # N_EXT and N_UNDF -> undefined external = import
-            imported.append(name.lstrip("_"))
+            imported.append(_demangle_c(name))
         elif (n_type & 0x01) and n_value:               # N_EXT defined -> export
-            exported.append(name.lstrip("_"))
+            exported.append(_demangle_c(name))
     info.imported_symbols = imported[:2048]
     info.exported_symbols = exported[:2048]
     # a Mach-O with no non-stab, non-dynamic local symbols is effectively stripped

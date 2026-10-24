@@ -53,6 +53,35 @@ OUTPUT_SCRATCH = "lykos.out"
 _OUT_WORD = re.compile(r"(?i)^(out|output|outfile|dst|dest|destination|target|result|outputfile)$")
 
 
+#: A metavar that names "more options", not a value: `-d [options]` does not make -d take a value.
+_GENERIC_META = re.compile(r"(?i)^(?:options?|opts|args?|arguments?|flags?|switches|params?|"
+                           r"parameters?)(?:\.\.\.)?$")
+
+
+def _positionals(usage) -> list:
+    """The POSITIONAL words of a usage line: `[optional]` groups, flags and each flag's own VALUE
+    dropped. A `<metavar>` or an UPPERCASE metavar written right after a flag is that flag's value
+    (`-o <outfile>`, `-c CONFIG`), not a positional -- counting it as one turned
+    `usage: prog -o <outfile> -c <config>` into a two-positional CONVERTER (`@@ @@out`) and
+    `usage: tool -c <config> parse <file>` into a verb named "config"."""
+    t = re.sub(r"(?i)^.*?\busage\b\s*:?\s*", "", usage or "")
+    t = re.sub(r"\[[^\]]*\]", " ", t)                    # drop [options]-style optional groups
+    out: list = []
+    after_flag = False
+    for w in re.split(r"\s+", t):
+        if not w:
+            continue
+        if w.startswith("-"):
+            after_flag = "=" not in w                     # `--out=FILE` carries its own value
+            continue
+        if after_flag and (w.startswith("<") or re.fullmatch(r"[A-Z][A-Z0-9_.-]*", w)):
+            after_flag = False
+            continue
+        after_flag = False
+        out.append(w)
+    return out
+
+
 def output_positional(usage) -> bool:
     """Does the usage line end in an OUTPUT positional (a converter's `... input output`)?
 
@@ -61,9 +90,7 @@ def output_positional(usage) -> bool:
     or the tool prints usage and exits -- which otherwise looks like a wrong invocation forever."""
     if not usage:
         return False
-    t = re.sub(r"(?i)^.*?\busage\b\s*:?\s*", "", usage)
-    t = re.sub(r"\[[^\]]*\]", " ", t)                    # drop [options]-style optional groups
-    toks = [w for w in re.split(r"\s+", t) if w and not w.startswith("-")]
+    toks = _positionals(usage)
     bare = [re.sub(r"[<>().]", "", w).strip(".") for w in toks]
     bare = [w for w in bare if w and w != "%s"]
     return len(bare) >= 2 and any(_OUT_WORD.match(w) for w in bare[1:])
@@ -72,6 +99,10 @@ def output_positional(usage) -> bool:
 #: A file-ish positional metavar word: file / input / path / src / doc / image / data (any affix).
 _FILE_POS = re.compile(r"(?i)(?:^|[_-])(?:in|input|infile|file|path|src|source|doc|image|img|data)"
                        r"(?:$|[_-]|name|arg)")
+#: Words a usage line uses as a METAVAR for the verb slot, never a literal verb.
+_VERB_METAVARS = {"file", "input", "path", "command", "cmd", "subcommand", "subcmd", "action",
+                  "verb", "mode", "operation", "op", "tool", "args", "arg", "options", "opts",
+                  "prog", "program", "name", "target", "files", "inputs", "paths"}
 
 
 def verb_subcommand(usage, prog=None):
@@ -84,14 +115,17 @@ def verb_subcommand(usage, prog=None):
     with no flags before the file and a plausible lowercase verb."""
     if not usage:
         return None
-    t = re.sub(r"(?i)^.*?\busage\b\s*:?\s*", "", usage)
-    t = re.sub(r"\[[^\]]*\]", " ", t)                     # drop [optional] groups
-    toks = [w for w in re.split(r"\s+", t) if w and not w.startswith("-")]
+    toks = _positionals(usage)
     if len(toks) < 3:                                    # need prog, verb, and a file positional
         return None
-    verb = toks[1].strip("<>[]().")                      # toks[0] is the program token (name/%s/path)
-    if not re.match(r"^[a-z][a-z0-9_-]{1,18}$", verb) or verb in ("file", "input", "path"):
+    # toks[0] is the program token (name/%s/path). A literal verb is written BARE: `<command>` is a
+    # metavar for "some command", and returning the word "command" proposed `tool command @@`.
+    if toks[1][:1] in "<[{(":
         return None
+    verb = toks[1].strip(".")
+    if (not re.match(r"^[a-z][a-z0-9_-]{1,18}$", verb) or verb in _VERB_METAVARS
+            or _FILE_POS.search(verb) or _OUT_WORD.match(verb)):
+        return None                                      # `src_file dst_file` is not a verb
     for w in toks[2:]:
         name = w.strip("<>[]().").lower()
         if _FILE_POS.search(name) or name in ("file", "input", "path", "infile", "f"):
@@ -101,7 +135,19 @@ def verb_subcommand(usage, prog=None):
 
 _OPTSTRING = re.compile(r"^[+-]?:?(?=[^:]*:)([A-Za-z0-9]:{0,2}){2,40}$")
 # usage: prog -c <config> --jar=FILE
-_USAGE_FLAG = re.compile(r"(--?[A-Za-z][A-Za-z0-9_-]*)(?:[= ]+([<\[]?[A-Za-z0-9_.<>\[\]-]+))?")
+# The value group may not START with '-': in `-v -c <config>` the next FLAG is not -v's value
+# (reading it as one lost -c entirely and handed -v the value "-c").
+_USAGE_FLAG = re.compile(r"(--?[A-Za-z][A-Za-z0-9_-]*)(?:[= ]+(?!-)([<\[]?[A-Za-z0-9_.<>\[\]-]+))?")
+
+
+def _usage_value(placeholder) -> Optional[str]:
+    """The flag-value placeholder, or None when there is none or it only says "more options"."""
+    if not placeholder:
+        return None
+    core = placeholder.strip("<>[]").strip()
+    if not core or _GENERIC_META.match(core.strip("<>[]")):
+        return None
+    return placeholder
 _USAGE_LINE = re.compile(r"(?i)\busage\b\s*:?\s")
 
 # What a value should look like, from the placeholder the usage line used.
@@ -433,7 +479,7 @@ def from_usage(strings, *, prog: Optional[str] = None) -> tuple:
             flag, placeholder = m.group(1), m.group(2)
             if flag in ("-", "--") or len(flag) > 32:
                 continue
-            takes = bool(placeholder and placeholder.strip("<>[]"))
+            takes = _usage_value(placeholder) is not None
             flags[flag] = flags.get(flag, False) or takes
             if takes:
                 flags[flag] = True
@@ -482,8 +528,10 @@ def optional_flags(usage: str) -> set:
 # way. We detect the command table and pick the subcommand that READS a single input document, so
 # the fuzzed input actually flows into the parser.
 _DISPATCH_HINT = re.compile(
-    r"(?im)^\s*usage:.*<(?:command|subcommand|verb|tool)>"       # usage: tool [opts] <command> ...
-    r"|^\s*(?:available\s+)?(?:sub)?commands:\s*$")              # a 'Commands:' section header
+    # `^[ \t]*`, never `^\s*`: under MULTILINE `\s` eats newlines, so every line start of a run of
+    # blank lines re-scanned the whole run -- quadratic on a hostile --help (8,000 blank lines: 1 s).
+    r"(?im)^[ \t]*usage:.*<(?:command|subcommand|verb|tool)>"     # usage: tool [opts] <command> ...
+    r"|^[ \t]*(?:available[ \t]+)?(?:sub)?commands:[ \t]*$")       # a 'Commands:' section header
 # a command-list row: leading indent, a lowercase command word, then a description (often after
 # `--` or 2+ spaces). Deliberately narrow so an ordinary wrapped help line is not mistaken for one.
 _SUBCMD_ROW = re.compile(r"^[ \t]+([a-z][a-z0-9][a-z0-9_-]{0,18})(?:[ \t]*--|[ \t]{2,}|\t)\s*(.+?)\s*$")
@@ -514,6 +562,8 @@ def from_subcommands(help_text: str) -> "tuple[Optional[str], list]":
         return None, []
     cmds: dict = {}
     for raw in text.splitlines():
+        if len(raw) > 512:                               # a command row is short; a huge line is
+            continue                                     # not one (and backtracks expensively)
         m = _SUBCMD_ROW.match(raw.rstrip())
         if not m:
             continue
@@ -553,7 +603,7 @@ def from_subcommands(help_text: str) -> "tuple[Optional[str], list]":
 # busybox 1.21.1's own CVE list is an out-of-bounds read in the unlzma decompressor and a
 # use-after-free in awk) were never reached at all.
 _MULTICALL_HINT = re.compile(r"(?im)multi-call binary"
-                             r"|^\s*usage:\s*\S+\s+\[?(?:function|applet)\b")
+                             r"|^[ \t]*usage:[ \t]*\S+[ \t]+\[?(?:function|applet)\b")
 #: The listing a multi-call binary offers about itself. Far better evidence than parsing wrapped
 #: help text, and it is the binary's own answer rather than ours.
 _LIST_FLAGS = ("--list", "--list-full")
@@ -596,7 +646,7 @@ _MULTICALL_PRIORITY = (
 
 
 #: `Usage: busybox [function [arguments]...]` -- the dispatcher's own name, in its own .rodata.
-_SELF_NAME = re.compile(r"(?im)^\s*usage:\s+([A-Za-z0-9_.+-]{2,24})\s+\[?(?:function|applet)\b")
+_SELF_NAME = re.compile(r"(?im)^[ \t]*usage:[ \t]+([A-Za-z0-9_.+-]{2,24})[ \t]+\[?(?:function|applet)\b")
 
 
 def multicall_self_name(text: str) -> Optional[str]:
@@ -760,7 +810,7 @@ _COMPRESSOR = re.compile(r"^(?:gzip|bzip2|xz|lzma|lzop|compress|zip)$")
 #: What a program prints when it did NOT accept the invocation. Checked in the OUTPUT rather than
 #: in the exit code: busybox exits 1 both for "usage" and for "that is not a valid archive", and
 #: the second one is a parser that ran, which is exactly what a door is.
-_REFUSED = re.compile(r"(?im)^\s*(?:usage|busybox\b.*multi-call|.*applet not found)")
+_REFUSED = re.compile(r"(?im)^[ \t]*(?:usage|busybox\b.*multi-call|.*applet not found)")
 
 
 #: The program inside the SAME image that produces what a door consumes. A utility box ships
@@ -945,7 +995,7 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     placeholders = {}
     for text in ([usage] if usage else []):
         for m in _USAGE_FLAG.finditer(text):
-            if m.group(2):
+            if _usage_value(m.group(2)):
                 placeholders[m.group(1)] = m.group(2)
     for flag, ph in help_ph.items():                 # help names shapes usage often omits
         placeholders.setdefault(flag, ph)
@@ -1027,7 +1077,7 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
         if not f.get("takes_value") or f.get("optional"):
             continue
         argv.append(f["flag"])
-        if not placed and f.get("kind") in input_kinds:
+        if not placed and f.get("kind") in input_kinds and not _is_output_slot(f):
             argv.append("@@")
             placed = True
         else:
@@ -1098,6 +1148,34 @@ def _is_read_flag(f: dict) -> bool:
     return bool(_READ_FLAG.search(hay))
 
 
+_OUTPUT_SLOT = re.compile(
+    r"(?i)(?<![a-z])(?:out(?:put)?(?:[_-]?(?:file|dir|path|name))?|outfile|outdir|write|save|"
+    r"dest(?:ination)?|dst|export|log(?:file)?|[a-z]*dir(?:ectory)?|folder)(?![a-z])")
+_DIR_SLOT = re.compile(r"(?i)(?<![a-z])(?:[a-z]*dir(?:ectory)?|folder)(?![a-z])")
+
+
+def _is_output_slot(f: dict) -> bool:
+    """A REQUIRED path-kind flag that names where the program WRITES (`-o <outfile>`,
+    `--log FILE`) or a DIRECTORY (`-d <dir>`), not a file it reads. Putting the fuzzed input there
+    made the target overwrite its own input (or reject a file as a directory) while the real input
+    positional was never given. Judged on the placeholder and long alias, plus the conventional
+    output letters -o/-w when nothing names the value as an input."""
+    hay = " ".join(x for x in ((f.get("placeholder") or "").strip("<>[]"), f.get("name") or "")
+                   if x)
+    if hay and _OUTPUT_SLOT.search(hay):
+        return True
+    if f.get("flag") in ("-o", "-w", "--out", "--output") and not re.search(
+            r"(?i)conf|cfg|in(?:put)?(?![a-z])|src|source|read", hay):
+        return True
+    return False
+
+
+def _is_dir_slot(f: dict) -> bool:
+    hay = " ".join(x for x in ((f.get("placeholder") or "").strip("<>[]"), f.get("name") or "")
+                   if x)
+    return bool(hay and _DIR_SLOT.search(hay))
+
+
 def _concrete(f: dict) -> str:
     d = f.get("default") or "x"
     if d == "@@":                            # a second path-ish value: give it a real one
@@ -1138,6 +1216,7 @@ def materialize(found: dict, directory, *, sample=None) -> list:
     out: list = []
     i = 0
     kinds = {f["flag"]: f.get("kind") for f in found.get("flags") or []}
+    dir_slots = {f["flag"] for f in found.get("flags") or [] if _is_dir_slot(f)}
     while i < len(argv):
         a = argv[i]
         if a == OUTPUT_PLACEHOLDER:                       # a converter's scratch output path
@@ -1147,7 +1226,10 @@ def materialize(found: dict, directory, *, sample=None) -> list:
         out.append(a)
         kind = kinds.get(a)
         if i + 1 < len(argv) and kind in _FILE_KINDS and argv[i + 1] != INPUT_PLACEHOLDER:
-            if kind == "jar":
+            if a in dir_slots and kind == "path":
+                path = d / "lykos.dir"                   # `-d <dir>` needs a DIRECTORY, not a file
+                path.mkdir(exist_ok=True)
+            elif kind == "jar":
                 path = d / "app.jar"
                 with zipfile.ZipFile(path, "w") as z:
                     z.writestr("META-INF/MANIFEST.MF", _MIN_MANIFEST.decode())

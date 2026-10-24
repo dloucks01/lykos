@@ -136,7 +136,9 @@ gdb.execute("set pagination off")
 gdb.execute("set height 0")
 # args must be inline on `run`/`starti`: `set args X` then `run < file` makes gdb reset the
 # argument list to empty (the redirect-only form), silently dropping argv.
-_RUN = RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else "")
+# The inferior's stdout/stderr go to /dev/null: it shares gdb's stdout, where the LYKOS_* result
+# markers are printed, so a target printing its own `LYKOS_MON [...]` could forge the result.
+_RUN = RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else "") + " > /dev/null 2>&1"
 RAN, ERR = False, ""
 try:
     if ADDR_SINKS:
@@ -206,10 +208,15 @@ def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20, addr_sinks=
         out = proc.stdout.decode("latin-1", "ignore")
         hits = status = None
         for line in out.splitlines():
-            if line.startswith("LYKOS_MON "):
-                hits = json.loads(line[len("LYKOS_MON "):])
-            elif line.startswith("LYKOS_STATUS "):
-                status = json.loads(line[len("LYKOS_STATUS "):])
+            try:
+                if line.startswith("LYKOS_MON "):
+                    hits = json.loads(line[len("LYKOS_MON "):])
+                elif line.startswith("LYKOS_STATUS "):
+                    status = json.loads(line[len("LYKOS_STATUS "):])
+            except ValueError:
+                continue                  # a torn/garbled line is not a result
+        if not isinstance(hits, list) or not isinstance(status, dict):
+            hits = status = None
         if hits is None or status is None:
             return {"ok": False, "hits": [], "note": "gdb did not run to completion (no result "
                     "marker) -- the target could not be monitored; nothing was observed"}

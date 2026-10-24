@@ -213,7 +213,10 @@ def _file_crash(ctx, target, fd, cr, *, harness_sha, harness_desc, entry, seen) 
         cwe, title, severity, state = claim
         faulted = False
     else:
-        cwe, title, severity = "CWE-787", "crash under libFuzzer", "high"
+        # No sanitizer class could be read from the report: the fault is real (libFuzzer wrote a
+        # crash artifact) but its KIND is unknown. Naming it CWE-787 claimed an out-of-bounds
+        # WRITE -- and the write primitive the ladder then hunts for -- on no evidence at all.
+        cwe, title, severity = "CWE-119", "crash under libFuzzer (sanitizer class unknown)", "high"
         state, faulted = "confirmed", True
     src_line = cls.get("source")
     key = src_line or hashlib.sha1(
@@ -226,6 +229,10 @@ def _file_crash(ctx, target, fd, cr, *, harness_sha, harness_desc, entry, seen) 
         input_sha = ctx.put_artifact("libfuzzer-crash-input", data=cr["input"])
         detail = (f"libFuzzer + {sanitizer} reproduced {title}" if faulted
                   else f"libFuzzer recorded {title}")
+        if cr.get("reproduced") is False:
+            # the loop's sanitizer report proves the fault, but no artifact was written and no
+            # replay reproduced it -- the saved input is a stand-in, not a verified reproducer
+            detail += " [crashing input NOT verified: stand-in seed, no replay reproduced it]"
         fd.upsert(target.id, target.case_id, {
             "cwe": cwe, "title": f"{title} (libFuzzer)", "severity": severity,
             "detector": "libfuzzer", "state": state, "confidence": 0.92 if faulted else 0.7,

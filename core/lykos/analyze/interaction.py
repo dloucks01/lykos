@@ -178,6 +178,7 @@ def _drive(exe, workdir, steps, *, idle=0.2, timeout=8.0):
     return all captured stdout (raw). Keeps a fixed read(N)+prompt loop in sync."""
     p = _spawn(exe, workdir)
     out = b""
+    sel = None
     try:
         sel = selectors.DefaultSelector()
         sel.register(p.stdout, selectors.EVENT_READ)
@@ -200,6 +201,8 @@ def _drive(exe, workdir, steps, *, idle=0.2, timeout=8.0):
         # Close the pipes BEFORE killing: a half-filled stdin buffer finalised after the
         # process is gone raises an unraisable BrokenPipeError that no `except` here can
         # catch. A real-corpus run printed dozens of them, all blaming this function.
+        if sel is not None:
+            sel.close()                                  # the epoll fd, one per drive
         sandbox.kill_quietly(p)
     return out
 
@@ -261,6 +264,7 @@ def _drive_bridge(exe, workdir, caps, *, timeout, max_steps=12):
     out = b""
     recipe = []
     ci = 0
+    sel = None
     try:
         sel = selectors.DefaultSelector()
         sel.register(p.stdout, selectors.EVENT_READ)
@@ -292,6 +296,8 @@ def _drive_bridge(exe, workdir, caps, *, timeout, max_steps=12):
         # Close the pipes BEFORE killing: a half-filled stdin buffer finalised after the
         # process is gone raises an unraisable BrokenPipeError that no `except` here can
         # catch. A real-corpus run printed dozens of them, all blaming this function.
+        if sel is not None:
+            sel.close()                                  # the epoll fd, one per drive
         sandbox.kill_quietly(p)
     return out, recipe
 

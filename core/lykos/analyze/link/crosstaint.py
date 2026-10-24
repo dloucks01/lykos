@@ -101,17 +101,33 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
             comps[tid] = _load_component(conn, targets[tid])
         return comps[tid]
 
+    # Above taint._MAX_FUNCS the engine analyses the RANKED top-N instead of nothing; what it
+    # could have reached but did not is the real loss, recorded per component (max over that
+    # component's runs, since the runs overlap) so a negative over it is stated as partial.
+    lost: dict = {}
+
+    def _note_loss(tid, rep):
+        sr = int((rep or {}).get("skipped_reachable") or 0)
+        if rep:
+            lost[tid] = max(lost.get(tid, 0), sr)
+
     def imports(tid):
         if tid not in imps_cache:
             fi, _n, ce = comp(tid)
-            imps_cache[tid] = taint.caller_tainted_imports(fi, ce, targets[tid].arch)
+            rep: dict = {}
+            imps_cache[tid] = taint.caller_tainted_imports(fi, ce, targets[tid].arch,
+                                                           ranked_out=rep)
+            _note_loss(tid, rep)
         return imps_cache[tid]
 
     def sinks(tid):
         if tid not in sink_cache:
             fi, n2a, ce = comp(tid)
+            reps: dict = {}
             sink_cache[tid] = taint.callee_sink_exports(
-                fi, ce, targets[tid].arch, n2a, incoming.get(tid, set()))
+                fi, ce, targets[tid].arch, n2a, incoming.get(tid, set()), ranked_out=reps)
+            for rep in reps.values():
+                _note_loss(tid, rep)
         return sink_cache[tid]
 
     fd = FindingDAO(conn)
@@ -128,7 +144,7 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
     why: dict = {"no_components": len(targets) < 2, "no_links": not dyn,
                  "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0,
                  "callers_without_ir": 0, "callees_without_ir": 0,
-                 "components_over_cap": 0}
+                 "components_over_cap": 0, "skipped_reachable": 0, "components_ranked": 0}
     for e in dyn:
         a, b = targets.get(e.src_target), targets.get(e.dst_target)
         if not a or not b:
@@ -149,14 +165,9 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
         if not comp(e.dst_target)[0]:
             why["callees_without_ir"] += 1
             continue
-        # The data-flow engine returns an empty result above its function ceiling, and says
-        # nothing. Without this check the diagnosis below could report "the callee does not
-        # carry it into a dangerous sink -- a real negative" about an analysis that never ran,
-        # which is a false negative stated with confidence. libcrypto is 13,529 functions
-        # against a ceiling of 6,000.
-        if len(src_ir) > taint._MAX_FUNCS or len(comp(e.dst_target)[0]) > taint._MAX_FUNCS:
-            why["components_over_cap"] += 1
-            continue
+        # Above the function ceiling (libcrypto: 13,529 against 6,000) the engine now runs on
+        # the ranked top-N rather than returning nothing, so the boundary IS examined; what was
+        # left out is reported via `skipped_reachable` below instead of skipping the edge.
         syms = set(edge_symbols(e.detail)) & imports(e.src_target)
         if not syms:
             why["edges_without_tainted_symbol"] += 1
@@ -185,8 +196,12 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
         why["edges_with_clean_callee"] += int(clean)
     # (no explicit commit: the connection is autocommit and the upserts above already persisted;
     # a bare conn.commit() here would prematurely commit any enclosing transaction.)
+    why["components_ranked"] = len(lost)
+    why["skipped_reachable"] = sum(lost.values())
     return {"edges_examined": len(dyn), "cross_findings": len(findings),
-            "components_analyzed": len(comps), "note": _why_nothing(why, len(findings))}
+            "components_analyzed": len(comps), "components_ranked": len(lost),
+            "skipped_reachable": why["skipped_reachable"],
+            "note": _why_nothing(why, len(findings))}
 
 
 def _why_nothing(why: dict, found: int):
@@ -199,7 +214,14 @@ def _why_nothing(why: dict, found: int):
     if why["no_links"]:
         return ("no dynamic-link edges are resolved, so there is no boundary to chase taint "
                 "across. Run link_case first.")
-    n = why["components_over_cap"]
+    sr = why.get("skipped_reachable") or 0
+    if sr:
+        n = why.get("components_ranked") or 1
+        return (f"{n} component{'s exceed' if n != 1 else ' exceeds'} the data-flow ceiling "
+                f"({taint._MAX_FUNCS} functions), so taint ran on the ranked top-N and {sr} "
+                f"reachable function(s) were NOT analysed. Nothing was found in what was "
+                f"examined, but this is not a negative result for the functions left out.")
+    n = why.get("components_over_cap") or 0
     if n:
         return (f"{n} boundar{'ies join' if n != 1 else 'y joins'} a component larger than "
                 f"the data-flow ceiling ({taint._MAX_FUNCS} functions), so the analysis did "

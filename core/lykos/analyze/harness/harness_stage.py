@@ -27,6 +27,15 @@ _ACCESS_CWE = {"read": ("CWE-125", "out-of-bounds read"),
                "fetch": ("CWE-119", "control-flow corruption")}
 _X86_64 = {"x86-64", "x86_64", "amd64"}
 
+
+def _fault_cwe(r) -> tuple:
+    """(CWE, kind) for a harness fault. An access inside the NULL page is a NULL-pointer
+    dereference (CWE-476) whatever its direction -- filing it as CWE-125/787 named an
+    out-of-bounds read/write (and the exploit primitive that implies) for a plain NULL deref."""
+    if r.fault_addr is not None and 0 <= r.fault_addr < 0x1000 and r.access in ("read", "write"):
+        return "CWE-476", f"NULL pointer dereference ({r.access})"
+    return _ACCESS_CWE.get(r.access, ("CWE-119", "memory fault"))
+
 #: Names that are IMPORTED libc routines, not the program's own code: the decompiler recovers their
 #: PLT thunk as a "function", but driving it is pointless (it just jumps through the GOT) and -- since
 #: its signature is the known libc prototype -- it scores a perfect harnessable shape and crowds the
@@ -201,7 +210,7 @@ def harness_stage(ctx) -> dict:
             r = c["result"]
             inp = c["input"]
             sha = ctx.put_artifact("harness-crash-input", data=inp)
-            cwe, kind = _ACCESS_CWE.get(r.access, ("CWE-119", "memory fault"))
+            cwe, kind = _fault_cwe(r)
             fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
             pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
             dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}"
@@ -250,7 +259,7 @@ def harness_stage(ctx) -> dict:
                     inp = c["input"]
                     msgs = [m for m in inp.split(b"\n") if m]
                     sha = ctx.put_artifact("harness-seq-input", data=inp)
-                    cwe, kind = _ACCESS_CWE.get(r.access, ("CWE-119", "memory fault"))
+                    cwe, kind = _fault_cwe(r)
                     fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
                     pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
                     nth = (r.seq_index + 1) if r.seq_index is not None else "?"

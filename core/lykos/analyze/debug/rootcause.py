@@ -18,7 +18,26 @@ from typing import Optional
 
 from ..detect.catalog import SOURCES, normalize
 
-_OBJDUMP_MACH = {"x86-64": "i386:x86-64", "x86": "i386", "aarch64": "aarch64", "arm": "arm"}
+# arch (triage naming) -> objdump `-m` machine. NO DEFAULT: the old `.get(arch, "i386:x86-64")`
+# decoded a MIPS/PPC/RISC-V fault's bytes as x86-64, and the garbage it printed decided read vs
+# write -- or, when the bytes happened to be 0xc3, a `ret` and so a CRITICAL "stack-return-
+# overwrite" on a target that has no such instruction. An arch we cannot decode is undecoded.
+_OBJDUMP_MACH = {"x86-64": "i386:x86-64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
+                 "mips": "mips", "mipsel": "mips", "riscv": "riscv:rv64",
+                 "riscv64": "riscv:rv64", "ppc": "powerpc:common", "ppc64": "powerpc:common64",
+                 "s390": "s390:64-bit", "loongarch": "loongarch64", "sh": "sh4",
+                 "sparc": "sparc", "sparcv9": "sparc:v9", "m68k": "m68k"}
+# Arches whose bytes are big-endian unless the capture says otherwise (objdump's binary input
+# otherwise assumes little-endian, which decodes a big-endian MIPS word as a different insn).
+_BIG_ENDIAN_DEFAULT = {"mips", "ppc", "ppc64", "s390", "sparc", "sparcv9", "m68k"}
+# Per-arch cross objdump to fall back on when the host one is single-target.
+_CROSS_OBJDUMP = {"aarch64": "aarch64-linux-gnu-objdump", "arm": "arm-linux-gnueabihf-objdump",
+                  "mips": "mips-linux-gnu-objdump", "mipsel": "mipsel-linux-gnu-objdump",
+                  "riscv": "riscv64-linux-gnu-objdump", "riscv64": "riscv64-linux-gnu-objdump",
+                  "ppc": "powerpc-linux-gnu-objdump", "ppc64": "powerpc64-linux-gnu-objdump",
+                  "s390": "s390x-linux-gnu-objdump", "loongarch": "loongarch64-linux-gnu-objdump",
+                  "sh": "sh4-linux-gnu-objdump", "sparcv9": "sparc64-linux-gnu-objdump",
+                  "m68k": "m68k-linux-gnu-objdump"}
 
 
 def _to_int(x):
@@ -28,29 +47,51 @@ def _to_int(x):
         return None
 
 
-def disasm_one(pc_bytes: bytes, arch: str):
-    """Disassemble the first instruction in `pc_bytes` via objdump; None if unavailable."""
-    if not pc_bytes or not shutil.which("objdump"):
+def disasm_one(pc_bytes: bytes, arch: str, endianness: Optional[str] = None,
+               thumb: bool = False):
+    """Disassemble the first instruction in `pc_bytes` via objdump; None if unavailable, or if
+    `arch` is one objdump is not asked to decode here (never guessed as x86)."""
+    mach = _OBJDUMP_MACH.get(arch or "")
+    if not pc_bytes or not mach:
         return None
-    mach = _OBJDUMP_MACH.get(arch, "i386:x86-64")
+    tools = [t for t in (shutil.which("objdump"), shutil.which(_CROSS_OBJDUMP.get(arch, "") or
+                                                               "\0")) if t]
+    if not tools:
+        return None
+    opts = []
+    if arch in ("x86-64", "x86"):
+        opts = ["-M", "intel"]
+    elif arch == "arm" and thumb:
+        opts = ["-M", "force-thumb"]
+    big = (endianness == "big") or (endianness is None and arch in _BIG_ENDIAN_DEFAULT)
+    if arch not in ("x86-64", "x86"):
+        opts.append("-EB" if big else "-EL")
     fd, path = tempfile.mkstemp(suffix=".bin")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(pc_bytes)
-        r = subprocess.run(["objdump", "-D", "-b", "binary", "-m", mach, "-M", "intel", path],
-                           capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
+        for tool in tools:
+            try:
+                r = subprocess.run([tool, "-D", "-b", "binary", "-m", mach, *opts, path],
+                                   capture_output=True, text=True, timeout=10, check=False)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            for line in r.stdout.splitlines():
+                s = line.strip()
+                parts = s.split("\t")
+                if len(parts) >= 3 and parts[0].rstrip().endswith(":"):
+                    # x86 objdump separates mnemonic and operands with spaces, the RISC
+                    # back ends with a TAB -- taking parts[2] alone kept `str` and dropped
+                    # `w1, [x0]`, the half that names the memory operand.
+                    ins = " ".join(" ".join(parts[2:]).split())
+                    if ins and not ins.startswith("(bad)"):
+                        return ins
+                    break
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
-    for line in r.stdout.splitlines():
-        s = line.strip()
-        parts = s.split("\t")
-        if len(parts) >= 3 and parts[0].rstrip().endswith(":"):
-            return parts[2].strip()
     return None
 
 
@@ -145,7 +186,17 @@ def symbolize(addr, maps, ranges, target_path, delta=None):
         "[anon]" if m else "??")
     entry = {"addr": addr, "module": module,
              "offset": (addr - m["start"]) if m else None, "symbol": None}
-    f = _fn_at(ranges, addr)                      # absolute match (no-PIE)
+    # Absolute match (no-PIE) -- but only for an address that is not POSITIVELY in some other
+    # module. A frame in libc, a [heap]/[stack] page or the vdso that happens to fall inside the
+    # decompiler's address range (a rebased PIE image at 0x100000, a 32-bit guest layout) was
+    # named after a target function it has nothing to do with.
+    foreign = False
+    if m and m.get("path") and target_path:
+        mp = str(m["path"])
+        if mp.endswith(" (deleted)"):
+            mp = mp[:-len(" (deleted)")]
+        foreign = mp.startswith("[") or os.path.basename(mp) != os.path.basename(target_path)
+    f = None if foreign else _fn_at(ranges, addr)
     static = addr
     if f is None and delta and module == os.path.basename(target_path or ""):
         f = _fn_at(ranges, addr - delta)          # PIE: rebase into the decompiler's image
@@ -256,15 +307,139 @@ def attribute(frames, findings, sites_by_finding=None):
     return sorted(best.values(), key=lambda a: -_TIERS.index(a["tier"]))
 
 
-def _is_memory_write(disasm):
-    """Intel-syntax: a store has the memory operand as the destination (before the comma)."""
+_X86_PREFIXES = frozenset({"rep", "repe", "repz", "repne", "repnz", "lock", "bnd", "notrack",
+                           "data16", "addr32", "xacquire", "xrelease", "cs", "ds", "es", "fs",
+                           "gs", "ss", "{vex}", "{vex3}", "{evex}"})
+# Instructions whose memory operand is only READ even when it is written first (Intel order).
+_X86_READ_ONLY = frozenset({"cmp", "test", "bt", "ptest", "vptest", "ucomiss", "ucomisd",
+                            "comiss", "comisd", "vucomiss", "vucomisd", "vcomiss", "vcomisd",
+                            "cmpsb", "cmpsw", "cmpsd", "cmpsq", "cmps", "scas", "scasb", "scasw",
+                            "scasd", "scasq", "push", "call", "jmp", "ljmp", "lcall", "bound",
+                            "verr", "verw", "lgdt", "lidt", "lldt", "ltr", "lmsw", "outs",
+                            "outsb", "outsw", "outsd", "ldmxcsr", "vldmxcsr", "mul", "div",
+                            "idiv", "clflush", "clflushopt", "clwb", "prefetch", "prefetchw",
+                            "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta"})
+# One-operand instructions that WRITE their memory operand (the rest -- fld, fadd, push, call,
+# mul, div, jmp, ... -- read it). `fld QWORD PTR [rax]` was a "write" because its only operand
+# "is the destination", and so was `call QWORD PTR [rax+8]`.
+_X86_SINGLE_WRITE = frozenset({"inc", "dec", "not", "neg", "pop", "fst", "fstp", "fist", "fistp",
+                               "fisttp", "fbstp", "fnstcw", "fstcw", "fnstsw", "fstsw",
+                               "fnstenv", "fstenv", "fnsave", "fsave", "fxsave", "fxsave64",
+                               "xsave", "xsave64", "xsaveopt", "xsavec", "xsaves", "stmxcsr",
+                               "vstmxcsr", "sgdt", "sidt", "sldt", "str", "smsw", "cmpxchg8b",
+                               "cmpxchg16b", "stos", "stosb", "stosw", "stosd", "stosq", "movs",
+                               "movsb", "movsw", "movsq", "ins", "insb", "insw", "insd"})
+
+
+def _x86_access(disasm: str) -> Optional[str]:
+    toks = disasm.replace(",", " , ").split()
+    while toks and toks[0].lower() in _X86_PREFIXES:
+        toks = toks[1:]
+    if not toks:
+        return None
+    mnem = toks[0].lower()
+    ops = [o.strip() for o in " ".join(toks[1:]).replace(" , ", ",").split(",") if o.strip()]
+    if not any("[" in o for o in ops):
+        # No explicit memory operand: only the implicit STACK accesses can fault here.
+        if mnem in ("push", "pushf", "pushfq", "pushfd", "call", "enter"):
+            return "write"
+        if mnem in ("pop", "popf", "popfq", "popfd", "leave"):
+            return "read"
+        return None                                   # direction is not in the instruction
+    if mnem in _X86_READ_ONLY or mnem.startswith(("j", "loop", "fld", "fild", "fxrstor",
+                                                  "xrstor", "frstor", "fldenv", "fldcw")):
+        return "read"
+    if mnem in ("xchg", "xadd", "cmpxchg"):
+        return "write"                                # always writes its memory operand
+    if len(ops) == 1:
+        if mnem in _X86_SINGLE_WRITE or mnem.startswith("set"):
+            return "write"
+        return "read"
+    return "write" if "[" in ops[0] else "read"
+
+
+# RISC ISAs name the direction in the MNEMONIC (the register operand comes first for a store as
+# well as a load), so `str w1, [x0]` -- a STORE -- read as a load under the x86 "is the first
+# operand memory?" rule, and every cross-arch out-of-bounds write was filed as CWE-125.
+_RISC_STORE_PREFIX = {
+    "aarch64": ("st", "ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin", "ldumax", "ldumin",
+                "swp", "cas"),
+    "arm": ("st", "push", "vst", "vpush", "swp"),
+    "ppc": ("st", "dcbz"), "ppc64": ("st", "dcbz"),
+    "loongarch": ("st", "fst", "sc.", "am"),
+    "sparc": ("st", "swap", "cas", "ldstub"), "sparcv9": ("st", "swap", "cas", "ldstub"),
+}
+_RISC_LOAD_PREFIX = {
+    "aarch64": ("ld", "prfm"), "arm": ("ld", "pop", "vld", "vpop"),
+    "ppc": ("l",), "ppc64": ("l",), "loongarch": ("ld", "fld", "ll."),
+    "sparc": ("ld",), "sparcv9": ("ld",),
+}
+_MIPS_STORES = frozenset({"sb", "sh", "sw", "sd", "swl", "swr", "sdl", "sdr", "sc", "scd",
+                          "swc1", "sdc1", "swc2", "sdc2", "swxc1", "sdxc1", "suxc1", "sq"})
+_MIPS_LOADS = frozenset({"lb", "lbu", "lh", "lhu", "lw", "lwu", "ld", "lwl", "lwr", "ldl", "ldr",
+                         "ll", "lld", "lwc1", "ldc1", "lwc2", "ldc2", "lwxc1", "ldxc1", "luxc1"})
+_RISCV_STORES = ("sb", "sh", "sw", "sd", "sq", "c.sw", "c.sd", "c.swsp", "c.sdsp", "fsw", "fsd",
+                 "fsq", "c.fsw", "c.fsd", "c.fswsp", "c.fsdsp", "sc.", "amo")
+_RISCV_LOADS = ("lb", "lbu", "lh", "lhu", "lw", "lwu", "ld", "c.lw", "c.ld", "c.lwsp", "c.ldsp",
+                "flw", "fld", "flq", "c.flw", "c.fld", "c.flwsp", "c.fldsp", "lr.")
+_S390_WRITES = frozenset({"mvc", "mvi", "mviy", "mvhi", "mvghi", "mvhhi", "xc", "oc", "nc", "ni",
+                          "oi", "xi", "niy", "oiy", "xiy", "mvcle", "mvst"})
+
+
+def _access_kind(disasm, arch: Optional[str] = None) -> Optional[str]:
+    """"read" / "write" for the memory access the faulting instruction makes, or None when the
+    instruction (or its absence) does not say. None is an answer: it must not be filed as a read."""
     if not disasm:
-        return False
-    ops = disasm.split(None, 1)
-    if len(ops) < 2:
-        return False
-    dest = ops[1].split(",")[0]
-    return "[" in dest                            # destination dereferences memory -> a write
+        return None
+    text = str(disasm).strip()
+    mnem = text.split(None, 1)[0].lower() if text else ""
+    rest = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    a = (arch or "").lower()
+    if a in ("", "x86-64", "x86", "amd64", "i386"):
+        if not a and mnem in ("str", "stp", "stur", "strb", "strh") and "," in rest:
+            return "write"                            # an arch-less aarch64/arm store
+        return _x86_access(text)
+    if a in ("mips", "mipsel", "mips64"):
+        m = mnem.rstrip(".")
+        return "write" if m in _MIPS_STORES else ("read" if m in _MIPS_LOADS else None)
+    if a in ("riscv", "riscv64"):
+        if mnem.startswith(_RISCV_STORES):
+            return "write"
+        return "read" if mnem.startswith(_RISCV_LOADS) else None
+    if a in ("s390", "s390x"):
+        if mnem in _S390_WRITES or mnem.startswith("st"):
+            return "write"
+        return "read" if mnem.startswith(("l", "c", "ic", "tm")) and "(" in rest else None
+    if a in ("sh", "m68k"):
+        # MIT/SuperH order: the DESTINATION is the last operand; `@` marks memory
+        ops = [o.strip() for o in rest.split(",") if o.strip()]
+        if not ops or not any("@" in o for o in ops):
+            return None
+        if mnem.startswith(("tst", "cmp", "btst", "pea", "jmp", "jsr", "lea", "bra")):
+            return "read"
+        if len(ops) == 1:
+            return "write" if mnem.startswith(("clr", "neg", "not", "s", "add", "sub", "mov",
+                                               "fmov")) else "read"
+        return "write" if "@" in ops[-1] else "read"
+    stores = _RISC_STORE_PREFIX.get(a)
+    if stores is not None:
+        if mnem.startswith(stores):
+            return "write"
+        if mnem.startswith(_RISC_LOAD_PREFIX.get(a, ())):
+            return "read"
+    return None
+
+
+def _is_memory_write(disasm, arch: Optional[str] = None):
+    """True when the faulting instruction STORES to memory (see `_access_kind`)."""
+    return _access_kind(disasm, arch) == "write"
+
+
+# A deliberate trap: an assertion, `__builtin_trap`, a compiler-inserted check (clang CFI,
+# -fsanitize-trap, Rust's abort) -- not "execution reached corrupted code". Reading `ud2` as
+# illegal-instruction rated it EXPLOITABLE ("bad control-flow target") on every such abort.
+_TRAP_MNEMONICS = frozenset({"ud2", "ud1", "ud0", "udf", "brk", "int3", "bkpt", "trap",
+                             "unimp", "c.unimp", "break", "illtrap", "tw", "td", "trapa"})
 
 
 # AddressSanitizer/UBSan bug class -> (CWE, severity). The sanitizer names the exact defect a
@@ -752,6 +927,17 @@ def classify(cap, disasm):
         return {"class": "control-flow-hijack", "cwe": "CWE-787", "severity": "critical",
                 "detail": f"program counter 0x{(pc or 0):x} is not in executable memory "
                           "(attacker-controlled execution transfer)"}
+    # No maps (a gdbstub capture), but si_addr == pc: the fault was the INSTRUCTION FETCH --
+    # execution was transferred to an address that cannot be executed. That is the same verdict
+    # the maps branch reaches, from the one fact a stub capture does carry.
+    if not maps and pc is not None and fault is not None and fault == pc \
+            and sig in ("SIGSEGV", "SIGBUS"):
+        if pc < 0x1000:
+            return {"class": "null-pointer-dereference", "cwe": "CWE-476", "severity": "medium",
+                    "detail": f"call/jump through a NULL function pointer (pc 0x{pc:x})"}
+        return {"class": "control-flow-hijack", "cwe": "CWE-787", "severity": "critical",
+                "detail": f"instruction fetch faulted at pc 0x{pc:x} "
+                          "(execution transferred to a non-executable address)"}
     if sig == "SIGABRT":
         return {"class": "detected-corruption-abort", "cwe": "CWE-787", "severity": "high",
                 "detail": "process aborted by a runtime integrity check "
@@ -759,6 +945,13 @@ def classify(cap, disasm):
     if sig == "SIGFPE":
         return {"class": "arithmetic-exception", "cwe": "CWE-369", "severity": "high",
                 "detail": "arithmetic fault (divide-by-zero or INT_MIN/-1)"}
+    mnem0 = (disasm or "").split()[0].lower() if disasm else ""
+    if sig == "SIGTRAP" or (sig == "SIGILL" and mnem0 in _TRAP_MNEMONICS):
+        return {"class": "reachable-assertion", "cwe": "CWE-617", "severity": "medium",
+                "detail": "the program executed a deliberate trap instruction"
+                          + (f" (`{disasm}`)" if disasm else "")
+                          + " -- an assertion, unreachable() or a compiler-inserted check fired; "
+                            "the defect behind it is not visible from the trap itself"}
     if sig == "SIGILL":
         return {"class": "illegal-instruction", "cwe": "CWE-119", "severity": "high",
                 "detail": "illegal instruction (corrupted code or control flow)"}
@@ -786,14 +979,25 @@ def classify(cap, disasm):
         return {"class": "stack-return-overwrite", "cwe": "CWE-121", "severity": "critical",
                 "detail": "fault at a function return: the saved return address was "
                           "overwritten (stack-based buffer overflow)"}
-    is_write = _is_memory_write(disasm)
-    rw = "write" if is_write else "read"
+    kind = _access_kind(disasm, cap.get("arch"))
     if fault is not None and fault < 0x1000:
         return {"class": "null-pointer-dereference", "cwe": "CWE-476", "severity": "medium",
-                "detail": f"{rw} through a NULL/near-NULL pointer (fault at 0x{fault:x})"}
+                "detail": f"{kind or 'access'} through a NULL/near-NULL pointer "
+                          f"(fault at 0x{fault:x})"}
+    if kind is None:
+        # Neither the instruction nor its absence says which way the access went (no objdump,
+        # an ISA we do not decode, an unreadable pc, a gdbstub capture). Calling that a READ
+        # filed every such crash as CWE-125 and rated it PROBABLY_NOT_EXPLOITABLE -- a write
+        # understated by default. Say what is known: an invalid access, direction unknown.
+        where = f" at 0x{fault:x}" if fault is not None else " (fault address not captured)"
+        return {"class": "invalid-memory-access", "cwe": "CWE-119", "severity": "high",
+                "detail": f"invalid memory access{where}; access direction unknown"
+                          + (f" (`{disasm}`)" if disasm else "")}
+    is_write = kind == "write"
     cwe = "CWE-787" if is_write else "CWE-125"
-    return {"class": f"out-of-bounds-{rw}", "cwe": cwe, "severity": "high",
-            "detail": f"invalid {rw} at 0x{(fault or 0):x}"
+    return {"class": f"out-of-bounds-{kind}", "cwe": cwe, "severity": "high",
+            "detail": (f"invalid {kind} at 0x{fault:x}" if fault is not None
+                       else f"invalid {kind} (fault address not captured)")
                       + (f" via `{disasm}`" if disasm else "")}
 
 
@@ -890,7 +1094,16 @@ def build_slice(cap, functions, call_edges, findings, maps, target_path,
 def analyze(cap, functions, call_edges, findings, target_path, arch,
             sites_by_finding=None, elf_entry=None):
     from . import exploitability
-    disasm = disasm_one(bytes.fromhex(cap.get("pc_bytes", "")), arch)
+    try:
+        pcb = bytes.fromhex(cap.get("pc_bytes") or "")
+    except ValueError:
+        pcb = b""
+    cap = dict(cap)
+    cap.setdefault("arch", arch)
+    # A gdbstub capture decodes its own faulting instruction (it alone knows the guest's
+    # endianness and Thumb state) and hands it over as `insn`.
+    disasm = disasm_one(pcb, arch, cap.get("endianness"), bool(cap.get("thumb"))) \
+        or cap.get("insn")
     verdict = classify(cap, disasm)
     exploit = exploitability.rate(cap, verdict)
     sl = build_slice(cap, functions, call_edges, findings, cap.get("maps") or [], target_path,

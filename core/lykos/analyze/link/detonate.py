@@ -141,8 +141,13 @@ def _run_once(*, emu, services, entry, channel, entry_input, timeout, readiness,
             _wait_proc(p, max(0.05, deadline - time.time()))
         th.join(timeout=0.3)
     finally:
+        # Remember who was still running BEFORE we kill them. `timed_out` used to be read as
+        # `returncode is None` after this block had already SIGKILLed and reaped every process,
+        # so it was never true: a hung entry read as a clean run with exit_code=None.
+        killed = set()
         for _comp, p in procs:
             if p.poll() is None:
+                killed.add(id(p))
                 sandbox._killpg(p)
         for _comp, p in procs:
             try:
@@ -153,12 +158,15 @@ def _run_once(*, emu, services, entry, channel, entry_input, timeout, readiness,
     outcomes = []
     for comp, p in procs:
         rc = p.returncode
-        crashed, sig, signame, exit_code = sandbox.classify_rc(rc)
+        was_killed = id(p) in killed
+        # a process WE killed reports -SIGKILL: that is our timeout, never the target's crash
+        crashed, sig, signame, exit_code = (sandbox.classify_rc(rc) if not was_killed
+                                            else (False, None, None, None))
         outcomes.append(CompOutcome(
             target_id=comp.get("target_id"), filename=comp.get("filename", "?"),
             role=("entry" if comp is entry else "service"),
             crashed=crashed, signal=sig, signal_name=signame, exit_code=exit_code,
-            timed_out=(rc is None)))
+            timed_out=was_killed))
     return outcomes
 
 
@@ -223,6 +231,11 @@ def detonate(components: list, *, channel=None, entry_input: bytes = b"",
         outcomes = _run_once(emu=emu, services=services, entry=entry, channel=channel,
                              entry_input=entry_input, timeout=timeout,
                              readiness=readiness, grace=grace, preexec=preexec)
+    except OSError as e:
+        # A component that cannot be exec'd at all (wrong format, missing interpreter, noexec
+        # scratch) used to raise straight out of the stage. Nothing ran -- say so, with no
+        # outcomes, so a caller cannot read it as "detonated and nothing crashed".
+        return DetonateResult(isolation="not-runnable", note=f"launch failed: {e!r}")
     finally:
         if made_fifo:
             _rm(made_fifo)

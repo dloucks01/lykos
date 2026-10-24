@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ... import observe
 from ..elf import parse as parse_elf
 
 _log = __import__("logging").getLogger(__name__)
@@ -59,6 +58,10 @@ class HarnessResult:
     huge_alloc: Optional[int] = None  # T5: an attacker-controlled allocation SIZE (CWE-789 DoS)
     seq_index: Optional[int] = None   # T6: which message in a driven sequence faulted
     note: str = ""
+    # A stub handed the function a NULL that the REAL call would not have (an unknown external
+    # stubbed to 0, the harness's own 16 MiB heap running out). A NULL-page fault after that is the
+    # harness's doing, not the input's -- see _drive_messages.
+    artifact_null: bool = False
 
 
 def available() -> bool:
@@ -85,29 +88,60 @@ def _map_segments(uc, data: bytes) -> None:
     en = "<" if data[5] == 1 else ">"
     if not is64:
         raise ValueError("harness executor is x86-64 only for now")
+    e_type = struct.unpack_from(en + "H", data, 0x10)[0]
     e_phoff = struct.unpack_from(en + "Q", data, 0x20)[0]
     e_phentsize, e_phnum = struct.unpack_from(en + "HH", data, 0x36)
+    page0_exec = False
     for i in range(e_phnum):
         off = e_phoff + i * e_phentsize
         p_type = struct.unpack_from(en + "I", data, off)[0]
         if p_type != 1:                                  # PT_LOAD
             continue
+        p_flags = struct.unpack_from(en + "I", data, off + 4)[0]
         p_offset = struct.unpack_from(en + "Q", data, off + 8)[0]
         p_vaddr = struct.unpack_from(en + "Q", data, off + 16)[0]
         p_filesz = struct.unpack_from(en + "Q", data, off + 32)[0]
         p_memsz = struct.unpack_from(en + "Q", data, off + 40)[0]
         base = p_vaddr & ~(_PAGE - 1)
-        end = (p_vaddr + p_memsz + _PAGE - 1) & ~(_PAGE - 1)
-        try:
-            uc.mem_map(base, max(_PAGE, end - base), UC_PROT_ALL)
-        except Exception:                                # noqa: BLE001 -- overlap: already mapped
-            observe.absorbed(_log, "segment overlap, continuing")
+        end = (p_vaddr + max(p_memsz, p_filesz) + _PAGE - 1) & ~(_PAGE - 1)
+        if base < _PAGE and (p_flags & 1):               # PF_X: code lives in the first page
+            page0_exec = True
+        _map_gaps(uc, base, max(_PAGE, end - base), UC_PROT_ALL)
         seg = data[p_offset:p_offset + p_filesz]
         if seg:
             uc.mem_write(p_vaddr, seg)
         loaded += 1
     if not loaded:
         raise ValueError("no PT_LOAD segments to map")
+    # A PIE is linked at 0, so its header segment maps the NULL page -- and a NULL dereference
+    # then quietly read ELF-header bytes and carried on instead of faulting. Real PIEs never run
+    # at 0. With separate-code (the modern default) page 0 holds only headers/dynsym, which code
+    # never reads, so it is unmapped and a NULL deref faults as it does on a real system. A layout
+    # that puts CODE in page 0 keeps it (unmapping it would break the function itself).
+    if e_type == 3 and not page0_exec:
+        try:
+            uc.mem_unmap(0, _PAGE)
+        except Exception:                                # noqa: BLE001 -- page 0 was not mapped
+            pass
+
+
+def _map_gaps(uc, base: int, size: int, prot) -> None:
+    """Map [base, base+size) except what is already mapped. Two PT_LOADs commonly share a page
+    (one ends and the next begins inside it); mapping the second whole failed on the overlap, the
+    failure was swallowed, and every OTHER page of that segment stayed unmapped -- the mem_write
+    that followed then failed and the whole harness setup was abandoned."""
+    end = base + size
+    cur = base
+    for b, e, _p in sorted(uc.mem_regions()):
+        if e < cur or b >= end:
+            continue
+        if b > cur:
+            uc.mem_map(cur, b - cur, prot)
+        cur = max(cur, e + 1)
+        if cur >= end:
+            return
+    if cur < end:
+        uc.mem_map(cur, end - cur, prot)
 
 
 def _sections(data: bytes) -> dict:
@@ -176,7 +210,39 @@ def _plt_map(data: bytes) -> dict:
     return out
 
 
-def _emulate_libc(uc, name, res, heap, regs) -> None:
+_NULL_PAGE = 0x1000
+# Above this no real allocator can succeed either, so a NULL for it is genuine, not an artifact.
+_IMPOSSIBLE_ALLOC = 1 << 40
+
+
+class _StubFault(Exception):
+    """A libc stub's argument span is (partly) unmapped: the real call would fault here."""
+
+    def __init__(self, access: str, addr: int):
+        super().__init__(f"{access} fault at {addr:#x}")
+        self.access, self.addr = access, addr
+
+
+def _first_unmapped(uc, addr: int, n: int) -> Optional[int]:
+    """First address in [addr, addr+n) that is NOT mapped, or None when the whole span is.
+
+    Checked BEFORE a stub touches memory: an attacker-controlled length (memcpy(dst, src, -1))
+    made `uc.mem_read(src, n)` try to allocate n bytes on the HOST first -- a MemoryError/
+    OverflowError, not a UcError, which escaped the stub, aborted the whole fuzz campaign for the
+    function, and lost every crash it had already found."""
+    if n <= 0:
+        return None
+    regions = sorted((b, e) for b, e, _perm in uc.mem_regions())
+    cur, end = addr, addr + n
+    while cur < end:
+        hit = next(((b, e) for b, e in regions if b <= cur <= e), None)
+        if hit is None:
+            return cur
+        cur = hit[1] + 1
+    return None
+
+
+def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) -> None:
     """Emulate one external libc call: read args from registers, operate on emulator memory, set
     the return value in rax. A memory op on a bad pointer (e.g. memcpy to an unmapped dst) raises
     and is recorded as a CRASH -- which is exactly the bug we are hunting. An unknown external is
@@ -192,15 +258,43 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
     def _cstr(addr, cap=0x10000):
         out = bytearray()
         while len(out) < cap:
-            b = uc.mem_read(addr + len(out), 1)[0]
+            try:
+                b = uc.mem_read(addr + len(out), 1)[0]
+            except UcError:
+                raise _StubFault("read", addr + len(out)) from None
             if b == 0:
                 break
             out.append(b)
         return bytes(out)
 
+    def _rd(addr, n):
+        bad = _first_unmapped(uc, addr, n)
+        if bad is not None:
+            raise _StubFault("read", bad)
+        return bytes(uc.mem_read(addr, n)) if n > 0 else b""
+
+    def _wr(addr, blob):
+        bad = _first_unmapped(uc, addr, len(blob))
+        if bad is not None:
+            raise _StubFault("write", bad)
+        if blob:
+            uc.mem_write(addr, blob)
+
+    def _wr_fill(addr, byte, n):
+        bad = _first_unmapped(uc, addr, n)          # checked BEFORE building n bytes on the host
+        if bad is not None:
+            raise _StubFault("write", bad)
+        if n > 0:
+            uc.mem_write(addr, bytes([byte]) * n)
+
     def _alloc(n):
-        n = (int(n) + 15) & ~15
+        n = int(n)
+        if n == 0:
+            n = 16                                       # glibc: malloc(0) is a unique minimum chunk
+        n = (n + 15) & ~15
         if n <= 0 or heap["next"] + n > _HEAP_ADDR + _HEAP_SZ:
+            if n < _IMPOSSIBLE_ALLOC:
+                res.artifact_null = True                 # the HARNESS heap ran out, not the target's
             return 0
         p = heap["next"]
         heap["next"] += n
@@ -208,31 +302,32 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
 
     try:
         if nm in ("memcpy", "memmove", "__memcpy_chk", "__memmove_chk", "mempcpy"):
-            uc.mem_write(a0, bytes(uc.mem_read(a1, a2)))
+            _wr(a0, _rd(a1, a2))                         # source checked first: an over-read is a READ
             _set(a0 + a2 if nm == "mempcpy" else a0)
         elif nm in ("memset", "__memset_chk"):
-            uc.mem_write(a0, bytes([a1 & 0xFF]) * a2)
+            _wr_fill(a0, a1 & 0xFF, a2)
             _set(a0)
         elif nm == "strlen":
             _set(len(_cstr(a0)))
         elif nm in ("strcpy", "__strcpy_chk", "stpcpy"):
             s = _cstr(a1)
-            uc.mem_write(a0, s + b"\x00")
+            _wr(a0, s + b"\x00")
             _set(a0 + len(s) if nm == "stpcpy" else a0)
         elif nm in ("strncpy", "__strncpy_chk"):
             s = _cstr(a1)[:a2]
-            uc.mem_write(a0, s + b"\x00" * (a2 - len(s)))
+            _wr(a0, s)
+            _wr_fill(a0 + len(s), 0, a2 - len(s))
             _set(a0)
         elif nm in ("strcat", "__strcat_chk"):
             d, s = _cstr(a0), _cstr(a1)
-            uc.mem_write(a0 + len(d), s + b"\x00")
+            _wr(a0 + len(d), s + b"\x00")
             _set(a0)
         elif nm == "strcmp":
             _set(0 if _cstr(a0) == _cstr(a1) else 1)
         elif nm == "strncmp":
             _set(0 if _cstr(a0)[:a2] == _cstr(a1)[:a2] else 1)
         elif nm == "memcmp":
-            _set(0 if bytes(uc.mem_read(a0, a2)) == bytes(uc.mem_read(a1, a2)) else 1)
+            _set(0 if _rd(a0, a2) == _rd(a1, a2) else 1)
         elif nm == "malloc":
             if a0 >= _HUGE_ALLOC and res.huge_alloc is None:
                 res.huge_alloc = int(a0)                 # T5: attacker-controlled allocation size
@@ -242,7 +337,7 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
             if n >= _HUGE_ALLOC and res.huge_alloc is None:
                 res.huge_alloc = int(n)                  # a huge count*size the input drove
             p = _alloc(n)
-            if p:
+            if p and n:
                 uc.mem_write(p, b"\x00" * ((n + 15) & ~15))
             _set(p)
         elif nm == "realloc":
@@ -262,9 +357,25 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
             _set(0)                                      # output: no-op
         else:
             res.note = (res.note + "; " if res.note else "") + f"stubbed-unknown:{nm}"
+            res.artifact_null = True                     # rax=0 is OUR answer, not the callee's
             _set(0)
+    except _StubFault as f:
+        # the precise side: a memcpy/strcpy SOURCE over-read is a READ (CWE-125), not the write
+        # the destination side would be; and the faulting address is known.
+        res.crashed = True
+        res.access = f.access
+        res.fault_addr = f.addr
+        if res.fault_pc is None:
+            res.fault_pc = call_site
+        res.note = (res.note + "; " if res.note else "") + f"fault in {nm}()"
+    except (MemoryError, OverflowError, ValueError) as e:
+        # a host-side failure of the stub itself is the HARNESS's limit, not a target fault
+        res.note = (res.note + "; " if res.note else "") + f"stub {nm} failed on host: {e!r}"[:200]
+        _set(0)
     except UcError:
         res.crashed = True
+        if res.fault_pc is None:
+            res.fault_pc = call_site
         # A fault INSIDE a libc stub that only READS its arguments (strlen/strcmp/memcmp/... over an
         # attacker-controlled pointer that over-reads unmapped memory) is a CWE-125 out-of-bounds
         # READ -- hardcoding "write" filed it as a CWE-787 out-of-bounds WRITE (wrong CWE, wrong
@@ -376,12 +487,31 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
                 res.note = "bad stack at external call"
                 break
             uc.reg_write(UC_X86_REG_RSP, rsp + 8)
+            # the CALL instruction that reached this stub, when it is a plain `call rel32` (E8):
+            # the caller's site, so two faulting calls to the same libc routine stay distinct
+            site = None
+            try:
+                if retaddr >= 5 and uc.mem_read(retaddr - 5, 1)[0] == 0xE8:
+                    site = retaddr - 5
+            except UcError:
+                site = None
             _emulate_libc(uc, pending["name"], res, heap,
                           (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX,
-                           UC_X86_REG_RAX, UC_X86_REG_RIP))
+                           UC_X86_REG_RAX, UC_X86_REG_RIP), call_site=site)
             if res.crashed:
                 break
             cur = retaddr
+        if (res.crashed and res.artifact_null and res.fault_addr is not None
+                and res.fault_addr < _NULL_PAGE):
+            # A NULL-page fault after a stub returned a NULL the real callee would not have
+            # (an unknown external stubbed to 0, the harness heap exhausted). `getenv()` -> 0 ->
+            # `strlen(NULL)` faulted in EVERY run and was filed as a high-severity CWE-125 in the
+            # target -- the harness's own artifact, not something the input did.
+            res.crashed = False
+            res.note = (res.note + "; " if res.note else "") + (
+                "NULL-page fault after a harness stub returned NULL -- harness artifact, "
+                "not attributed to the input")
+            break
         if res.crashed:
             res.seq_index = idx
             break

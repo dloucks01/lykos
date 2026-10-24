@@ -20,6 +20,15 @@ _PC = re.compile(r"LYKOS_PC (0x[0-9a-fA-F]+)")
 _FAULT = re.compile(r"si_addr = (0x[0-9a-fA-F]+)")
 _FRAME = re.compile(r"^#(\d+)\s+(?:0x0*([0-9a-fA-F]+)\s+in\s+|)")
 _XBYTES = re.compile(r"0x[0-9a-fA-F]+(?:\s*<[^>]*>)?:\s+((?:0x[0-9a-fA-F]{2}\s*)+)")
+_SICODE = re.compile(r"si_code = (-?\d+)")
+# The signals a capture may report as the CRASH. gdb also stops (and prints "received signal")
+# on SIGPIPE/SIGUSR1/..., and the script then captured THAT stop: a target writing to a closed
+# pipe came back `ok: True, SIGPIPE`, and the classifier filed it as an out-of-bounds read
+# [measured]. The non-fatal ones are passed through without stopping (`_PASS_SIGNALS`).
+_CRASH_SIGNALS = frozenset({"SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE", "SIGABRT", "SIGTRAP"})
+_PASS_SIGNALS = ("SIGPIPE SIGUSR1 SIGUSR2 SIGALRM SIGVTALRM SIGPROF SIGCHLD SIGWINCH SIGURG "
+                 "SIGIO SIGHUP SIGTERM SIGCONT SIGXFSZ SIGXCPU")
+_HANDLE = f"handle {_PASS_SIGNALS} nostop noprint pass"
 _MAPLINE = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+"
                       r"0x[0-9a-fA-F]+\s+(\S*)\s*(.*)$")
 
@@ -82,6 +91,7 @@ def _capture_cmds(stdin_file, preload: str | None = None):
     return pre + [
         "set pagination off", "set confirm off", "set height 0", "set width 0",
         "set debuginfod enabled off",     # no network under --unshare-net; avoid the probe
+        _HANDLE,
         "run" + ((" < " + stdin_file) if stdin_file else ""),
         'printf "LYKOS_PC %#lx\\n", $pc',
         "print $_siginfo",
@@ -126,6 +136,7 @@ def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int =
         "set follow-fork-mode child",     # trace the child on fork...
         "set detach-on-fork on",          # ...detaching the parent
         "set follow-exec-mode new",       # follow through execve into the new image
+        _HANDLE,
         "run" + ((" < " + stdin_file) if stdin_file else ""),
         'printf "LYKOS_PC %#lx\\n", $pc',
         "print $_siginfo",
@@ -158,8 +169,18 @@ def _parse(out: str) -> dict:
     sig = _SIG.search(out)
     if sig is None:
         return {"ok": False, "reason": "gdb reported no crash", "raw": out[-400:]}
+    if sig.group(1) not in _CRASH_SIGNALS:
+        return {"ok": False, "reason": f"stopped on {sig.group(1)}, which is not a crash signal",
+                "raw": out[-400:]}
     pc = _PC.search(out)
     fault = _FAULT.search(out)
+    code = _SICODE.search(out)
+    # si_addr is the faulting address only for a KERNEL-generated fault (si_code > 0). A signal
+    # sent with raise()/kill() has si_code <= 0 and the same union bytes hold the sender's
+    # pid/uid -- 0x3e80000000c for pid 12, uid 1000 [measured] -- which was then reported as the
+    # address the program touched.
+    if code is not None and int(code.group(1)) <= 0:
+        fault = None
     pc_bytes = ""
     for m in _XBYTES.finditer(out):
         for tok in m.group(1).split():

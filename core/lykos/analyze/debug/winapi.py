@@ -235,8 +235,15 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
     truncated = timed_out = False
     with tempfile.TemporaryFile() as errf:
         try:
+            # The same resource caps sandbox._run_windows puts on every other wine detonation
+            # (wine runs unwrapped by design, so rlimits are its ONLY containment); this path
+            # had none, so a PE fork/memory bomb under +relay ran against the host uncapped.
             sandbox.run_reaped(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=errf,
-                               timeout=timeout, env=env)
+                               timeout=timeout, env=env,
+                               preexec_fn=sandbox._rlimits(
+                                   2048, int(timeout) + 5, set_as=False,
+                                   nproc=sandbox._nproc_cap(True),
+                                   as_mb=max(2048, getattr(sandbox, "_EMU_AS_MB", 2048))))
         except subprocess.TimeoutExpired:
             # We stopped watching; the program did not stop running. Swallowed silently, this
             # is indistinguishable from a program that ran to completion and did nothing --

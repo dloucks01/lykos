@@ -319,6 +319,7 @@ class ChannelSession:
             observe.absorbed(_log, "keeping the default")
             out, err = b"", b""
         rc = self.proc.returncode
+        _kill_session(self.proc)            # the leader died; its forked workers must not linger
         self.proc = None
         crashed, sig, signame, exit_code, fault_pc, detail = _classify(self.jvm, rc, out, err)
         n = f"channel={self.family}:{self.key} (session)"
@@ -333,11 +334,12 @@ class ChannelSession:
                          cmd=getattr(self, "cmd", []), note=n)
 
     def _reap(self):
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.kill()
-            except Exception:
-                observe.absorbed(_log, "continuing")
+        # The listener leads its own session (start_new_session=True), and a daemon-style
+        # target forks workers into it. `proc.kill()` signalled the leader only and never waited:
+        # forked children kept the port bound (the next _start then raced a stale listener for
+        # it), and the leader stayed a zombie for the life of the campaign.
+        if self.proc is not None:
+            _kill_session(self.proc)
         self.proc = None
 
     def close(self):
@@ -422,6 +424,7 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
         rc, timed = None, True
     th.join(timeout=0.5)
     dur = int((time.monotonic() - start) * 1000)
+    _kill_session(p)                        # a listener's forked workers outlive the leader
     if made_fifo:
         _rm(made_fifo)
 
@@ -461,6 +464,26 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
         exit_code=exit_code, signal=sig, signal_name=signame, fault_pc=fault_pc,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
         duration_ms=dur, cmd=cmd, note=note, blocks_hit=blocks_hit)
+
+
+def _kill_session(proc, reap: float = 2.0) -> None:
+    """SIGKILL every process in `proc`'s session group, then reap the leader.
+
+    Only for a child spawned with start_new_session=True: its pgid IS its pid, so the group can
+    be signalled even after the leader itself has been reaped (`os.getpgid` would then fail and
+    leave the forked children running). ESRCH -- the group is already empty -- is the normal
+    case and is ignored."""
+    import signal as _signal
+    pid = getattr(proc, "pid", None)
+    if pid and pid > 1 and pid != os.getpgrp():
+        try:
+            os.killpg(pid, _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.wait(timeout=reap)
+    except Exception:
+        observe.absorbed(_log, "continuing")
 
 
 def _rm(path):

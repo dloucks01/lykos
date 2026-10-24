@@ -63,8 +63,9 @@ def _uleb(data: bytes, pos: int) -> tuple[int, int]:
 
 def _name(data: bytes, pos: int) -> tuple[str, int]:
     n, pos = _uleb(data, pos)
-    n = min(n, 4096)
-    s = data[pos:pos + n].decode("utf-8", "replace")
+    # Truncate what is KEPT, but advance past the whole name: advancing by the clamped length
+    # left `pos` inside an over-long name, so every later entry in the section decoded garbage.
+    s = data[pos:pos + min(n, 4096)].decode("utf-8", "replace")
     return s, pos + n
 
 

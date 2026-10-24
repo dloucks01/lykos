@@ -28,7 +28,13 @@ from ..dynamic import sandbox
 
 _log = logging.getLogger(__name__)
 
-_SIGNALS = {4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE",
+# Stop-reply signal numbers are GDB's TARGET-INDEPENDENT enum (gdb/signals.def), which qemu's
+# gdbstub translates every guest signal into -- NOT the Linux numbering. They agree for ILL/TRAP/
+# ABRT/FPE/SEGV but not for SIGBUS: GDB_SIGNAL_BUS is 10 (7 is GDB_SIGNAL_EMT). Mapping 7 here
+# meant a guest SIGBUS (unaligned access on MIPS/SPARC/ARM, a truncated mmap) stopped with T0a,
+# got no name, and the capture read as "no fault" -- a real crash dropped [measured: aarch64
+# raise(SIGBUS) -> signal 10].
+_SIGNALS = {4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 8: "SIGFPE", 10: "SIGBUS",
             11: "SIGSEGV"}
 
 # g-packet register layout per ISA: ordered (name, byte_width). The gdbstub returns every
@@ -295,6 +301,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
     # caller read as "the cyclic did not fault". Give the stub longer to open.
     _connect_deadline = max(12.0, float(timeout))
     regs = sig = bp_alias = None
+    fault_extra: dict = {}
     for _att in range(_attempts):
         port = port if _pinned else _free_port()
         # Detonating a hostile guest: contain the filesystem and cap resources. The network
@@ -364,6 +371,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
                     return {"note": f"gdbstub for {arch} serves no target description",
                             "arch": arch}
                 regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch, endianness)
+                fault_extra = _fault_extras(sock, arch, regs, endianness, bits)
             except socket.timeout:
                 # The guest never reached a stop within the budget (hang / long loop). A raised
                 # exception here is not a clean capture -- report it as "could not run", honestly.
@@ -381,13 +389,86 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
             if cand in bp_alias:
                 hit = bp_alias[cand]              # the caller's address, bit 0 and all
                 break
+    insn = None
+    if fault_extra.get("insn_bytes"):
+        try:
+            from .rootcause import disasm_one
+            insn = disasm_one(fault_extra["insn_bytes"], arch, endianness,
+                              bool(fault_extra.get("thumb")))
+        except Exception:                               # noqa: BLE001 -- decoding is optional
+            observe.absorbed(_log, "faulting instruction left undecoded")
     return {
         "ok": True, "arch": arch, "isolation": "qemu-gdbstub", "signal": sig,
         "breakpoint_hit": hit,
         "signal_name": _SIGNALS.get(sig), "pc": pc, "sp": sp,
         "regs": {k: v for k, v in regs.items() if k not in ("cpsr", "msr", "pswm")},
-        "fault_addr": None, "maps": [], "backtrace": [],   # not available over the stub
+        # si_addr, only when the KERNEL raised a SEGV/BUS (see _fault_extras); maps and a
+        # backtrace are still not available over the stub.
+        "fault_addr": fault_extra.get("fault_addr"), "maps": [], "backtrace": [],
+        # The faulting instruction, decoded here because only this side knows the guest's
+        # endianness and Thumb state. Deliberately NOT exposed as `pc_bytes`, which the x86-only
+        # primitive parsers would read.
+        "insn": insn, "endianness": endianness,
+        "thumb": bool(fault_extra.get("thumb")),
     }
+
+
+def _rsp_unescape(body: str) -> bytes:
+    """RSP binary data (qXfer replies): `}` escapes the next byte XOR 0x20."""
+    raw = body.encode("latin-1")
+    out, i = bytearray(), 0
+    while i < len(raw):
+        if raw[i] == 0x7D and i + 1 < len(raw):
+            out.append(raw[i + 1] ^ 0x20)
+            i += 2
+        else:
+            out.append(raw[i])
+            i += 1
+    return bytes(out)
+
+
+#: Guest SIGSEGV / SIGBUS in the GUEST's numbering (SIGBUS is 7 on most Linux ABIs, 10 on
+#: MIPS/SPARC/Alpha) -- the only signals whose si_addr is the faulting DATA address.
+_SI_ADDR_SIGNOS = (7, 10, 11)
+
+
+def _fault_extras(sock, arch, regs, endianness, bits) -> dict:
+    """The fault address and the faulting instruction's bytes, read over the live stub.
+
+    The stub reports registers only, so every cross-arch capture had `fault_addr: None` -- a NULL
+    dereference could not be told from a wild pointer, and the classifier had nothing but the
+    signal. qemu-user serves the guest's siginfo (`qXfer:siginfo:read`, qemu >= 8.2) and memory
+    at pc. si_addr is used ONLY when si_code > 0 (kernel-generated): a `raise(SIGSEGV)` / `kill`
+    has si_code <= 0 and its "address" field is a pid/uid, not an address [measured]. Best-
+    effort; any failure leaves the capture exactly as it was."""
+    out: dict = {}
+    try:
+        layout = _layout_for(arch) or []
+        pcn = _pc_name(arch)
+        ptr = next((w for n, w in layout if n == pcn), None) or ((bits or 64) // 8)
+        order = "big" if endianness == "big" else "little"
+        pc = regs.get(pcn)
+        if arch == "arm" and regs.get("cpsr") is not None:
+            out["thumb"] = bool(int(regs["cpsr"]) & 0x20)
+        if pc is not None:
+            for n in (16, 4):
+                b = _read_mem(sock, int(pc), n)
+                if b:
+                    out["insn_bytes"] = b
+                    break
+        r = _txn(sock, "qXfer:siginfo:read::0,80")
+        if r and r[0] in "ml":
+            data = _rsp_unescape(r[1:])
+            code_off = 4 if arch.startswith("mips") else 8        # MIPS swaps si_code/si_errno
+            addr_off = 16 if ptr == 8 else 12
+            if len(data) >= addr_off + ptr:
+                signo = int.from_bytes(data[0:4], order, signed=True)
+                code = int.from_bytes(data[code_off:code_off + 4], order, signed=True)
+                if code > 0 and signo in _SI_ADDR_SIGNOS:
+                    out["fault_addr"] = int.from_bytes(data[addr_off:addr_off + ptr], order)
+    except (OSError, ValueError, socket.timeout):
+        observe.absorbed(_log, "fault address / instruction not captured")
+    return out
 
 
 def _read_mem(sock, addr: int, n: int) -> bytes:

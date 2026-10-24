@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import sys
+from pathlib import Path
 
 from ... import observe
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
@@ -254,8 +255,19 @@ def _sanitizer_report(exe, mode, base_argv, data, scratch, timeout, target) -> s
         f = scratch / "asan-in.bin"
         f.write_bytes(data)
         argv = [str(exe)] + place(list(base_argv), str(f))
+    # CONTAINED like every other detonation. This re-run used a bare subprocess.run: the target
+    # (a build of operator-supplied, untrusted source) ran with the analyst's full privileges --
+    # no read-only root, its network, the case store and ~/.ssh readable, and on timeout only
+    # the direct child was killed, so anything it forked outlived the stage.
+    exe_abs = str(Path(exe).resolve())
+    ro = [str(Path(scratch).resolve())] if mode == "file" else []
+    cmd = sandbox.isolate_prefix(str(Path(exe_abs).parent), net=False, ro_binds=ro) + \
+        [exe_abs] + argv[1:]
     try:
-        r = _sp.run(argv, input=stdin, capture_output=True, timeout=max(4.0, float(timeout)), env=env)
+        r = sandbox.run_reaped(cmd, input=stdin, capture_output=True,
+                               timeout=max(4.0, float(timeout)), env=env,
+                               preexec_fn=sandbox._rlimits(4096, int(max(4.0, float(timeout))) + 10,
+                                                           set_as=False))
     except (OSError, ValueError, _sp.SubprocessError):
         return ""
     return (r.stderr or b"").decode("latin-1", "ignore")

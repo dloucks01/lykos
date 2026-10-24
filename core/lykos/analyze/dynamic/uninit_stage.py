@@ -103,6 +103,22 @@ def _probe_inputs(conn, target) -> list:
 _LEAK_RUNS = 2
 
 
+def _delivery_argv(ctx, data: bytes, mode: str, argv) -> list:
+    """The argv that delivers `data` exactly as `memoracle.valgrind_triage` did for the run that
+    observed the disclosure. Passing the bare `argv` re-ran a FILE-driven target with a literal
+    `@@` (and an ARG-driven one with no input at all), so the bytes read back came from a
+    different execution than the one memcheck watched -- and a real, provable leak was reported
+    as "anchors no base"."""
+    argv = [str(a) for a in (argv or [])]
+    if mode == "arg":
+        return [data.split(b"\x00", 1)[0].decode("latin-1")] + argv
+    if mode == "file":
+        f = ctx.scratch() / "uninit-input.bin"
+        f.write_bytes(data)
+        return [str(f) if a == "@@" else a for a in argv] if "@@" in argv else argv + [str(f)]
+    return argv
+
+
 def _disclosed_bases(ctx, target, exe, data, mode, argv, timeout):
     """Run the UNINSTRUMENTED target (memcheck's own output is not the program's) under live ASLR
     and ask what its bytes prove. Returns `leak.disclosed_bases`' verdict, or None."""
@@ -119,8 +135,9 @@ def _disclosed_bases(ctx, target, exe, data, mode, argv, timeout):
     # **[measured on the format-string fixture: 24 pointers, no base]**. The second run exists
     # because a run may disclose nothing, not to pool evidence.
     last = None
+    run_argv = _delivery_argv(ctx, data, mode, argv)
     for _ in range(_LEAK_RUNS):
-        r = sandbox.run(exe, argv=list(argv or []), stdin=(data if mode == "stdin" else b""),
+        r = sandbox.run(exe, argv=run_argv, stdin=(data if mode == "stdin" else b""),
                         timeout=min(float(timeout), 20.0), aslr=True)
         out = (r.stdout or b"") + (r.stderr or b"")
         if not out:

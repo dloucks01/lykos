@@ -102,6 +102,7 @@ def _matched_files(output: str, root: Path) -> list:
     """
     seen = []
     seen_set = set()
+    rroot = _resolved(root)
     # strip ANSI color so a path is not split by escape codes
     plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
     for tok in re.split(r"[\s:]+", plain):
@@ -110,7 +111,7 @@ def _matched_files(output: str, root: Path) -> list:
         # weggli prints paths relative to cwd; try as-is and under root
         for cand in (Path(tok), root / tok):
             try:
-                if cand.is_file():
+                if cand.is_file() and _inside(cand, rroot):
                     rp = str(cand.resolve())
                     if rp not in seen_set:
                         seen.append(rp)
@@ -119,6 +120,23 @@ def _matched_files(output: str, root: Path) -> list:
             except OSError:
                 pass
     return seen
+
+
+def _resolved(root: Path) -> Path:
+    try:
+        return Path(root).resolve()
+    except OSError:
+        return Path(root)
+
+
+def _inside(cand: Path, rroot: Path) -> bool:
+    """Only files under the scanned tree are hits. A bare token resolved against lykos's OWN cwd
+    (`README.md`, `main.c`) could otherwise be reported as a match in the target's source."""
+    try:
+        rp = cand.resolve()
+    except OSError:
+        return False
+    return rp == rroot or rroot in rp.parents
 
 
 # a C/C++ function DEFINITION: an identifier, a parenthesised param list with no ; { } inside, then
@@ -136,6 +154,7 @@ def _parse_matches(output: str, root: Path) -> list:
     lines = plain.splitlines()
     matches = []
     cur = None
+    rroot = _resolved(root)
 
     def _flush():
         if cur and cur["file"]:
@@ -152,7 +171,7 @@ def _parse_matches(output: str, root: Path) -> list:
             p = h.group("path")
             for cand in (Path(p), root / p):
                 try:
-                    if cand.is_file():
+                    if cand.is_file() and _inside(cand, rroot):
                         f = str(cand.resolve()); break
                 except OSError:
                     pass
@@ -190,6 +209,12 @@ def run_query(query: str, path, *, cpp: bool = False, timeout: float = 120.0,
     except (OSError, subprocess.SubprocessError) as e:
         return {"ok": False, "files": [], "matches": [], "count": 0, "raw": "", "error": str(e)}
     out = r.stdout or ""
+    err = (r.stderr or "").strip()
+    if r.returncode != 0 and not out.strip() and err:
+        # weggli REJECTED the run (a query it cannot parse, an unreadable path): that is a
+        # failure to say, not "no matches" -- reported ok, it read as a clean pass over the tree
+        return {"ok": False, "files": [], "matches": [], "count": 0, "raw": "",
+                "error": f"weggli exited {r.returncode}: {err[:400]}"}
     files = _matched_files(out, root)
     matches = _parse_matches(out, root)
     return {"ok": True, "files": files, "matches": matches, "count": len(files),
@@ -207,10 +232,13 @@ def scan(path, *, queries=None, cpp: bool = False, timeout: float = 120.0) -> di
                 "note": "weggli not found; install it (cargo install weggli) or set LYKOS_WEGGLI"}
     pack = queries if queries is not None else query_pack(include_cpp=cpp)
     findings = []
+    failed = []
     for q in pack:
         if q.get("cpp_only") and not cpp:
             continue
         res = run_query(q["query"], path, cpp=cpp, timeout=timeout)
+        if not res["ok"]:
+            failed.append({"name": q["name"], "error": res.get("error")})
         if res["ok"] and res["count"] > 0:
             findings.append({"name": q["name"], "cwe": q["cwe"], "severity": q["severity"],
                              "query": q["query"], "why": q["why"],
@@ -220,7 +248,9 @@ def scan(path, *, queries=None, cpp: bool = False, timeout: float = 120.0) -> di
     _sev = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings.sort(key=lambda f: (_sev.get(f["severity"], 9), -f["count"]))
     return {"supported": True, "findings": findings,
-            "queries_run": len(pack), "note": None}
+            "queries_run": len(pack), "queries_failed": failed,
+            "note": (f"{len(failed)} of {len(pack)} weggli queries failed to run" if failed
+                     else None)}
 
 
 # ---------------------------------------------------------------- variant workflow

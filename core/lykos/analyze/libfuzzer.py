@@ -1555,6 +1555,42 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 }
 
 
+def _run_group(argv, *, timeout: float, cwd=None, env=None):
+    """subprocess.run(capture_output=True, text=True) whose timeout takes the WHOLE process tree.
+
+    `subprocess.run` kills only the direct child on timeout. A project's `./configure` (the
+    project's own, untrusted shell script) forks compilers and test programs, and an ASan replay
+    forks llvm-symbolizer; those grandchildren survived the kill and kept running unbounded after
+    the stage had moved on. Here the child leads its own session and the group is SIGKILLed.
+    Raises subprocess.TimeoutExpired (with whatever output was captured) like run() does."""
+    import signal as _signal
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         stdin=subprocess.DEVNULL, cwd=cwd, env=env, start_new_session=True,
+                         errors="replace")
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        try:
+            os.killpg(p.pid, _signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            out, err = p.communicate(timeout=5)
+        except Exception:                                # noqa: BLE001 -- pipes held open
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from e
+    finally:
+        if p.poll() is None:
+            from .dynamic.sandbox import kill_quietly
+            kill_quietly(p)                  # pipes closed first, then the whole group
+    # the leader is done; anything it left behind in its group goes too
+    try:
+        os.killpg(p.pid, _signal.SIGKILL)
+    except OSError:
+        pass
+    return subprocess.CompletedProcess(argv, p.returncode, out, err)
+
+
 def ensure_configured(root, *, timeout: int = 300) -> bool:
     """Run the project's own `configure` when a header it generates is missing.
 
@@ -1575,8 +1611,7 @@ def ensure_configured(root, *, timeout: int = 300) -> bool:
                 break
         if not missing:
             return False
-        subprocess.run(["sh", "./configure", "--disable-shared"], cwd=str(root),
-                       capture_output=True, text=True, timeout=timeout)
+        _run_group(["sh", "./configure", "--disable-shared"], cwd=str(root), timeout=timeout)
         return True
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1755,6 +1790,15 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # shows up on someone else's target.
     ensure_configured(root, timeout=timeout)
     tmp = Path(tempfile.mkdtemp(prefix="lykos-lf-"))
+    try:
+        return _build_in(root, out, tmp, spec, kind, cxx, timeout, cache)
+    finally:
+        # any raise between mkdtemp and the old trailing rmtree (a synth helper, a path outside
+        # the tree, a compile-pool error) leaked one lykos-lf-* directory per call
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
     srcs = _sources(root, exclude_main=True)
     # Compile THE LIBRARY the entry point belongs to, not the whole repository. Building every
     # source in a real project drags in `contrib/` and `test/`, which reference symbols that do
@@ -1824,7 +1868,6 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # and wrong for the one file that defines the entry point. Silently skipping it produced a link
     # error about `LLVMFuzzerTestOneInput` instead of the compile error that caused it.
     res = _compile_and_link(srcs, incs, out, tmp, timeout, required=h, cache=cache)
-    shutil.rmtree(tmp, ignore_errors=True)
     res["harness"] = harness_desc
     res["harness_id"] = spec["id"]
     res["entry"] = spec.get("entry")
@@ -2121,8 +2164,7 @@ def _replay_report(binary, workdir: Path, data: bytes) -> str:
     # (which was the replay's own flake). Only the ONE reproducing replay pays this -- the pass
     # breaks on the first sourced report, and a non-crashing candidate exits fast with no symbolizer.
     try:
-        r = subprocess.run([str(binary), str(f)], capture_output=True, text=True, timeout=120,
-                           env=env, cwd=str(workdir))
+        r = _run_group([str(binary), str(f)], timeout=120, env=env, cwd=str(workdir))
     except (subprocess.TimeoutExpired, OSError):
         return ""
     return fault_report((r.stderr or "") + (r.stdout or "")) or ""
@@ -2149,11 +2191,13 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
     crashes = []
     before = set(art.iterdir())
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=seconds + 30, env=env,
-                           cwd=str(workdir))
+        r = _run_group(argv, timeout=seconds + 30, env=env, cwd=str(workdir))
         out = (r.stderr or "") + (r.stdout or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stderr or b"").decode("latin-1", "ignore") if isinstance(e.stderr, bytes) else (e.stderr or "")
+    except OSError as e:
+        return {"crashes": [], "log": f"libFuzzer binary could not be run: {e!r}", "corpus": [],
+                "execs": 0}
     report = fault_report(out)
     for f in sorted(set(art.iterdir()) - before):
         kind = next((k for pre, k in ARTIFACT_KINDS.items() if f.name.startswith(pre)), None)
@@ -2178,9 +2222,12 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
                 crash_input = Path(m.group(1)).read_bytes()
             except OSError:
                 crash_input = b""
+        guessed = False
         if not crash_input and corpus:
             crash_input = max((bytes(s) for s in corpus), key=len, default=b"")
-        crashes.append({"input": crash_input, "report": report, "kind": "crash", "artifact": None})
+            guessed = True                               # a stand-in until a replay proves it
+        crashes.append({"input": crash_input, "report": report, "kind": "crash", "artifact": None,
+                        "reproduced": not guessed})
     # DETERMINISTIC REPLAY. The report the fuzzing loop captured can be incomplete under CPU
     # contention -- a corpus-seed crash can abort() before the symbolizer finishes (source line
     # lost), and a timed-out run's stderr can be truncated so no report is captured at all -- which
@@ -2199,21 +2246,42 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
             if s not in seen_inputs:
                 seen_inputs.add(s); candidates.append(s)
         best_rep, best_input = "", b""
+        reproduced_inputs: set = set()
         for data in candidates:
             rep = _replay_report(binary, workdir, data)
             if not rep:
                 continue
+            reproduced_inputs.add(data)
             if not best_rep:
                 best_rep, best_input = rep, data         # keep any reproduction as a floor
             if _report_has_source(rep):
                 best_rep, best_input = rep, data          # a sourced one wins outright
                 break
         if best_rep:
-            if crashes:
-                crashes[0]["report"] = best_rep           # enrich the sourceless crash in place
+            # The replayed report belongs to the input that PRODUCED it. Pasting it onto
+            # crashes[0] regardless filed one input's file:line against another input -- and
+            # when crashes[0] was the largest-seed stand-in, the saved reproducer did not
+            # reproduce at all while the finding claimed it did.
+            same = next((c for c in crashes if bytes(c.get("input") or b"") == best_input), None)
+            # A stand-in is an entry whose input is NOT a verified reproducer: the largest-seed
+            # guess, or an artifact with no report that did not reproduce on replay (libFuzzer
+            # lost the race and wrote the EMPTY unit, crash-da39a3ee..., for a seed crash).
+            stand_in = next((c for c in crashes
+                             if c.get("reproduced") is False
+                             or (not c.get("report")
+                                 and bytes(c.get("input") or b"") not in reproduced_inputs)),
+                            None)
+            if same is not None:
+                same["report"] = best_rep
+                same["reproduced"] = True
+            elif stand_in is not None:
+                if stand_in.get("artifact"):
+                    stand_in["note"] = (f"libFuzzer artifact {stand_in['artifact']} did not "
+                                        "reproduce; replaced by the input that did")
+                stand_in.update(input=best_input, report=best_rep, reproduced=True)
             else:
                 crashes.append({"input": best_input, "report": best_rep, "kind": "crash",
-                                "artifact": None})         # a crash the loop missed entirely
+                                "artifact": None, "reproduced": True})  # one the loop missed
     # THE CORPUS IS THE PRODUCT, not a by-product. libFuzzer writes every input that reached new
     # coverage into this directory -- 1,208 of them in one 420 s run on libtiff -- and it lived in
     # the stage's scratch directory, so every run started from nothing and re-derived the same

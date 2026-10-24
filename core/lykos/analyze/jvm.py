@@ -209,6 +209,9 @@ _APP_PREFIXES = ("BOOT-INF/classes/", "WEB-INF/classes/")
 # Cap every member read so one hostile entry cannot exhaust memory. 8 MB is far above any real
 # class file (a single method's bytecode maxes at 64 KB) or manifest.
 _MAX_ENTRY_BYTES = 8 * 1024 * 1024
+# ...and cap the TOTAL inflated across one jar. The per-entry cap alone still let 4,000 members
+# of just-under-8 MB each inflate ~32 GB of CPU work out of a few hundred KB of deflate.
+_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
 
 def _safe_read(z: "zipfile.ZipFile", name: str) -> Optional[bytes]:
@@ -263,11 +266,17 @@ def parse(data: bytes, *, max_classes: int = 4000) -> JvmInfo:
         strings: list = []
         seen: set = set()
         calls: set = set()
+        inflated = 0
         for n in app[:max_classes]:
+            if inflated >= _MAX_TOTAL_BYTES:
+                info.errors.append(f"jar inflated past {_MAX_TOTAL_BYTES} bytes of classes; "
+                                   f"stopped before {n} (remaining classes not parsed)")
+                break
             raw = _safe_read(z, n)
             if raw is None:
                 info.errors.append(f"{n}: skipped (entry too large or unreadable)")
                 continue
+            inflated += len(raw)
             try:
                 sub = parse_class(raw)
             except Exception as e:

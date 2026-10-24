@@ -129,6 +129,14 @@ def whole_system_stage(ctx) -> dict:
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         data = mut.mutate(rng.choice(corpus), corpus)
         res = _detonate(data)
+        if _not_run(res):
+            # nothing executed: counting these as detonations reported "120 detonations, 0
+            # cross-boundary crashes" for a campaign that never started a process
+            ctx.emit("system.done", payload={"error": res.note, "execs": execs,
+                                             "cross_boundary": crossb})
+            ctx.progress(pct=100, msg=f"whole-system detonation could not run: {res.note}")
+            return {"metrics": {"execs": execs, "cross_boundary": crossb,
+                                "error": res.note}}
         execs += 1
         if res.blame and res.cross_boundary and res.blame["signal"] not in seen:
             seen.add(res.blame["signal"])
@@ -157,8 +165,17 @@ def whole_system_stage(ctx) -> dict:
     return {"metrics": {"execs": execs, "cross_boundary": crossb}}
 
 
+def _not_run(res) -> bool:
+    """True when a detonation never executed anything (no qemu for the arch, a component that
+    cannot be exec'd, a FIFO that could not be made). It returns no outcomes and a note; the old
+    test for this was `"arch" in note`, which the actual message ("no qemu-user for mips on
+    x86-64", "launch failed: ...") never contains -- so a run that executed nothing was reported
+    as "no cross-boundary crash", a clean negative."""
+    return not res.outcomes and bool(res.note)
+
+
 def _finish_single(ctx, res, entry, data) -> int:
-    if res.note and "arch" in (res.note or ""):
+    if _not_run(res):
         ctx.emit("system.done", payload={"error": res.note, "crashes": 0})
         ctx.progress(pct=100, msg=res.note)
         return 0

@@ -146,6 +146,28 @@ def heap_op_sequences(menu_options, *, max_seqs: int = 40,
     return out[:max_seqs]
 
 
+# DR7 LEN encoding per watched length (x86): 00=1, 01=2, 11=4, 10=8 bytes.
+_DR7_LEN = {1: 0b00, 2: 0b01, 4: 0b11, 8: 0b10}
+
+
+def watch_len(addr: int, limit=None) -> int:
+    """The hardware-watch length for a guard at `addr`: the largest of 8/4/2/1 that `addr` is
+    aligned to, capped at `limit` (the guard element's size) when known.
+
+    x86 IGNORES the low address bits below the watch length, so an 8-byte watch on an address
+    that is only 4-aligned watches the qword it sits in -- i.e. the 4 bytes BEFORE the guard. For
+    the guard just past an int[] with an odd count that is the array's own last element, and a
+    legitimate in-bounds access was filed as an out-of-bounds index. Watching exactly from `addr`
+    (and no wider than one element) keeps the guard outside the array on both sides."""
+    n = 8
+    while n > 1 and addr % n:
+        n //= 2
+    if limit:
+        while n > 1 and n > int(limit):
+            n //= 2
+    return n
+
+
 if __name__ == "__main__":                                            # ---- the ptrace tracer ----
     import ctypes
     import json
@@ -188,7 +210,10 @@ if __name__ == "__main__":                                            # ---- the
         # Static guard watchpoints: [off, note] pairs (vaddr offsets, rebased for PIE) armed from
         # the start. A read/write to a guard from program code = an out-of-bounds ARRAY access (the
         # guard sits just before/after a fixed-size global array = an unchecked index (CWE-129).
-        static_watch = [(int(o), str(n)) for o, n in spec.get("static_watch", [])]
+        # [offset, note] or [offset, note, length]: `length` (the element stride) bounds the
+        # watch so it can never cover the array's own first element (see watch_len)
+        static_watch = [(int(g[0]), str(g[1]), (int(g[2]) if len(g) > 2 and g[2] else None))
+                        for g in spec.get("static_watch", []) if len(g) >= 2]
         # The bytes the driving sequence writes into the allocation that RECLAIMS a freed chunk.
         # With them the tracer can answer the question a target with no printing path cannot:
         # are the ATTACKER's bytes in the chunk a stale pointer still addresses? Memory is read
@@ -282,13 +307,13 @@ if __name__ == "__main__":                                            # ---- the
             v = libc.ptrace(PTRACE_PEEKUSER, pid, ctypes.c_void_p(_DR + n * 8), None)
             return 0 if (v == -1 and ctypes.get_errno()) else (v & 0xFFFFFFFFFFFFFFFF)
 
-        def set_watch(slot, addr, rw=0b11):
+        def set_watch(slot, addr, rw=0b11, length=8):
             poke_dr(slot, addr)                          # DRn = watched address
             dr7 = peek_dr(7)
             dr7 |= (1 << (slot * 2))                     # Ln: local enable
             dr7 &= ~(0b1111 << (16 + slot * 4))
             dr7 |= (rw << (16 + slot * 4))               # R/W: 0b11 read+write, 0b01 write-only
-            dr7 |= (0b10 << (18 + slot * 4))             # LEN = 10 (8 bytes)
+            dr7 |= (_DR7_LEN.get(length, 0b10) << (18 + slot * 4))   # LEN: 1/2/4/8 bytes
             poke_dr(7, dr7)
 
         def clear_watch(slot):
@@ -462,7 +487,7 @@ if __name__ == "__main__":                                            # ---- the
             off = rip - rebase
             return any(a <= off < b for a, b in ignore_ranges)
 
-        def arm(addr, kind, chunk, rw):
+        def arm(addr, kind, chunk, rw, length=8):
             """Take a debug-register slot and watch `addr` (UAF: read+write on freed data;
             overflow: write-only just past a live chunk's end). Best-effort: no-op when slots are
             exhausted."""
@@ -470,7 +495,7 @@ if __name__ == "__main__":                                            # ---- the
                 return None
             slot = free_slots.pop()
             watches[slot] = {"addr": addr, "kind": kind, "chunk": chunk}
-            set_watch(slot, addr, rw)
+            set_watch(slot, addr, rw, length)
             return slot
 
         def disarm(slot):
@@ -489,8 +514,9 @@ if __name__ == "__main__":                                            # ---- the
 
         # Arm the static array guards up front (read+write): a hit means program code indexed the
         # array out of bounds. These hold their slots for the whole run.
-        for off, note in static_watch:
-            slot = arm(rebase + off, "static", None, 0b11)
+        for off, note, glen in static_watch:
+            ga = rebase + off
+            slot = arm(ga, "static", None, 0b11, watch_len(ga, glen))
             if slot is not None:
                 watches[slot]["note"] = note
 

@@ -81,7 +81,9 @@ def _sections(data: bytes, sh: int, nsections: int):
 def _rva_to_off(rva: int, secs) -> Optional[int]:
     for vaddr, vsize, roff, rsize in secs:
         if vaddr <= rva < vaddr + max(vsize, rsize):
-            return roff + (rva - vaddr)
+            # past SizeOfRawData the section is zero-fill with no file bytes; `roff + delta` there
+            # read the NEXT section's bytes as this one's metadata
+            return roff + (rva - vaddr) if rva - vaddr < rsize else None
     return None
 
 
@@ -164,6 +166,9 @@ def parse(data: bytes) -> DotNetInfo:
     opt, is64, dir_off, n_dirs, sh, nsections = hdr
     info.bits = 64 if is64 else 32
     if n_dirs <= _DIR_COM:
+        return info
+    if dir_off + _DIR_COM * 8 + 8 > len(data):
+        info.errors.append("CLI data directory truncated")
         return info
     com_rva, com_size = struct.unpack_from("<II", data, dir_off + _DIR_COM * 8)
     if not (com_rva and com_size):

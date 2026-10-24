@@ -340,7 +340,11 @@ def _elf_interp(path) -> tuple[bool, Optional[str]]:
     """(is_elf, PT_INTERP-string-or-None) for an ELF, pure stdlib. A RELATIVE interp (./ld-...)
     is the tell that a binary is part of a challenge bundle and cannot run standalone."""
     try:
-        d = Path(path).read_bytes()
+        # The program headers and PT_INTERP live at the front of any real ELF; reading every file
+        # of a bundle WHOLE (a firmware tree, a 2 GB core dump beside the binary) only to look at
+        # its header was the dominant cost of ingesting a directory.
+        with open(path, "rb") as fh:
+            d = fh.read(1 << 20)
     except OSError:
         return False, None
     if d[:4] != b"\x7fELF" or len(d) < 64:
@@ -381,7 +385,18 @@ def gather_bundle(dirpath) -> tuple[Optional[Path], dict[str, str]]:
     the deps are everything else in the tree (a bundled loader named by a relative PT_INTERP, the
     challenge's libc, data files like flag.txt), so they can be staged beside it at run time."""
     dirpath = Path(dirpath)
-    files = [p for p in dirpath.rglob("*") if p.is_file()]
+    root = dirpath.resolve()
+
+    def _inside(p: Path) -> bool:
+        # A bundle member that is a symlink OUT of the bundle (`libc.so.6 -> /etc/shadow`, or an
+        # absolute link a careless tar kept) must not be read: its target is host content, which
+        # would be copied into the case store as a "dependency" and staged beside the target.
+        try:
+            p.resolve().relative_to(root)
+            return True
+        except (ValueError, OSError, RuntimeError):
+            return False
+    files = [p for p in dirpath.rglob("*") if p.is_file() and _inside(p)]
     scanned = [(p, _elf_interp(p)) for p in files]
     mains = [p for (p, (is_elf, interp)) in scanned
              if is_elf and interp and not _looks_like_lib(p.name)]

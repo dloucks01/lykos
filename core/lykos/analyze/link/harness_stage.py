@@ -51,27 +51,41 @@ def _discovered_argv(ctx, target, key=None):
     except Exception:
         observe.absorbed(_log, "answering empty")
         return []
+    return _channel_argv(argv, found, key)
+
+
+def _channel_argv(argv: list, found: dict, key) -> list:
+    """Rewrite a proposed argv for channel delivery: drop the input slot (a value-flag's `@@`,
+    or a positional `@@`) and point host/port flags at the channel address.
+
+    Walked by what each token IS, not by position. Pairing every token with the next one broke
+    on the first token that is not a value-flag: a dispatch tool's `["parse", "@@"]` lost its
+    SUBCOMMAND together with the positional input, and after a leading subcommand every
+    flag/value pair was read one slot out of phase, so `-g x` never became `-g <group>`."""
     host, port = _hostport_of(key)
-    kinds = {f["flag"]: f.get("kind") for f in found.get("flags") or []}
+    flags = found.get("flags") or []
+    kinds = {f["flag"]: f.get("kind") for f in flags}
+    takes = {f["flag"] for f in flags if f.get("takes_value")}
     out: list = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        val = argv[i + 1] if i + 1 < len(argv) else None
-        if val == "@@":
-            i += 2                       # drop the flag and its placeholder together
-            continue
-        kind = kinds.get(a)
-        if val is not None and kind in ("host", "id") and host:
-            val = host                   # the group/address the harness will send to
-        elif val is not None and kind == "port" and port:
-            val = str(port)
-        out.append(a)
-        if val is not None:
-            out.append(val)
+        if a in takes and i + 1 < len(argv):
+            val = argv[i + 1]
             i += 2
-        else:
-            i += 1
+            if val == "@@":
+                continue                 # drop the flag and its placeholder together
+            kind = kinds.get(a)
+            if kind in ("host", "id") and host:
+                val = host               # the group/address the harness will send to
+            elif kind == "port" and port:
+                val = str(port)
+            out += [a, val]
+            continue
+        i += 1
+        if a == "@@":
+            continue                     # a positional input slot: the channel carries it
+        out.append(a)
     return out
 
 

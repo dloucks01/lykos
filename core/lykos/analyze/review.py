@@ -27,6 +27,30 @@ from .fuzz.runner import run_input
 _log = logging.getLogger(__name__)
 
 
+def _flag_prefix(argv: list, mode: str, data: bytes) -> list:
+    """The recorded argv minus the input CARRIER, when the row recorded one.
+
+    Writers disagree: `dynamic_run` and the fuzz campaign record only the flag PREFIX (the carrier
+    is a scratch path that is gone by replay time -- see `poc.capture.how_to_feed`), while the
+    synthesizer and the MSan/LSan detonations record the whole invocation. Dropping the last
+    element unconditionally therefore cut a real flag off every prefix row (`tool parse` replayed
+    as `tool <file>`, which never reaches the parser) and the crash read as non-deterministic.
+    Strip it only when it IS the carrier: the input itself for `arg`, a scratch path for `file`."""
+    argv = [str(a) for a in (argv or [])]
+    if not argv or mode not in ("arg", "file"):
+        return argv
+    last = argv[-1]
+    if last == "@@":
+        return argv
+    if mode == "arg":
+        carried = data.split(b"\x00", 1)[0].decode("latin-1")
+        return argv[:-1] if last in (carried, data.decode("latin-1")) else argv
+    p = Path(last)
+    if p.is_absolute() and (not p.exists() or str(p).startswith(tempfile.gettempdir())):
+        return argv[:-1]
+    return argv
+
+
 def replay_verdict(store, target, input_sha: str, *, times: int = 5,
                    timeout: float = 8.0, persist: bool = True) -> Optional[dict]:
     """Replay `input_sha` against `target` `times` times (bounded 1..10) and return the verdict
@@ -46,13 +70,21 @@ def replay_verdict(store, target, input_sha: str, *, times: int = 5,
                if d.input_sha == input_sha), None)
     mode = (dr.input_mode if dr else None) or "stdin"
     argv = list(dr.argv) if (dr and dr.argv) else []
-    base_argv = argv[:-1] if (mode in ("arg", "file") and argv) else argv
-    blob = store.content.path(target.sha256).read_bytes()
+    base_argv = _flag_prefix(argv, mode, data)
 
     d = Path(tempfile.mkdtemp(prefix="lykos-replay-"))
     try:
-        exe = d / "target.bin"
-        exe.write_bytes(blob)
+        # Staged WITH its companion deps and under the name a multi-call image dispatches on,
+        # like every other stage that executes the target. A bare `target.bin` write made a
+        # bundle with a relative loader (or busybox) fail to start on every replay, which this
+        # verdict then reported as "not deterministic" for a crash that reproduces.
+        name = "target.bin"
+        try:
+            from .invocation import exec_name_for
+            name = exec_name_for(store.content.path(target.sha256).read_bytes()) or name
+        except Exception:                         # noqa: BLE001 -- the default name still runs
+            name = "target.bin"
+        exe = store.content.stage_target(target, d, name)
         os.chmod(exe, 0o755)
         workfile = d / "in.bin"
         crashed = 0

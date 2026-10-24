@@ -52,6 +52,26 @@ def upx_available() -> Optional[str]:
     return shutil.which("upx")
 
 
+def _fsize_cap():
+    """Child-side: no file upx writes may exceed the bomb ceiling (+1 so an over-cap result is
+    still recognisable as over-cap). SIGXFSZ ignored so the write fails instead of a core dump."""
+    import resource
+    import signal
+    try:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (_MAX_UNPACKED + 1, _MAX_UNPACKED + 1))
+    except (OSError, ValueError):
+        pass
+
+
+def _confine(d: Path) -> list:
+    try:
+        from .dynamic import sandbox
+        return sandbox.isolate_prefix(str(d), net=False, rw_binds=[str(d)], chdir=str(d))
+    except Exception:                                    # noqa: BLE001 -- containment best-effort
+        return []
+
+
 def upx_unpack(data: bytes, *, timeout: int = 60) -> tuple[Optional[bytes], str]:
     """Decompress a UPX image with the `upx -d` tool. Returns (unpacked_bytes, note); the bytes are
     None with a reason when the tool is missing, the input is not UPX, or decompression fails. UPX
@@ -66,12 +86,19 @@ def upx_unpack(data: bytes, *, timeout: int = 60) -> tuple[Optional[bytes], str]
     try:
         src, dst = d / "packed.bin", d / "unpacked.bin"
         src.write_bytes(data)
+        # Confined (bwrap: read-only root, only this throwaway dir writable, no network) and with
+        # RLIMIT_FSIZE at the bomb ceiling: upx -d is itself a parser of the hostile container
+        # (it has had heap-overflow CVEs in exactly this path), and the size check below only ran
+        # AFTER the whole expansion had already been written to disk.
         try:
-            proc = subprocess.run([tool, "-d", "-q", "-o", str(dst), str(src)],
+            proc = subprocess.run(_confine(d) + [tool, "-d", "-q", "-o", str(dst), str(src)],
                                   capture_output=True, timeout=timeout,
-                                  stdin=subprocess.DEVNULL, check=False)
+                                  stdin=subprocess.DEVNULL, check=False,
+                                  preexec_fn=_fsize_cap)
         except subprocess.TimeoutExpired:
             return None, "upx -d timed out"
+        except OSError as e:
+            return None, f"upx -d could not run: {e}"
         if proc.returncode != 0 or not dst.exists():
             err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()[:200]
             return None, f"upx -d failed: {err or 'unknown error'}"

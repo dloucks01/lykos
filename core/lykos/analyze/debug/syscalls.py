@@ -106,7 +106,9 @@ gdb.execute("catch syscall " + " ".join(sorted(set(NR.values()))))
 RAN, ERR = False, ""
 try:
     # args inline: `set args X` then `run < file` resets args to empty (gdb quirk) -> argv lost
-    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
+    # inferior output -> /dev/null: it shares gdb's stdout with the LYKOS_* result markers
+    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else "")
+                + " > /dev/null 2>&1")
     RAN = True            # the inferior executed (run reached the first catchpoint or exit)
 except gdb.error as _e:
     ERR = str(_e)         # never ran (exec-format / cannot-execute / ptrace-denied)
@@ -268,10 +270,15 @@ def trace(exe, arch, *, argv=(), stdin=b"", timeout=25):
         out = proc.stdout.decode("latin-1", "ignore")
         ev = status = None
         for line in out.splitlines():
-            if line.startswith("LYKOS_SYS "):
-                ev = json.loads(line[len("LYKOS_SYS "):])
-            elif line.startswith("LYKOS_STATUS "):
-                status = json.loads(line[len("LYKOS_STATUS "):])
+            try:
+                if line.startswith("LYKOS_SYS "):
+                    ev = json.loads(line[len("LYKOS_SYS "):])
+                elif line.startswith("LYKOS_STATUS "):
+                    status = json.loads(line[len("LYKOS_STATUS "):])
+            except ValueError:
+                continue                  # a torn/garbled line is not a result
+        if not isinstance(ev, list) or not isinstance(status, dict):
+            ev = status = None
         if ev is None or status is None:
             return {"ok": False, "note": "gdb did not run to completion (no result marker) -- "
                     "the target could not be traced; no behavior was observed"}
