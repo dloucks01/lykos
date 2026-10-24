@@ -4,7 +4,6 @@ set ONLY when converge=True, so a normal (time-boxed) run is byte-for-byte uncha
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 from lykos.analyze.fuzz import aflpp
 

@@ -17,8 +17,8 @@ from pathlib import Path
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
-from .source_lookup import source_project_for
 from .debug.rootcause import parse_asan_report
+from .source_lookup import source_project_for
 
 TOOL, TOOL_VERSION = "libfuzzer", "libfuzzer-1"
 

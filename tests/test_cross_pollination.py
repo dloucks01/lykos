@@ -98,8 +98,7 @@ def test_l2_to_l3_prefers_the_crash_being_weaponized(store):
     the crash it is weaponizing (_STAGE.input_sha), not the newest from an unrelated defect -- while
     the crashless early attempt (no input_sha) still takes the newest, and a lone unrelated L2 is a
     fallback, not filtered out."""
-    from lykos.analyze.poc import exploit_stage
-    from lykos.analyze.poc.exploit_stage import _confirmed_l2, _l2_offset, _STAGE
+    from lykos.analyze.poc.exploit_stage import _STAGE, _l2_offset
     cid, t = _target(store)
     # crash A (offset 40), then crash B (offset 72) -- B is newer
     _emit(store, cid, t.id, "poc_primitive", "primitive.done",
@@ -127,6 +126,7 @@ def test_directed_fuzz_boosts_sinks_of_a_matched_cve_class():
     above an equal-state sink of an unmatched class -- so a known-vulnerable linked component steers
     the campaign, not just cve_poc."""
     from types import SimpleNamespace as NS
+
     from lykos.analyze.fuzz.directed import select_targets
     fs = [
         NS(detector="dangerous_api", function_addr="0x1000", site_addr="0x1004",

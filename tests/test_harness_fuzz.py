@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-
 from lykos.analyze.harness.emulate import available
 from lykos.analyze.harness.fuzz import fuzz_function
 

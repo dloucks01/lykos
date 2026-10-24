@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-
 from lykos.analyze.harness.emulate import available
 from lykos.analyze.harness.harness_stage import harness_stage
 from lykos.db.dao import CallEdgeDAO, FindingDAO, FunctionDAO

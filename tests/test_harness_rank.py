@@ -3,7 +3,7 @@ has a pointer+length prototype and loops ranks above one that does none of those
 with no attack-surface signal at all is dropped."""
 from __future__ import annotations
 
-from lykos.analyze.harness.rank import _ptr_len_confidence, _param_types, rank_functions
+from lykos.analyze.harness.rank import _param_types, _ptr_len_confidence, rank_functions
 from lykos.db.dao import CallEdgeDAO, FunctionDAO
 
 

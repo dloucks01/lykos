@@ -41,6 +41,9 @@ ignore = ["E402", "E702"]       # deliberate lazy imports; compact `stmt; return
 # core/, which it was not until 2026-10-16: `ruff check core tests` never looked at tools/, so
 # the directory holding every gate was the one directory with no gate on it.
 "tools/pipeline_conformance.py" = ["E501"]
+# A lookup table of one-line CWE descriptions shown verbatim in the GUI; one entry per line keeps
+# it greppable and diffable, and splitting a sentence across string fragments buys nothing.
+"core/lykos/cwe.py" = ["E501"]
 # SIM115 earns its place in core, where a stage runs for minutes and a driver is killed on
 # timeout. A test process opens the system libc, reads it, and exits seconds later; there is no
 # handle to leak and no interpreter left to leak it in. Enforcing it here would be 28 edits of

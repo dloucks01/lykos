@@ -5,7 +5,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze.harness import fuzz as hfuzz
 from lykos.analyze.harness.emulate import HarnessResult, available, run_function
 from lykos.analyze.harness.harness_stage import _fault_cwe

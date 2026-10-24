@@ -13,9 +13,9 @@ import subprocess
 
 import pytest
 from lykos.analyze import register
-from lykos.analyze.harness.harness_stage import enqueue_harness
 from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.dynamic import sandbox
+from lykos.analyze.harness.harness_stage import enqueue_harness
 from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.db.dao import DynResultDAO, FindingDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool

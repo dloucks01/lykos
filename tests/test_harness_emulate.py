@@ -6,8 +6,7 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-
-from lykos.analyze.harness.emulate import available, run_function, _INPUT_ADDR
+from lykos.analyze.harness.emulate import _INPUT_ADDR, available, run_function
 
 pytestmark = pytest.mark.skipif(not available(), reason="unicorn not installed")
 

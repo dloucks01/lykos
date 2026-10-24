@@ -89,8 +89,9 @@ def _stream(unit: bytes, n: int) -> bytes:
 
 def _leaked_bytes(ctx, lsbin, unit, n, mode, argv_base) -> int:
     """Run the LSan build on n requests and return the total bytes it reports leaked, or -1."""
-    from ..fuzz.runner import invocation
     import os as _os
+
+    from ..fuzz.runner import invocation
     env = dict(_os.environ)
     env["LSAN_OPTIONS"] = "symbolize=0:exitcode=23"
     prefix = sandbox.isolate_prefix(str(lsbin.parent), net=False)

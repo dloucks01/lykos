@@ -223,6 +223,7 @@ def test_gdb_script_passes_benign_signals():
 def test_sanitizer_report_runs_inside_the_sandbox(tmp_path):
     import importlib
     from types import SimpleNamespace
+
     from lykos.analyze.dynamic import sandbox
     stage = importlib.import_module("lykos.analyze.debug.stage")
     cc = shutil.which("gcc") or shutil.which("clang")

@@ -1,8 +1,7 @@
 """A directory bundle must never pull HOST files in through a symlink (analyze/ingest.py)."""
+import importlib
 import os
 import shutil
-
-import importlib
 
 ingest = importlib.import_module("lykos.analyze.ingest")
 

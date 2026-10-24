@@ -10,7 +10,6 @@ main(). Additive + opt-in: it fires only when LYKOS_QEMU_SYSROOT is set.
 import subprocess
 
 import pytest
-
 from lykos.analyze.dynamic import sandbox
 
 

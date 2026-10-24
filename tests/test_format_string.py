@@ -11,7 +11,6 @@ so it classifies as literal and is never flagged."""
 from __future__ import annotations
 
 import subprocess
-import types
 
 import pytest
 from lykos.analyze import register

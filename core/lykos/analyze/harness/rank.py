@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO
+from ...db.dao import CallEdgeDAO, FindingDAO
 from ..detect.catalog import DANGEROUS, SOURCES, normalize
 
 

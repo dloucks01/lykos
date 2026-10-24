@@ -4,13 +4,12 @@ never reaches it and its sinks are invisible. The engine CAN propagate taint fro
 buffer-pointer param (test 1); the stage just never seeded a non-`main` entry -- so the ranked
 parser's buffer param is seeded as attacker-controlled (test 2), recovering the injection.
 Findings are CANDIDATES (attacker-reachability assumed). Gated by LYKOS_BUFFER_SEED."""
-import os
 import shutil
 import subprocess
 
 import pytest
 from lykos.analyze import register
-from lykos.analyze.detect import bounds, taint
+from lykos.analyze.detect import taint
 from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.harness.rank import rank_functions
 from lykos.analyze.ingest import enqueue_triage, ingest

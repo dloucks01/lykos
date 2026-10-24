@@ -237,7 +237,6 @@ def to_html(report: dict[str, Any]) -> str:
     parts.append(_stat(summ.get("poc_backed", 0), "PoC-backed"))
     parts.append('</div>')
     bysev = summ.get("by_severity", {})
-    bystate = summ.get("by_state", {})
     if bysev:
         parts.append('<div class="chips">' + "".join(
             _badge(f"{k} · {v}", _SEV_COLOR.get(k, "#8b8d98")) for k, v in bysev.items())

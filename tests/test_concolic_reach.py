@@ -13,13 +13,12 @@ stands in for angr's exploration result:
 """
 import json
 
+import pytest
 from lykos.analyze import register
 from lykos.analyze.ingest import ingest
 from lykos.analyze.symbolic import enqueue_concolic
 from lykos.db.dao import ArtifactDAO, FindingDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
-
-import pytest
 
 _GATED = ("#include <string.h>\n#include <unistd.h>\n"
           "void handle(char*in){ if(strstr(in,\"OVERFLOWME\")){char s[16];strcpy(s,in);} }\n"

@@ -73,9 +73,12 @@ def test_malformed_client_traffic_is_none_rather_than_an_exception(junk):
     assert console._parse(junk) is None
 
 
-def test_valid_json_that_is_not_an_object_still_parses_without_raising():
-    assert console._parse(b'"a string"') == "a string"
-    assert console._parse(b"123") == 123
+@pytest.mark.parametrize("non_object", [b'"a string"', b"[]", b"3", b"null"])
+def test_valid_json_that_is_not_an_object_is_not_a_message(non_object):
+    """Only a JSON object is a client message. A bare string/array/number used to be returned
+    and then reached `msg.get(...)` in the proxy loop, which raised and wrote an HTTP 500 into the
+    already-upgraded socket."""
+    assert console._parse(non_object) is None
 
 
 def test_sending_on_a_closed_socket_is_swallowed():

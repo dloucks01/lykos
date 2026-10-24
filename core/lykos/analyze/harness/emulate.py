@@ -416,10 +416,23 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
     across the whole sequence. The sequence stops at the first call that faults or ends abnormally;
     `res.seq_index` records which message that was."""
     import time as _time
-    from unicorn import (UC_HOOK_BLOCK, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED,
-                         UC_HOOK_MEM_WRITE_UNMAPPED, UcError)
-    from unicorn.x86_const import (UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDI, UC_X86_REG_RDX,
-                                   UC_X86_REG_RIP, UC_X86_REG_RSI, UC_X86_REG_RSP)
+
+    from unicorn import (
+        UC_HOOK_BLOCK,
+        UC_HOOK_MEM_FETCH_UNMAPPED,
+        UC_HOOK_MEM_READ_UNMAPPED,
+        UC_HOOK_MEM_WRITE_UNMAPPED,
+        UcError,
+    )
+    from unicorn.x86_const import (
+        UC_X86_REG_RAX,
+        UC_X86_REG_RCX,
+        UC_X86_REG_RDI,
+        UC_X86_REG_RDX,
+        UC_X86_REG_RIP,
+        UC_X86_REG_RSI,
+        UC_X86_REG_RSP,
+    )
     pending = {"name": None}
     deadline = {"t": 0.0}
 
