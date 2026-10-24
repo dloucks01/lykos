@@ -414,3 +414,25 @@ def test_scorecard_events_are_scoped_to_the_target(store, case):
     assert execs == [111]
     assert {e.type for e in got} - {"job.queued"} == {"fuzz.done", "link.done", "autopilot.note"}
     assert all(e.run_id != rb.id for e in got)            # nothing from the other target's run
+
+
+# ---- hang proof selection (prove phase) -----------------------------------------------------
+
+
+def test_prove_phase_selects_unproved_hang_inputs_only(store, case):
+    """Recorded hangs (CWE-835, no dyn_result row) are handed to build_poc's hang path; one a
+    verified PoC already backs is not re-proved, and a non-hang finding is never picked up."""
+    from lykos.db.dao import PocDAO
+    t = _target(store, case, b"hangs")
+    fd = FindingDAO(store.conn)
+    for mode, sha in (("stdin", "a" * 64), ("file", "b" * 64)):
+        fd.upsert(t.id, case.id, {
+            "cwe": "CWE-835", "title": "hang", "severity": "medium", "detector": "fuzz",
+            "state": "corroborated", "confidence": 0.75, "dedup_key": f"CWE-835:hang:{mode}",
+            "evidence": [{"channel": "dynamic", "detail": "x", "input_sha": sha}]})
+    fd.upsert(t.id, case.id, {
+        "cwe": "CWE-787", "title": "oob", "severity": "high", "detector": "fuzz",
+        "state": "corroborated", "confidence": 0.9, "dedup_key": "CWE-787:x",
+        "evidence": [{"channel": "dynamic", "detail": "y", "input_sha": "c" * 64}]})
+    PocDAO(store.conn).insert(t.id, case.id, level="L1", verified=True, input_sha="b" * 64)
+    assert O._unproved_hang_inputs(store, t.id) == ["a" * 64]

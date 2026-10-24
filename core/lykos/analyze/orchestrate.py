@@ -1291,6 +1291,31 @@ _RECAPTURE_MODES = ("stdin", "file", "arg", "env", "prompt")
 #: representatives are ranked first and a truncation is reported (`autopilot.crashes_capped`).
 _MAX_DISTINCT_CRASHES = 32
 
+#: Hang inputs proved per target. Each proof runs the target to a multi-second timeout at least
+#: twice (control + hang), and a campaign files one CWE-835 finding per channel, so a handful
+#: covers every distinct hang while keeping a hang-heavy target from eating the prove phase.
+_MAX_HANG_PROOFS = 4
+
+
+def _unproved_hang_inputs(store, target_id) -> list:
+    """Input shas of this target's CWE-835 (non-termination) findings that no verified PoC backs
+    yet, highest confidence first. Advisory: a read error yields [] (the crash loop is unaffected)."""
+    try:
+        backed = {p.input_sha for p in PocDAO(store.conn).list_by_target(target_id)
+                  if getattr(p, "verified", False) and getattr(p, "input_sha", None)}
+        out: list = []
+        hangs = [f for f in FindingDAO(store.conn).list_by_target(target_id)
+                 if f.cwe == "CWE-835" and f.state != "poc-backed"]
+        for f in sorted(hangs, key=lambda f: -(f.confidence or 0)):
+            for ev in (f.evidence or []):
+                sha = ev.get("input_sha") if isinstance(ev, dict) else None
+                if sha and sha not in backed and sha not in out:
+                    out.append(sha)
+        return out
+    except Exception:                                    # noqa: BLE001 -- advisory
+        observe.absorbed(_log, "no hang inputs to prove")
+        return []
+
 #: Representatives kept for an UNRESOLVABLE `(signal, None, channel)` bucket -- one whose crashes
 #: carry no fault PC and no sanitizer key and where no re-capture can supply one (a wine PE, a
 #: foreign-arch image under qemu). One representative there meant a second, genuinely different
@@ -2362,6 +2387,15 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     _staged(bud, store, t, "build_poc", status, stop, p, want=60.0)
                     _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
                     _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
+                # Prove each recorded HANG (CWE-835). A campaign files a re-verified hang as a
+                # corroborated finding with no dyn_result row, so the crash loop above never sees
+                # it; build_poc's hang path verifies it differentially against a terminating
+                # control and files L1 + a bundle only on a pass (inconclusive files nothing).
+                for hang_sha in _unproved_hang_inputs(store, tid)[:_MAX_HANG_PROOFS]:
+                    if stop.is_set():
+                        break
+                    _staged(bud, store, t, "build_poc", status, stop,
+                            {"input_sha": hang_sha, "kind": "hang"}, want=75.0)
                 if crashes and not stop.is_set():
                     # WEAPONIZE EACH DISTINCT CRASH, best first. This ran once, on `crashes[0]` -- so a
                     # binary with three defects got three PoCs (the loop above) but only ever ONE
