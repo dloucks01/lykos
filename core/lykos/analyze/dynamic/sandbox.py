@@ -354,8 +354,26 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
             reached = struct.unpack("<%dQ" % nnew, out[off:off + 8 * nnew])
             off += 8 * nnew
         crashed, sig, signame, exit_code = classify_rc(code)
-        results.append(RunResult(isolation="bwrap+netns+batch"
-                                 + ("+" + GUARD_PAGE_TAG if guarded else ""),
+        iso = "bwrap+netns+batch" + ("+" + GUARD_PAGE_TAG if guarded else "")
+        # Did this execution actually START the program? `run()` asks this of every result
+        # (`_exec_failed`); the batch path did not, so a dynamic ELF missing a `.so` -- the loader
+        # prints "error while loading shared libraries" and exits 127 -- was "fuzzed" thousands
+        # of times and the campaign read clean. `flags & 2` is the runner's own "the exec itself
+        # failed" bit (execv raised in the child, or subprocess could not start it), which carries
+        # rc=0 on the wire and so read as a CLEAN exit. Both are a non-run, reported as one with
+        # the same `/not-runnable` suffix `run()` uses, so `did_not_run` and the attempt log see it.
+        exec_bit = bool(flags & 2)
+        if exec_bit or (not crashed and not (flags & 1) and _exec_failed(code, se)):
+            results.append(RunResult(
+                isolation=iso + "/not-runnable", crashed=False, timed_out=False,
+                exit_code=(None if exec_bit else exit_code), stdout=so, stderr=se,
+                duration_ms=per_ms,
+                note=("the image never executed (" + (
+                    "the batch runner could not exec it" if exec_bit else
+                    "the loader refused it") + _why_suffix(se) + "); nothing was run, which is "
+                    "not the same as nothing found")))
+            continue
+        results.append(RunResult(isolation=iso,
                                  crashed=bool(crashed),
                                  timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
@@ -2169,6 +2187,16 @@ _LOADER_FAIL_MARKERS = (
 )
 
 
+def _why_suffix(err: bytes) -> str:
+    """`: <the loader's own words>` -- the first non-empty stderr line, for a not-runnable note.
+    "the loader refused it" alone hid WHICH library was missing, the one fact the operator needs."""
+    for ln in (err or b"")[:4096].decode("latin-1", "replace").splitlines():
+        ln = ln.strip()
+        if ln:
+            return ": " + ln[:200]
+    return ""
+
+
 def _exec_failed(rc: int, err: bytes) -> bool:
     """Post-hoc: did the process never actually start?
 
@@ -2340,11 +2368,17 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),
         env_overrides: Optional[dict] = None, aslr: bool = False,
-        guard_page: bool = False) -> RunResult:
+        guard_page: bool = False, ro_binds=()) -> RunResult:
     """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
     ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
     was running blind on output shape alone -- eleven of the twelve architectures the platform
-    builds real targets for. qemu logs the guest PC of each translated block itself."""
+    builds real targets for. qemu logs the guest PC of each translated block itself.
+
+    `ro_binds` are extra directories the caller has put the target's INPUT in (a `file`-mode
+    input staged outside the exe's own directory). The sandbox masks /tmp with an empty tmpfs, so
+    an input file under /tmp that is not bound back in reaches the target as a name it cannot
+    open -- every input then "runs" as the same usage error and a campaign reads clean. Native
+    (bwrap) path only; the managed runtimes bind their own argv paths."""
     host = host or host_arch()
     if _is_elf_shared_object(exe):
         # Not a crash and not a clean run: this image has no entry point, so nothing of the
@@ -2489,6 +2523,10 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             # directory writable; it holds nothing else.
             tdir = str(Path(trace_log).parent)
             extra += ["--bind", tdir, tdir]
+        for _d in ro_binds or ():
+            _d = str(_d)
+            if _d and os.path.isdir(_d) and os.path.realpath(_d) != os.path.realpath(exedir):
+                extra += ["--ro-bind", _d, _d]
         if native_sysroot and os.path.isdir(native_sysroot):
             # The native sysroot's lib dirs are on LD_LIBRARY_PATH (above), but a sysroot under
             # /tmp is MASKED by the sandbox's tmpfs, so the loader would still not find the deps.
@@ -2538,8 +2576,9 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             return RunResult(isolation=iso + "/not-runnable", crashed=False, exit_code=rc,
                              stdout=out[:capture], stderr=err[:capture], duration_ms=dur,
                              cmd=cmd,
-                             note="the image never executed (the loader refused it); "
-                                  "nothing was run, which is not the same as nothing found")
+                             note="the image never executed (the loader refused it"
+                                  + _why_suffix(err) + "); nothing was run, which is not the "
+                                  "same as nothing found")
         if trace_log:
             reached, last = _qemu_reached(trace_log, blocks, want_last=True)
             note = ",".join(str(x) for x in reached) or None

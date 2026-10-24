@@ -406,6 +406,12 @@ def coverage_stage(ctx) -> dict:
                               mode=mode, qemu=use_qemu, argv_template=argv_template,
                               input_file=input_file, qemu_ld_prefix=_ld_prefix,
                               converge=bool(p.get("converge")))
+    # How contained the campaign was. A degraded (unsandboxed) run is reported at warn level --
+    # coverage fuzzing still happened, but the operator must be able to see it ran unconfined.
+    _iso = getattr(proc, "isolation", None)
+    if _iso:
+        ctx.emit("coverage.isolation", level=("warn" if _iso == "rlimits-only" else "info"),
+                 payload={"isolation": _iso, "note": getattr(proc, "isolation_note", "") or None})
     if proc.returncode != 0 and not (out_dir / "default").exists() \
             and not (out_dir / "crashes").exists():
         tail = (proc.stderr or b"")[-800:].decode("latin-1", "ignore")
@@ -574,7 +580,7 @@ def coverage_stage(ctx) -> dict:
                              seconds=seconds, workfile=workfile)
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
                                        "unique": len(seen_crashes), "confirmed": confirmed,
-                                       "attempts": _brief(_att)})
+                                       "attempts": _brief(_att), "isolation": _iso})
     ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_crashes)} unique crashes")
     # Persist the campaign's own measure of how much it exercised, so the run's output carries
     # the coverage it achieved -- not just its crash count. `bitmap_cvg` is AFL's edge-map
@@ -587,6 +593,7 @@ def coverage_stage(ctx) -> dict:
             return None
     summary = {"backend": "aflpp", "execs": _num("execs_done"), "execs_per_sec": _num("execs_per_sec"),
                "corpus_count": _num("corpus_count"), "unique_crashes": len(seen_crashes),
+               "isolation": _iso,
                "coverage": {"kind": "edge", "bitmap_cvg_pct": _num("bitmap_cvg"),
                             "edges_found": _num("edges_found")}}
     # Persist as the run's output artifact so /runs/<id>/output carries the coverage achieved.

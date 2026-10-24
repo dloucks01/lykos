@@ -4,7 +4,10 @@ Every file/argv/stdin channel feeds input the program reads explicitly; an env-v
 Shellshock class, many setuid parsers) is reached by setting an ENVIRONMENT VARIABLE and running
 the program with no other input. This discovers the env names the binary reads (UPPER_SNAKE strings
 in a binary that imports getenv), fuzzes a value into them, and attributes a crash to the single
-variable that reproduces it. rlimits-only, run-once-and-exit (not a server). Pure stdlib.
+variable that reproduces it. Run-once-and-exit (not a server), contained like every other execution
+of an untrusted target: bubblewrap (read-only root, tmpfs /tmp, host secrets masked, no network, pid
+namespace) plus rlimits -- rlimits alone where bubblewrap is unusable, and then the result SAYS so
+(`isolation`). Pure stdlib.
 """
 from __future__ import annotations
 
@@ -12,8 +15,12 @@ import logging
 import os
 import random
 import re
+import shutil
+import signal
 import subprocess
+import tempfile
 import time
+from pathlib import Path
 
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
@@ -84,14 +91,50 @@ def env_var_candidates(strings, limit: int = 24, *, fallback: bool = True) -> li
 
 class EnvFuzzResult:
     def __init__(self, crashed, payload=None, var=None, signal_name=None, signal_num=None,
-                 execs=0, note=None):
+                 execs=0, note=None, isolation=None):
         self.crashed, self.payload, self.var = crashed, payload, var
         self.signal_name, self.signal, self.execs, self.note = signal_name, signal_num, execs, note
+        # The containment the native runs got (`bwrap+netns` / `rlimits-only`); None for a
+        # caller-supplied (managed) runner, which reports its own.
+        self.isolation = isolation
+
+
+def isolation_tier() -> str:
+    """The containment a native env-fuzz execution gets on this host."""
+    return "bwrap+netns" if sandbox._bwrap_usable() else "rlimits-only"
+
+
+def _env_cmd(exe: str, argv: list, env: dict):
+    """(cmd, popen_env, cwd, isolation) for one contained execution with exactly `env`.
+
+    Under bubblewrap the variables are handed to the TARGET with `env -i` inside the namespace,
+    not to bwrap through its own environment: the fuzzed names include loader knobs (LD_PRELOAD,
+    LD_AUDIT, GLIBC_TUNABLES, MALLOC_*), and set on the bwrap process they would be interpreted
+    by bwrap's own loader -- a fault there would be read as the target's crash. `env -i` gives the
+    target precisely the environment the unwrapped path gave it (and that `sandbox.run`'s
+    env_overrides replay reproduces)."""
+    exedir = str(Path(exe).resolve().parent)
+    rel = sandbox._relative_interp(exe)
+    prefix = sandbox.isolate_prefix(exedir, net=False, rw_binds=([exedir] if rel else ()),
+                                    chdir=(exedir if rel else ""))
+    envbin = shutil.which("env") if prefix else None
+    if prefix and (not envbin or "=" in exe):
+        # No `env` to scope the variables (or an exe path `env` would parse as an assignment):
+        # still contained, with the variables handed over through bwrap's environment.
+        return prefix + [exe] + [str(a) for a in argv], env, None, "bwrap+netns"
+    if prefix and envbin:
+        cmd = prefix + [envbin, "-i"] + [f"{k}={v}" for k, v in env.items()] + \
+            [exe] + [str(a) for a in argv]
+        return cmd, None, None, "bwrap+netns"
+    # Unwrapped: never inherit the worker's cwd -- a target that writes relative paths would
+    # litter (or clobber) the directory lykos runs from.
+    cwd = exedir if rel else tempfile.mkdtemp(prefix="lykos-envfuzz-")
+    return [exe] + [str(a) for a in argv], env, cwd, "rlimits-only"
 
 
 def _run_with_env(exe: str, argv: list, env_overrides: dict, timeout: float = 5.0):
     """Run `exe` once with the given env vars set (plus a minimal PATH), return its exit status
-    (negative = killed by that signal), or None on spawn failure. rlimits-only.
+    (negative = killed by that signal), or None on spawn failure. Contained by `_env_cmd`.
 
     This is a bare subprocess, so unlike `sandbox.run` it does not reject an un-runnable image on
     its own. A shared object has no entry point and faults in the loader every time; returning
@@ -105,38 +148,75 @@ def _run_with_env_detail(exe: str, argv: list, env_overrides: dict, timeout: flo
     """`_run_with_env`, keeping what the attempt log needs: {rc, timed_out, spawn_failed, stderr,
     ms}. `rc` is None on a spawn failure OR a timeout -- the two are told apart here, and only
     here, which is the difference between "never started" and "started and hung"."""
-    out = {"rc": None, "timed_out": False, "spawn_failed": False, "stderr": b"", "ms": 0}
-    if sandbox._is_elf_shared_object(exe):
+    out = {"rc": None, "timed_out": False, "spawn_failed": False, "stderr": b"", "ms": 0,
+           "isolation": None}
+    if sandbox._is_elf_shared_object(exe) or not os.path.exists(exe):
+        # nothing to execute: a library has no entry point, and a missing path cannot start
         out["spawn_failed"] = True
         return out
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL") if k in os.environ}
+    # A sanitizer build cannot take an RLIMIT_AS cap (its ~20 TB shadow reservation fails and it
+    # aborts before main -- every run a spurious SIGABRT), and without abort_on_error ASan reports
+    # a real memory error by EXITING 1 -- read as an ordinary exit, the bug lost. Same treatment
+    # as sandbox.run: no AS cap, resident memory bounded by ASan, errors abort. Set BEFORE the
+    # overrides, so a fuzzed ASAN_OPTIONS still wins.
+    san = sandbox._is_sanitizer_exe(exe)
+    if san:
+        env["ASAN_OPTIONS"] = "abort_on_error=1:hard_rss_limit_mb=1024:detect_leaks=0"
     env.update(env_overrides)
+    cmd, penv, cwd, iso = _env_cmd(exe, argv, env)
+    out["isolation"] = iso
+    tmp_cwd = cwd if (cwd and iso == "rlimits-only" and not sandbox._relative_interp(exe)) else None
     t0 = time.time()
     try:
-        proc = subprocess.Popen([exe] + [str(a) for a in argv], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
-                                # baseline-aware: RLIMIT_NPROC counts EVERY process this user
-                                # runs, so a flat 64 failed every fork on a busy desktop
-                                preexec_fn=sandbox._rlimits(1024, int(timeout) + 2, set_as=True,
-                                                            nproc=sandbox._nproc_cap(False)))
-    except Exception:                                    # noqa: BLE001
-        out["spawn_failed"] = True
-        return out
-    try:
-        _o, err = proc.communicate(timeout=timeout)
-        out["stderr"] = (err or b"")[:4096]
-    except subprocess.TimeoutExpired:
-        proc.kill()
         try:
-            proc.communicate(timeout=2)                  # bounded: a forked child must not wedge us
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, env=penv, cwd=cwd,
+                                    # its own process group, so a timeout kills what it forked too
+                                    start_new_session=True,
+                                    # baseline-aware: RLIMIT_NPROC counts EVERY process this user
+                                    # runs, so a flat 64 failed every fork on a busy desktop
+                                    preexec_fn=sandbox._rlimits(1024, int(timeout) + 2,
+                                                                set_as=not san,
+                                                                nproc=sandbox._nproc_cap(san)))
+        except Exception:                                # noqa: BLE001
+            out["spawn_failed"] = True
+            return out
+        try:
+            _o, err = proc.communicate(timeout=timeout)
+            out["stderr"] = (err or b"")[:4096]
         except subprocess.TimeoutExpired:
-            pass
-        out["timed_out"] = True
+            # The whole GROUP: a bare proc.kill() left anything the target forked running on the
+            # host, still holding the stderr pipe.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            try:
+                proc.communicate(timeout=2)              # bounded: a forked child must not wedge us
+            except subprocess.TimeoutExpired:
+                pass
+            out["timed_out"] = True
+            out["ms"] = int((time.time() - t0) * 1000)
+            return out
+        rc = proc.returncode
+        if iso.startswith("bwrap") and rc is not None and rc > 128 \
+                and (rc - 128) in sandbox.CRASH_SIGNALS:
+            # bwrap reports a target killed by signal N as exit 128+N. Hand callers the native
+            # convention this function has always promised (negative = killed by that signal),
+            # or the attempt log reads every crash as an ordinary non-zero exit.
+            rc = -(rc - 128)
+        out["rc"] = rc
         out["ms"] = int((time.time() - t0) * 1000)
+        if iso.startswith("bwrap") and rc in (126, 127) and sandbox._exec_failed(rc, out["stderr"]):
+            # Inside the sandbox an exec failure arrives as `env`'s 126/127 ("No such file",
+            # "Permission denied", a loader refusal) rather than as a Popen exception -- the
+            # same "never started" the unwrapped path reports as spawn_failed.
+            out["spawn_failed"] = True
         return out
-    out["rc"] = proc.returncode
-    out["ms"] = int((time.time() - t0) * 1000)
-    return out
+    finally:
+        if tmp_cwd:
+            shutil.rmtree(tmp_cwd, ignore_errors=True)
 
 
 def _crashes(exe, argv, overrides, timeout, on_attempt=None, data=b"", phase="mutate"):
@@ -173,6 +253,7 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
     """
     if not env_names:
         return EnvFuzzResult(False, note="no candidate env vars")
+    _iso = None if run is not None else isolation_tier()
     # `on_attempt(data, detail, phase, overrides)` sees every execution (the attempt log). A
     # managed runner only answers crashed-or-not, so its detail is reduced to that.
     if run is not None:
@@ -196,12 +277,12 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
     while n < max_execs:
         if stop():
             return EnvFuzzResult(False, execs=n, note=f"stopped after {n} execution(s): out of "
-                                                      f"budget or cancelled")
+                                                      f"budget or cancelled", isolation=_iso)
         for data in payloads:
             if stop():
                 return EnvFuzzResult(False, execs=n,
                                      note=f"stopped after {n} execution(s): out of budget or "
-                                          f"cancelled")
+                                          f"cancelled", isolation=_iso)
             n += 1
             val = data.replace(b"\x00", b"")             # execve env truncates at NUL
             crashed, _, _ = fire({name: val.decode("latin-1") for name in env_names}, val,
@@ -212,8 +293,10 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
                     c2, sig, signame = fire({name: val.decode("latin-1")}, val, "reproduce")
                     if c2:
                         return EnvFuzzResult(True, payload=val, var=name, signal_name=signame,
-                                             signal_num=sig, execs=n, note=f"env {name}")
+                                             signal_num=sig, execs=n, note=f"env {name}",
+                                             isolation=_iso)
                 # crashed under the shotgun but no single var reproduced -> flaky/combination
-                return EnvFuzzResult(False, execs=n, note="shotgun crash not reproduced per-var")
+                return EnvFuzzResult(False, execs=n, note="shotgun crash not reproduced per-var",
+                                     isolation=_iso)
         payloads = [mut.mutate(rng.choice(corpus), corpus) for _ in range(32)]
-    return EnvFuzzResult(False, execs=n, note="no-crash")
+    return EnvFuzzResult(False, execs=n, note="no-crash", isolation=_iso)

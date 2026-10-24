@@ -101,7 +101,11 @@ def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float 
 
     t0 = time.monotonic()
     deadline = t0 + max(0.5, float(timeout))
-    proc, out = None, bytearray()
+    proc, out, sel = None, bytearray(), None
+    # Say what containment this run really had: `_spawn_menu` wraps in bubblewrap only when it
+    # is usable, and the label used to claim "bwrap+netns" either way. "prompted" stays in it --
+    # the replay paths look for that word to re-deliver one field per prompt.
+    iso = ("bwrap+netns" if sandbox._bwrap_usable() else "rlimits-only") + "/prompted"
     try:
         proc = heap_discover._spawn_menu(Path(exe).parent, Path(exe))
         sel = selectors.DefaultSelector()
@@ -139,21 +143,31 @@ def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float 
             rc = proc.wait(timeout=max(0.2, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
+            # Kill BEFORE reading what is left: a bare `stdout.read()` on a process that is still
+            # running blocks until it exits -- a target spinning in a loop never does, and the
+            # per-execution timeout this path promises was not enforced at all.
+            from . import menu as _m
+            _m._kill(proc, close=False)
         if rc is None and not timed_out:
             rc = proc.poll()
-        try:                                             # whatever it said on the way out
-            rest = proc.stdout.read() or b"" if proc.stdout else b""
-            out.extend(rest)
-        except (OSError, ValueError):
-            pass
+        out.extend(_read_rest(proc, sel, budget=0.5))   # whatever it said on the way out
         crashed, sig, signame, code = sandbox.classify_rc(rc)
+        if not crashed and not timed_out and sandbox._exec_failed(rc, bytes(out[:4096])):
+            # stderr is merged into stdout here; a loader that refused the image ("error while
+            # loading shared libraries", exit 127) means nothing ran -- the same `/not-runnable`
+            # verdict `sandbox.run` gives, never a clean exit.
+            iso += "/not-runnable"
         return [], sandbox.RunResult(
-            isolation="bwrap+netns/prompted", crashed=crashed, timed_out=timed_out,
+            isolation=iso, crashed=crashed, timed_out=timed_out,
             exit_code=code, signal=sig, signal_name=signame, stdout=bytes(out[:65536]),
             duration_ms=int((time.monotonic() - t0) * 1000),
             note=f"delivered {len(d.split(chr(10).encode()))} field(s) one per prompt")
     except Exception as e:                               # noqa: BLE001 -- a failed run is a run
-        return [], sandbox.RunResult(isolation="bwrap+netns/prompted", stdout=bytes(out[:65536]),
+        # ...but only once the process exists. A spawn that raised ran NOTHING, and a result
+        # with crashed=False and no suffix read as a clean execution.
+        return [], sandbox.RunResult(isolation=iso + ("" if proc is not None
+                                                      else "/not-runnable"),
+                                     stdout=bytes(out[:65536]),
                                      note=f"prompted delivery failed: {type(e).__name__}: {e}")
     finally:
         if proc is not None:
@@ -162,6 +176,31 @@ def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float 
                 _m._kill(proc)
             except Exception:
                 observe.absorbed(_log, "continuing")
+
+
+def _read_rest(proc, sel, *, budget: float) -> bytes:
+    """What is left on the target's stdout, read WITHOUT blocking past `budget` seconds. A
+    descendant that outlived the target (an unwrapped run, a daemonised child) can hold the pipe
+    open forever, and a blocking read() would wait on it."""
+    import time
+    if proc is None or proc.stdout is None or sel is None:
+        return b""
+    buf = bytearray()
+    end = time.monotonic() + budget
+    while time.monotonic() < end and len(buf) < 65536:
+        try:
+            ready = sel.select(max(0.0, min(0.05, end - time.monotonic())))
+            if not ready:
+                if proc.poll() is not None:
+                    break                   # it is gone and nothing more is pending
+                continue
+            chunk = proc.stdout.read1(65536)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break                           # EOF
+        buf += chunk
+    return bytes(buf)
 
 
 def prompted_runner(fields=(), *, idle: float = 0.08):

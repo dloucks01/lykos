@@ -56,28 +56,42 @@ def _place(argv, value):
 
 def run_program(prog: Program, data: bytes, *, timeout: float = 5.0):
     """Run one program on ``data`` via the sandbox and return its RunResult."""
+    import shutil
+
     from ..dynamic import sandbox
-    argv, stdin, tmp = list(prog.base_argv), b"", None
+    argv, stdin, tmpdir, binds = list(prog.base_argv), b"", None, ()
     try:
         if prog.mode == "stdin":
             stdin = data
         elif prog.mode == "arg":
             argv = _place(argv, data.split(b"\x00", 1)[0].decode("latin-1"))
         elif prog.mode == "file":
-            fd, tmp = tempfile.mkstemp(prefix="lykos-diff-")
-            os.write(fd, data); os.close(fd)
-            argv = _place(argv, tmp)
+            # Its own directory, BOUND into the sandbox. A bare mkstemp() under /tmp is invisible
+            # inside bwrap (its /tmp is an empty tmpfs), so every implementation got "No such
+            # file", every one "rejected" every input, and the campaign reported "the
+            # implementations behaved identically on every input" -- a broken run read as a
+            # clean negative.
+            tmpdir = tempfile.mkdtemp(prefix="lykos-diff-")
+            path = os.path.join(tmpdir, "input")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            argv, binds = _place(argv, path), (tmpdir,)
         return sandbox.run(prog.exe, argv=argv, stdin=stdin, timeout=timeout,
-                           arch=prog.arch, endianness=prog.endianness, bits=prog.bits)
+                           arch=prog.arch, endianness=prog.endianness, bits=prog.bits,
+                           ro_binds=binds)
     finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 _WS = re.compile(rb"\s+")
+# Outcomes that are NOT an implementation's verdict on the input. A program that never started
+# (missing loader/library, unsupported arch) has no opinion, and a timeout is as often host load
+# as behaviour. Read as "reject" (exit_code None != 0) -- as they were -- either one against a
+# sibling's "accept" manufactured an accept-reject DISCREPANCY: a fabricated finding.
+NORUN = "norun"
+TIMEOUT = "timeout"
+_INCONCLUSIVE = (NORUN, TIMEOUT)
 
 
 def outcome(res, *, compare: str = "status") -> str:
@@ -88,8 +102,14 @@ def outcome(res, *, compare: str = "status") -> str:
     stdout in, so two programs that both accept but PRODUCE different bytes still count as diverging
     (decompressors, transcoders, canonicalizers).
     """
+    if hasattr(res, "isolation"):
+        from ..dynamic import sandbox
+        if sandbox.did_not_run(res.isolation):
+            return NORUN
     if getattr(res, "crashed", False):
         return "crash:" + (getattr(res, "signal_name", None) or "?")
+    if getattr(res, "timed_out", False):
+        return TIMEOUT
     code = getattr(res, "exit_code", None)
     verdict = "accept" if code == 0 else "reject"
     if compare == "output":
@@ -112,12 +132,14 @@ def discrepancy(outcomes: dict) -> dict:
     one implementation accepts what another rejects, the highest-value signal), ``crash`` (one
     crashed and another did not), or ``output`` (all accepted but produced different bytes).
     """
-    vals = list(outcomes.values())
-    distinct = set(vals)
+    # An inconclusive outcome (never ran / timed out) is not a vote: only the implementations that
+    # actually produced a verdict are compared.
+    voting = {n: o for n, o in outcomes.items() if o not in _INCONCLUSIVE}
+    distinct = set(voting.values())
     if len(distinct) <= 1:
         return {"disagree": False, "partitions": {}, "kind": None}
     partitions = {}
-    for name, o in outcomes.items():
+    for name, o in voting.items():
         partitions.setdefault(o, []).append(name)
     bases = {o.split(":", 1)[0] for o in distinct}
     if "crash" in bases and len(bases) > 1:
@@ -142,6 +164,9 @@ class DiffStats:
     delta_diversity: int = 0
     discrepancies: list = field(default_factory=list)   # {input(hex), kind, partitions}
     corpus: int = 0
+    # Per program: executions that produced NO verdict (never ran / timed out). A campaign in
+    # which one implementation never ran compared nothing, and must not read as "identical".
+    inconclusive: dict = field(default_factory=dict)
 
 
 def differential_campaign(programs, seeds, *, rng, iterations: int = 2000, timeout: float = 5.0,
@@ -164,6 +189,9 @@ def differential_campaign(programs, seeds, *, rng, iterations: int = 2000, timeo
         data = mut.mutate(base, corpus)
         oc = outcomes_for(programs, data, compare=compare, timeout=timeout)
         stats.execs += 1
+        for name, o in oc.items():
+            if o in _INCONCLUSIVE:
+                stats.inconclusive[name] = stats.inconclusive.get(name, 0) + 1
         key = delta_key(oc)
         if key not in seen_delta:
             seen_delta.add(key)

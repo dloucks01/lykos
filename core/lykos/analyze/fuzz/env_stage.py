@@ -136,6 +136,14 @@ def env_fuzz_stage(ctx) -> dict:
                 "note": f"{sub.execs_per_sec:.0f} exec/s measured on {sub.runtime or sub.backend}"
                         f": {budget} executions is what fits in this stage's budget"})
             max_execs = budget
+    tier = envfuzz.isolation_tier() if runner is None else None
+    if tier == "rlimits-only":
+        # Reported, never silent: the native runs go ahead with resource limits only.
+        ctx.emit("env_fuzz.isolation", level="warn", payload={
+            "isolation": tier,
+            "note": "bubblewrap is unusable on this host, so the target runs with resource limits "
+                    "only -- no read-only root, no secret masking, no network namespace. Fuzzing "
+                    "continues; install/enable bubblewrap for full containment."})
     ctx.progress(msg=f"fuzzing {len(names)} environment variable(s): {', '.join(names[:6])}")
     # The stage's own clock, polled per execution. `max_execs` is sized from a measured exec/s
     # rate and that rate does not hold on an interactive target, where each run blocks for the
@@ -179,7 +187,7 @@ def env_fuzz_stage(ctx) -> dict:
                  "execs": res.execs, "vars": names, "note": note,
                  "ran": (ran["ok"] if runner is not None else True),
                  "did_not_run": _att.get("verdict") == _attempts.ERRORING,
-                 "attempts": _att_brief})
+                 "attempts": _att_brief, "isolation": res.isolation or tier})
         ctx.progress(pct=100, msg=f"{res.execs} exec(s), no crash ({note})"[:90])
         return {}
 
@@ -194,7 +202,7 @@ def env_fuzz_stage(ctx) -> dict:
         extra=f"(reproduced by setting the environment variable {res.var})"))
     ctx.emit("env_fuzz.done", payload={"applicable": True, "crashed": True,
              "signal": res.signal_name, "var": res.var, "input_sha": input_sha, "execs": res.execs,
-             "attempts": _att_brief})
+             "attempts": _att_brief, "isolation": res.isolation or tier})
     ctx.progress(pct=100, msg=f"env crash: {res.signal_name} via ${res.var}")
     return {}
 

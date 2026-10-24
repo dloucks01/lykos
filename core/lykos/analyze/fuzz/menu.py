@@ -239,11 +239,19 @@ def _drain(proc, sel, *, idle: float, deadline: float) -> tuple[str, bool]:
     buf = bytearray()
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            try:                                             # flush anything still buffered
-                rest = proc.stdout.read() or b""
-            except (OSError, ValueError):
-                rest = b""
-            buf += rest
+            # Flush what is still buffered -- WITHOUT a blocking read(). The process is gone, but
+            # anything it forked (an unwrapped run, a daemonised child) may still hold the write
+            # end, and read() would then wait on EOF forever, past every deadline here.
+            while time.monotonic() < deadline:
+                try:
+                    if not sel.select(min(idle, 0.05)):
+                        break
+                    b = proc.stdout.read1(4096)
+                except (OSError, ValueError):
+                    break
+                if not b:
+                    break
+                buf += b
             return buf.decode("latin1"), False
         if sel.select(idle):
             try:                                             # read1: return what's buffered, never
@@ -388,13 +396,18 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
     return model
 
 
-def _kill(proc) -> None:
+def _kill(proc, *, close: bool = True) -> None:
     # Close the pipes FIRST, suppressing the BrokenPipe from flushing buffered bytes to a process
     # that has already exited -- a menu's "Exit" option makes this the common case. Left to garbage
     # collection, that unflushed BufferedWriter raises an *unraisable* BrokenPipeError the caller
     # cannot catch (and which pytest turns into a failure), so the crawl looked flaky on any target
-    # that can quit mid-probe.
-    for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+    # that can quit mid-probe. `close=False` keeps STDOUT open, for a caller that still wants to
+    # read what the killed process left in the pipe (stdin is always closed: nothing writes to a
+    # process being killed).
+    streams = [getattr(proc, "stdin", None)]
+    if close:
+        streams.append(getattr(proc, "stdout", None))
+    for stream in streams:
         try:
             if stream is not None:
                 stream.close()

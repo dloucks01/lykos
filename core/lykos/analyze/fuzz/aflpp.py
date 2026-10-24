@@ -280,8 +280,13 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES": "1",
         "AFL_NO_UI": "1",
         "AFL_NO_AFFINITY": "1",
-        "AFL_BENCH_JUST_ONE": "0",
     })
+    # AFL++ tests these flags for PRESENCE, not value: `AFL_BENCH_JUST_ONE=0` ENABLES bench-just-
+    # one, so afl-fuzz stopped after its first queue entry ("Testing aborted by user", ~1 s in)
+    # whatever `-V` asked for -- every coverage campaign silently ran for about a second.
+    # Measured: 838 execs / 0 s run_time with it, 18,115 execs / 15 s (and the crash) without.
+    # Never set it, and drop an inherited one.
+    env.pop("AFL_BENCH_JUST_ONE", None)
     if converge:
         # Run-to-convergence (doc 47 U1): stop when AFL has cycled through every path with no new
         # find for a while -- its own coverage-plateau signal -- instead of burning the full `-V`
@@ -343,6 +348,10 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
     import tempfile
 
     from ..dynamic import sandbox as _sandbox
+    cmd, isolation, iso_note = contain(cmd, afl=afl, exe=exe, seeds_dir=seeds_dir,
+                                       out_dir=out_dir, env=env, afl_path=afl_path,
+                                       cmplog=cmplog, input_file=input_file,
+                                       qemu_ld_prefix=qemu_ld_prefix)
     with tempfile.TemporaryDirectory(prefix="afl-io-") as _io:
         o_path, e_path = Path(_io) / "stdout", Path(_io) / "stderr"
         with o_path.open("wb") as _o, e_path.open("wb") as _e:
@@ -368,7 +377,130 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         if (out_dir / "default").exists() or (out_dir / "crashes").exists() \
                 or (out_dir / "queue").exists():
             rc = 0
-    return subprocess.CompletedProcess(cmd, rc, out, err)
+    cp = subprocess.CompletedProcess(cmd, rc, out, err)
+    # How contained the campaign was -- reported by the stage, never silent.
+    cp.isolation, cp.isolation_note = isolation, iso_note
+    return cp
+
+
+# ---- containment ---------------------------------------------------------------------------
+#
+# afl-fuzz EXECUTES the target (via its forkserver, under afl-qemu-trace in -Q mode), so the
+# campaign is a detonation of an untrusted binary like any other -- and it used to run with no
+# sandbox at all: a hostile target could read ~/.ssh, write the operator's files and reach the
+# network. The whole afl-fuzz process tree now runs inside the same bubblewrap namespace the
+# sibling paths use (read-only root, tmpfs /tmp, host secrets masked, no network, pid namespace,
+# die-with-parent), with exactly the directories the campaign needs bound back in.
+#
+# The fallback is decided by a TRUSTED probe, never by the target's own behaviour: afl-fuzz (and
+# the qemu tracer) are started inside the candidate sandbox with `-h` / `--version`. If they cannot
+# start there but can outside it (a relocated bundle under a masked path, a bwrap that cannot
+# create a namespace), the campaign runs unwrapped and SAYS so -- coverage fuzzing never silently
+# stops, and a target that merely fails its handshake can never talk its way out of the sandbox.
+_probe_cache: dict = {}
+
+
+def _starts(cmd, env) -> Optional[bool]:
+    """Did this trusted tool START (True), fail to start (False), or could we not tell (None)?"""
+    try:
+        r = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=20)
+    except Exception:                                    # noqa: BLE001 -- inconclusive
+        return None
+    from ..dynamic import sandbox as _sb
+    err = (r.stderr or b"") + (r.stdout or b"")
+    if err.lstrip().startswith(b"bwrap:") or _sb._exec_failed(r.returncode, err) \
+            or r.returncode in (126, 127):
+        return False
+    return True
+
+
+def _probe_ok(prefix, tools, env) -> tuple:
+    """(ok, why) -- can every trusted tool in `tools` start inside `prefix`?"""
+    for tool, args in tools:
+        key = (tuple(prefix), str(tool))
+        if key not in _probe_cache:
+            inside = _starts(prefix + [str(tool)] + args, env)
+            if inside is False and _starts([str(tool)] + args, env) is False:
+                inside = None          # broken everywhere: the sandbox is not the cause
+            _probe_cache[key] = inside
+        if _probe_cache[key] is False:
+            return False, f"{Path(tool).name} cannot start inside the sandbox"
+    return True, ""
+
+
+def _existing_dir(p) -> Optional[str]:
+    try:
+        if p is None:
+            return None
+        q = Path(p)
+        d = q if q.is_dir() else q.parent
+        return str(d.resolve()) if d.is_dir() else None
+    except OSError:
+        return None
+
+
+def contain(cmd, *, afl, exe, seeds_dir, out_dir, env, afl_path=None, cmplog=None,
+            input_file=None, qemu_ld_prefix=None) -> tuple:
+    """(cmd, isolation, note): `cmd` wrapped in bubblewrap when that can work, else unchanged.
+
+    `isolation` is `bwrap+netns` or `rlimits-only`; `note` explains a degraded tier (empty when
+    fully contained)."""
+    from ..dynamic import sandbox as _sb
+    if not _sb._bwrap_usable():
+        return cmd, "rlimits-only", ("bubblewrap is unusable on this host, so afl-fuzz and the "
+                                     "target ran WITHOUT the sandbox (no read-only root, no "
+                                     "secret masking, no network isolation)")
+    try:
+        Path(out_dir).parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    exedir = _existing_dir(exe) or str(Path(exe).resolve().parent)
+    rw = []
+    for d in (_existing_dir(Path(out_dir).parent),
+              _existing_dir(input_file) if input_file else None):
+        if d and d not in rw:
+            rw.append(d)
+    rel = _sb._relative_interp(exe)
+    if rel and exedir not in rw:
+        rw.append(exedir)
+    ro = []
+    trace_real = None
+    if afl_path:
+        link = Path(afl_path) / "afl-qemu-trace"
+        try:
+            trace_real = link.resolve() if link.exists() else None
+        except OSError:
+            trace_real = None
+    cands = [seeds_dir, afl, _resolved(afl), afl_path, trace_real, cmplog, qemu_ld_prefix]
+    cands += [d for d in (env.get("LD_LIBRARY_PATH") or "").split(":") if d]
+    for c in cands:
+        d = _existing_dir(c) if c else None
+        if d and d not in ro and d not in rw:
+            ro.append(d)
+    # aslr=True: no setarch in front of afl-fuzz -- the campaign's own behaviour is unchanged,
+    # only its containment is.
+    prefix = _sb.isolate_prefix(exedir, net=False, ro_binds=ro, rw_binds=rw,
+                                chdir=(exedir if rel else ""), aslr=True)
+    if not prefix:
+        return cmd, "rlimits-only", ("bubblewrap is unusable on this host, so afl-fuzz and the "
+                                     "target ran WITHOUT the sandbox")
+    tools = [(afl, ["-h"])]
+    if trace_real is not None:
+        tools.append((Path(afl_path) / "afl-qemu-trace", ["--version"]))
+    ok, why = _probe_ok(prefix, tools, env)
+    if not ok:
+        return cmd, "rlimits-only", (f"{why} (its files live outside what the sandbox exposes), "
+                                     "so this campaign ran WITHOUT the sandbox -- coverage "
+                                     "fuzzing continues, containment is reduced")
+    return prefix + list(cmd), "bwrap+netns", ""
+
+
+def _resolved(p):
+    try:
+        return Path(p).resolve() if p else None
+    except OSError:
+        return None
 
 
 # afl-fuzz exits 0 after printing these, so the return code alone does not tell you it failed

@@ -50,8 +50,19 @@ def net_fuzz_stage(ctx) -> dict:
         return {}
 
     exe = ctx.scratch() / "net_target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    # stage_target, not a bare write: a bundled target needs its relocated loader/libc staged
+    # BESIDE it, or every spawn dies in the loader and the campaign reads "no-listen".
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
+    # Containment is reported, never silent: without bubblewrap the server runs rlimits-only
+    # (no read-only root, no secret mask), and the operator has to be able to see that.
+    tier = netfuzz.isolation_tier()
+    if tier == "rlimits-only":
+        ctx.emit("net_fuzz.isolation", level="warn", payload={
+            "isolation": tier,
+            "note": "bubblewrap is unusable on this host, so the server runs with resource "
+                    "limits only -- no read-only root, no secret masking, no pid namespace. "
+                    "Fuzzing continues; install/enable bubblewrap for full containment."})
 
     argv = [str(a) for a in (p.get("argv") or [])]
     ctx.progress(msg=f"fuzzing {proto.upper()} server over a socket")
@@ -69,7 +80,8 @@ def net_fuzz_stage(ctx) -> dict:
 
     res = netfuzz.fuzz_server(str(exe), proto, argv=argv, port=p.get("port"),
                               max_execs=int(p.get("max_execs", 1500)),
-                              seed=int(p.get("seed", 1337)), on_attempt=_on_attempt)
+                              seed=int(p.get("seed", 1337)), on_attempt=_on_attempt,
+                              should_stop=lambda: ctx.should_cancel() or ctx.timed_out())
     _att = alog.finish()
     _att_brief = {k: _att.get(k) for k in ("counts", "verdict", "verdict_note", "log")}
 
@@ -81,7 +93,8 @@ def net_fuzz_stage(ctx) -> dict:
                  "note": (_att.get("verdict_note") if _att.get("verdict") == _attempts.ERRORING
                           else ((_att.get("top_errors") or {}).get("no_start") or [{}])[0].get("msg")
                           or res.note if _erroring else res.note),
-                 "did_not_run": _erroring, "attempts": _att_brief})
+                 "did_not_run": _erroring, "attempts": _att_brief,
+                 "isolation": res.isolation or tier})
         ctx.progress(pct=100, msg=f"{res.execs} socket exec(s), no crash ({res.note})")
         return {}
 
@@ -96,7 +109,8 @@ def net_fuzz_stage(ctx) -> dict:
         extra=f"(reproduced over a {proto.upper()} socket on port {res.port})"))
     ctx.emit("net_fuzz.done", payload={"applicable": True, "crashed": True,
              "signal": res.signal_name, "port": res.port, "proto": proto,
-             "input_sha": input_sha, "execs": res.execs, "attempts": _att_brief})
+             "input_sha": input_sha, "execs": res.execs, "attempts": _att_brief,
+             "isolation": res.isolation or tier})
     ctx.progress(pct=100, msg=f"{proto.upper()} crash: {res.signal_name} on port {res.port}")
     return {}
 

@@ -286,10 +286,16 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
                 except OSError:
                     pass
             os.execv(argv[0], argv)
-        except Exception:
+        except BaseException as e:                      # noqa: BLE001 -- see below
             # This is the forked CHILD, between fork and execv. There is no result channel and
-            # no observe to reach: exiting 127 IS the report, and the parent reads it as a failed
-            # exec rather than as a target that ran and exited 127 on its own.
+            # no observe to reach: exiting 127 IS the report. Say WHY on the target's stderr (fd 2
+            # is already the capture pipe once dup2 ran) so the parent can quote it; the parent
+            # recognises the exit as "never reached execve" below, not as the target exiting 127.
+            try:
+                os.write(2, ("lykos-batch: cannot execute %s: %s\n"
+                             % (argv[0], e)).encode("utf-8", "replace"))
+            except Exception:                           # noqa: BLE001 -- best-effort diagnostic
+                pass
             os._exit(127)
     os.close(w_out); os.close(w_err); os.close(r_in)
     # Feed stdin from a thread. The tracee is stopped at execve and not yet reading fd 0, so a
@@ -311,7 +317,25 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
         except OSError:
             pass
     threading.Thread(target=_feed_stdin, daemon=True).start()
-    os.waitpid(pid, 0)                                  # stop at execve
+    _wpid, status0 = os.waitpid(pid, 0)                 # stop at execve
+    if os.WIFEXITED(status0) or os.WIFSIGNALED(status0):
+        # The child never STOPPED at execve: execv itself failed (no such file, a missing ELF
+        # interpreter, exec format) and the child exited -- it is already reaped. Falling through
+        # used to read the reaped pid as an exit with rc=0, i.e. a CLEAN run of a program that
+        # never started. Report it on the exec-failed channel (flags=2) with what the child said.
+        err = b""
+        try:
+            os.set_blocking(r_err, False)
+            err = os.read(r_err, 4096)
+        except (BlockingIOError, OSError):
+            pass
+        for fd in (r_out, r_err):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        rc0 = (os.WEXITSTATUS(status0) if os.WIFEXITED(status0) else -os.WTERMSIG(status0))
+        return rc0, b"", err, 2, [], 0
 
     base = _maps_base(pid, exe) - _elf_min_vaddr(exe)
     mem = _open_mem(pid)
@@ -436,6 +460,39 @@ def _now():
     return time.time()
 
 
+def _run_untraced(argv, stdin, timeout, preexec, env):
+    """One untraced execution: (rc, stdout, stderr, flags). The child leads its own process
+    group so a timeout takes down whatever it forked too: `subprocess.run` kills only the direct
+    child and then waits, UNBOUNDED, for EOF on pipes a surviving grandchild still holds -- one
+    forking input then stalled the whole batch until the parent's budget expired and the batch
+    was thrown away."""
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, preexec_fn=preexec, env=env,
+                         start_new_session=True)
+    try:
+        so, se = p.communicate(input=stdin, timeout=timeout)
+        return p.returncode, (so or b"")[:4096], (se or b"")[:4096], 0
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            p.communicate(timeout=1)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            for st in (p.stdin, p.stdout, p.stderr):
+                try:
+                    if st is not None:
+                        st.close()
+                except OSError:
+                    pass
+            try:
+                p.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        return 0, b"", b"", 1
+
+
 def main():
     mode = sys.argv[1]
     per_timeout = float(sys.argv[2])
@@ -509,17 +566,16 @@ def main():
                                                               blocks, exe, plan, sanitizer)
         else:
             try:
-                pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=per_timeout,
-                                    preexec_fn=_nontraced_preexec(sanitizer), env=child_env)
-                rc, so, se, flags = pr.returncode, pr.stdout[:4096], pr.stderr[:4096], 0
-            except subprocess.TimeoutExpired:
-                rc, so, se, flags = 0, b"", b"", 1
-            except Exception:
-                # Already reported, in the one channel this loop has: `flags=2` goes into the
-                # binary record the parent reads, and the parent treats it as "this exec did not
-                # produce a usable result" rather than as a clean run.
-                rc, so, se, flags = 0, b"", b"", 2
+                rc, so, se, flags = _run_untraced(argv, stdin, per_timeout,
+                                                  _nontraced_preexec(sanitizer), child_env)
+            except Exception as e:                      # noqa: BLE001 -- reported via flags
+                # Reported in the one channel this loop has: `flags=2` goes into the binary record
+                # the parent reads, and the parent (sandbox.run_batch) turns it into a
+                # `/not-runnable` result -- "this exec never started", never a clean run. The
+                # reason travels on stderr so the attempt log can quote it.
+                rc, so, flags = 0, b"", 2
+                se = ("lykos-batch: cannot execute %s: %s" % (argv[0], e)).encode(
+                    "utf-8", "replace")[:4096]
         out.write(struct.pack("<iIIBIQ", rc, len(so), len(se), flags, len(reached), fault_pc))
         out.write(so); out.write(se)
         if reached:
