@@ -126,3 +126,22 @@ def test_numeric_log_level_is_honoured(monkeypatch):
     observe.configure(force=True)
     assert logging.getLogger("lykos").level == logging.DEBUG
     observe.configure("warning", force=True)
+
+
+def test_diff_test_does_not_call_a_never_running_implementation_identical(tmp_path):
+    """A program that never starts casts no vote; with fewer than two conclusive implementations
+    diff-test must say nothing was compared (exit 3), not 'behaved identically'."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    broken = tmp_path / "broken"
+    broken.write_bytes(b"\x7fELF not really")
+    broken.chmod(0o755)
+    core = Path(__file__).resolve().parent.parent / "core"
+    r = subprocess.run([sys.executable, "-m", "lykos", "diff-test", "/bin/cat", str(broken),
+                        "--iterations", "3"], capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "PYTHONPATH": str(core)})
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "identically" not in r.stdout and "inconclusive" in r.stdout

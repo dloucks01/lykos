@@ -814,7 +814,8 @@ def _cmd_diff_test(args: argparse.Namespace) -> int:
                                  timeout=args.timeout, compare=args.compare)
     if args.json:
         print(json.dumps({"execs": st.execs, "delta_diversity": st.delta_diversity,
-                          "discrepancies": st.discrepancies}, indent=2, default=list))
+                          "discrepancies": st.discrepancies,
+                          "inconclusive": st.inconclusive}, indent=2, default=list))
         return 0
     print(f"diff-test: {st.execs} execs, {st.delta_diversity} distinct behaviour-combinations, "
           f"{len(st.discrepancies)} disagreement(s):\n")
@@ -825,8 +826,22 @@ def _cmd_diff_test(args: argparse.Namespace) -> int:
     if st.discrepancies:
         print("\nEach disagreement is a candidate bug -- one implementation accepts/handles input "
               "another does not. Confirm which behaviour violates the spec.")
-    else:
-        print("no disagreements found (the implementations behaved identically on every input).")
+    # A program that never ran or timed out casts no vote; "identical" is only true of the inputs
+    # every implementation actually executed.
+    inc = {n: c for n, c in (st.inconclusive or {}).items() if c}
+    if inc:
+        print("\ninconclusive runs (never started or timed out -- not counted as a behaviour): "
+              + ", ".join(f"{n} x{c}" for n, c in sorted(inc.items())))
+    if not st.discrepancies:
+        # each program runs every input once: one whose inconclusive count reaches `execs` never
+        # produced a single result, and fewer than two such programs means nothing was compared
+        live = [p for p in progs if inc.get(p.name, 0) < max(1, st.execs)]
+        if len(live) < 2:
+            print("no comparison possible: fewer than two implementations produced a conclusive "
+                  "result.")
+            return 3
+        print("no disagreements found on the inputs every implementation executed"
+              + (" (some runs were inconclusive, see above)." if inc else "."))
     return 0
 
 
