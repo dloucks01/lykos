@@ -1144,6 +1144,8 @@ def _record_cve_weaponized(store, target, cve: str, level: int) -> None:
 #: collapsing bucket. A re-capture is one short ptrace run; the cap bounds the cost on a target
 #: with a large crash corpus while still separating the handful of genuinely distinct defects.
 _MAX_FAULT_PC_RECOVERY = 16
+#: (target_id, input_sha) pairs already re-captured by `_recover_missing_fault_pcs` in this process.
+_FAULTPC_TRIED: set = set()
 
 
 def _recover_missing_fault_pcs(store, target_id, crashes):
@@ -1167,32 +1169,60 @@ def _recover_missing_fault_pcs(store, target_id, crashes):
     best-effort -- any failure leaves the row exactly as it was.
     """
     from ..db.dao import TargetDAO
-    from .dynamic import sandbox
-    # Only act where a bucket actually collides: a `(signal, None)` bucket with >1 distinct input.
+    # Only act where a bucket actually collides: a `(signal, None, channel)` bucket with >1
+    # distinct input. Every channel the ptrace capture can deliver is covered, not only stdin: a
+    # file parser's or an argv-driven target's crashes collapsed exactly the same way and no
+    # recovery ever ran for them, so a second distinct defect on those channels was never proved.
     buckets: dict = {}
     for d in crashes:
-        if d.defect_key or d.fault_pc is not None or d.input_mode not in (None, "stdin"):
+        if d.defect_key or d.fault_pc is not None:
             continue
-        buckets.setdefault(d.signal_name, []).append(d)
+        mode = _crash_channel(d)
+        if mode not in _RECAPTURE_MODES:
+            continue
+        buckets.setdefault((d.signal_name, mode), []).append(d)
     collide = [d for rows in buckets.values() if len({r.input_sha for r in rows}) > 1
                for d in rows]
+    # Each input is re-captured AT MOST ONCE per process. A hijack crash recovers no in-image PC,
+    # so its row keeps `fault_pc=None` and -- without this -- was re-captured on EVERY
+    # `_distinct_crashes` call (four or more per target), up to 16 x a 4s ptrace run each time,
+    # none of it charged to the case budget.
+    collide = [d for d in collide if (target_id, d.input_sha) not in _FAULTPC_TRIED]
     if not collide:
         return
     target = TargetDAO(store.conn).get(target_id)
-    if not target or (target.arch or "") != sandbox.host_arch():
-        return                                           # native only; an emulated re-capture is
-        #                                                  heavier and this is a best-effort split
+    if not _fault_pc_recoverable(target):
+        return                                           # native ELF only; an emulated re-capture
+        #                                                  is heavier and this is a best-effort split
+    import shutil
+    import tempfile
+    # The staged copy is a FULL copy of the binary (tens of MB on a real engagement target) and
+    # this runs on every `_distinct_crashes` call -- several per target. It was never removed, so
+    # each collision-split leaked a whole binary into /tmp. Removed in `finally` below.
+    workdir = None
     try:
-        from .poc.capture import make_capture, materialize_helper
         import pathlib
-        import sys as _sys
-        import tempfile
+
+        from .poc.capture import make_capture, materialize_helper
         helper = materialize_helper()
         workdir = pathlib.Path(tempfile.mkdtemp(prefix="faultpc-"))
         exe = store.content.stage_target(target, workdir, name="target.bin")
     except Exception:                                    # noqa: BLE001
         observe.absorbed(_log, "no capture for fault-pc recovery")
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
         return
+    try:
+        _recapture_fault_pcs(store, collide, helper, exe, make_capture)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _recapture_fault_pcs(store, collide, helper, exe, make_capture) -> None:
+    """Re-capture each colliding crash once and record an in-image fault PC (see the caller)."""
+    import sys as _sys
+
+    from .dynamic import sandbox
 
     class _Ctx:
         def run_subprocess(self, argv, timeout=None):
@@ -1205,10 +1235,13 @@ def _recover_missing_fault_pcs(store, target_id, crashes):
         if done >= _MAX_FAULT_PC_RECOVERY:
             break
         guard = sandbox.GUARD_PAGE_TAG in (d.isolation or "")
+        _FAULTPC_TRIED.add((d.target_id, d.input_sha))
         try:
             data = store.content.get_bytes(d.input_sha)
-            cap = make_capture(_Ctx(), helper, exe, "stdin", [], 4, _sys.executable,
-                               guard_page=guard)(data)
+            # dyn_result.argv is the recorded FLAG PREFIX (see capture.how_to_feed); the capture
+            # places the carrier itself, exactly as the replay stages do.
+            cap = make_capture(_Ctx(), helper, exe, _crash_channel(d), list(d.argv or []), 4,
+                               _sys.executable, guard_page=guard)(data)
         except Exception:                                # noqa: BLE001
             observe.absorbed(_log, "fault-pc recapture failed", input_sha=d.input_sha)
             continue
@@ -1247,14 +1280,66 @@ def _has_unproven_harness_leads(store, target_id) -> bool:
     return False
 
 
+#: Channels the native ptrace capture (`poc.capture.make_capture`) can deliver an input over, so a
+#: crash on one of them can have its fault PC re-captured. "socket" has no exec-time carrier.
+_RECAPTURE_MODES = ("stdin", "file", "arg", "env", "prompt")
+
+#: Runaway guard on how many distinct crashes reach the prove loop. The CLOCK is the honest bound
+#: -- every prove stage is budget-sliced and declined once the phase is spent -- so this only stops
+#: a pathological corpus from queueing hundreds of stages. It was 12 and applied to DynResult
+#: order (newest first), so the 13th distinct defect was dropped with no record; now the
+#: representatives are ranked first and a truncation is reported (`autopilot.crashes_capped`).
+_MAX_DISTINCT_CRASHES = 32
+
+#: Representatives kept for an UNRESOLVABLE `(signal, None, channel)` bucket -- one whose crashes
+#: carry no fault PC and no sanitizer key and where no re-capture can supply one (a wine PE, a
+#: foreign-arch image under qemu). One representative there meant a second, genuinely different
+#: defect of the same signal was never proved. A second is proved only after every primary has
+#: been, so it spends leftover budget, never the budget a distinct defect needed.
+_UNRESOLVED_REPS = 2
+
+
+def _crash_channel(d) -> str:
+    """The delivery channel a crash was found on: prompted stdin is its own (pacing) channel."""
+    if "prompted" in (d.isolation or ""):
+        return "prompt"
+    return d.input_mode or "stdin"
+
+
+def _fault_pc_recoverable(target) -> bool:
+    """Can `_recover_missing_fault_pcs` re-capture a fault PC for this target at all?
+
+    Native ELF on the host CPU only: the ptrace helper drives a host process. A PE (wine) has the
+    host arch but cannot be ptrace-captured as an ELF, and a foreign-arch image needs qemu."""
+    from .dynamic import sandbox
+    if not target:
+        return False
+    return (substrate.of(target.file_type).backend == substrate.NATIVE
+            and (target.file_type or "").lower() == "elf"
+            and (target.arch or "") == sandbox.host_arch())
+
+
 def _distinct_crashes(store, target_id):
+    """The distinct crashes the prove loop should take, ranked, capped at `_MAX_DISTINCT_CRASHES`."""
+    return _crash_representatives(store, target_id)[:_MAX_DISTINCT_CRASHES]
+
+
+def _crash_representatives(store, target_id):
+    """Every distinct crash bucket's representative(s), primaries first (uncapped)."""
     crashes = [d for d in DynResultDAO(store.conn).list_by_target(target_id)
                if d.crashed and d.input_sha]
-    # Recover the fault PC of any stdin crashes that would otherwise collapse into one
+    # Recover the fault PC of any crashes that would otherwise collapse into one
     # `(signal, None)` bucket, so two genuinely distinct in-code defects both reach the prove
     # loop. Hijacks stay None and keep collapsing (see `_recover_missing_fault_pcs`).
     _recover_missing_fault_pcs(store, target_id, crashes)
+    from ..db.dao import TargetDAO
+    try:
+        recoverable = _fault_pc_recoverable(TargetDAO(store.conn).get(target_id))
+    except Exception:                                    # noqa: BLE001 -- the conservative answer
+        observe.absorbed(_log, "treating the fault PC as recoverable (one rep per bucket)")
+        recoverable = True
     seen, out = set(), []
+    extra: dict = {}                                     # unresolved key -> [primary, extras...]
     for d in crashes:
         # A SIGABRT is bucketed by signal alone (its PC is in the abort/check machinery, not the
         # defect), so one double-free is proved once, not 47 times -- EXCEPT a sanitizer abort,
@@ -1271,12 +1356,29 @@ def _distinct_crashes(store, target_id):
         # A recovered IN-CODE fault PC (above) separates distinct defects of one signal -- the
         # `dump=` read vs the `name=` write -- while a hijack keeps its None PC and so stays in
         # the one `(signal, None)` bucket, i.e. a single stack smash does not fan out.
-        key = ((d.signal_name, d.defect_key) if d.defect_key
-               else (d.signal_name, d.fault_pc))
+        #
+        # An UNRESOLVED crash (no PC, no sanitizer key) is keyed by its CHANNEL too: the same
+        # signal on stdin and in an argv filename are two entry routes that need not share a
+        # defect, and folding them made the second route's crash unprovable. On a substrate where
+        # no PC can be recovered (wine, qemu) the bucket also keeps a second representative.
+        if d.defect_key:
+            key = (d.signal_name, d.defect_key)
+        elif d.fault_pc is not None:
+            key = (d.signal_name, d.fault_pc)
+        else:
+            key = (d.signal_name, None, _crash_channel(d))
         if key not in seen:
             seen.add(key)
             out.append(d)
-    return out[:12]
+            if len(key) == 3:
+                extra[key] = [d]
+        elif len(key) == 3 and not recoverable and len(extra[key]) < _UNRESOLVED_REPS \
+                and all(r.input_sha != d.input_sha for r in extra[key]):
+            extra[key].append(d)
+    # Secondaries go LAST: a possibly-duplicate representative only spends budget that every
+    # primary bucket has already had first claim on.
+    out.extend(d for reps in extra.values() for d in reps[1:])
+    return out
 
 
 # CWE classes where a static finding SHOULD be reproducible but may not fault a non-instrumented
@@ -1410,6 +1512,34 @@ def _declines_from_events(events) -> dict:
 SCORECARD_EVENT = "autopilot.scorecard"
 
 
+def _target_events(store, target, events) -> list:
+    """The subset of a case's events that belong to `target`.
+
+    A stage's events carry its `run_id`, and the run row says which target it ran on; an event
+    with no run (the autopilot's own) says so in `payload.target_id`. Kept: this target's runs,
+    case-level runs (no target), and run-less events naming this target or no target at all. On
+    any failure to read the run table the case-wide list is returned unchanged -- the old
+    behaviour, never fewer events than before."""
+    try:
+        from ..db.dao import AnalysisRunDAO
+        owner = {r.id: getattr(r, "target_id", None)
+                 for r in AnalysisRunDAO(store.conn).list_by_case(target.case_id)}
+    except Exception:                                    # noqa: BLE001 -- advisory
+        observe.absorbed(_log, "scoring from the case-wide event list")
+        return list(events)
+    out = []
+    for e in events:
+        rid = getattr(e, "run_id", None)
+        if rid and rid in owner:
+            if owner[rid] in (None, target.id):
+                out.append(e)
+            continue
+        pl = e.payload if isinstance(e.payload, dict) else {}
+        if pl.get("target_id") in (None, target.id):
+            out.append(e)
+    return out
+
+
 def _scorecard(store, target, bud, status, *, absorbed_base=None,
                settled: bool = True) -> dict:
     """What this run actually DID to the target, recorded whether or not it found anything.
@@ -1441,6 +1571,11 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
         events = list(EventDAO(store.conn).walk(case_id=target.case_id))
     except Exception:                                    # noqa: BLE001 -- advisory
         _log.debug("scorecard: event read failed", exc_info=True)
+    # THIS TARGET's events only. The walk is case-wide, so in a multi-target case (a carved
+    # firmware, a source project's several tools) one target's baseline, execution counts,
+    # declines and engine-health signals were read into ANOTHER target's card -- a target whose
+    # fuzzers never ran could report another component's campaign as its own.
+    events = _target_events(store, target, events)
     for e in events:
         pl = e.payload if isinstance(e.payload, dict) else {}
         if e.type == "dynamic.done" and "baseline" not in card:
@@ -1610,14 +1745,14 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
     # looked like a clean 'no bugs' instead of "the fuzzers could not run here, and here is why".
     # `health.summarize` folds them into {engines:[...], verdict, note}; a `none` verdict is the
     # alert that this run's dynamic coverage is a tooling outcome, not a property of the binary.
-    # (Uses the per-TARGET plan to choose which engines to report; events are the case's, so in a
-    # multi-target case an engine's signal could carry over -- acceptable, same scoping as by_engine.)
+    # (Per-TARGET plan and per-target events -- see `_target_events`.)
     try:
         from .fuzz import health as _fuzz_health
         card["fuzz_health"] = _fuzz_health.summarize(
             status.get("plan") or [],
             [{"type": e.type, "payload": e.payload} for e in events])
-        store.events.append("fuzz.health", case_id=target.case_id, payload=card["fuzz_health"])
+        store.events.append("fuzz.health", case_id=target.case_id,
+                            payload={**card["fuzz_health"], "target_id": target.id})
     except Exception:                                    # noqa: BLE001 -- advisory, never fail on it
         _log.debug("fuzz-health summary failed for %s", target.id, exc_info=True)
     store.events.append(SCORECARD_EVENT, case_id=target.case_id, payload=card)
@@ -1636,6 +1771,36 @@ _HUGE_BINARY_MB = 90
 #: Default safety ceiling for a run-to-convergence run when the operator set no minutes: a long but
 #: bounded campaign (6h), so a wedged/slow target cannot run forever.
 _CONVERGENCE_CEILING_SECONDS = 21600.0
+
+
+def _target_failed(store, case_id: str, tid: str, exc: BaseException, status: dict) -> None:
+    """Record that one target's analysis raised, so the worklist can move on WITHOUT hiding it.
+
+    Three places carry it, because any one of them may be the thing that is broken: the run's
+    status dict (always writable -- it is in memory, and it is what the GUI polls), the plan row
+    of the stage that was in flight, and an `autopilot.target_error` event. The event write is
+    itself guarded: the commonest cause of getting here is a transient 'database is locked', and a
+    second lock error while reporting the first must not abort the remaining targets either.
+    """
+    import traceback
+    err = f"{type(exc).__name__}: {exc}"
+    stage = status.get("stage")
+    _log.error("autopilot: target %s failed in stage %s; continuing with the next target",
+               tid, stage, exc_info=(type(exc), exc, exc.__traceback__))
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)[-3:])[-1500:]
+    status.setdefault("target_errors", []).append(
+        {"target_id": tid, "stage": stage, "error": err[:300], "ts": time.time()})
+    if stage:
+        _plan_set(status, stage, "error", f"target analysis aborted: {err[:120]}")
+    _finalize_plan(status)
+    try:
+        store.events.append("autopilot.target_error", level="error", case_id=case_id,
+                            payload={"target_id": tid, "stage": stage, "error": err[:500],
+                                     "traceback": tb,
+                                     "note": "this target's analysis stopped here; the remaining "
+                                             "targets were still analysed"})
+    except Exception:                                    # noqa: BLE001 -- status already has it
+        observe.absorbed(_log, "target error recorded in status only", target_id=tid)
 
 
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
@@ -1695,616 +1860,636 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # single baseline taken at the top would add the first target's absorptions to the
             # second one's scorecard. Firmware carving registers a child target per component,
             # so several targets per case is the normal shape.
-            absorbed_base = observe.absorbed_counts()
-            t = store.targets.get(tid)
-            if not t:
-                continue
-            # A SIBLING TARGET HAS NEVER BEEN TRIAGED. The caller triages the target it hands
-            # us; the executables a source project also built were registered by `ingest` and
-            # nothing triaged them, so `file_type`, `arch` and `bits` were NULL for every one of
-            # libtiff's five extra tools. That is not a cosmetic gap: `coverage_fuzz` reads
-            # `target.arch` to find the matching afl-qemu-trace, got None, fell through to the
-            # un-suffixed lookup (this machine has afl-qemu-trace-x86-64, not a bare
-            # afl-qemu-trace) and ERRORED -- twice in one run, on a native x86-64 ELF the stage
-            # could have fuzzed. Every substrate guard keys off `file_type` too, so an untriaged
-            # target gets the wrong answer from each of them.
-            # When no budget was specified (the web Autopilot button sends none), scale the default
-            # by the binary's size rather than using a flat 900s: a 20-100MB binary spends most of a
-            # short budget on recon before the fuzzers get a slice -- exactly how a real large-binary
-            # run came back with only static findings. An explicit --budget / budget_seconds always
-            # wins; this only fills the "caller sent nothing" case. (CLI passes an explicit default,
-            # so it is unaffected; this is the web/API path.)
-            eff_budget = budget_seconds
-            if eff_budget is None:
-                _mb = (t.size or 0) / 1_000_000.0
-                eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
-                                 min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
-            # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
-            # operator's intent is "keep going until coverage plateaus". The slider's minutes are
-            # that ceiling when given; with none, use a high default (6h) so a long campaign is
-            # bounded but not cut short. (The coverage-plateau auto-stop + stalled-engine auto-skip
-            # is the next increment; today the run uses the ceiling and the live coverage/health
-            # panel shows the plateau for the operator to stop on.)
-            if converge and budget_seconds is None:
-                eff_budget = _CONVERGENCE_CEILING_SECONDS
-            bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages,
-                                        pause=pause)
-            status["budget"] = bud.spent()                # serializable; refreshed as we go
-            if not t.file_type:
-                _staged(bud, store, t, "ingest_triage", status, stop)
-                t = store.targets.get(tid) or t
-            else:
-                # already triaged (a re-run): mark the plan row done rather than leaving it
-                # "pending" -> "skipped", which read as "Triage never ran" in the rail.
-                _plan_set(status, "ingest_triage", "done", "already triaged")
-            # EXECUTIONS, not seconds. The clock is the operator's unit, but what a second
-            # BUYS is not constant: an ASan build of the same binary runs ~5x slower, and it is
-            # the only configuration whose oracle can see a heap out-of-bounds access at all.
-            # Dividing seconds therefore handed the search that can find the bug a 5x smaller
-            # one. See budget.exec_rate / budget.CaseBudget.slice(want_execs=...).
-            _sub = substrate.of(t.file_type)
-            _san = False
+            # PER-TARGET ISOLATION. Everything below runs inside one try: an unhandled exception
+            # while analysing target #3 (a transient 'database is locked' on an event write, a
+            # helper that raises on an odd binary) used to propagate to the case-level handler and
+            # abort targets #4..N, so a ten-component firmware run ended after three with the rest
+            # never analysed. The failure is RECORDED (event + status + plan row), never swallowed,
+            # and the worklist moves on.
             try:
-                from .fuzz.aflpp import is_sanitizer_build
-                _san = is_sanitizer_build(ctx_bytes := store.content.path(t.sha256).read_bytes())
-                del ctx_bytes
-            except Exception:                            # noqa: BLE001 -- advisory
-                observe.absorbed(_log, "keeping the default")
-            bud.set_exec_rate(budget_mod.exec_rate(_sub.execs_per_sec, sanitizer=_san))
-            if _san:
-                _adv = bud.advice()
-                ctx_note = _adv["note"]
-                store.events.append("budget.exec_rate", case_id=t.case_id,
-                                    payload={"target_id": t.id, "sanitizer": True, **_adv})
-                _log.info("instrumented build: %s", ctx_note)
-            # The plan is built AFTER triage, not before: it is chosen from the target's
-            # substrate, and for an untriaged target that was an empty string.
-            _init_plan(status, t, len(done_tids), len(worklist))
-            # Large-binary mode. Past a size where whole-binary structural analysis and whole-program
-            # symbolic execution stop being tractable, the reachable attack surface is still best
-            # explored by EXECUTION -- coverage + directed fuzzing (the afl handshake-timeout fix now
-            # survives a big binary) -- not by angr loading the whole image. `size_mb` gates the
-            # doomed symbolic lane below and the note tells the operator to give it a large budget.
-            size_mb = (t.size or 0) / 1_000_000.0
-            if size_mb >= _LARGE_BINARY_MB:
-                store.events.append("autopilot.large_binary", case_id=t.case_id, payload={
-                    "target_id": t.id, "size_mb": round(size_mb, 1),
-                    "mode": "huge" if size_mb >= _HUGE_BINARY_MB else "large",
-                    "note": ("every lane still runs -- nothing is skipped by size. The expensive "
-                             "ones are SCOPED to stay tractable: structural analysis prioritises the "
-                             "attack-surface functions and symbolic execution loads lib-free and "
-                             "explores from a bounded budget. Give it a large --budget (hours for a "
-                             "~100MB binary) so the scoped lanes have room.")})
-            # A firmware image is not a program: carve it into its embedded binaries (each registered
-            # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
-            # and misses every component + secret.
-            if (t.file_type or "").lower() == "firmware":
-                # CVE-fingerprint the image's OWN bytes first: a monolithic RTOS image (VxWorks,
-                # bare-metal) statically links its libraries, so a vulnerable zlib/openssl/etc.
-                # lives as a version banner in the container itself with no filesystem to carve
-                # and no standalone ELF to extract. The byte-scan finds it either way.
-                _staged(bud, store, t, "cve_scan", status, stop)
-                _staged(bud, store, t, "firmware_carve", status, stop)
-                # A bare-metal image (no filesystem, no embedded ELF) is a Cortex-M blob: rehost
-                # it under Unicorn and fuzz its modelled MMIO inputs. The stage self-gates to a
-                # detected Cortex-M reset-vector table, so it is a cheap no-op otherwise.
-                _staged(bud, store, t, "firmware_rehost", status, stop)
-                for sub in store.targets.list_by_case(case_id):
-                    if sub.id not in done_tids and sub.id not in worklist:
-                        worklist.append(sub.id)
-                _finalize_plan(status)
-                continue
-            # A runtime-packed executable (UPX) is a compressed stub around the real program: the
-            # machine-code stages would analyse the decompressor, not the code. Unpack it into a
-            # child target and analyse THAT, exactly as a firmware image is carved into its binaries.
-            if _looks_packed(store, t):
-                _staged(bud, store, t, "unpack", status, stop)
-                for sub in store.targets.list_by_case(case_id):
-                    if sub.id not in done_tids and sub.id not in worklist:
-                        worklist.append(sub.id)
-                _finalize_plan(status)
-                continue
-            # THE FLOOR, before any analysis: can this image be executed here at all, and what
-            # does it do with one input? Measured on stock /usr/bin binaries, this stage --
-            # whose own capability description is "Run once, to see the target work" -- was
-            # registered, wired to the API and offered in the UI, and the autopilot never called
-            # it. So the pipeline's first execution of an arbitrary target happened inside a
-            # fuzzer twenty stages later, and if anything upstream consumed the budget the
-            # program was never run at all while the report still showed corroborated findings.
-            #
-            # It is also the cheapest honest signal there is: a target that cannot start (wrong
-            # loader, missing runtime, needs an argument) is a different situation from one that
-            # runs and survives, and every later stage's result is read in that light.
-            bud.phase("recover")
-            # WEAPONIZE FIRST, before anything that can spend the phase allowance. The crashless
-            # build_exploit(strategy="auto") recovers its own IP-control offset with a deterministic
-            # cyclic probe and drives the ret2win / ret2libc / cross-arch ret2libc chain -- a ~1 s
-            # path to L3 on every buildable ISA **[measured 2026-10-19: aarch64 1.1s, s390x 1.0s,
-            # ppc 0.9s, riscv64 0.9s, loongarch 1.3s, each a verified shell]**. It MUST precede the
-            # two stages below: `dynamic_run` blocks on a target that reads stdin and waits out its
-            # whole slice, and `disassemble` is heavy on a large static binary -- together they
-            # time out and consume the entire recover allowance, so build_exploit scheduled after
-            # them (or in `prove`, after fuzz/concolic have burned the wall clock) is handed 0 s and
-            # skipped "no budget left", on EVERY run. The qemu-gated fuzzer rarely lands the overflow
-            # crash that this probe finds instantly, so for a cross-arch target this is the ONLY
-            # route to a demonstrated shell -- the previous placement left them stuck at L1. Gated
-            # on < L3 so a target already weaponized elsewhere pays nothing, and the stage self-gates
-            # per arch/mitigation (PIE-emulated, managed runtimes, no gadget) and declines cheaply.
-            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
-                _staged(bud, store, t, "build_exploit", status, stop,
-                        {"strategy": "auto"}, want=60.0)
-            # THE FLOOR: run once to see the target work, then recover + detect.
-            _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
-            # Recover + detect.
-            _staged(bud, store, t, "disassemble", status, stop)
-            _staged(bud, store, t, "detect_cwe", status, stop)
-            _staged(bud, store, t, "cve_scan", status, stop)
-            # Known-CVE scan of a built-from-source project's declared dependencies + vendored
-            # headers -- versions that never survive into the compiled binary's banners.
-            _staged(bud, store, t, "source_cve_scan", status, stop)
-            # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
-            _staged(bud, store, t, "embedded_audit", status, stop)
-            # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
-            _staged(bud, store, t, "int_overflow_scan", status, stop)
-            # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
-            _staged(bud, store, t, "uaf_scan", status, stop)
-            # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
-            _staged(bud, store, t, "source_sink_scan", status, stop)
-            # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
-            # an expected token, a menu command -- by breaking on its comparison functions. Those
-            # are the values every later stage needs in order to get PAST a gate, so this belongs
-            # before the campaigns, not after them. Native-arch + gdb only; self-gates.
-            _staged(bud, store, t, "extract_secrets", status, stop, want=30.0)
-            # Package any hard-coded credential detect_cwe found (CWE-798/321) into a verified,
-            # self-contained PoC. It is the one demonstrated-effect class that needs NO crash --
-            # deterministic, offline, and it never executes the target, so it costs nothing and
-            # can never be starved by the fuzzing budget. It must follow detect_cwe, whose
-            # findings it promotes rather than duplicates.
-            _staged(bud, store, t, "synthesize_secret", status, stop, want=20.0)
-            # A SOCKET SERVER has to be fuzzed before anything else touches it. Such a target
-            # blocks in accept() and never reads stdin, so every stage that drives it that way --
-            # the injection prober, the crashless exploit ladder, the OOB-index driver, the generic
-            # fuzzers -- waits out its full timeout and finds nothing, draining the budget before
-            # the one channel that works is ever tried. net_fuzz crashes such a server in about
-            # three execs. It self-gates on bind/listen/recvfrom imports, so a non-server pays
-            # nothing for being asked first.
-            try:
-                from ..db.dao import CallEdgeDAO as _CE  # imported here: the module-level name
-                from .fuzz import netfuzz as _nf  # lives in _ranked_channels, not this scope
-                _is_server = _nf.detect_server(_CE(store.conn).list_by_target(tid))[1]
-            except Exception:
-                _log.debug("server detection failed for %s", tid, exc_info=True)
-                _is_server = False
-            if _is_server:
-                _staged(bud, store, t, "net_fuzz", status, stop, want=45.0)
-            else:
-                # Not a server -> net_fuzz is INAPPLICABLE, not a budget casualty. If left unstaged
-                # it stays `pending` and _finalize_plan turns it into "skipped", which the health
-                # panel then renders as "no budget left / not reached" -- a misleading tooling
-                # verdict for a binary that simply has no socket to fuzz. Record the honest decline.
-                why = "no socket-server imports (bind/listen/accept/recvfrom) -- not a server"
-                _plan_set(status, "net_fuzz", "declined", why)
-                _emit_stage(store, t.case_id, "net_fuzz", "declined", target_id=tid, detail=why)
-            # An IPC/protocol boundary (a unix socket, a pipe, a datagram listener) is a channel
-            # the generic fuzzers cannot reach at all: they drive stdin/argv/files. It discovers
-            # its own channel and declines when there is none, so a plain binary pays nothing.
-            _staged(bud, store, t, "boundary_fuzz", status, stop, want=45.0)
-            # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
-            # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
-            # CWE-class probes -- recording a verified reproduction only if the target faults.
-            _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
-            # Demonstrate injection / format-string leaks by probing the binary's sinks directly
-            # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
-            _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
-            # (The crashless, leak-centric build_exploit(strategy="auto") -- canary-bypass
-            # ret2win/ret2libc, the format-%n saved-return overwrite, the heap FSOP chain, the ASLR
-            # info-leak, and the overflow-offset ret2libc all in one -- now runs FIRST in this phase,
-            # before dynamic_run/disassemble can spend the allowance; see the top of the block. It
-            # used to sit here, last in the phase, where it was handed 0 s and skipped on every run.)
-            # SEARCH: everything from here actually executes the target with attacker input, so
-            # it gets the largest share and the phase reserve stops an earlier stage spending it.
-            bud.phase("search")
-            # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
-            channels = _ranked_channels(store, tid)
-            primary = channels[0] if channels else None
-            dyn = {"input_mode": primary} if primary else {}
-            # PINNING a channel is right only when something chose it. The `fuzz` stage splits
-            # its budget across every channel it is given, and passing one collapses that sweep
-            # to a single guess -- which on `zigzag` (static-pie, stripped: no import table to
-            # rank by) was the wrong guess, so the campaign spent its whole slice delivering
-            # input where the program never reads it and managed nine executions. With no
-            # evidence to pin on, hand the stage nothing and let it sweep all three at a third
-            # of the budget each. A target whose imports DID say something keeps the full slice
-            # on the channel they named.
-            from .poc.capture import no_import_evidence as _no_imports
-            _blind = not channels or _no_imports(t)
-            fz = {} if _blind else dyn
-            # A target that does not terminate pays its FULL per-execution timeout every time,
-            # so the campaigns get single-digit executions out of a whole slice. The input is
-            # consumed long before the program blocks, so a short timeout reaches the same code
-            # and buys forty times the executions.
-            _nonterm = _baseline_timed_out(store, tid)
-            if _nonterm:
-                dyn = dict(dyn, exec_timeout=_NONTERM_EXEC_TIMEOUT)
-                fz = dict(fz, exec_timeout=_NONTERM_EXEC_TIMEOUT)
-                _emit_stage(store, t.case_id, "dynamic_run", "note", target_id=tid,
-                            detail=(f"the baseline did not terminate, so the campaigns use a "
-                                    f"{_NONTERM_EXEC_TIMEOUT:g}s per-execution timeout"))
-            # Run-to-convergence: the coverage campaign stops on AFL's own plateau signal
-            # (AFL_EXIT_WHEN_DONE) instead of burning the whole ceiling. Threaded via the dynamic
-            # params so coverage_stage -> aflpp.run_campaign sees it.
-            if converge:
-                dyn = dict(dyn, converge=True)
-                fz = dict(fz, converge=True)
-            # DISCOVERY that needs NO fuzzer crash -- run it BEFORE the budget-draining fuzz/concolic,
-            # for the same reason as the crashless weaponization above: a menu-driven heap / OOB target
-            # rarely yields a blind-mutation crash, so with the old ordering heap_trace + oob_index +
-            # chain_primitive were starved (the conformance harness caught a UAF-read heap failing here
-            # for exactly this reason). heap_check (libc guard pages) + the custom-allocator UAF/
-            # double-free trace + OOB-index discovery, then chain their primitives into a demonstrated
-            # hijack / L2 recipe (chain_primitive consumes those Findings).
-            # heap_check (libc guard pages), heap_trace (custom-allocator UAF/double-free) and
-            # oob_index (OOB-index discovery) are three INDEPENDENT discovery passes -- none reads a
-            # Finding or artifact another writes (heap_check -> detector "heap_monitor"; heap_trace ->
-            # "heap_trace"; oob_index -> "oob_index"), so they run concurrently under the pool's
-            # per-class caps (the single sandbox governor), halving this phase on a multi-core box
-            # without oversubscribing the sandbox. chain_primitive then runs SERIALLY after them --
-            # its _lead_finding consumes the heap_trace / oob_index Findings, so it must see them done.
-            # Budgeted: each discovery pass gets a slice of the phase, so a non-terminating target
-            # cannot make one of them (heap_check/heap_trace drive the live process repeatedly) run
-            # for hundreds of seconds and blow the case budget. `want` is generous so a legitimate
-            # menu-driven heap target is not starved; `budget.slice` caps it to what the phase affords.
-            # A target whose baseline never terminates (a server that blocks forever) cannot be
-            # menu-crawled -- every option-drive just hits its timeout -- so the crawl-driven
-            # discovery passes are told, and skip the crawl with a clear note instead of wedging
-            # for their whole slice and being hard-reclaimed (which read as an ERROR, not a
-            # deliberate skip). heap_check is a single guarded run, already bounded, and keeps the
-            # short per-exec timeout from `dyn`.
-            _ht = {"baseline_nonterm": True} if _nonterm else None
-            _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", _ht),
-                                          ("oob_index", _ht)], status, stop,
-                               budget=bud, want=90.0)
-            # A defect that never crashes is invisible to every stage above and below this one.
-            # Shadow memory sees an uninitialised read as it happens, and tells a disclosure --
-            # undefined bytes reaching a write syscall, which IS the effect -- from a merely
-            # internal one. Native-ELF only and ~10-30x a bare run, so it is a bounded pass over
-            # a few inputs here rather than anything inside a campaign.
-            _staged(bud, store, t, "mem_oracle", status, stop, want=60.0)
-            _staged(bud, store, t, "chain_primitive", status, stop, want=45.0)
-            # Search. The CHANNEL-SPECIFIC fuzzers go first, because each one knows the channel its
-            # target actually reads and both self-gate to the imports that prove it (bind/listen/
-            # recvfrom; getenv), so a target they do not apply to pays nothing. Running them after
-            # the generic sweeps starved them: a socket server BLOCKS in accept(), so every
-            # stdin/argv/file exec runs to its timeout and drains the budget before net_fuzz is ever
-            # reached -- while net_fuzz crashes the same server in about three execs. The generic
-            # coverage/directed sweeps then follow for whatever the binary reads conventionally.
-            _staged(bud, store, t, "env_fuzz", status, stop, want=45.0)
-            # On an EXPENSIVE SUBSTRATE, synthesize the static overflow BEFORE the campaigns for
-            # exactly the reason net_fuzz moved ahead of them. Wine, the JVM and qemu cannot be
-            # batched (sandbox.run_batch returns None for them), so every execution pays a fresh
-            # interpreter/emulator start-up -- seconds, not milliseconds. A coverage campaign then
-            # eats the whole time budget and the run never reaches synthesize_poc at the end, even
-            # though that stage demonstrates this bug class in ONE detonation from the recovered
-            # stack frame. Measured on a mingw PE whose scanf("%s") overflow synthesize_poc proves
-            # instantly: the full autopilot spent its entire budget fuzzing under wine and finished
-            # at L0. Native targets keep the original order -- there, fuzzing is cheap and finds
-            # strictly more. The stage no-ops without recovered stack buffers.
-            if _expensive_substrate(t):
-                _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
-            # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
-            # strongest crash finder available -- thousands of executions a second with a
-            # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
-            # own harness and reports unsupported for a binary-only target.
-            # In-process fuzzing is the engine built for a library, and on one it outproduces
-            # everything else by orders of magnitude (libtiff 4.0.3: a sanitizer finding in 36
-            # executions, where 14,821 external file-channel executions found none).
-            #
-            # It is FIRST among the campaigns and inside the SEARCH phase, both for the same
-            # reason. It used to be scheduled in `recover`, beside `disassemble` and
-            # `detect_cwe`, and a campaign budgeted as recovery is capped by the 30% allowance
-            # that phase gets. Measured on the libtiff tarball at 600s per target:
-            # `disassemble` took 138s and `detect_cwe` 237s (and was CANCELLED anyway), so the
-            # allowance was gone and the autopilot skipped the one engine that finds this
-            # library's bug -- "libfuzzer: skipped, no budget left in the recover phase". The
-            # same tarball at 900s had enough slack for it to run, found the heap overflow and
-            # produced a verified PoC. That difference was budget luck, not design.
-            _staged(bud, store, t, "libfuzzer", status, stop, want=180.0)
-            # THE REST OF THE LIBRARY. One `libfuzzer` call fuzzes the strongest entry point,
-            # which on a real library is a fraction of its input surface: libtiff 4.0.3 offers
-            # six doors the synthesizer can reach and the campaign went through one of them. The
-            # second call takes the next few, and it is a SEPARATE call so that the first keeps
-            # its full slice -- breadth is worth having, and not at the price of the depth that
-            # found the bug the first harness finds. Each harness links objects the first compile
-            # already produced (measured: 13.4 s for the first, 0.5 s for each of the next five),
-            # so the extra reach costs fuzzing time and almost no build time.
-            #
-            # Guarded by what the stage ITSELF reported, because only it has the source tree and
-            # so only it can say how many entry points exist. The case budget decides whether
-            # there is room: this is a sampler in the search phase like any other, so the solver's
-            # reserve and the prove phase's are untouched by it.
-            _lf = _last_done_payload(store, t, "libfuzzer") or {}
-            if _lf.get("more_entry_points") and not stop.is_set():
-                _staged(bud, store, t, "libfuzzer", status, stop,
-                        {"harness_from": int(_lf.get("next_entry_point") or 1),
-                         "harness_max": _MORE_ENTRY_POINTS}, want=180.0)
-            # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same
-            # channel -- EXCEPT on a non-native image, where AFL cannot apply at all. AFL
-            # instruments machine code: a .class/.jar is bytecode and a PE runs under wine, so
-            # coverage_fuzz got as far as AFL++ qemu-mode and then ERRORED ("needs afl-qemu-trace"),
-            # which is not the documented "falls back to blind". directed_fuzz then had no recovered
-            # functions to direct at and synthesize_poc has no stack frame to work from, so a JVM
-            # target reached the end of the ladder having executed the program ZERO times.
-            #
-            # The blind campaign is the right stage for these and already knows them -- it carries
-            # the measured per-execution costs for wine (~1/s) and the JVM (~36/s) and reads a
-            # defect as an uncaught exception rather than a signal -- but the autopilot never ran
-            # it: "fuzz" appeared only in the stage registry. It splits its budget across every
-            # channel, which is what this needs, since a bytecode target has no call edges and so
-            # no channel ranking either.
-            # Size the primary campaigns to the OPERATOR'S budget, not a fixed exec count: a large
-            # --budget must buy a longer search. affordable_execs() is this stage-share's execs at
-            # the target's rate; max() keeps the meaningful floor on a small budget, and slice()
-            # still caps each call to the single-stage share + phase reserve so one campaign cannot
-            # eat the case. Before this, a fixed 12-18k execs ran ~30s regardless of budget -- the
-            # "raising --budget did nothing, directed fuzzing still cut out at 30s" an operator hit.
-            _camp_execs = max(_CAMPAIGN_EXECS, bud.affordable_execs())
-            _dir_execs = max(_DIRECTED_EXECS, bud.affordable_execs())
-            if _nonnative_image(t):
-                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
-            elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
-                         want_execs=_camp_execs) != "done" or \
-                    bud.slice("fuzz") > 0:
-                # The blind campaign is a SECOND campaign, not only a fallback. Measured on
-                # /usr/bin/xxd with a 400s budget: coverage_fuzz returned "done" after 22s of a
-                # 97s allowance -- AFL finishing early is not AFL having searched -- and because
-                # `fuzz` was reached only when coverage_fuzz failed, the remaining 75 seconds of
-                # the search phase went unspent. The two look for different things (one is
-                # coverage-guided and single-channel, the other splits its budget across every
-                # channel the target reads), so with budget left both are worth running.
-                #
-                # AFL can also abort for reasons that say nothing about the target: its dry run is
-                # FATAL on a single seed that times out ("results in a timeout",
-                # perform_dry_run()), a missing qemu tracer ends it, a forkserver handshake can
-                # fail. Without a fallback the one campaign a native target gets simply does not
-                # happen, and the run then reports only static findings -- "nothing was run"
-                # wearing the face of "nothing was found", at campaign scale. The blind stage
-                # carries none of those preconditions, so it runs the same corpus regardless.
-                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
-            # THE REST OF THE DISPATCH TABLE. A multi-call binary is many programs behind one
-            # image and the campaign above drove ONE of them -- the deepest parser among the
-            # doors the stage verified by running them. busybox 1.21.1 opens 14: every
-            # decompressor it carries, which is also where its own CVE list starts (an
-            # out-of-bounds read in unlzma). Taking the next few is the `libfuzzer` breadth pass
-            # again with no build to repeat, so it costs only fuzzing time.
-            _mc = (_payloads_of(store, t, "fuzz.multicall") or [{}])[-1]
-            _rest = [d for d in (_mc.get("doors") or []) if d != _mc.get("chosen")]
-            for _door in _rest[:_MORE_MULTICALL_DOORS]:
-                if stop.is_set():
-                    break
-                _staged(bud, store, t, "fuzz", status, stop, dict(fz, multicall_door=_door),
-                        want_execs=_camp_execs)
-            _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_dir_execs)
-            crashes = _distinct_crashes(store, tid)
-            # Multi-channel retry: the best-guess channel is not always where the bug is (a file
-            # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
-            # directed fuzzer at each of the OTHER channels before spending concolic's budget.
-            if not crashes and not stop.is_set():
-                for j, alt in enumerate([c for c in channels[1:] if c != primary]):
-                    if stop.is_set():
-                        break
-                    _staged(bud, store, t, "directed_fuzz", status, stop,
-                                      {"input_mode": alt, "seed": 91 + j})
-                    crashes = _distinct_crashes(store, tid)
-                    if crashes:
-                        store.events.append("autopilot.channel_hit", case_id=t.case_id,
-                                            payload={"target_id": tid, "mode": alt})
-                        break
-            # Run concolic when the search found nothing OR left the binary under-covered: a low
-            # block-coverage number means guarded branches (magic values, length checks) were
-            # never reached -- exactly what concolic solves for.
-            cov_pct = _best_block_pct(store, tid)
-            want_concolic = not crashes or (cov_pct is not None and cov_pct < 60)
-            # An ON-DEMAND harness run leaves function-level leads the fuzzer did not reach from the
-            # entry: force the steered concolic pass so it drives toward those functions (seeded with
-            # the harness's gate-passing inputs, now DynResult rows) even when other crashes exist --
-            # otherwise a harness-only lead would never be escalated. Gated on harness having run, so
-            # the default plan (no harness) is unaffected ("stop adding fuzzing to every run").
-            if not want_concolic and _has_unproven_harness_leads(store, tid):
-                want_concolic = True
-            # Concolic runs REGARDLESS of size -- a large binary must not lose the symbolic-execution
-            # capability. It is kept tractable by SCOPING, not skipping: angr loads with
-            # auto_load_libs=False and explores from a bounded state/step budget, and on a large
-            # binary the orchestrator hands it the attack-surface targets rather than the whole image
-            # (see concolic's own large-binary handling). A longer slice on a large binary so the
-            # scoped exploration has room.
-            if want_concolic:
-                _concolic_want = 240.0 if size_mb >= _LARGE_BINARY_MB else 120.0
-                _staged(bud, store, t, "concolic", status, stop, dyn, want=_concolic_want)
-                # Close the coverage loop: re-fuzz once more, now that directed_fuzz automatically
-                # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
-                # guarded branches concolic just unlocked, instead of the run ending at them.
-                _staged(bud, store, t, "directed_fuzz", status, stop,
-                        {**dyn, "seed": 4242}, want=120.0)
-                crashes = _distinct_crashes(store, tid)
-            # Static-overflow synthesis: an unbounded stack overflow (gets(), a size-less strcpy,
-            # scanf("%s")) needs a long, NEWLINE-FREE payload that blind mutation almost never
-            # generates -- a stray 0x0a ends gets() before the frame is smashed -- so the fuzzer
-            # reports full block coverage and zero crashes on a binary whose bug is glaringly
-            # static. Derive the overflow straight from the recovered stack frame and detonate once
-            # over the channel the binary reads; on a fault it files a verified L1 crash exactly
-            # like a fuzzer-found one, which the exploit ladder below then builds into L2/L3. The
-            # stage no-ops when no stack buffers were recovered, so it is safe to run generally.
-            # Run it when the fuzzer found NOTHING, and also when it found crashes that do not
-            # include an overflow: a binary with two defects (say a format sink on one menu branch
-            # and a scanf("%s") overflow on another) gives the fuzzer the easy one, and gating on
-            # `not crashes` then skipped the synthesis the hard one needs -- so "find every crash"
-            # held for one defect per target but not for several in one binary. The stage no-ops
-            # when no stack buffers were recovered, so the added cost is one detonation.
-            # ...and when a RECOVERED FRAME still has no PoC of its own. The gate above asks
-            # whether an overflow was demonstrated ANYWHERE on the target, which is not the same
-            # question: a binary with two unbounded buffers gets one crash from the fuzzer, the
-            # target then "has a demonstrated overflow", and the second buffer's static finding
-            # keeps its `candidate` state forever. Measured across 22 kept conformance stores,
-            # `stack_frame/CWE-121` stayed below poc-backed 5 times out of 5 -- every occurrence --
-            # and the stage that exists to prove exactly that shape was never asked. One
-            # detonation per unproven frame lead is the whole cost.
-            if not stop.is_set() and (not crashes
-                                      or not _has_demonstrated(store, tid, _OVERFLOW_CWES)
-                                      or _unproven_frame_lead(store, tid)):
-                _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
-                crashes = _distinct_crashes(store, tid)
-            # CVE -> exploit chain: which of these crashes were REPRODUCED by a matched-CVE trigger,
-            # so if the ladder escalates one we can attribute the exploit back to the CVE. Accumulate
-            # the BEST level reached per CVE and record once at the end (so an L3 is not masked by an
-            # earlier L2 record that shares the finding's dedup key).
-            cve_origin = _cve_crash_origins(store, tid)
-            cve_best: dict = {}
-
-            def _note_escalation(cve, before, tid=tid, cve_best=cve_best):
-                after = _max_verified_poc_level(store, tid)
-                if cve and after > before and after >= 2:    # the ladder raised THIS CVE crash to L2/L3
-                    cve_best[cve] = max(cve_best.get(cve, 0), after)
-            # PROVE what the search found. This phase keeps no reserve -- it is last, and every
-            # crash it is given is already evidence that something is there. The reserve the
-            # search phase held back exists for exactly this: a campaign that finds a crash in
-            # its final seconds must still have time to root-cause and prove it.
-            bud.phase("prove")
-            # Prove each distinct crash.
-            for cr in crashes:
-                if stop.is_set():
-                    break
-                p = {"input_sha": cr.input_sha}
-                cve = cve_origin.get(cr.input_sha)
-                lvl0 = _max_verified_poc_level(store, tid) if cve else 0
-                _staged(bud, store, t, "root_cause", status, stop, p, want=60.0)
-                _staged(bud, store, t, "build_poc", status, stop, p, want=60.0)
-                _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
-                _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
-            if crashes and not stop.is_set():
-                # WEAPONIZE EACH DISTINCT CRASH, best first. This ran once, on `crashes[0]` -- so a
-                # binary with three defects got three PoCs (the loop above) but only ever ONE
-                # exploit, and `crashes[0]` is DynResult order, which says nothing about which
-                # crash is exploitable. Ordering by what each crash has already demonstrated means
-                # the one that reached IP control is tried before the sanitizer abort that cannot
-                # be. Now EVERY distinct crash is weaponized (best-first), not just the top three;
-                # the budget declines the rest when the clock is gone, so the clock -- not an
-                # arbitrary count -- is the honest bound. `_MAX_EXPLOITS` is only a safety ceiling.
-                ordered = _exploit_order(store, tid, crashes)[:_MAX_EXPLOITS]
-                for cr_x in ordered:
-                    if stop.is_set():
-                        break
-                    rep_x = {"input_sha": cr_x.input_sha}
-                    cve_x = cve_origin.get(cr_x.input_sha)
-                    lvl_x = _max_verified_poc_level(store, tid) if cve_x else 0
-                    _staged(bud, store, t, "build_exploit", status, stop, rep_x, want=60.0)
-                    _note_escalation(cve_x, lvl_x)       # ran on THIS CVE crash's input
-                rep = {"input_sha": ordered[0].input_sha}
-                _staged(bud, store, t, "behavior_trace", status, stop, rep, want=45.0)
-                _staged(bud, store, t, "dynamic_taint", status, stop, rep, want=60.0)
-                # Follow fork/exec and blame the CHILD. A forking server or a target that
-                # execve()s a helper faults in a process the ordinary single-process capture
-                # never sees, so without this the crash is attributed to the parent or missed
-                # entirely. gdb-only and native-only; self-gates and says so.
-                _staged(bud, store, t, "multi_debug", status, stop, rep, want=45.0)
-                # Break on the dangerous calls live and record the arguments they were actually
-                # reached with -- the runtime counterpart to the static sink findings.
-                _staged(bud, store, t, "debug_monitor", status, stop, rep, want=45.0)
-            for cve, lvl in cve_best.items():            # one CVE->exploit link per CVE, at its best
-                _record_cve_weaponized(store, t, cve, lvl)
-            # Format-string -> shell WITHOUT a crash. A reachable printf(user) sink is an L3
-            # candidate on its own -- overwrite printf@GOT with system and send "/bin/sh" -- and
-            # needs no crashing input, but build_exploit otherwise runs only for a crash (above),
-            # so a crashless format bug topped out at the synthesize_injection L1 leak. When a
-            # CWE-134 finding was corroborated and the ladder has not already reached L3, drive the
-            # format strategy directly. The stage self-gates (x86-64, writable GOT, a looping sink)
-            # and reports an honest ceiling (full-RELRO / PIE blocks the GOT overwrite) rather than
-            # faking it -- so the demonstrated info-disclosure stands and RCE stays potential.
-            if not stop.is_set() and _unexploited(store, tid, {"CWE-134"}):
-                # `candidate` counts. The gate asked for a CORROBORATED CWE-134, and the
-                # detector that finds a printf sink is static -- it files `candidate` and stays
-                # there unless something else happens to confirm it. Measured across 22 kept
-                # conformance stores: `dangerous_api/CWE-134` appeared 12 times and was below
-                # corroborated in 10 of them, so on ten targets with a format sink the L3 strategy
-                # was never attempted at all. The stage self-gates hard (x86-64, a writable GOT, a
-                # sink reached in a loop) and reports an honest ceiling when it cannot, so the cost
-                # of asking is bounded and the cost of not asking is the whole rung.
-                fmt_hit = any(f.cwe == "CWE-134" for f in FindingDAO(store.conn).list_by_target(tid))
-                if fmt_hit:
-                    _staged(bud, store, t, "build_exploit", status, stop,
-                                      {"strategy": "format"})
-            # Menu-driven glibc-heap -> shell WITHOUT a crash. A notebook/heap-menu target
-            # (malloc/free pair + a numbered add/free/view/edit menu) is an L3 candidate via the
-            # tcache-poison + House-of-Apple-2 chain, which needs no crashing input -- but
-            # build_exploit's heap path runs only on a crash (above) or the `auto` strategy, which
-            # the autopilot never reaches for a crashless target. Drive strategy="heap" directly
-            # when the binary looks like a heap menu and the ladder has not reached L3. The stage
-            # self-gates (confirms only by a spawned shell; a target whose primitive is not
-            # discovered or whose menu does not match just returns an honest "not confirmed"), so
-            # this is a bounded attempt, not a false positive.
-            if not stop.is_set() and _unexploited(store, tid, _HEAP_CWES):
+                absorbed_base = observe.absorbed_counts()
+                t = store.targets.get(tid)
+                if not t:
+                    continue
+                # A SIBLING TARGET HAS NEVER BEEN TRIAGED. The caller triages the target it hands
+                # us; the executables a source project also built were registered by `ingest` and
+                # nothing triaged them, so `file_type`, `arch` and `bits` were NULL for every one of
+                # libtiff's five extra tools. That is not a cosmetic gap: `coverage_fuzz` reads
+                # `target.arch` to find the matching afl-qemu-trace, got None, fell through to the
+                # un-suffixed lookup (this machine has afl-qemu-trace-x86-64, not a bare
+                # afl-qemu-trace) and ERRORED -- twice in one run, on a native x86-64 ELF the stage
+                # could have fuzzed. Every substrate guard keys off `file_type` too, so an untriaged
+                # target gets the wrong answer from each of them.
+                # When no budget was specified (the web Autopilot button sends none), scale the default
+                # by the binary's size rather than using a flat 900s: a 20-100MB binary spends most of a
+                # short budget on recon before the fuzzers get a slice -- exactly how a real large-binary
+                # run came back with only static findings. An explicit --budget / budget_seconds always
+                # wins; this only fills the "caller sent nothing" case. (CLI passes an explicit default,
+                # so it is unaffected; this is the web/API path.)
+                eff_budget = budget_seconds
+                if eff_budget is None:
+                    _mb = (t.size or 0) / 1_000_000.0
+                    eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
+                                     min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
+                # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
+                # operator's intent is "keep going until coverage plateaus". The slider's minutes are
+                # that ceiling when given; with none, use a high default (6h) so a long campaign is
+                # bounded but not cut short. (The coverage-plateau auto-stop + stalled-engine auto-skip
+                # is the next increment; today the run uses the ceiling and the live coverage/health
+                # panel shows the plateau for the operator to stop on.)
+                if converge and budget_seconds is None:
+                    eff_budget = _CONVERGENCE_CEILING_SECONDS
+                bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages,
+                                            pause=pause)
+                status["budget"] = bud.spent()                # serializable; refreshed as we go
+                if not t.file_type:
+                    _staged(bud, store, t, "ingest_triage", status, stop)
+                    t = store.targets.get(tid) or t
+                else:
+                    # already triaged (a re-run): mark the plan row done rather than leaving it
+                    # "pending" -> "skipped", which read as "Triage never ran" in the rail.
+                    _plan_set(status, "ingest_triage", "done", "already triaged")
+                # EXECUTIONS, not seconds. The clock is the operator's unit, but what a second
+                # BUYS is not constant: an ASan build of the same binary runs ~5x slower, and it is
+                # the only configuration whose oracle can see a heap out-of-bounds access at all.
+                # Dividing seconds therefore handed the search that can find the bug a 5x smaller
+                # one. See budget.exec_rate / budget.CaseBudget.slice(want_execs=...).
+                _sub = substrate.of(t.file_type)
+                _san = False
                 try:
-                    from .poc.exploit_stage import _looks_like_heap_menu
-                    tb = store.content.path(t.sha256).read_bytes()
-                    heap_menu = _looks_like_heap_menu(None, t, tb)
-                except Exception:
-                    _log.debug("heap-menu gate check failed for %s", tid, exc_info=True)
-                    heap_menu = False
-                if heap_menu:
+                    from .fuzz.aflpp import is_sanitizer_build
+                    _san = is_sanitizer_build(ctx_bytes := store.content.path(t.sha256).read_bytes())
+                    del ctx_bytes
+                except Exception:                            # noqa: BLE001 -- advisory
+                    observe.absorbed(_log, "keeping the default")
+                bud.set_exec_rate(budget_mod.exec_rate(_sub.execs_per_sec, sanitizer=_san))
+                if _san:
+                    _adv = bud.advice()
+                    ctx_note = _adv["note"]
+                    store.events.append("budget.exec_rate", case_id=t.case_id,
+                                        payload={"target_id": t.id, "sanitizer": True, **_adv})
+                    _log.info("instrumented build: %s", ctx_note)
+                # The plan is built AFTER triage, not before: it is chosen from the target's
+                # substrate, and for an untriaged target that was an empty string.
+                _init_plan(status, t, len(done_tids), len(worklist))
+                # Large-binary mode. Past a size where whole-binary structural analysis and whole-program
+                # symbolic execution stop being tractable, the reachable attack surface is still best
+                # explored by EXECUTION -- coverage + directed fuzzing (the afl handshake-timeout fix now
+                # survives a big binary) -- not by angr loading the whole image. `size_mb` gates the
+                # doomed symbolic lane below and the note tells the operator to give it a large budget.
+                size_mb = (t.size or 0) / 1_000_000.0
+                if size_mb >= _LARGE_BINARY_MB:
+                    store.events.append("autopilot.large_binary", case_id=t.case_id, payload={
+                        "target_id": t.id, "size_mb": round(size_mb, 1),
+                        "mode": "huge" if size_mb >= _HUGE_BINARY_MB else "large",
+                        "note": ("every lane still runs -- nothing is skipped by size. The expensive "
+                                 "ones are SCOPED to stay tractable: structural analysis prioritises the "
+                                 "attack-surface functions and symbolic execution loads lib-free and "
+                                 "explores from a bounded budget. Give it a large --budget (hours for a "
+                                 "~100MB binary) so the scoped lanes have room.")})
+                # A firmware image is not a program: carve it into its embedded binaries (each registered
+                # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
+                # and misses every component + secret.
+                if (t.file_type or "").lower() == "firmware":
+                    # CVE-fingerprint the image's OWN bytes first: a monolithic RTOS image (VxWorks,
+                    # bare-metal) statically links its libraries, so a vulnerable zlib/openssl/etc.
+                    # lives as a version banner in the container itself with no filesystem to carve
+                    # and no standalone ELF to extract. The byte-scan finds it either way.
+                    _staged(bud, store, t, "cve_scan", status, stop)
+                    _staged(bud, store, t, "firmware_carve", status, stop)
+                    # A bare-metal image (no filesystem, no embedded ELF) is a Cortex-M blob: rehost
+                    # it under Unicorn and fuzz its modelled MMIO inputs. The stage self-gates to a
+                    # detected Cortex-M reset-vector table, so it is a cheap no-op otherwise.
+                    _staged(bud, store, t, "firmware_rehost", status, stop)
+                    for sub in store.targets.list_by_case(case_id):
+                        if sub.id not in done_tids and sub.id not in worklist:
+                            worklist.append(sub.id)
+                    _finalize_plan(status)
+                    continue
+                # A runtime-packed executable (UPX) is a compressed stub around the real program: the
+                # machine-code stages would analyse the decompressor, not the code. Unpack it into a
+                # child target and analyse THAT, exactly as a firmware image is carved into its binaries.
+                if _looks_packed(store, t):
+                    _staged(bud, store, t, "unpack", status, stop)
+                    for sub in store.targets.list_by_case(case_id):
+                        if sub.id not in done_tids and sub.id not in worklist:
+                            worklist.append(sub.id)
+                    _finalize_plan(status)
+                    continue
+                # THE FLOOR, before any analysis: can this image be executed here at all, and what
+                # does it do with one input? Measured on stock /usr/bin binaries, this stage --
+                # whose own capability description is "Run once, to see the target work" -- was
+                # registered, wired to the API and offered in the UI, and the autopilot never called
+                # it. So the pipeline's first execution of an arbitrary target happened inside a
+                # fuzzer twenty stages later, and if anything upstream consumed the budget the
+                # program was never run at all while the report still showed corroborated findings.
+                #
+                # It is also the cheapest honest signal there is: a target that cannot start (wrong
+                # loader, missing runtime, needs an argument) is a different situation from one that
+                # runs and survives, and every later stage's result is read in that light.
+                bud.phase("recover")
+                # WEAPONIZE FIRST, before anything that can spend the phase allowance. The crashless
+                # build_exploit(strategy="auto") recovers its own IP-control offset with a deterministic
+                # cyclic probe and drives the ret2win / ret2libc / cross-arch ret2libc chain -- a ~1 s
+                # path to L3 on every buildable ISA **[measured 2026-10-19: aarch64 1.1s, s390x 1.0s,
+                # ppc 0.9s, riscv64 0.9s, loongarch 1.3s, each a verified shell]**. It MUST precede the
+                # two stages below: `dynamic_run` blocks on a target that reads stdin and waits out its
+                # whole slice, and `disassemble` is heavy on a large static binary -- together they
+                # time out and consume the entire recover allowance, so build_exploit scheduled after
+                # them (or in `prove`, after fuzz/concolic have burned the wall clock) is handed 0 s and
+                # skipped "no budget left", on EVERY run. The qemu-gated fuzzer rarely lands the overflow
+                # crash that this probe finds instantly, so for a cross-arch target this is the ONLY
+                # route to a demonstrated shell -- the previous placement left them stuck at L1. Gated
+                # on < L3 so a target already weaponized elsewhere pays nothing, and the stage self-gates
+                # per arch/mitigation (PIE-emulated, managed runtimes, no gadget) and declines cheaply.
+                if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
                     _staged(bud, store, t, "build_exploit", status, stop,
-                                      {"strategy": "heap"})
-            # (The crashless build_exploit(strategy="auto") runs FIRST in the recover phase -- see
-            # the top of the per-target block -- so it reaches its ~1 s ret2libc/ret2win chain
-            # before the stages that time out on a blocking stdin read or a heavy static
-            # disassembly can spend the phase allowance. It is not repeated here.)
-            # Review each demonstrated finding: replay its input several times so a flaky crash is
-            # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
-            # inputs come first (never dropped), then any distinct crash; capped so a target with
-            # many faults cannot become hundreds of sandbox runs. This is the SAME false-positive
-            # review the interactive Autopilot runs -- the background path shipped findings
-            # unreviewed without it.
-            if crashes and not stop.is_set():
-                from . import review
-                pocs = PocDAO(store.conn).list_by_target(tid)
-                shas = list(dict.fromkeys(
-                    [p.input_sha for p in pocs if getattr(p, "verified", False) and p.input_sha]
-                    + [c.input_sha for c in crashes]))[:12]
-                if shas:
-                    status["stage"] = "verify"
-                    _plan_set(status, "verify", "running", f"{len(shas)} to replay")
-                    _emit_stage(store, t.case_id, "verify", "running", target_id=t.id,
-                                detail=f"replaying {len(shas)} input(s)")
-                    for sha in shas:
+                            {"strategy": "auto"}, want=60.0)
+                # THE FLOOR: run once to see the target work, then recover + detect.
+                _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
+                # Recover + detect.
+                _staged(bud, store, t, "disassemble", status, stop)
+                _staged(bud, store, t, "detect_cwe", status, stop)
+                _staged(bud, store, t, "cve_scan", status, stop)
+                # Known-CVE scan of a built-from-source project's declared dependencies + vendored
+                # headers -- versions that never survive into the compiled binary's banners.
+                _staged(bud, store, t, "source_cve_scan", status, stop)
+                # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
+                _staged(bud, store, t, "embedded_audit", status, stop)
+                # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
+                _staged(bud, store, t, "int_overflow_scan", status, stop)
+                # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
+                _staged(bud, store, t, "uaf_scan", status, stop)
+                # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
+                _staged(bud, store, t, "source_sink_scan", status, stop)
+                # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
+                # an expected token, a menu command -- by breaking on its comparison functions. Those
+                # are the values every later stage needs in order to get PAST a gate, so this belongs
+                # before the campaigns, not after them. Native-arch + gdb only; self-gates.
+                _staged(bud, store, t, "extract_secrets", status, stop, want=30.0)
+                # Package any hard-coded credential detect_cwe found (CWE-798/321) into a verified,
+                # self-contained PoC. It is the one demonstrated-effect class that needs NO crash --
+                # deterministic, offline, and it never executes the target, so it costs nothing and
+                # can never be starved by the fuzzing budget. It must follow detect_cwe, whose
+                # findings it promotes rather than duplicates.
+                _staged(bud, store, t, "synthesize_secret", status, stop, want=20.0)
+                # A SOCKET SERVER has to be fuzzed before anything else touches it. Such a target
+                # blocks in accept() and never reads stdin, so every stage that drives it that way --
+                # the injection prober, the crashless exploit ladder, the OOB-index driver, the generic
+                # fuzzers -- waits out its full timeout and finds nothing, draining the budget before
+                # the one channel that works is ever tried. net_fuzz crashes such a server in about
+                # three execs. It self-gates on bind/listen/recvfrom imports, so a non-server pays
+                # nothing for being asked first.
+                try:
+                    from ..db.dao import CallEdgeDAO as _CE  # imported here: the module-level name
+                    from .fuzz import netfuzz as _nf  # lives in _ranked_channels, not this scope
+                    _is_server = _nf.detect_server(_CE(store.conn).list_by_target(tid))[1]
+                except Exception:
+                    _log.debug("server detection failed for %s", tid, exc_info=True)
+                    _is_server = False
+                if _is_server:
+                    _staged(bud, store, t, "net_fuzz", status, stop, want=45.0)
+                else:
+                    # Not a server -> net_fuzz is INAPPLICABLE, not a budget casualty. If left unstaged
+                    # it stays `pending` and _finalize_plan turns it into "skipped", which the health
+                    # panel then renders as "no budget left / not reached" -- a misleading tooling
+                    # verdict for a binary that simply has no socket to fuzz. Record the honest decline.
+                    why = "no socket-server imports (bind/listen/accept/recvfrom) -- not a server"
+                    _plan_set(status, "net_fuzz", "declined", why)
+                    _emit_stage(store, t.case_id, "net_fuzz", "declined", target_id=tid, detail=why)
+                # An IPC/protocol boundary (a unix socket, a pipe, a datagram listener) is a channel
+                # the generic fuzzers cannot reach at all: they drive stdin/argv/files. It discovers
+                # its own channel and declines when there is none, so a plain binary pays nothing.
+                _staged(bud, store, t, "boundary_fuzz", status, stop, want=45.0)
+                # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
+                # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
+                # CWE-class probes -- recording a verified reproduction only if the target faults.
+                _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
+                # Demonstrate injection / format-string leaks by probing the binary's sinks directly
+                # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
+                _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
+                # (The crashless, leak-centric build_exploit(strategy="auto") -- canary-bypass
+                # ret2win/ret2libc, the format-%n saved-return overwrite, the heap FSOP chain, the ASLR
+                # info-leak, and the overflow-offset ret2libc all in one -- now runs FIRST in this phase,
+                # before dynamic_run/disassemble can spend the allowance; see the top of the block. It
+                # used to sit here, last in the phase, where it was handed 0 s and skipped on every run.)
+                # SEARCH: everything from here actually executes the target with attacker input, so
+                # it gets the largest share and the phase reserve stops an earlier stage spending it.
+                bud.phase("search")
+                # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
+                channels = _ranked_channels(store, tid)
+                primary = channels[0] if channels else None
+                dyn = {"input_mode": primary} if primary else {}
+                # PINNING a channel is right only when something chose it. The `fuzz` stage splits
+                # its budget across every channel it is given, and passing one collapses that sweep
+                # to a single guess -- which on `zigzag` (static-pie, stripped: no import table to
+                # rank by) was the wrong guess, so the campaign spent its whole slice delivering
+                # input where the program never reads it and managed nine executions. With no
+                # evidence to pin on, hand the stage nothing and let it sweep all three at a third
+                # of the budget each. A target whose imports DID say something keeps the full slice
+                # on the channel they named.
+                from .poc.capture import no_import_evidence as _no_imports
+                _blind = not channels or _no_imports(t)
+                fz = {} if _blind else dyn
+                # A target that does not terminate pays its FULL per-execution timeout every time,
+                # so the campaigns get single-digit executions out of a whole slice. The input is
+                # consumed long before the program blocks, so a short timeout reaches the same code
+                # and buys forty times the executions.
+                _nonterm = _baseline_timed_out(store, tid)
+                if _nonterm:
+                    dyn = dict(dyn, exec_timeout=_NONTERM_EXEC_TIMEOUT)
+                    fz = dict(fz, exec_timeout=_NONTERM_EXEC_TIMEOUT)
+                    _emit_stage(store, t.case_id, "dynamic_run", "note", target_id=tid,
+                                detail=(f"the baseline did not terminate, so the campaigns use a "
+                                        f"{_NONTERM_EXEC_TIMEOUT:g}s per-execution timeout"))
+                # Run-to-convergence: the coverage campaign stops on AFL's own plateau signal
+                # (AFL_EXIT_WHEN_DONE) instead of burning the whole ceiling. Threaded via the dynamic
+                # params so coverage_stage -> aflpp.run_campaign sees it.
+                if converge:
+                    dyn = dict(dyn, converge=True)
+                    fz = dict(fz, converge=True)
+                # DISCOVERY that needs NO fuzzer crash -- run it BEFORE the budget-draining fuzz/concolic,
+                # for the same reason as the crashless weaponization above: a menu-driven heap / OOB target
+                # rarely yields a blind-mutation crash, so with the old ordering heap_trace + oob_index +
+                # chain_primitive were starved (the conformance harness caught a UAF-read heap failing here
+                # for exactly this reason). heap_check (libc guard pages) + the custom-allocator UAF/
+                # double-free trace + OOB-index discovery, then chain their primitives into a demonstrated
+                # hijack / L2 recipe (chain_primitive consumes those Findings).
+                # heap_check (libc guard pages), heap_trace (custom-allocator UAF/double-free) and
+                # oob_index (OOB-index discovery) are three INDEPENDENT discovery passes -- none reads a
+                # Finding or artifact another writes (heap_check -> detector "heap_monitor"; heap_trace ->
+                # "heap_trace"; oob_index -> "oob_index"), so they run concurrently under the pool's
+                # per-class caps (the single sandbox governor), halving this phase on a multi-core box
+                # without oversubscribing the sandbox. chain_primitive then runs SERIALLY after them --
+                # its _lead_finding consumes the heap_trace / oob_index Findings, so it must see them done.
+                # Budgeted: each discovery pass gets a slice of the phase, so a non-terminating target
+                # cannot make one of them (heap_check/heap_trace drive the live process repeatedly) run
+                # for hundreds of seconds and blow the case budget. `want` is generous so a legitimate
+                # menu-driven heap target is not starved; `budget.slice` caps it to what the phase affords.
+                # A target whose baseline never terminates (a server that blocks forever) cannot be
+                # menu-crawled -- every option-drive just hits its timeout -- so the crawl-driven
+                # discovery passes are told, and skip the crawl with a clear note instead of wedging
+                # for their whole slice and being hard-reclaimed (which read as an ERROR, not a
+                # deliberate skip). heap_check is a single guarded run, already bounded, and keeps the
+                # short per-exec timeout from `dyn`.
+                _ht = {"baseline_nonterm": True} if _nonterm else None
+                _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", _ht),
+                                              ("oob_index", _ht)], status, stop,
+                                   budget=bud, want=90.0)
+                # A defect that never crashes is invisible to every stage above and below this one.
+                # Shadow memory sees an uninitialised read as it happens, and tells a disclosure --
+                # undefined bytes reaching a write syscall, which IS the effect -- from a merely
+                # internal one. Native-ELF only and ~10-30x a bare run, so it is a bounded pass over
+                # a few inputs here rather than anything inside a campaign.
+                _staged(bud, store, t, "mem_oracle", status, stop, want=60.0)
+                _staged(bud, store, t, "chain_primitive", status, stop, want=45.0)
+                # Search. The CHANNEL-SPECIFIC fuzzers go first, because each one knows the channel its
+                # target actually reads and both self-gate to the imports that prove it (bind/listen/
+                # recvfrom; getenv), so a target they do not apply to pays nothing. Running them after
+                # the generic sweeps starved them: a socket server BLOCKS in accept(), so every
+                # stdin/argv/file exec runs to its timeout and drains the budget before net_fuzz is ever
+                # reached -- while net_fuzz crashes the same server in about three execs. The generic
+                # coverage/directed sweeps then follow for whatever the binary reads conventionally.
+                _staged(bud, store, t, "env_fuzz", status, stop, want=45.0)
+                # On an EXPENSIVE SUBSTRATE, synthesize the static overflow BEFORE the campaigns for
+                # exactly the reason net_fuzz moved ahead of them. Wine, the JVM and qemu cannot be
+                # batched (sandbox.run_batch returns None for them), so every execution pays a fresh
+                # interpreter/emulator start-up -- seconds, not milliseconds. A coverage campaign then
+                # eats the whole time budget and the run never reaches synthesize_poc at the end, even
+                # though that stage demonstrates this bug class in ONE detonation from the recovered
+                # stack frame. Measured on a mingw PE whose scanf("%s") overflow synthesize_poc proves
+                # instantly: the full autopilot spent its entire budget fuzzing under wine and finished
+                # at L0. Native targets keep the original order -- there, fuzzing is cheap and finds
+                # strictly more. The stage no-ops without recovered stack buffers.
+                if _expensive_substrate(t):
+                    _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
+                # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
+                # strongest crash finder available -- thousands of executions a second with a
+                # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
+                # own harness and reports unsupported for a binary-only target.
+                # In-process fuzzing is the engine built for a library, and on one it outproduces
+                # everything else by orders of magnitude (libtiff 4.0.3: a sanitizer finding in 36
+                # executions, where 14,821 external file-channel executions found none).
+                #
+                # It is FIRST among the campaigns and inside the SEARCH phase, both for the same
+                # reason. It used to be scheduled in `recover`, beside `disassemble` and
+                # `detect_cwe`, and a campaign budgeted as recovery is capped by the 30% allowance
+                # that phase gets. Measured on the libtiff tarball at 600s per target:
+                # `disassemble` took 138s and `detect_cwe` 237s (and was CANCELLED anyway), so the
+                # allowance was gone and the autopilot skipped the one engine that finds this
+                # library's bug -- "libfuzzer: skipped, no budget left in the recover phase". The
+                # same tarball at 900s had enough slack for it to run, found the heap overflow and
+                # produced a verified PoC. That difference was budget luck, not design.
+                _staged(bud, store, t, "libfuzzer", status, stop, want=180.0)
+                # THE REST OF THE LIBRARY. One `libfuzzer` call fuzzes the strongest entry point,
+                # which on a real library is a fraction of its input surface: libtiff 4.0.3 offers
+                # six doors the synthesizer can reach and the campaign went through one of them. The
+                # second call takes the next few, and it is a SEPARATE call so that the first keeps
+                # its full slice -- breadth is worth having, and not at the price of the depth that
+                # found the bug the first harness finds. Each harness links objects the first compile
+                # already produced (measured: 13.4 s for the first, 0.5 s for each of the next five),
+                # so the extra reach costs fuzzing time and almost no build time.
+                #
+                # Guarded by what the stage ITSELF reported, because only it has the source tree and
+                # so only it can say how many entry points exist. The case budget decides whether
+                # there is room: this is a sampler in the search phase like any other, so the solver's
+                # reserve and the prove phase's are untouched by it.
+                _lf = _last_done_payload(store, t, "libfuzzer") or {}
+                if _lf.get("more_entry_points") and not stop.is_set():
+                    _staged(bud, store, t, "libfuzzer", status, stop,
+                            {"harness_from": int(_lf.get("next_entry_point") or 1),
+                             "harness_max": _MORE_ENTRY_POINTS}, want=180.0)
+                # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same
+                # channel -- EXCEPT on a non-native image, where AFL cannot apply at all. AFL
+                # instruments machine code: a .class/.jar is bytecode and a PE runs under wine, so
+                # coverage_fuzz got as far as AFL++ qemu-mode and then ERRORED ("needs afl-qemu-trace"),
+                # which is not the documented "falls back to blind". directed_fuzz then had no recovered
+                # functions to direct at and synthesize_poc has no stack frame to work from, so a JVM
+                # target reached the end of the ladder having executed the program ZERO times.
+                #
+                # The blind campaign is the right stage for these and already knows them -- it carries
+                # the measured per-execution costs for wine (~1/s) and the JVM (~36/s) and reads a
+                # defect as an uncaught exception rather than a signal -- but the autopilot never ran
+                # it: "fuzz" appeared only in the stage registry. It splits its budget across every
+                # channel, which is what this needs, since a bytecode target has no call edges and so
+                # no channel ranking either.
+                # Size the primary campaigns to the OPERATOR'S budget, not a fixed exec count: a large
+                # --budget must buy a longer search. affordable_execs() is this stage-share's execs at
+                # the target's rate; max() keeps the meaningful floor on a small budget, and slice()
+                # still caps each call to the single-stage share + phase reserve so one campaign cannot
+                # eat the case. Before this, a fixed 12-18k execs ran ~30s regardless of budget -- the
+                # "raising --budget did nothing, directed fuzzing still cut out at 30s" an operator hit.
+                _camp_execs = max(_CAMPAIGN_EXECS, bud.affordable_execs())
+                _dir_execs = max(_DIRECTED_EXECS, bud.affordable_execs())
+                if _nonnative_image(t):
+                    _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
+                elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
+                             want_execs=_camp_execs) != "done" or \
+                        bud.slice("fuzz") > 0:
+                    # The blind campaign is a SECOND campaign, not only a fallback. Measured on
+                    # /usr/bin/xxd with a 400s budget: coverage_fuzz returned "done" after 22s of a
+                    # 97s allowance -- AFL finishing early is not AFL having searched -- and because
+                    # `fuzz` was reached only when coverage_fuzz failed, the remaining 75 seconds of
+                    # the search phase went unspent. The two look for different things (one is
+                    # coverage-guided and single-channel, the other splits its budget across every
+                    # channel the target reads), so with budget left both are worth running.
+                    #
+                    # AFL can also abort for reasons that say nothing about the target: its dry run is
+                    # FATAL on a single seed that times out ("results in a timeout",
+                    # perform_dry_run()), a missing qemu tracer ends it, a forkserver handshake can
+                    # fail. Without a fallback the one campaign a native target gets simply does not
+                    # happen, and the run then reports only static findings -- "nothing was run"
+                    # wearing the face of "nothing was found", at campaign scale. The blind stage
+                    # carries none of those preconditions, so it runs the same corpus regardless.
+                    _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
+                # THE REST OF THE DISPATCH TABLE. A multi-call binary is many programs behind one
+                # image and the campaign above drove ONE of them -- the deepest parser among the
+                # doors the stage verified by running them. busybox 1.21.1 opens 14: every
+                # decompressor it carries, which is also where its own CVE list starts (an
+                # out-of-bounds read in unlzma). Taking the next few is the `libfuzzer` breadth pass
+                # again with no build to repeat, so it costs only fuzzing time.
+                _mc = (_payloads_of(store, t, "fuzz.multicall") or [{}])[-1]
+                _rest = [d for d in (_mc.get("doors") or []) if d != _mc.get("chosen")]
+                for _door in _rest[:_MORE_MULTICALL_DOORS]:
+                    if stop.is_set():
+                        break
+                    _staged(bud, store, t, "fuzz", status, stop, dict(fz, multicall_door=_door),
+                            want_execs=_camp_execs)
+                _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_dir_execs)
+                crashes = _distinct_crashes(store, tid)
+                # Multi-channel retry: the best-guess channel is not always where the bug is (a file
+                # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
+                # directed fuzzer at each of the OTHER channels before spending concolic's budget.
+                if not crashes and not stop.is_set():
+                    for j, alt in enumerate([c for c in channels[1:] if c != primary]):
                         if stop.is_set():
                             break
-                        try:
-                            review.replay_verdict(store, t, sha, times=5)
-                        except Exception:
-                            _log.debug("replay verdict failed for %s", sha, exc_info=True)
-                            pass
-                    _plan_set(status, "verify", "cancelled" if stop.is_set() else "done")
-                    _emit_stage(store, t.case_id, "verify",
-                                "cancelled" if stop.is_set() else "done", target_id=t.id)
-            # Link a matched CVE to a demonstrated crash of a matching class (soft corroboration),
-            # now that crashes/PoCs for this target exist.
-            if not stop.is_set():
-                _staged(bud, store, t, "cve_corroborate", status, stop, want=30.0)
-            # Explain a static-only outcome: a memory-corruption defect was found but no runtime
-            # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
-            # leaving a bare "static" that reads like "nothing to see".
-            if not crashes and not stop.is_set():
-                _note_static_memcorruption(store, t)
-            _finalize_plan(status)          # any step never reached is marked skipped
-            # Record what this run DID, not only what it found. See _scorecard.
-            try:
-                # Let the log settle first: a stage cancelled when the budget ran out is still
-                # running, and its final `.done` -- carrying the executions it managed -- lands
-                # after this point. See _settle.
-                _settled = _settle(store, t.case_id)
-                status["scorecard"] = _scorecard(store, t, bud, status,
-                                                 absorbed_base=absorbed_base,
-                                                 settled=_settled)
-            except Exception:                            # noqa: BLE001 -- never fail a run on this
-                _log.debug("scorecard failed for %s", tid, exc_info=True)
+                        _staged(bud, store, t, "directed_fuzz", status, stop,
+                                          {"input_mode": alt, "seed": 91 + j})
+                        crashes = _distinct_crashes(store, tid)
+                        if crashes:
+                            store.events.append("autopilot.channel_hit", case_id=t.case_id,
+                                                payload={"target_id": tid, "mode": alt})
+                            break
+                # Run concolic when the search found nothing OR left the binary under-covered: a low
+                # block-coverage number means guarded branches (magic values, length checks) were
+                # never reached -- exactly what concolic solves for.
+                cov_pct = _best_block_pct(store, tid)
+                want_concolic = not crashes or (cov_pct is not None and cov_pct < 60)
+                # An ON-DEMAND harness run leaves function-level leads the fuzzer did not reach from the
+                # entry: force the steered concolic pass so it drives toward those functions (seeded with
+                # the harness's gate-passing inputs, now DynResult rows) even when other crashes exist --
+                # otherwise a harness-only lead would never be escalated. Gated on harness having run, so
+                # the default plan (no harness) is unaffected ("stop adding fuzzing to every run").
+                if not want_concolic and _has_unproven_harness_leads(store, tid):
+                    want_concolic = True
+                # Concolic runs REGARDLESS of size -- a large binary must not lose the symbolic-execution
+                # capability. It is kept tractable by SCOPING, not skipping: angr loads with
+                # auto_load_libs=False and explores from a bounded state/step budget, and on a large
+                # binary the orchestrator hands it the attack-surface targets rather than the whole image
+                # (see concolic's own large-binary handling). A longer slice on a large binary so the
+                # scoped exploration has room.
+                if want_concolic:
+                    _concolic_want = 240.0 if size_mb >= _LARGE_BINARY_MB else 120.0
+                    _staged(bud, store, t, "concolic", status, stop, dyn, want=_concolic_want)
+                    # Close the coverage loop: re-fuzz once more, now that directed_fuzz automatically
+                    # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
+                    # guarded branches concolic just unlocked, instead of the run ending at them.
+                    _staged(bud, store, t, "directed_fuzz", status, stop,
+                            {**dyn, "seed": 4242}, want=120.0)
+                    crashes = _distinct_crashes(store, tid)
+                # Static-overflow synthesis: an unbounded stack overflow (gets(), a size-less strcpy,
+                # scanf("%s")) needs a long, NEWLINE-FREE payload that blind mutation almost never
+                # generates -- a stray 0x0a ends gets() before the frame is smashed -- so the fuzzer
+                # reports full block coverage and zero crashes on a binary whose bug is glaringly
+                # static. Derive the overflow straight from the recovered stack frame and detonate once
+                # over the channel the binary reads; on a fault it files a verified L1 crash exactly
+                # like a fuzzer-found one, which the exploit ladder below then builds into L2/L3. The
+                # stage no-ops when no stack buffers were recovered, so it is safe to run generally.
+                # Run it when the fuzzer found NOTHING, and also when it found crashes that do not
+                # include an overflow: a binary with two defects (say a format sink on one menu branch
+                # and a scanf("%s") overflow on another) gives the fuzzer the easy one, and gating on
+                # `not crashes` then skipped the synthesis the hard one needs -- so "find every crash"
+                # held for one defect per target but not for several in one binary. The stage no-ops
+                # when no stack buffers were recovered, so the added cost is one detonation.
+                # ...and when a RECOVERED FRAME still has no PoC of its own. The gate above asks
+                # whether an overflow was demonstrated ANYWHERE on the target, which is not the same
+                # question: a binary with two unbounded buffers gets one crash from the fuzzer, the
+                # target then "has a demonstrated overflow", and the second buffer's static finding
+                # keeps its `candidate` state forever. Measured across 22 kept conformance stores,
+                # `stack_frame/CWE-121` stayed below poc-backed 5 times out of 5 -- every occurrence --
+                # and the stage that exists to prove exactly that shape was never asked. One
+                # detonation per unproven frame lead is the whole cost.
+                if not stop.is_set() and (not crashes
+                                          or not _has_demonstrated(store, tid, _OVERFLOW_CWES)
+                                          or _unproven_frame_lead(store, tid)):
+                    _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
+                    crashes = _distinct_crashes(store, tid)
+                # CVE -> exploit chain: which of these crashes were REPRODUCED by a matched-CVE trigger,
+                # so if the ladder escalates one we can attribute the exploit back to the CVE. Accumulate
+                # the BEST level reached per CVE and record once at the end (so an L3 is not masked by an
+                # earlier L2 record that shares the finding's dedup key).
+                cve_origin = _cve_crash_origins(store, tid)
+                cve_best: dict = {}
+
+                def _note_escalation(cve, before, tid=tid, cve_best=cve_best):
+                    after = _max_verified_poc_level(store, tid)
+                    if cve and after > before and after >= 2:    # the ladder raised THIS CVE crash to L2/L3
+                        cve_best[cve] = max(cve_best.get(cve, 0), after)
+                # PROVE what the search found. This phase keeps no reserve -- it is last, and every
+                # crash it is given is already evidence that something is there. The reserve the
+                # search phase held back exists for exactly this: a campaign that finds a crash in
+                # its final seconds must still have time to root-cause and prove it.
+                bud.phase("prove")
+                # The prove loop's ceiling, made VISIBLE when it bites: a crash bucket that is never
+                # proved because of the cap must not read as "there was no such crash".
+                _reps = _crash_representatives(store, tid)
+                if len(_reps) > len(crashes) and len(crashes) >= _MAX_DISTINCT_CRASHES:
+                    store.events.append("autopilot.crashes_capped", level="warn",
+                                        case_id=t.case_id,
+                                        payload={"target_id": tid, "distinct": len(_reps),
+                                                 "proving": len(crashes),
+                                                 "unproved_inputs": [d.input_sha for d in
+                                                                     _reps[len(crashes):]][:64]})
+                # Prove each distinct crash.
+                for cr in crashes:
+                    if stop.is_set():
+                        break
+                    p = {"input_sha": cr.input_sha}
+                    cve = cve_origin.get(cr.input_sha)
+                    lvl0 = _max_verified_poc_level(store, tid) if cve else 0
+                    _staged(bud, store, t, "root_cause", status, stop, p, want=60.0)
+                    _staged(bud, store, t, "build_poc", status, stop, p, want=60.0)
+                    _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
+                    _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
+                if crashes and not stop.is_set():
+                    # WEAPONIZE EACH DISTINCT CRASH, best first. This ran once, on `crashes[0]` -- so a
+                    # binary with three defects got three PoCs (the loop above) but only ever ONE
+                    # exploit, and `crashes[0]` is DynResult order, which says nothing about which
+                    # crash is exploitable. Ordering by what each crash has already demonstrated means
+                    # the one that reached IP control is tried before the sanitizer abort that cannot
+                    # be. Now EVERY distinct crash is weaponized (best-first), not just the top three;
+                    # the budget declines the rest when the clock is gone, so the clock -- not an
+                    # arbitrary count -- is the honest bound. `_MAX_EXPLOITS` is only a safety ceiling.
+                    ordered = _exploit_order(store, tid, crashes)[:_MAX_EXPLOITS]
+                    for cr_x in ordered:
+                        if stop.is_set():
+                            break
+                        rep_x = {"input_sha": cr_x.input_sha}
+                        cve_x = cve_origin.get(cr_x.input_sha)
+                        lvl_x = _max_verified_poc_level(store, tid) if cve_x else 0
+                        _staged(bud, store, t, "build_exploit", status, stop, rep_x, want=60.0)
+                        _note_escalation(cve_x, lvl_x)       # ran on THIS CVE crash's input
+                    rep = {"input_sha": ordered[0].input_sha}
+                    _staged(bud, store, t, "behavior_trace", status, stop, rep, want=45.0)
+                    _staged(bud, store, t, "dynamic_taint", status, stop, rep, want=60.0)
+                    # Follow fork/exec and blame the CHILD. A forking server or a target that
+                    # execve()s a helper faults in a process the ordinary single-process capture
+                    # never sees, so without this the crash is attributed to the parent or missed
+                    # entirely. gdb-only and native-only; self-gates and says so.
+                    _staged(bud, store, t, "multi_debug", status, stop, rep, want=45.0)
+                    # Break on the dangerous calls live and record the arguments they were actually
+                    # reached with -- the runtime counterpart to the static sink findings.
+                    _staged(bud, store, t, "debug_monitor", status, stop, rep, want=45.0)
+                for cve, lvl in cve_best.items():            # one CVE->exploit link per CVE, at its best
+                    _record_cve_weaponized(store, t, cve, lvl)
+                # Format-string -> shell WITHOUT a crash. A reachable printf(user) sink is an L3
+                # candidate on its own -- overwrite printf@GOT with system and send "/bin/sh" -- and
+                # needs no crashing input, but build_exploit otherwise runs only for a crash (above),
+                # so a crashless format bug topped out at the synthesize_injection L1 leak. When a
+                # CWE-134 finding was corroborated and the ladder has not already reached L3, drive the
+                # format strategy directly. The stage self-gates (x86-64, writable GOT, a looping sink)
+                # and reports an honest ceiling (full-RELRO / PIE blocks the GOT overwrite) rather than
+                # faking it -- so the demonstrated info-disclosure stands and RCE stays potential.
+                if not stop.is_set() and _unexploited(store, tid, {"CWE-134"}):
+                    # `candidate` counts. The gate asked for a CORROBORATED CWE-134, and the
+                    # detector that finds a printf sink is static -- it files `candidate` and stays
+                    # there unless something else happens to confirm it. Measured across 22 kept
+                    # conformance stores: `dangerous_api/CWE-134` appeared 12 times and was below
+                    # corroborated in 10 of them, so on ten targets with a format sink the L3 strategy
+                    # was never attempted at all. The stage self-gates hard (x86-64, a writable GOT, a
+                    # sink reached in a loop) and reports an honest ceiling when it cannot, so the cost
+                    # of asking is bounded and the cost of not asking is the whole rung.
+                    fmt_hit = any(f.cwe == "CWE-134" for f in FindingDAO(store.conn).list_by_target(tid))
+                    if fmt_hit:
+                        _staged(bud, store, t, "build_exploit", status, stop,
+                                          {"strategy": "format"})
+                # Menu-driven glibc-heap -> shell WITHOUT a crash. A notebook/heap-menu target
+                # (malloc/free pair + a numbered add/free/view/edit menu) is an L3 candidate via the
+                # tcache-poison + House-of-Apple-2 chain, which needs no crashing input -- but
+                # build_exploit's heap path runs only on a crash (above) or the `auto` strategy, which
+                # the autopilot never reaches for a crashless target. Drive strategy="heap" directly
+                # when the binary looks like a heap menu and the ladder has not reached L3. The stage
+                # self-gates (confirms only by a spawned shell; a target whose primitive is not
+                # discovered or whose menu does not match just returns an honest "not confirmed"), so
+                # this is a bounded attempt, not a false positive.
+                if not stop.is_set() and _unexploited(store, tid, _HEAP_CWES):
+                    try:
+                        from .poc.exploit_stage import _looks_like_heap_menu
+                        tb = store.content.path(t.sha256).read_bytes()
+                        heap_menu = _looks_like_heap_menu(None, t, tb)
+                    except Exception:
+                        _log.debug("heap-menu gate check failed for %s", tid, exc_info=True)
+                        heap_menu = False
+                    if heap_menu:
+                        _staged(bud, store, t, "build_exploit", status, stop,
+                                          {"strategy": "heap"})
+                # (The crashless build_exploit(strategy="auto") runs FIRST in the recover phase -- see
+                # the top of the per-target block -- so it reaches its ~1 s ret2libc/ret2win chain
+                # before the stages that time out on a blocking stdin read or a heavy static
+                # disassembly can spend the phase allowance. It is not repeated here.)
+                # Review each demonstrated finding: replay its input several times so a flaky crash is
+                # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
+                # inputs come first (never dropped), then any distinct crash; capped so a target with
+                # many faults cannot become hundreds of sandbox runs. This is the SAME false-positive
+                # review the interactive Autopilot runs -- the background path shipped findings
+                # unreviewed without it.
+                if crashes and not stop.is_set():
+                    from . import review
+                    pocs = PocDAO(store.conn).list_by_target(tid)
+                    shas = list(dict.fromkeys(
+                        [p.input_sha for p in pocs if getattr(p, "verified", False) and p.input_sha]
+                        + [c.input_sha for c in crashes]))[:12]
+                    if shas:
+                        status["stage"] = "verify"
+                        _plan_set(status, "verify", "running", f"{len(shas)} to replay")
+                        _emit_stage(store, t.case_id, "verify", "running", target_id=t.id,
+                                    detail=f"replaying {len(shas)} input(s)")
+                        for sha in shas:
+                            if stop.is_set():
+                                break
+                            try:
+                                review.replay_verdict(store, t, sha, times=5)
+                            except Exception:
+                                _log.debug("replay verdict failed for %s", sha, exc_info=True)
+                                pass
+                        _plan_set(status, "verify", "cancelled" if stop.is_set() else "done")
+                        _emit_stage(store, t.case_id, "verify",
+                                    "cancelled" if stop.is_set() else "done", target_id=t.id)
+                # Link a matched CVE to a demonstrated crash of a matching class (soft corroboration),
+                # now that crashes/PoCs for this target exist.
+                if not stop.is_set():
+                    _staged(bud, store, t, "cve_corroborate", status, stop, want=30.0)
+                # Explain a static-only outcome: a memory-corruption defect was found but no runtime
+                # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
+                # leaving a bare "static" that reads like "nothing to see".
+                if not crashes and not stop.is_set():
+                    _note_static_memcorruption(store, t)
+                _finalize_plan(status)          # any step never reached is marked skipped
+                # Record what this run DID, not only what it found. See _scorecard.
+                try:
+                    # Let the log settle first: a stage cancelled when the budget ran out is still
+                    # running, and its final `.done` -- carrying the executions it managed -- lands
+                    # after this point. See _settle.
+                    _settled = _settle(store, t.case_id)
+                    status["scorecard"] = _scorecard(store, t, bud, status,
+                                                     absorbed_base=absorbed_base,
+                                                     settled=_settled)
+                except Exception:                            # noqa: BLE001 -- never fail a run on this
+                    _log.debug("scorecard failed for %s", tid, exc_info=True)
+            except Exception as _exc:                   # noqa: BLE001 -- isolate, then record
+                _target_failed(store, case_id, tid, _exc, status)
+                continue
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
         # components are exactly such a set).
         if len(worklist) > 1 and not stop.is_set():
@@ -2320,8 +2505,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         outcome = "poc" if verified else ("crash" if crashed else "static")
         status.update({"state": "cancelled" if stop.is_set() else "done",
                        "outcome": outcome, "stage": None, "updated": time.time()})
-        store.events.append("autopilot.done", case_id=case_id,
-                            payload={"outcome": outcome, "cancelled": stop.is_set()})
+        _done = {"outcome": outcome, "cancelled": stop.is_set()}
+        if status.get("target_errors"):
+            # A run where some targets aborted is NOT a clean "done": say how many, and which.
+            _done["target_errors"] = len(status["target_errors"])
+            _done["failed_targets"] = [e["target_id"] for e in status["target_errors"]]
+        store.events.append("autopilot.done", case_id=case_id, payload=_done)
     except Exception as e:
         status.update({"state": "error", "error": str(e), "updated": time.time()})
         try:

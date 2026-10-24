@@ -344,10 +344,21 @@ class JobQueue:
             self._emit("job.error", run_id=rid, case_id=cid, level="error",
                        payload={"error": error})
 
-    def reap(self, now: Optional[int] = None) -> int:
+    def reap(self, now: Optional[int] = None, live: Optional[Iterable[str]] = None) -> int:
         """Reclaim runs whose lease has lapsed. A run the budget stopped is CANCELLED; a run
-        that simply went unresponsive is requeued or errored, as before."""
+        that simply went unresponsive is requeued or errored, as before.
+
+        `live` is the set of run ids the CALLER KNOWS are still executing in a healthy worker
+        thread (the in-process pool passes its own). A lapsed lease on one of those is HEARTBEAT
+        STARVATION under a write storm, not a dead worker: with `max_attempts=1` reaping it marked
+        a working stage `error` and threw its result away when it returned. Such a row's lease is
+        renewed here instead -- inside the same write transaction the reaper already holds, so it
+        cannot itself lose the lock race the heartbeat lost. A cancel-requested run is still
+        reaped (the heartbeat stops renewing those on purpose).
+        """
         now = now or _now()
+        live = set(live or ())
+        renewed = 0
         mark = len(self._pending)
         self._begin_immediate()
         try:
@@ -373,11 +384,23 @@ class JobQueue:
                     self._emit("job.cancelled", run_id=r["id"], case_id=r["case_id"],
                                payload={"error": "past its budget slice"})
                     continue
+                if r["id"] in live:
+                    span = max(30, int((r["lease_expires_at"] or now) - (r["heartbeat_at"] or now)))
+                    self.conn.execute(
+                        "UPDATE analysis_run SET lease_expires_at=? WHERE id=? AND status='running'",
+                        (now + span, r["id"]))
+                    self._emit("job.lease_renewed", run_id=r["id"], case_id=r["case_id"],
+                               level="warn",
+                               payload={"reason": "heartbeat starved under write contention; the "
+                                                  "owning worker is alive, so the lease was "
+                                                  "renewed instead of reaping a working stage"})
+                    renewed += 1
+                    continue
                 self._requeue_or_error(r, "lease expired")
             self._commit()
         except Exception:
             self._rollback(mark); raise
-        return len(rows)
+        return len(rows) - renewed
 
     def recover_orphans(self) -> int:
         """Startup crash-recovery: all 'running' rows have no live worker (JE-07)."""

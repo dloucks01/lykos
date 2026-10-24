@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -50,6 +51,9 @@ def _atexit_kill_children() -> None:
 atexit.register(_atexit_kill_children)
 
 _log = logging.getLogger("lykos.jobs.context")
+
+#: Attempts an event write gets against a transient 'database is locked' (see JobContext.emit).
+_EMIT_RETRIES = 4
 
 # Scratch targets are STAGED here and then EXECUTED, so the staging filesystem must allow exec. A
 # hardened / air-gapped box frequently mounts /tmp (and $TMPDIR) `noexec`, where `chmod +x` succeeds
@@ -112,8 +116,21 @@ class JobContext:
 
     # -- events (JE-22/27) --
     def emit(self, type: str, level: str = "info", payload: Optional[dict] = None) -> None:
-        ev = EventDAO(self.conn).append(type, level, case_id=self.case_id,
-                                        run_id=self.run_id, payload=payload)
+        # An event INSERT is an autocommit write: under a write storm it can still see 'database
+        # is locked' after the connection's full busy_timeout, and that exception used to kill
+        # the stage outright -- a campaign that had found a crash ended `error` on its progress
+        # heartbeat. Ride out a few more lock waits (as the queue's own writers do) before letting
+        # it surface; a non-lock error surfaces at once.
+        for attempt in range(_EMIT_RETRIES):
+            try:
+                ev = EventDAO(self.conn).append(type, level, case_id=self.case_id,
+                                                run_id=self.run_id, payload=payload)
+                break
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if ("lock" not in msg and "busy" not in msg) or attempt == _EMIT_RETRIES - 1:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         if self.on_event:
             self.on_event({"id": ev.id, "type": ev.type, "level": ev.level,
                            "case_id": ev.case_id, "run_id": ev.run_id, "ts": ev.ts,
@@ -127,8 +144,16 @@ class JobContext:
 
     # -- cancellation / timeout (JE-19/21) --
     def _db_cancel(self) -> bool:
-        r = self.conn.execute("SELECT cancel_requested FROM analysis_run WHERE id=?",
-                              (self.run_id,)).fetchone()
+        # A transient lock on this READ must not crash the stage polling it (every campaign loop
+        # calls should_cancel() per batch): answer "not cancelled" this time and ask again on the
+        # next poll. A cancel is still seen one poll later; the deadline check needs no database.
+        try:
+            r = self.conn.execute("SELECT cancel_requested FROM analysis_run WHERE id=?",
+                                  (self.run_id,)).fetchone()
+        except sqlite3.OperationalError:
+            _log.warning("cancel poll for run %s failed; retrying on the next poll", self.run_id,
+                         exc_info=True)
+            return False
         return bool(r["cancel_requested"]) if r else False
 
     def timed_out(self) -> bool:
@@ -238,6 +263,12 @@ class JobContext:
             self._emit_exec(cmd, start, rc=proc.returncode, out=out, err=err)
             return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
         finally:
+            # ANY exit path that leaves the child alive kills it: the deliberate timeout/cancel
+            # raise has already done so, but an exception from the poll itself (a database error
+            # in should_cancel, a KeyboardInterrupt) used to propagate with the tool still running
+            # in its own session -- an orphan the worker no longer tracked.
+            if proc.poll() is None:
+                self._kill_group(proc)
             if pgid is not None:
                 with _LIVE_LOCK:
                     _LIVE_PGIDS.discard(pgid)

@@ -212,8 +212,11 @@ class CaseBudget:
         #: seconds. None until something knows; `slice(want_execs=...)` then falls back to the
         #: default rate and says so in `sizing()`.
         self._rate: Optional[float] = None
-        #: What the last conversion decided, for the scorecard and the stage's own event.
+        #: What the last conversion decided, for the stage's own event (empty when the latest
+        #: request was refused on the clock before any conversion), and the last conversion that
+        #: DID happen, for the scorecard.
         self._sizing: dict = {}
+        self._last_sizing: dict = {}
 
     # ---- the clock ------------------------------------------------------------------------
     def elapsed(self) -> float:
@@ -286,6 +289,11 @@ class CaseBudget:
         the case; it is told how many executions the phase could afford.
         """
         if want_execs is not None:
+            # Forget the PREVIOUS conversion first. When this call is refused below on the phase
+            # clock alone (avail < FLOOR_SECONDS) it never writes `_sizing`, and the caller then
+            # quoted the last stage's verdict -- "N executions is below the floor at R exec/s" --
+            # as this stage's reason, instead of "the phase budget was already spent".
+            self._sizing = {}
             needed = self.seconds_for(want_execs)
             want = needed if want is None else max(float(want), needed)
         avail = self.available()
@@ -331,6 +339,7 @@ class CaseBudget:
                                 f"floor at {self.rate:.1f} exec/s -- a campaign this small "
                                 f"tests the seed corpus, not the program"),
                 }
+                self._last_sizing = dict(self._sizing)
                 return 0.0
             self._sizing = {
                 "stage": stage, "want_execs": int(want_execs), "rate": round(self.rate, 1),
@@ -340,6 +349,7 @@ class CaseBudget:
                 # starved instrumented campaign looks identical to a thorough one.
                 "capped": afforded < int(want_execs),
             }
+            self._last_sizing = dict(self._sizing)
         return s
 
     # ---- what actually happened -----------------------------------------------------------
@@ -390,5 +400,5 @@ class CaseBudget:
             "skipped_for_budget": list(self._skipped),
             "exec_rate": round(self.rate, 1),
             "exec_rate_measured": self._rate is not None,
-            "last_sizing": dict(self._sizing),
+            "last_sizing": dict(self._last_sizing),
         }

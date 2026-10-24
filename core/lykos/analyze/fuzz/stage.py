@@ -1027,6 +1027,92 @@ def _not_run_reason(isolation, note: str = "") -> str:
 #: Attempts after which a campaign where NONE reached the program stops (an error loop).
 _ERROR_LOOP_SAMPLE = 64
 
+#: HANG / DoS CAPTURE (doc 47 P7). An input on which the target never terminates is a finding in
+#: its own right -- an availability defect (CWE-835 infinite loop / CWE-400 unbounded consumption)
+#: -- and it used to be discarded as just another timed-out execution. Filing one is held to the
+#: same precision bar as a crash, by DIFFERENTIAL evidence rather than a single timeout:
+#:   * the target must be one that normally terminates: some input in this campaign ran to a clean
+#:     exit, and hangs are a small minority of executions (a server or menu loop that blocks on
+#:     EVERY input is not hanging on any one of them -- `_HANG_RATE_MAX`);
+#:   * the hanging input is re-run ALONE under a timeout at least twice the campaign's and must
+#:     time out again, while the benign control re-run under the same long timeout must exit;
+#:   * only the plain runner (stdin/file/arg/env); a harness runner's hang may be the harness.
+#: Filed `corroborated` (as libFuzzer's own timeout artifacts are): a reproduced non-termination
+#: is not a crash, and there is no fault for the PoC ladder to chase (no crash row is written).
+_HANG_MIN_EXECS = 20             # enough executions to know the target normally terminates
+_HANG_RATE_MAX = 0.05            # hangs above this share are the target's normal behaviour
+_HANG_TIMEOUT_MIN = 4.0          # the re-verification timeout floor (seconds)
+_HANG_TIMEOUT_MAX = 30.0         # ... and ceiling, so one check cannot eat a campaign
+_HANG_MAX_CHECKS = 2             # re-verifications per campaign (each costs one long timeout)
+_HANG_CANDIDATES = 4             # timed-out inputs remembered as candidates
+
+
+def _hang_timeout(exec_timeout: float) -> float:
+    """The re-verification timeout: at least 2x the campaign's own, within the floor/ceiling."""
+    return min(_HANG_TIMEOUT_MAX, max(2.0 * float(exec_timeout or 0), _HANG_TIMEOUT_MIN))
+
+
+def _hang_eligible(execs: int, timeouts: int, have_control: bool) -> bool:
+    """Is this campaign one whose timeouts can mean anything? See the block above."""
+    return (have_control and execs >= _HANG_MIN_EXECS and timeouts > 0
+            and timeouts <= _HANG_RATE_MAX * execs)
+
+
+def _verify_hang(exe, mode, workfile, exec_timeout, target, cand, control, alog=None):
+    """Re-run `cand` and the benign `control` under the long timeout. Returns
+    (hang_result, control_result) when the differential holds, else None."""
+    t = _hang_timeout(exec_timeout)
+    kw = {"endianness": target.endianness, "bits": target.bits}
+    c_data, c_prefix, c_guard = control
+    h_data, h_prefix, h_guard = cand
+    try:
+        _a, c = run_input(exe, mode, workfile, t, target.arch, c_data, base_argv=c_prefix,
+                          guard_page=c_guard, **kw)
+        if alog is not None:
+            alog.record_result(c_data, c, phase="confirm", argv=c_prefix)
+        if c.timed_out or c.crashed or sandbox.did_not_run(c.isolation):
+            return None                              # the control did not exit: no differential
+        _a, h = run_input(exe, mode, workfile, t, target.arch, h_data, base_argv=h_prefix,
+                          guard_page=h_guard, **kw)
+        if alog is not None:
+            alog.record_result(h_data, h, phase="confirm", argv=h_prefix)
+    except Exception:                                # noqa: BLE001 -- a check, never a finding
+        observe.absorbed(_log, "hang not re-verified")
+        return None
+    if not h.timed_out or h.crashed or sandbox.did_not_run(h.isolation):
+        return None
+    return h, c
+
+
+def _file_hang(ctx, target, fd, *, mode, data, prefix, hang, control, exec_timeout,
+               detector, event_prefix) -> str:
+    """Record a re-verified hang as a CWE-835 finding carrying its input artifact.
+
+    Deliberately NO dyn_result row: several stages seed themselves from every recorded input
+    (concolic's `_gather_seeds`, mem_oracle's probes), and a hang input there costs each of them
+    a full timeout per replay. The finding's evidence names the input, channel and argv prefix,
+    which is everything a replay needs."""
+    t = _hang_timeout(exec_timeout)
+    input_sha = ctx.put_artifact("fuzz-hang-input", data=data)
+    detail = (f"input {input_sha[:12]} ({len(data)}B via {mode}) did not terminate within "
+              f"{exec_timeout:g}s in the campaign and again within {t:g}s when re-run alone, "
+              f"while a benign input exited in {control.duration_ms} ms under the same "
+              f"{t:g}s limit -- an input-dependent non-termination (infinite loop or unbounded "
+              f"resource consumption)")
+    fd.upsert(target.id, target.case_id, {
+        "cwe": "CWE-835", "title": "Input that does not terminate (denial of service)",
+        "severity": "medium", "detector": detector, "state": "corroborated",
+        "confidence": 0.75, "dedup_key": f"CWE-835:hang:{mode}",
+        "function_addr": None, "site_addr": None,
+        "evidence": [{"channel": "dynamic", "detail": detail,
+                      "input_sha": input_sha, "input_mode": mode, "argv": list(prefix),
+                      "isolation": hang.isolation}]})
+    ctx.emit(f"{event_prefix}.hang", payload={"input_sha": input_sha, "mode": mode,
+                                              "argv": list(prefix), "timeout": t,
+                                              "control_ms": control.duration_ms})
+    return input_sha
+
+
 #: The campaign's event prefix -> the autopilot stage (engine) it runs as.
 _ENGINE_OF_PREFIX = {"fuzz": "fuzz", "directed": "directed_fuzz", "harness": "boundary_fuzz"}
 
@@ -1257,6 +1343,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # ran every execution guarded reported 5,810 executions and zero crashes on a target that
     # crashes on its own seed. Only the seeds are doubled (a few dozen executions): the
     # mutation phase keeps the stage's chosen oracle.
+    # Hang capture (see `_HANG_MIN_EXECS`): a benign control, the first few timed-out inputs.
+    hang_control = None
+    hang_cands: list = []
+    hang_timeouts = 0
+    hang_checks = 0
+    hang_sha = None
     _seeds = list(corpus)[:_CALIBRATE_CAP]
     replay: list = [(s, guard) for s in _seeds] + [(s, not guard) for s in _seeds]
     ctx.progress(msg=f"{event_prefix} campaign")
@@ -1347,6 +1439,13 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     first_notrun_note = first_notrun_note or (res.note or "")
                 else:
                     ran_any = True
+            if run_fn is run_input and not sandbox.did_not_run(res.isolation):
+                if res.timed_out and not res.crashed:
+                    hang_timeouts += 1
+                    if hang_sha is None and len(hang_cands) < _HANG_CANDIDATES:
+                        hang_cands.append((data, list(run_argv), guard_eff))
+                elif hang_control is None and not res.crashed and not res.timed_out:
+                    hang_control = (data, list(run_argv), guard_eff)
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
@@ -1491,6 +1590,23 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                               fault_pc=res.fault_pc,
                               defect_key=(asan_defect_key(res.stderr)
                                           if res.signal_name == "SIGABRT" else None))
+        # Re-verify a hang candidate while the slice can still afford the long re-run (two of
+        # them: the control and the candidate), never past the campaign's own deadline.
+        if (hang_cands and hang_sha is None and hang_checks < _HANG_MAX_CHECKS
+                and _hang_eligible(execs, hang_timeouts, hang_control is not None)
+                and deadline - time.time() > 2 * _hang_timeout(exec_timeout) + 1.0):
+            hang_checks += 1
+            _hd, _hp, _hg = hang_cands.pop(0)
+            _v = _verify_hang(exe, mode, workfile, exec_timeout, target, (_hd, _hp, _hg),
+                              hang_control, alog=alog)
+            execs += 2
+            if _v is not None:
+                try:
+                    hang_sha = _file_hang(ctx, target, fd, mode=mode, data=_hd, prefix=_hp,
+                                          hang=_v[0], control=_v[1], exec_timeout=exec_timeout,
+                                          detector=detector, event_prefix=event_prefix)
+                except Exception:                    # noqa: BLE001 -- never break the campaign
+                    observe.absorbed(_log, "hang not filed")
         # An ERROR LOOP: the program "ran" as far as the sandbox is concerned, but the loader refused
         # it every time (missing .so, wrong interpreter -> exit 127). Without this the campaign spent
         # its whole budget re-proving it -- measured: 3,100 attempts across fuzz + directed on one
@@ -1567,6 +1683,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         or (execs >= 200 and not entered)
         or (coverage_dead and not did_work))
     stats = {"execs": execs, "crashes": crashes, "flaky": flaky,
+             # Timed-out executions, and the re-verified hang filed from them (if any) -- so a
+             # campaign whose timeouts were never checked does not read as "no hang".
+             "timeouts": hang_timeouts, "hang_input": hang_sha,
+             "hang_checked": hang_checks,
              "crashes_reproducible": crashes_reproducible, "unique": len(seen_sigs),
              "starved": starved, "directed_kept": directed_kept,
              "nearest_sink_dist": (round(best_dist, 2) if best_dist is not None else None),

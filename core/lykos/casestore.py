@@ -180,8 +180,11 @@ class ContentStore:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(self.path(sha).read_bytes())
                 dst.chmod(0o755)
-            except OSError:
-                pass
+            except OSError as e:
+                # A companion that did not stage (a bundled loader / libc) makes the target
+                # not-runnable; say which one, or that reads as a clean run with nothing found.
+                _log.warning("could not stage companion %s for %s (%s); the target may not run",
+                             rel, exe, e)
         if deps:
             _make_runnable(exe, workdir)                  # cwd-independent interp/libc resolution
         return exe
@@ -258,15 +261,19 @@ class CaseStore:
             raise KeyError(f"no case {case_id!r}")
         archive_path = Path(archive_path)
         tmp = Path(tempfile.mkdtemp()) / "case-export"
-        dst = CaseStore.open(tmp)
+        # The staging copy holds every blob of the case; it was removed only on success, so a
+        # failed copy or tar left a full duplicate of the engagement in the tempdir.
         try:
-            copy_case(self, dst, case_id)
-            dst.checkpoint()
+            dst = CaseStore.open(tmp)
+            try:
+                copy_case(self, dst, case_id)
+                dst.checkpoint()
+            finally:
+                dst.close()
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(tmp, arcname="case-export")
         finally:
-            dst.close()
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(tmp, arcname="case-export")
-        shutil.rmtree(tmp.parent, ignore_errors=True)
+            shutil.rmtree(tmp.parent, ignore_errors=True)
         return archive_path
 
     def import_archive(self, archive_path: str | Path) -> list[str]:
@@ -360,6 +367,23 @@ def _case_artifact_shas(conn: sqlite3.Connection, case_id: str) -> list[str]:
     return sorted(shas)
 
 
+#: Bound parameters per `IN (...)` copy step. One statement per table used to bind EVERY artifact
+#: sha / finding id at once, and SQLite caps bound variables per statement (999 before 3.32,
+#: 32766 after) -- a large engagement's export failed with "too many SQL variables".
+_IN_CHUNK = 900
+
+
+def _in_chunks(table: str, col: str, values: list) -> list[_CasePlan]:
+    """`table WHERE col IN (...)` copy steps, chunked under the bound-variable limit."""
+    if not values:
+        return [(table, "0=1", ())]
+    out: list[_CasePlan] = []
+    for i in range(0, len(values), _IN_CHUNK):
+        part = tuple(values[i:i + _IN_CHUNK])
+        out.append((table, f"{col} IN ({','.join('?' * len(part))})", part))
+    return out
+
+
 def _case_tables(conn: sqlite3.Connection, case_id: str) -> list[_CasePlan]:
     tids = [r["id"] for r in
             conn.execute("SELECT id FROM target WHERE case_id=?", (case_id,))]
@@ -371,11 +395,10 @@ def _case_tables(conn: sqlite3.Connection, case_id: str) -> list[_CasePlan]:
     fids = [r["id"] for r in
             conn.execute("SELECT id FROM finding WHERE case_id=?", (case_id,))]
     shas = _case_artifact_shas(conn, case_id)
-    art_where = f"sha256 IN ({','.join('?' * len(shas))})" if shas else "0=1"
     plan = [('"case"', "id=?", (case_id,)),
-            ("target", "case_id=?", (case_id,)),
-            ("artifact", art_where, tuple(shas)),
-            ("analysis_run", "case_id=?", (case_id,))]
+            ("target", "case_id=?", (case_id,))]
+    plan += _in_chunks("artifact", "sha256", shas)
+    plan += [("analysis_run", "case_id=?", (case_id,))]
     for tid in tids:
         plan += [("function", "target_id=?", (tid,)),
                  ("call_edge", "target_id=?", (tid,)),
@@ -384,9 +407,8 @@ def _case_tables(conn: sqlite3.Connection, case_id: str) -> list[_CasePlan]:
         plan.append(("run_artifact", "run_id=?", (rid,)))
     plan.append(("finding", "case_id=?", (case_id,)))
     # Must follow `finding` (FK finding_id -> finding.id, foreign_keys=ON on import).
-    fid_where = f"finding_id IN ({','.join('?' * len(fids))})" if fids else "0=1"
-    plan += [("finding_site", fid_where, tuple(fids)),
-             ("finding_verdict", fid_where, tuple(fids))]
+    plan += _in_chunks("finding_site", "finding_id", fids)
+    plan += _in_chunks("finding_verdict", "finding_id", fids)
     plan += [("dyn_result", "case_id=?", (case_id,)),
              ("poc", "case_id=?", (case_id,)),
              ("component_edge", "case_id=?", (case_id,)),

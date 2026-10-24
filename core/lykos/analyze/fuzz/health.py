@@ -138,7 +138,9 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
         # already reached and found no crash executed the target without testing anything new.
         val = att.get("value") or {}
         found = (_int(done.get("crashes")) or _int(done.get("unique")) or _int(done.get("confirmed"))
-                 or (1 if done.get("crashed") else 0) or 0)
+                 or (1 if done.get("crashed") else 0)
+                 # a re-verified hang (CWE-835) is a finding too, not "found nothing"
+                 or (1 if done.get("hang_input") else 0) or 0)
         if val.get("unit") in ("blocks", "behaviours", "edges") and val.get("gained") == 0 \
                 and not found:
             return mk(NO_GAIN, (f"ran {execs:,} attempts but reached nothing beyond what its "

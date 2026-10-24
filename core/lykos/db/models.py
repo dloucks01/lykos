@@ -82,6 +82,10 @@ STATIC_DETECTORS = frozenset({
     "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
     "int_overflow_check", "int_overflow_alloc", "scanf_bounded_overflow", "heap_fptr_call",
     "lang_sinks", "scriptscan", "pyc_scan",
+    # detect/ -- the logic/auth detectors and static CWE-129, re-derived by detect/stage on every
+    # run (its `_STATIC_DETECTORS`), so static by construction
+    "unchecked_privdrop", "world_writable_perms", "privilege_drop_order", "format_string",
+    "array_index",
     # detect/jvmdetect -- the constant pool, read directly
     "jvm_sink", "jvm_crypto", "jvm_tls",
     # fingerprint/ -- version matching and source/config scanning

@@ -233,6 +233,11 @@ class WorkerPool:
         # What each worker index is currently executing, for the supervisor's wedge watchdog.
         self._active: dict[int, _Active] = {}
         self._alock = threading.Lock()
+        # idx -> the spawn generation that currently OWNS that index. A wedged worker is abandoned
+        # and replaced at the same idx; if its stuck stage ever returns, its loop must see it has
+        # been replaced and EXIT -- otherwise it kept claiming jobs as an untracked surplus thread
+        # with its own connection (invisible to stop(), so never joined, and over the pool size).
+        self._owner: dict[int, int] = {}
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -269,6 +274,7 @@ class WorkerPool:
         # lease-lost guard (`claimed_by not in (None, worker_id)`) then can't tell a stale result
         # from the abandoned attempt apart from the fresh one's, letting stale outputs overwrite it.
         gen = next(self._spawn_gen)
+        self._owner[idx] = gen                    # callers hold _tlock (start / _supervise)
         t = threading.Thread(target=self._worker_loop, args=(idx, gen), daemon=True,
                              name=f"worker-{idx}")
         t.start()
@@ -282,11 +288,19 @@ class WorkerPool:
         q = JobQueue(conn, self.on_event)
         wid = self._worker_id(idx, gen)
         try:
-            while not self._stopping.is_set():
+            while not self._stopping.is_set() and self._owns(idx, gen):
                 if not self._try_one(q, wid, idx):
                     time.sleep(self.cfg.poll_interval)
+            if not self._stopping.is_set():
+                self._bump("retired_replaced")
+                _log.warning("worker-%d (generation %d) returned after being replaced; retiring "
+                             "it instead of running as a surplus worker", idx, gen)
         finally:
             conn.close()
+
+    def _owns(self, idx: int, gen: int) -> bool:
+        """Is this worker generation still the pool's worker for `idx`?"""
+        return self._owner.get(idx) == gen
 
     def _try_one(self, q: JobQueue, wid: str, idx: int) -> bool:
         """Claim+run one job across allowed classes (honoring caps). True if one ran."""
@@ -398,10 +412,28 @@ class WorkerPool:
         interval = max(1.0, self.cfg.lease_seconds / 2)
         try:
             while not self._stopping.is_set():
-                q.reap()
+                try:
+                    q.reap(live=self._live_run_ids())
+                except Exception:                        # noqa: BLE001 -- the reaper must survive
+                    # A 'database is locked' that outlasts every retry used to kill this thread
+                    # for good: nothing respawns the reaper, so from then on a crashed or
+                    # wedged job's row stayed 'running' forever and the case never finished.
+                    self._bump("reap_failed")
+                    _log.warning("reaper pass failed; retrying next interval", exc_info=True)
                 self._stopping.wait(interval)
         finally:
             conn.close()
+
+    def _live_run_ids(self) -> set:
+        """Runs a worker thread of THIS pool is executing right now and that are not past their
+        hard deadline. Their lease can lapse only because the heartbeat lost a write-lock race
+        (a write storm), never because nobody is working on them -- so the reaper must not mark
+        them `error` and discard the result the stage is about to return. A run past its hard
+        deadline is excluded: that is the wedge the reaper exists for."""
+        now = time.time()
+        with self._alock:
+            return {a.run_id for a in self._active.values()
+                    if a.hard_deadline is None or now <= a.hard_deadline}
 
     def _supervise(self) -> None:
         """JE-10 respawn dead worker threads, and reclaim WEDGED ones so the pool cannot deadlock."""
