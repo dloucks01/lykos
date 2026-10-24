@@ -803,7 +803,7 @@ _CHMOD_MODE_REG = {"chmod": ("rsi", "esi"), "fchmod": ("rsi", "esi"), "lchmod": 
 _IMM_RE = re.compile(r"^mov\s+(\w+)\s*,\s*(0x[0-9a-fA-F]+|\d+)\s*$", re.I)
 
 
-def _imm_into_reg(ir: dict, site_addr, regs) -> "Optional[int]":
+def _imm_into_reg(ir: dict, site_addr, regs) -> "int | None":
     """The immediate most recently moved into `regs` (a register and its 32-bit alias) BEFORE the
     call at `site_addr`, within the same basic block -- e.g. `mov esi, 0x1ff` ahead of `call chmod`.
     Returns None if the mode is computed (not a literal) or the register is clobbered first, so a
