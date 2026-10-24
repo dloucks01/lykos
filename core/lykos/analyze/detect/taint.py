@@ -130,7 +130,91 @@ for _grp in _X86_SUBREGS:
         _REG_FAMILY.setdefault(_r, set()).update(_grp)
 
 _MAX_BLOCKS = 3000
+# The inter-procedural fixpoint's function budget (a runtime ceiling). ABOVE it the analysis is no
+# longer dropped whole (the old behaviour returned an empty set: a 13,529-function libcrypto got NO
+# data flow at all); it runs on a RANKED top-N instead -- see `rank_functions`.
 _MAX_FUNCS = 6000
+_INF = float("inf")
+
+
+def _bfs_dist(adj, starts) -> dict:
+    """Unweighted shortest-path distance from the nearest of `starts` over `adj`."""
+    dist = {s: 0 for s in starts}
+    q = deque(dist)
+    while q:
+        a = q.popleft()
+        d = dist[a] + 1
+        for b in adj.get(a, ()):
+            if b not in dist:
+                dist[b] = d
+                q.append(b)
+    return dist
+
+
+def rank_functions(func_addrs, call_edges, cap, *, seeds=(), seed_sources=True):
+    """Choose which `cap` functions the inter-procedural taint analyses when the program has more.
+
+    Returns (selected_addr_set, report). Ranking, and why it loses as little as possible:
+
+      * ORIGINS are where taint can enter: functions calling a SOURCE (read/recv/getenv/...) when
+        `seed_sources`, plus the seeded entry points (`seeds` -- argv at main, a library's exported
+        parameters, a summarised callee export).
+      * Taint moves only along call edges (arguments down, return values up), so a function NOT
+        connected to any origin in the call graph can never carry taint: it cannot flag a sink or
+        a tainted dereference. Excluding it loses NOTHING -- these are reported as `unreachable`,
+        separately from the real loss.
+      * Reachable functions are taken in breadth-first LAYERS of call-graph distance from the
+        origins: taint reaches a function at distance k only THROUGH one at distance < k (an
+        excluded function is opaque -- an unanalysed call), so a far function analysed without its
+        nearer path is wasted budget. Within a layer, functions nearer a DANGEROUS sink call come
+        first (the source->sink paths the detectors corroborate), then address order (stable).
+
+    If every reachable function fits under `cap`, the selection is EXACT -- the result equals the
+    unbounded analysis. Otherwise `skipped_reachable` counts the functions taint could have reached
+    but that were not analysed: that number is the honest size of the capability loss."""
+    func_addrs = set(func_addrs)
+    adj = defaultdict(set)
+    origins = {a for a in seeds if a in func_addrs}
+    sink_fns = set()
+    for e in call_edges:
+        src, dst = e.src_addr, e.dst_addr
+        if src not in func_addrs:
+            continue
+        if dst in func_addrs and dst != src:
+            adj[src].add(dst)
+            adj[dst].add(src)
+        nm = normalize(e.dst_name)
+        if seed_sources and nm in SOURCES:
+            origins.add(src)
+        if nm in DANGEROUS:
+            sink_fns.add(src)
+    d_src = _bfs_dist(adj, origins)
+    d_sink = _bfs_dist(adj, sink_fns)
+    reachable = sorted(d_src, key=lambda a: (d_src[a], d_sink.get(a, _INF), str(a)))
+    selected = set(reachable[:max(0, int(cap))])
+    unreachable = len(func_addrs) - len(d_src)
+    skipped_reachable = len(reachable) - len(selected)
+    depth = max((d_src[a] for a in selected), default=0)
+    report = {
+        "total": len(func_addrs), "cap": int(cap), "analyzed": len(selected),
+        "skipped": len(func_addrs) - len(selected),
+        "unreachable": unreachable, "skipped_reachable": skipped_reachable,
+        "origins": len(origins), "sink_functions": len(sink_fns),
+        "max_depth": depth, "exact": skipped_reachable == 0,
+    }
+    if skipped_reachable:
+        report["note"] = (
+            f"{len(func_addrs)} functions exceed the data-flow budget of {int(cap)}: analysed the "
+            f"{len(selected)} nearest the {len(origins)} taint origin(s) (call-graph distance <= "
+            f"{depth}, sink-adjacent first); {unreachable} cannot be reached from any origin (no "
+            f"loss) and {skipped_reachable} reachable function(s) were NOT analysed -- flows "
+            f"through them are not seen, so their absence is not a negative.")
+    else:
+        report["note"] = (
+            f"{len(func_addrs)} functions exceed the data-flow budget of {int(cap)}, but only "
+            f"{len(selected)} are reachable from the {len(origins)} taint origin(s); the other "
+            f"{unreachable} cannot carry taint, so this analysis is complete (exact).")
+    return selected, report
 
 
 def _arch_key(arch):
@@ -722,7 +806,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
 
 
 def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,
-                    max_funcs=None, skipped_out=None, heap_regions=None):
+                    max_funcs=None, skipped_out=None, heap_regions=None, ranked_out=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -740,6 +824,11 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     heap allocation (P1.2). A tainted store through such a pointer taints its region and a later
     read of the same allocation comes back tainted -- so attacker data that lands in heap memory
     is not lost at the store.
+
+    Above `max_funcs` (default _MAX_FUNCS) functions the analysis runs on the RANKED top-N
+    (`rank_functions`) instead of returning nothing; `ranked_out`, when given, is filled with that
+    selection's report (total / analyzed / skipped / unreachable / skipped_reachable / exact /
+    note) so the caller can state exactly how much was not looked at. Untouched at or below it.
     """
     heap_regions = heap_regions or {}
     ak = _arch_key(arch)
@@ -747,8 +836,17 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
         return set()
     abi = ARCH_ABI[ak]
     func_addrs = set(func_irs.keys())
-    if not func_addrs or len(func_addrs) > (max_funcs or _MAX_FUNCS):
+    if not func_addrs:
         return set()
+    cap = max_funcs or _MAX_FUNCS
+    if len(func_addrs) > cap:
+        func_addrs, rep = rank_functions(func_addrs, call_edges, cap,
+                                         seeds=(entry_seeds or {}).keys(), seed_sources=True)
+        if ranked_out is not None:
+            ranked_out.update(rep)
+        _log.info("taint: %s", rep["note"])
+        if not func_addrs:
+            return set()
     callmap = build_callmap(call_edges)
     dstmap = {e.site_addr: e.dst_addr for e in call_edges if e.site_addr and e.dst_addr}
     callers = defaultdict(set)
@@ -798,7 +896,8 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
 
 
 # ---------------------------------------------------- cross-binary summaries (Phase 8, 17.2)
-def _program(func_irs, call_edges, arch, *, seed_params=None, seed_sources=True):
+def _program(func_irs, call_edges, arch, *, seed_params=None, seed_sources=True,
+             ranked_out=None):
     """Inter-procedural fixpoint with optional entry-param seeds and SOURCES toggle.
 
     Returns (flagged_sink_sites, tainted_imported_symbols). `seed_params` maps a function
@@ -810,8 +909,16 @@ def _program(func_irs, call_edges, arch, *, seed_params=None, seed_sources=True)
         return set(), set()
     abi = ARCH_ABI[ak]
     func_addrs = set(func_irs)
-    if not func_addrs or len(func_addrs) > _MAX_FUNCS:
+    if not func_addrs:
         return set(), set()
+    if len(func_addrs) > _MAX_FUNCS:                  # ranked top-N, as in analyze_program
+        func_addrs, rep = rank_functions(func_addrs, call_edges, _MAX_FUNCS,
+                                         seeds=(seed_params or {}).keys(),
+                                         seed_sources=seed_sources)
+        if ranked_out is not None:
+            ranked_out.update(rep)
+        if not func_addrs:
+            return set(), set()
     callmap = build_callmap(call_edges)
     dstmap = {e.site_addr: e.dst_addr for e in call_edges if e.site_addr and e.dst_addr}
     extmap = {e.site_addr: normalize(e.dst_name) for e in call_edges
@@ -854,17 +961,20 @@ def _program(func_irs, call_edges, arch, *, seed_params=None, seed_sources=True)
     return flagged, ext
 
 
-def caller_tainted_imports(func_irs, call_edges, arch) -> set:
+def caller_tainted_imports(func_irs, call_edges, arch, *, ranked_out=None) -> set:
     """Imported-symbol names this component calls with tainted (untrusted-input) arguments.
-    These are the outbound boundaries where tainted data leaves this component."""
-    _, ext = _program(func_irs, call_edges, arch, seed_sources=True)
+    These are the outbound boundaries where tainted data leaves this component. Over the function
+    budget it runs on the ranked top-N; `ranked_out` receives that selection's report."""
+    _, ext = _program(func_irs, call_edges, arch, seed_sources=True, ranked_out=ranked_out)
     return ext
 
 
 def callee_sink_exports(func_irs, call_edges, arch, name_to_addr, export_names,
-                        max_exports=96) -> dict:
+                        max_exports=96, *, ranked_out=None) -> dict:
     """For each exported function named in `export_names`, does tainting its parameters
-    reach a dangerous sink? Returns {export_name: set((cwe, sink_symbol))}."""
+    reach a dangerous sink? Returns {export_name: set((cwe, sink_symbol))}. Over the function
+    budget each export is summarised on the ranked top-N around it; `ranked_out` (a dict) then
+    receives {export_name: that selection's report}."""
     ak = _arch_key(arch)
     if not ak or not _has_abi(ARCH_ABI[ak]):
         return {}
@@ -879,8 +989,12 @@ def callee_sink_exports(func_irs, call_edges, arch, name_to_addr, export_names,
         n += 1
         if n > max_exports:
             break
+        rep = {} if ranked_out is not None else None
         flagged, _ = _program(func_irs, call_edges, arch,
-                              seed_params={addr: set(range(nargs))}, seed_sources=False)
+                              seed_params={addr: set(range(nargs))}, seed_sources=False,
+                              ranked_out=rep)
+        if rep:
+            ranked_out[name] = rep
         sinks = set()
         for site in flagged:
             sym = callmap.get(site)

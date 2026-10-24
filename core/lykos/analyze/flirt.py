@@ -272,7 +272,7 @@ def _exec_ranges(target: bytes):
     return out
 
 
-def identify(target_bytes: bytes, functions=None, signatures: dict = None) -> dict:
+def identify(target_bytes: bytes, functions=None, signatures: Optional[dict] = None) -> dict:
     """{function-address-string: canonical-name} for every place in the executable segments whose
     bytes match a reference signature -- NOT limited to recovered function starts, because the
     functions worth naming (IFUNC-resolved str/mem variants) are exactly the ones rizin reaches
@@ -283,15 +283,17 @@ def identify(target_bytes: bytes, functions=None, signatures: dict = None) -> di
     found: dict = {}
     if not signatures:
         return found
-    ranges = _exec_ranges(target_bytes)
+    # Slice each executable segment ONCE, not once per signature variant: with the target mapped
+    # (disassemble hands an mmap) every slice is a fresh copy of the whole segment.
+    segs = [(seg_va, target_bytes[seg_off: seg_off + seg_size])
+            for seg_off, seg_va, seg_size in _exec_ranges(target_bytes)]
     for name, variants in signatures.items():
         for sig, mask in variants:
             anc = _anchor(sig, mask)
             if not anc:
                 continue
             anchor, aoff = anc
-            for seg_off, seg_va, seg_size in ranges:
-                seg = target_bytes[seg_off: seg_off + seg_size]
+            for seg_va, seg in segs:
                 pos = 0
                 while True:
                     k = seg.find(anchor, pos)

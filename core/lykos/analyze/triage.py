@@ -178,12 +178,29 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         "format_details": {}, "parse_errors": parse_errors,
         "tool": TOOL, "tool_version": TOOL_VERSION,
     }
+    view = None
     try:
-        data = Path(path).read_bytes()
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+        if filetype.detect(head) == filetype.ELF:
+            # An ELF is parsed through a read-only MAPPING: elf.parse reads headers, tables and a
+            # bounded entropy sample, so a 100MB+ engagement binary no longer sits whole in the
+            # ingest worker's RSS. Every other format keeps the in-memory read its parser expects.
+            view = elfmod.MappedFile(path)
+            data = view.__enter__()
+        else:
+            data = Path(path).read_bytes()
     except Exception as e:
         parse_errors.append(f"read: {e!r}")
         return rec
+    try:
+        return _build_triage(rec, data, parse_errors, filename)
+    finally:
+        if view is not None:
+            view.__exit__(None, None, None)
 
+
+def _build_triage(rec: dict, data, parse_errors: list, filename: str) -> dict:
     rec["file_type"] = filetype.detect(data[:64])
     if rec["file_type"] == filetype.JAR and not jvmmod.is_jar(data):
         # `PK\x03\x04` is every zip, not only a Java one: a firmware bundle, a .docx and an

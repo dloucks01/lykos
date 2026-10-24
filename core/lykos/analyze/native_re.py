@@ -46,6 +46,9 @@ _MAX_FUNCS = int(os.environ.get("LYKOS_MAX_FUNCS", "0") or "0")
 # serialises every function's bytes to the worker, so a hostile symbol table declaring millions of
 # functions would OOM. Independent of _MAX_FUNCS (which defaults to unlimited).
 _SLEIGH_RECOVER_MAX = 100000
+# How many times the isolated P-Code lifter is resumed after a native crash (pypcode aborts on some
+# encodings) before the rest of the instructions are left un-lifted (and reported as such).
+_LIFT_RESTARTS = int(os.environ.get("LYKOS_LIFT_RESTARTS", "8") or "8")
 # The per-function structural pass is chunked into batches of this many functions. Each batch is a
 # separate rizin invocation, so a batch that times out or errors costs only that batch -- the
 # functions from prior batches are already on disk and get built and persisted. Smaller batches =
@@ -64,6 +67,29 @@ _AAA_MAX = int(os.environ.get("LYKOS_AAA_MAX", "2000") or "2000")
 # stack geometry, exactly the fallback the >_AAA_MAX function path already uses. The point is that a
 # large binary comes back ANALYZED-but-lighter instead of not at all. Env-overridable.
 _AAA_FULL_MAX_MB = float(os.environ.get("LYKOS_AAA_FULL_MAX_MB", "48") or "48")
+# SIZE-TIERED recovery. Below this file size pass 1 is the original single whole-program `aaa` --
+# a small binary gets exactly what it always got. At or above it, `aaa` (measured on r2 6.0.7:
+# 110s / 2.3GB on a 36MB stripped C++ image, and on the field rizin it stopped finishing in the
+# disassemble slice at ~24MB) is replaced by an ESCALATING ladder run in ONE process with a
+# checkpoint after every rung:
+#     aa  -> aflj checkpoint -> aac -> aflj checkpoint -> aar + string xrefs -> [aaa -> checkpoint]
+# `aa` (symbols + entry) lands first so SOMETHING always comes back; `aac` (call-target function
+# discovery) is what recovers a stripped binary's functions (gh, 36MB stripped Go: aa=65 functions,
+# aa+aac=9,989 = the same as aaa, in 8s vs 25s); `aaa` is attempted last only below
+# _AAA_FULL_MAX_MB, as a deepening the run keeps if it finishes. The deepest checkpoint that parses
+# is used, so a per-pass timeout or an RLIMIT_AS kill mid-`aaa` keeps the `aa+aac` function list
+# and call graph instead of collapsing to strings-only. Env-overridable.
+_AAA_TIER_MB = float(os.environ.get("LYKOS_AAA_TIER_MB", "16") or "16")
+# Share of the remaining stage time the tiered pass 1 may use (the per-function structural pass,
+# the P-Code lift and the string table need the rest). When it runs out the deepest checkpoint is
+# kept -- the cut is reported, never silent.
+_P1_SHARE = float(os.environ.get("LYKOS_P1_SHARE", "0.6") or "0.6")
+# Share of the (then) remaining time the optional `aaa` deepening may take, below _AAA_FULL_MAX_MB.
+_P1_DEEPEN_SHARE = float(os.environ.get("LYKOS_P1_DEEPEN_SHARE", "0.25") or "0.25")
+# Under a stage deadline, the batched structural pass stops while this share of the time it
+# started with is still left, so the P-Code lift and the persist always run (see the batch loop).
+_P2_RESERVE = float(os.environ.get("LYKOS_P2_RESERVE", "0.2") or "0.2")
+_P2_POST_FACTOR = float(os.environ.get("LYKOS_P2_POST_FACTOR", "1.25") or "1.25")
 # The (advisory, slowest) decompiled-C pass. Decompiling thousands of functions up front would take
 # many minutes and risk losing everything on a timeout, and the detectors use the pypcode P-Code,
 # not the C. So we decompile up to this many up front (small binaries come back fully decompiled),
@@ -231,6 +257,136 @@ def _run(cli: Path, binary: Path, script: str, *, ctx=None, timeout: int,
             pass
 
 
+def _is_local_cut(e: BaseException, ctx) -> bool:
+    """Is `e` a per-CALL cut (this one rizin call overran its own `timeout`) rather than the stage
+    itself stopping? A local cut is recoverable -- keep the checkpoints already written; a user
+    cancel / stage deadline (ctx.should_cancel()) or anything else must propagate."""
+    if isinstance(e, subprocess.TimeoutExpired):
+        return True
+    if type(e).__name__ == "StageTimeout":
+        try:
+            return ctx is not None and not ctx.should_cancel()
+        except Exception:                                   # noqa: BLE001
+            return False
+    return False
+
+
+def _time_share(ctx, timeout: float, share: float, floor: int = 30) -> int:
+    """A per-call timeout that is `share` of what the stage still has (its deadline when the ctx
+    carries one, else `timeout`), floored so a pass is never handed a useless sliver."""
+    import time as _t
+    avail = float(timeout)
+    dl = getattr(ctx, "deadline", None) if ctx is not None else None
+    if isinstance(dl, (int, float)):
+        avail = min(avail, max(0.0, dl - _t.time()))
+    return int(max(floor, avail * max(0.05, min(1.0, share))))
+
+
+# Read-only mmap view of a file for the byte-level ELF helpers (see elf.MappedFile).
+from .elf import MappedFile as _Mapped  # noqa: E402
+
+
+def _deadline_left(ctx):
+    """Seconds until the stage deadline, or None when the ctx carries none."""
+    dl = getattr(ctx, "deadline", None) if ctx is not None else None
+    if not isinstance(dl, (int, float)):
+        return None
+    import time as _t
+    return dl - _t.time()
+
+
+def _prioritize(addrs: list, fn_by_addr: dict) -> list:
+    """`addrs` with the functions that CALL a catalogued input source or dangerous sink first
+    (stable otherwise). Uses pass-1 call refs (rizin embeds them in aflj); with none, unchanged."""
+    try:
+        from .detect.catalog import DANGEROUS, SOURCES, normalize
+    except Exception:                                       # noqa: BLE001
+        return addrs
+    hot = set(DANGEROUS) | set(SOURCES)
+    names = {a: _clean_name((f or {}).get("name")) for a, f in fn_by_addr.items()}
+
+    def score(a):
+        for c in (fn_by_addr.get(a) or {}).get("callrefs") or ():
+            if isinstance(c, dict) and normalize(names.get(c.get("to")) or "") in hot:
+                return 0
+        return 1
+    return sorted(addrs, key=score)                         # sorted() is stable
+
+
+def _tiered_pass1(cli: Path, binary: Path, T: Path, main_seed: str, size_mb: float, string_addrs,
+                  *, ctx, timeout: int) -> dict:
+    """Pass 1 for a large binary (see _AAA_TIER_MB), in two rizin calls:
+
+      1. ESSENTIAL, checkpointed: cheap facts -> `aa` -> aflj -> `aac` -> aflj -> `aar` + the string
+         xrefs, within _P1_SHARE of the time left. Whatever rung it reaches is kept.
+      2. DEEPEN (only below _AAA_FULL_MAX_MB, and only when call 1 finished): a fresh `aaa` -> aflj,
+         attempted only if its estimated cost (~1.5x call 1, measured 1.4x on a 36MB C++ image) fits
+         _P1_DEEPEN_SHARE of what is left; a cut or skipped deepening keeps the `aa+aac` list
+         (measured: the same function count to within 0.1%) and is noted, never silent.
+
+    Returns {"aflj", "tier", "planned", "proc", "cut", "budget", "xrefs_done", "notes"}."""
+    import time as _t
+    seed = main_seed.strip().rstrip(";")
+    rungs = [("aa", "aa"), ("aa+aac", "aac")]
+    planned = [r[0] for r in rungs] + (["aaa"] if size_mb < _AAA_FULL_MAX_MB else [])
+    # Cheap facts first, so they land even if the analysis is killed (RLIMIT_AS on a huge image).
+    parts = [_redir("ij", T / "ij"), _redir("izj", T / "strings"), _redir("iij", T / "imports")]
+    for i, (_label, cmd) in enumerate(rungs):
+        parts.append(cmd)
+        if seed:
+            parts.append(seed)
+        parts.append(_redir("aflj", T / f"funcs.{i}"))
+    # String xrefs ride on the analysis already loaded (a second whole-program pass just for them
+    # would double the cost); `aar` is what records data references (+2s on a 43MB Go image), and
+    # gives the same xrefs `aaa` does (measured on a 36MB C++ and a 36MB Go image).
+    if string_addrs:
+        parts.append("aar")
+        for a in string_addrs:
+            parts.append(f"s {a}")
+            parts.append(_redir("axtj", T / f"x_{a}"))
+        parts.append(_redir("ij", T / "xrefs.done"))           # marker: every xref was written
+    budget = _time_share(ctx, timeout, _P1_SHARE)
+    _emit(ctx, msg=(f"large binary ({size_mb:.0f}MB): tiered analysis "
+                    f"{' -> '.join(planned)} (checkpointed; {budget}s share)"))
+    proc, cut, notes = None, False, []
+    t0 = _t.time()
+    try:
+        proc = _run(cli, binary, ";".join(parts), ctx=ctx, timeout=budget, scratch=T)
+    except Exception as e:                                      # noqa: BLE001
+        if not _is_local_cut(e, ctx):
+            raise
+        cut = True
+    took = _t.time() - t0
+    # The deepest checkpoint that parses (a rung killed mid-write leaves torn JSON -> skipped), but
+    # never let an EMPTY deeper rung hide a non-empty shallower one.
+    parsed = [(rungs[i][0], _readj(T / f"funcs.{i}", None)) for i in range(len(rungs))]
+    parsed = [(t, g) for t, g in parsed if isinstance(g, list)]
+    tier, aflj = ([p for p in parsed if p[1]] or parsed or [(None, [])])[-1]
+
+    if "aaa" in planned and not cut and tier == "aa+aac" and aflj:
+        est = took * 1.5
+        d_budget = _time_share(ctx, timeout, _P1_DEEPEN_SHARE, floor=0)
+        if est > d_budget:
+            notes.append(f"`aaa` deepening skipped: estimated {est:.0f}s exceeds its "
+                         f"{d_budget}s share of the time left; functions and call graph come "
+                         f"from `aa+aac`")
+        else:
+            dparts = ["aaa"] + ([seed] if seed else []) + [_redir("aflj", T / "funcs.2")]
+            try:
+                _run(cli, binary, ";".join(dparts), ctx=ctx, timeout=d_budget, scratch=T)
+            except Exception as e:                              # noqa: BLE001
+                if not _is_local_cut(e, ctx):
+                    raise
+            deeper = _readj(T / "funcs.2", None)
+            if isinstance(deeper, list) and deeper:
+                tier, aflj = "aaa", deeper
+            else:
+                notes.append(f"`aaa` deepening did not finish in its {d_budget}s share; "
+                             f"functions and call graph come from `aa+aac`")
+    return {"aflj": aflj, "tier": tier, "planned": planned, "proc": proc, "cut": cut,
+            "budget": budget, "xrefs_done": (T / "xrefs.done").exists(), "notes": notes}
+
+
 def _emit(ctx, *, pct=None, msg=None):
     """Best-effort progress emit. Never raises: progress is a courtesy, not part of the result,
     and a ctx that lacks progress() (or one that fails) must not take the analysis down."""
@@ -323,16 +479,60 @@ class _Lifter:
     def __init__(self, langid: Optional[str]):
         self.langid = langid or None
         self.available = bool(langid) and _have_pypcode()
+        # Honest bookkeeping for the last lift_all: instructions that crashed the lifter (skipped
+        # after being pinpointed), and how many were left un-lifted (crash budget / timeout).
+        self.crashed_at: list = []
+        self.unlifted = 0
+        self.lift_status = "ok"
 
     def lift_all(self, instrs: list, *, ctx=None, timeout: int = 600) -> dict:
         """Lift many instructions at once in a child process. `instrs` is [(addr_int, hexbytes)].
-        Returns {addr_hex: [op_strings]}. On a crash/timeout the child dies and we return whatever
-        it flushed (possibly nothing) -- the analysis continues with that much P-Code."""
+        Returns {addr_hex: [op_strings]}.
+
+        A native crash on ONE encoding used to cost every instruction after the last flush --
+        on a large binary, a crash early in 1.5M instructions silently left ~all of it without
+        P-Code. The worker writes one row per instruction IN ORDER, so the parent knows exactly
+        where it stopped: it RESUMES from there (the first resume flushes per-instruction so the
+        offending encoding is pinpointed), SKIPS the crasher, and carries on -- bounded by
+        _LIFT_RESTARTS and the overall timeout. What could not be lifted is counted on
+        `self.unlifted` / `self.crashed_at` for the caller to report."""
+        self.crashed_at, self.unlifted, self.lift_status = [], 0, "ok"
         if not self.available or not instrs:
             return {}
-        rows = self._invoke({"langid": self.langid, "instrs": [[a, h] for a, h in instrs]},
-                            ctx=ctx, timeout=timeout)
-        return {row["a"]: (row.get("p") or []) for row in rows if "a" in row}
+        import time as _t
+        out: dict = {}
+        remaining = list(instrs)
+        pinpoint = False
+        t_end = _t.time() + max(1, timeout)
+        for _attempt in range(_LIFT_RESTARTS + 1):
+            left = int(t_end - _t.time())
+            if left < 1:
+                self.lift_status = "timeout"
+                break
+            rows, status = self._invoke_status(
+                {"langid": self.langid, "instrs": [[a, h] for a, h in remaining],
+                 "flush_first": 256 if pinpoint else 0},
+                ctx=ctx, timeout=left)
+            done = 0
+            for row in rows:
+                if "a" in row:
+                    out[row["a"]] = row.get("p") or []
+                    done += 1
+            if done >= len(remaining) or status != "crashed":
+                if done < len(remaining):
+                    self.lift_status = status
+                remaining = remaining[done:]
+                break
+            if pinpoint and done < 256:
+                self.crashed_at.append(remaining[done][0])      # this encoding kills the lifter
+                remaining = remaining[done + 1:]
+                pinpoint = False
+            else:
+                remaining = remaining[done:]
+                pinpoint = True
+            self.lift_status = "crashed"
+        self.unlifted = max(0, len(instrs) - len(out) - len(self.crashed_at))
+        return out
 
     def disasm_regions(self, regions: list, *, ctx=None, timeout: int = 600) -> dict:
         """Linearly disassemble whole function byte-ranges in the isolated worker -- for an arch the
@@ -347,6 +547,11 @@ class _Lifter:
     def _invoke(self, spec: dict, *, ctx=None, timeout: int = 600) -> list:
         """Run the isolated pcode worker with `spec` and return the parsed JSONL rows. A crash/timeout
         kills only the child; whatever it flushed is returned."""
+        return self._invoke_status(spec, ctx=ctx, timeout=timeout)[0]
+
+    def _invoke_status(self, spec: dict, *, ctx=None, timeout: int = 600) -> tuple:
+        """`_invoke`, plus how the worker ended: "ok", "crashed" (non-zero exit / signal) or
+        "timeout". A genuine stage cancel / deadline propagates (it used to be swallowed here)."""
         import tempfile
         d = Path(tempfile.mkdtemp(prefix="lykos-pcode-"))
         inp, outp = d / "in.json", d / "out.jsonl"
@@ -354,13 +559,22 @@ class _Lifter:
             inp.write_text(json.dumps(spec))
             cmd = [sys.executable, str(_pcode_worker_path()), str(inp), str(outp)]
             popen_env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+            status = "ok"
             try:
                 if ctx is not None:
-                    ctx.run_subprocess(cmd, timeout=timeout, env=popen_env)
+                    res = ctx.run_subprocess(cmd, timeout=timeout, env=popen_env)
                 else:
-                    subprocess.run(cmd, timeout=timeout, capture_output=True, check=False,
-                                   stdin=subprocess.DEVNULL, env=popen_env)
-            except Exception:                              # noqa: BLE001 -- crash/timeout: use partial
+                    res = subprocess.run(cmd, timeout=timeout, capture_output=True, check=False,
+                                         stdin=subprocess.DEVNULL, env=popen_env)
+                if getattr(res, "returncode", 0) not in (0, None):
+                    status = "crashed"
+                    _log.warning("pcode worker exited rc=%s; using its partial output",
+                                 res.returncode)
+            except Exception as e:                         # noqa: BLE001 -- crash/timeout: use partial
+                if type(e).__name__ in ("StageCancelled", "StageTimeout") and (
+                        ctx is not None and ctx.should_cancel()):
+                    raise
+                status = "timeout"
                 _log.debug("pcode worker crashed or timed out; using partial output", exc_info=True)
             rows = []
             try:
@@ -374,7 +588,7 @@ class _Lifter:
                                 continue
             except OSError:
                 pass
-            return rows
+            return rows, status
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -504,20 +718,26 @@ def quick_facts(binary: Path, *, ctx=None, timeout: int = 60) -> dict:
         return {"program": {}, "strings": [], "imports": []}
     binary = Path(binary)
     import tempfile
-    scratch = ctx.scratch() if ctx is not None else Path(tempfile.mkdtemp(prefix="lykos-qf-"))
+    own = ctx is None
+    scratch = ctx.scratch() if not own else Path(tempfile.mkdtemp(prefix="lykos-qf-"))
     T = Path(scratch) / "qf"
     T.mkdir(parents=True, exist_ok=True)
     try:
-        _run(cli, binary, ";".join([
-            _redir("ij", T / "ij"), _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
-            ctx=ctx, timeout=timeout, scratch=T)
-    except Exception:
-        observe.absorbed(_log, "quick_facts extraction cut short")
-    ij = _readj(T / "ij", {})
+        try:
+            _run(cli, binary, ";".join([
+                _redir("ij", T / "ij"), _redir("izj", T / "strings"),
+                _redir("iij", T / "imports")]),
+                ctx=ctx, timeout=timeout, scratch=T)
+        except Exception:
+            observe.absorbed(_log, "quick_facts extraction cut short")
+        ij = _readj(T / "ij", {})
+        izj = _readj(T / "strings", [])
+        iij = _readj(T / "imports", [])
+    finally:
+        if own:
+            shutil.rmtree(scratch, ignore_errors=True)
     binf = ij.get("bin", {}) if isinstance(ij, dict) else {}
     core = ij.get("core", {}) if isinstance(ij, dict) else {}
-    izj = _readj(T / "strings", [])
-    iij = _readj(T / "imports", [])
     strings = [{"addr": hex(s["vaddr"]) if isinstance(s.get("vaddr"), int) else "",
                 "value": s.get("string") or "", "xrefs": []}
                for s in (izj if isinstance(izj, list) else []) if isinstance(s, dict)]
@@ -545,10 +765,22 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     binary = Path(binary)
 
     import tempfile
-    scratch = ctx.scratch() if ctx is not None else Path(tempfile.mkdtemp(prefix="lykos-nre-"))
+    # A ctx owns (and cleans) its scratch; a ctx-less caller (the CLI variant/patch-diff commands)
+    # got a private temp dir that was never removed -- on a large binary that is hundreds of
+    # thousands of per-function files left in /tmp per call. Remove it when we made it.
+    own = ctx is None
+    scratch = ctx.scratch() if not own else Path(tempfile.mkdtemp(prefix="lykos-nre-"))
     T = Path(scratch) / "nre"
     T.mkdir(parents=True, exist_ok=True)
+    try:
+        return _analyze_in(cli, binary, T, ctx=ctx, timeout=timeout)
+    finally:
+        if own:
+            shutil.rmtree(scratch, ignore_errors=True)
 
+
+def _analyze_in(cli: Path, binary: Path, T: Path, *, ctx, timeout: int) -> dict:
+    """The body of `analyze`, writing its rizin output files under `T`."""
     # Recover `main` on an aarch64 binary where the disassembler would miss it: main is passed to
     # __libc_start_main only as a data pointer (never called), so a static/stripped aarch64 target
     # gets no function/name there. Decode _start (doc 04) and seed rizin with it so main is
@@ -556,7 +788,8 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     main_seed = ""
     try:
         from . import elf as _elf
-        _mva = _elf.main_from_start(binary.read_bytes())
+        with _Mapped(binary) as _data:                    # mmap: never copy a 100MB image whole
+            _mva = _elf.main_from_start(_data)
         if _mva is not None:
             main_seed = f"af @ {hex(_mva)}; afn main @ {hex(_mva)}; "
     except Exception:
@@ -568,22 +801,54 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # fell back to an old/incompatible build and recovered nothing (see the empty-recovery check
     # after the function list is parsed).
     #
-    # SIZE-GATED analysis depth: `aaa` times out on a very large image (a 160MB .so never returns),
-    # which fails the whole stage and recovers nothing. Above _AAA_FULL_MAX_MB, use the lighter `aa`
-    # so the function list still comes back; the structural/buffer recovery already has a non-`aaa`
-    # fallback for large targets.
+    # SIZE-TIERED analysis depth (see _AAA_TIER_MB): whole-program `aaa` stops finishing in a normal
+    # budget on a large image (and its RSS gets it killed by the RLIMIT_AS cap on a ~100MB one), and
+    # a pass 1 that dies recovers NOTHING structural -- the run degraded to strings-only. A small
+    # binary keeps the original single `aaa` pass byte-for-byte; a large one runs the checkpointed
+    # aa -> aac -> [aaa] ladder and keeps the deepest rung that landed.
     try:
         _size_mb = binary.stat().st_size / (1024.0 * 1024.0)
     except OSError:
         _size_mb = 0.0
-    _aa_cmd = "aaa" if _size_mb < _AAA_FULL_MAX_MB else "aa"
-    if _aa_cmd != "aaa":
-        _emit(ctx, msg=(f"large binary ({_size_mb:.0f}MB): using fast analysis ({_aa_cmd}) to avoid "
-                        "an autoanalysis timeout; buffers recovered from stack geometry"))
-    _p1 = _run(cli, binary, _aa_cmd + ";" + main_seed + ";".join([
-        _redir("ij", T / "ij"), _redir("aflj", T / "funcs"),
-        _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
-        ctx=ctx, timeout=timeout, scratch=T)
+    tiered = _size_mb >= _AAA_TIER_MB
+    degradations: list = []               # honest notes on every rung/pass that fell short
+    tier = "aaa"
+    p1_cut = False
+    if not tiered:
+        _p1 = _run(cli, binary, "aaa;" + main_seed + ";".join([
+            _redir("ij", T / "ij"), _redir("aflj", T / "funcs"),
+            _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
+            ctx=ctx, timeout=timeout, scratch=T)
+        aflj = _readj(T / "funcs", [])
+    else:
+        # The string table first (no analysis, seconds) so pass 1 can compute the string xrefs on
+        # the analysis it already holds.
+        try:
+            _run(cli, binary, _redir("izj", T / "strings"), ctx=ctx,
+                 timeout=_time_share(ctx, min(timeout, 180), 1.0), scratch=T)
+        except Exception as e:                            # noqa: BLE001
+            if not _is_local_cut(e, ctx):
+                raise
+        _izj0 = _readj(T / "strings", [])
+        xref_strings = [s.get("vaddr") for s in (_izj0 if isinstance(_izj0, list) else [])
+                        if isinstance(s, dict)
+                        and isinstance(s.get("vaddr"), int)][:_MAX_STRING_XREFS]
+        _tp = _tiered_pass1(cli, binary, T, main_seed, _size_mb, xref_strings,
+                            ctx=ctx, timeout=timeout)
+        _p1, aflj, tier, p1_cut = _tp["proc"], _tp["aflj"], _tp["tier"], _tp["cut"]
+        _how = (f"was cut at its {_tp['budget']}s share" if p1_cut else
+                f"exited rc={getattr(_p1, 'returncode', None)}")
+        if tier is None:
+            degradations.append(f"tiered analysis ({' -> '.join(_tp['planned'])}) {_how} before "
+                                f"even the `aa` rung landed: no function list was recovered")
+        elif tier == "aa":
+            degradations.append(f"tiered analysis {_how} after the `aa` rung (planned "
+                                f"{' -> '.join(_tp['planned'])}): call-target discovery (aac) "
+                                f"did not finish, so functions reached only by calls in a "
+                                f"stripped binary are missing")
+        degradations.extend(_tp["notes"])
+        _emit(ctx, msg=(f"pass 1 recovered {len(aflj)} functions at the `{tier}` rung"
+                        if tier else "pass 1 recovered no function list"))
     _p1_rc = getattr(_p1, "returncode", None)
     _p1_err = _tail_stderr(getattr(_p1, "stderr", None))
     # rizin warns to stderr by design, but a NON-ZERO exit is a real problem: surface its stderr
@@ -606,7 +871,6 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     prog["language"] = _langid(prog) or f'{prog["arch"]}:{prog["bits"]}'
     lifter = _Lifter(_langid(prog))
 
-    aflj = _readj(T / "funcs", [])
     izj = _readj(T / "strings", [])
     iij = _readj(T / "imports", [])
     fn_by_addr = {_faddr(f): f for f in aflj if isinstance(f, dict) and _faddr(f) is not None}
@@ -669,6 +933,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     addrs = [] if rizin_blind else list(fn_by_addr)   # rizin-blind arch: SLEIGH recovery owns bodies
     done = 0
     failed_batches = 0
+    stopped_at = None                                     # batch index a deadline stop cut at
 
     def _reraise_if_cancel(e):
         # A genuine stage cancel/deadline must PROPAGATE, not be swallowed as a "failed batch":
@@ -694,7 +959,9 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
             parts.append(_redir("afxj", T / f"{a}.x"))
         return parts
 
-    if target_fns <= _AAA_MAX:
+    if target_fns <= _AAA_MAX and not tiered:
+        # (a large image always takes the batched path below: one whole-program pass that times
+        # out would lose every function, and its `aaa` is exactly what tiering avoids)
         parts = ["aaa"]
         for a in addrs:
             parts += _fn_cmds(a)
@@ -707,16 +974,46 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
                            f"building the functions that were written")
         _emit(ctx, pct=75, msg=f"disassembled {target_fns} functions")
     else:
+        # DEADLINE-AWARE batching. Running into the stage deadline mid-batch raised out of
+        # analyze() and discarded EVERY batch already written (plus the whole function list), so a
+        # large binary on a budget slice came back strings-only. When the stage has a deadline, the
+        # loop instead stops while a reserve is still left for the P-Code lift + persist; the
+        # functions it did not reach keep their pass-1 name and call edges (the call graph stays
+        # whole) and the shortfall is reported. No deadline (CLI, tests) -> unchanged.
+        # The reserve GROWS with the work done: building + lifting + persisting the functions
+        # structured so far costs about as long as structuring them did (measured on a 36MB C++
+        # image: 18,000 functions structured in ~100s, then ~40s just to build them and a 2.1M-
+        # instruction lift), so the loop stops when the time left can no longer cover
+        # _P2_POST_FACTOR x the structural time spent (+ the next batch), floored by _P2_RESERVE.
+        import time as _t
+        left0 = _deadline_left(ctx)
+        reserve = None if left0 is None else max(30.0, _P2_RESERVE * left0)
+        p2_t0, p2_batches = _t.time(), 0
+        # With a deadline in play, take the functions that call a catalogued source/sink first,
+        # so a cut keeps structure where the detectors look. Order is result-neutral otherwise.
+        if reserve is not None:
+            addrs = _prioritize(addrs, fn_by_addr)
         for i in range(0, len(addrs), _BATCH):
             if ctx is not None:
                 ctx.check_cancel()                        # honor a cancel/timeout between batches
+            left = _deadline_left(ctx)
+            need = None
+            if reserve is not None and left is not None:
+                spent = _t.time() - p2_t0
+                nxt = spent / p2_batches if p2_batches else 0.0
+                need = max(reserve, (spent + nxt) * _P2_POST_FACTOR + 20.0)
+                if left - nxt < need:
+                    stopped_at = i
+                    break
+            p2_batches += 1
             chunk = addrs[i:i + _BATCH]
             parts = []
             for a in chunk:
                 parts.append(f"af @ {a}")
                 parts += _fn_cmds(a)
+            btimeout = timeout if need is None else int(max(15, min(timeout, left - need)))
             try:
-                _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
+                _run(cli, binary, ";".join(parts), ctx=ctx, timeout=btimeout, scratch=T)
             except Exception as e:                        # noqa: BLE001 -- one batch, not the run
                 _reraise_if_cancel(e)
                 failed_batches += 1
@@ -726,6 +1023,13 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
             pct = 5 + int(70 * done / max(1, target_fns))  # 5..75% is the structural pass
             _emit(ctx, pct=min(75, pct),
                   msg=f"disassembled {min(done, target_fns)}/{target_fns} functions")
+        if stopped_at is not None:
+            degradations.append(
+                f"structural pass stopped ahead of the stage deadline: {done}/{len(addrs)} "
+                f"functions got CFG/instructions/P-Code; the other {len(addrs) - done} keep "
+                f"their name and call edges only (time reserved for the P-Code lift and persist)"
+                " -- raise the budget for full depth")
+            _emit(ctx, msg=degradations[-1])
 
     # Pass 3 (decompile): advisory C, the slowest step. We decompile only up to _MAX_DECOMPILE up
     # front (small binaries come back fully decompiled); every other function decompiles lazily on
@@ -733,24 +1037,44 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # big binary is not held up for minutes producing C that the detectors never read.
     if _MAX_DECOMPILE and target_fns <= _MAX_DECOMPILE and not rizin_blind:
         dec_cmd = "pdg" if _has_pdg(cli, binary, ctx, timeout) else "pdc"
-        dparts = ["aaa"]
+        # A large (tiered) image defines just the functions it decompiles (`af @ a`) instead of
+        # re-running the whole-program `aaa` that tiering exists to avoid.
+        dparts = [] if tiered else ["aaa"]
         for a in addrs:
+            if tiered:
+                dparts.append(f"af @ {a}")
             dparts.append(f"s {a}")
             dparts.append(_redir(dec_cmd, T / f"{a}.d"))
         try:
             _run(cli, binary, ";".join(dparts), ctx=ctx, timeout=timeout, scratch=T)
-        except Exception:
+        except Exception as e:                            # noqa: BLE001 -- advisory C only
+            _reraise_if_cancel(e)          # a user cancel / stage deadline must still stop the run
             _log.debug("up-front decompile pass failed", exc_info=True)
-            pass
     elif target_fns > _MAX_DECOMPILE:
         _emit(ctx, pct=78, msg=f"decompiled C is on-demand for {target_fns} functions "
                                f"(opens decompile the function you click; detectors use P-Code)")
 
     _emit(ctx, pct=80, msg=f"lifting P-Code for {target_fns} functions")
-    functions = (_recover_via_pcode(binary, fn_by_addr, lifter, ctx=ctx, timeout=timeout)
+    # Bound the SLEIGH recovery by the stage deadline too (the rizin path bounds its lift inside
+    # _build_functions): cut locally it keeps what it recovered; run INTO the deadline it raises.
+    _left = _deadline_left(ctx)
+    lift_timeout = timeout if _left is None else int(max(15, min(timeout, _left * 0.85)))
+    functions = (_recover_via_pcode(binary, fn_by_addr, lifter, ctx=ctx, timeout=lift_timeout)
                  if rizin_blind
-                 else _build_functions(T, fn_by_addr, lifter, embedded, ctx=ctx, timeout=timeout))
-    strings = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout)
+                 else _build_functions(T, fn_by_addr, lifter, embedded, ctx=ctx,
+                                       timeout=timeout))
+    if lifter.crashed_at or lifter.unlifted:
+        # P-Code is what every data-flow detector reads: a lift that lost instructions is a
+        # degradation of exactly those detectors, never a silent one.
+        degradations.append(
+            f"P-Code lift incomplete ({lifter.lift_status}): "
+            f"{lifter.unlifted + len(lifter.crashed_at)} instruction(s) "
+            f"left without P-Code" + (f"; {len(lifter.crashed_at)} encoding(s) crashed the "
+                                      f"lifter and were skipped" if lifter.crashed_at else ""))
+    strings, _xref_note = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout,
+                                         precomputed=tiered)
+    if _xref_note:
+        degradations.append(_xref_note)
     imports = [i.get("name") for i in iij if isinstance(i, dict) and i.get("name")]
 
     # Empty recovery that is actually a FAILURE, not a clean "0 functions". When rizin crashed,
@@ -759,9 +1083,13 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # functions" and every function-keyed detector silently starved. Flag it so the stage reports
     # recovery FAILED with the rc/stderr, rather than a silent clean small result.
     recovery_failed = (len(functions) == 0
-                       and (_p1_rc not in (0, None) or bool(_p1_err)))
+                       and (_p1_rc not in (0, None) or bool(_p1_err) or p1_cut))
     recovery_error = ""
-    if recovery_failed:
+    if recovery_failed and p1_cut:
+        recovery_error = (f"rizin/r2 recovered 0 functions: the tiered analysis of this "
+                          f"{_size_mb:.0f} MB binary was cut before its first rung (`aa`) landed "
+                          f"-- not a clean empty program; raise the budget to analyse it")
+    elif recovery_failed:
         recovery_error = (f"rizin/r2 recovered 0 functions (rc={_p1_rc}"
                           + (f", stderr: {_p1_err}" if _p1_err else "")
                           + ") -- the disassembler produced no program (an old/incompatible "
@@ -772,11 +1100,16 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
             "functions": functions, "strings": strings, "imports": imports,
             # honest bookkeeping: how complete this analysis is, surfaced by the stage.
             "total_functions": total_fns, "analyzed_functions": len(functions),
-            "partial": bool(failed_batches) or recovery_failed
-                       or (_MAX_FUNCS and total_fns > _MAX_FUNCS),
+            "partial": bool(failed_batches or recovery_failed or stopped_at is not None
+                            or (_MAX_FUNCS and total_fns > _MAX_FUNCS)
+                            # tiered: stopped at `aa` -> call-discovered functions are missing
+                            or (tiered and tier in (None, "aa"))),
             "failed_batches": failed_batches,
             # an empty recovery that was really a crash/incompatible-rizin, not a clean 0.
-            "recovery_failed": recovery_failed, "recovery_error": recovery_error}
+            "recovery_failed": recovery_failed, "recovery_error": recovery_error,
+            # which pass-1 depth produced the function list ("aaa" for every small binary; the
+            # deepest checkpointed rung for a tiered large one), and every pass that fell short.
+            "analysis_tier": tier, "tiered": tiered, "degradations": degradations}
 
 
 def decompile_one(binary: Path, addr, *, ctx=None, timeout: int = 120) -> str:
@@ -793,8 +1126,11 @@ def decompile_one(binary: Path, addr, *, ctx=None, timeout: int = 120) -> str:
         cli = None
     if cli is None or addr is None:
         return ""
-    a = int(addr, 16) if isinstance(addr, str) and addr.lower().startswith("0x") \
-        else int(addr) if isinstance(addr, str) else addr
+    try:
+        a = int(addr, 16) if isinstance(addr, str) and addr.lower().startswith("0x") \
+            else int(addr) if isinstance(addr, str) else int(addr)
+    except (TypeError, ValueError):
+        return ""                      # a malformed address: no C, not an endpoint 500
     import tempfile
     d = Path(tempfile.mkdtemp(prefix="lykos-dec1-"))
     try:
@@ -920,7 +1256,12 @@ def _recover_via_pcode(binary: Path, fn_by_addr: dict, lifter: "_Lifter", *,
     the isolated worker. Recovers instructions (+ P-Code) and call edges (from P-Code CALL/CALLIND
     ops, whose direct targets SLEIGH resolves) -- the function LIST and names still come from rizin's
     (correct) symbol-table read; only the bodies are recovered here."""
-    data = binary.read_bytes()
+    with _Mapped(binary) as data:          # mmap: only the function byte ranges are paged in
+        return _recover_regions(data, fn_by_addr, lifter, ctx=ctx, timeout=timeout)
+
+
+def _recover_regions(data, fn_by_addr: dict, lifter: "_Lifter", *, ctx=None,
+                     timeout: int = 600) -> list:
     # The per-function SIZE in the structural backend's list was computed by its wrong (x86) decode,
     # so it cannot be trusted here. Bound each region by the NEXT function's start (the standard
     # linear-sweep bound), falling back to the symtab size then a cap -- decoding a little trailing
@@ -1070,8 +1411,19 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
 
     # Lift every instruction's P-Code in ONE isolated child, then fill it into the built functions.
     if to_lift:
+        # Deadline-aware: the lift gets what is left of the stage minus a persist reserve, measured
+        # HERE (building the functions above takes real time on a large binary). A lift cut on its
+        # own timeout keeps what it lifted and reports the rest; one that ran INTO the stage
+        # deadline raised and lost the whole analysis.
+        left = _deadline_left(ctx)
+        lt = timeout if left is None else int(min(timeout, left * 0.8 - 5))
+        if lt < 10:
+            lifter.crashed_at, lifter.unlifted = [], len(to_lift)
+            lifter.lift_status = "no time left before the stage deadline"
+            _emit(ctx, msg=f"no time left to lift P-Code for {len(to_lift)} instructions")
+            return functions
         _emit(ctx, msg=f"lifting P-Code for {len(to_lift)} instructions (isolated)")
-        pcode_map = lifter.lift_all(sorted(to_lift.items()), ctx=ctx, timeout=timeout)
+        pcode_map = lifter.lift_all(sorted(to_lift.items()), ctx=ctx, timeout=lt)
         for a, ins in pending:
             ops = pcode_map.get(hex(a))
             if ops:
@@ -1094,25 +1446,48 @@ def _decompiled(text: str) -> str:
     return "" if (not t or _is_missing_decompiler(t)) else t
 
 
-def _build_strings(cli: Path, binary: Path, izj, T: Path, *, ctx, timeout) -> list:
-    """Strings + their xref sites (axtj per string address), each redirected to a file."""
+def _build_strings(cli: Path, binary: Path, izj, T: Path, *, ctx, timeout,
+                   precomputed: bool = False) -> tuple:
+    """Strings + their xref sites (axtj per string address), each redirected to a file.
+
+    Returns (strings, note). `precomputed` (a tiered large binary): pass 1 already wrote the
+    `x_<addr>` files on the analysis it held, so only read them -- re-running a whole-program
+    analysis here just for xrefs is the cost tiering avoids. `note` is "" when every capped string
+    got its xref pass, else an honest one-line degradation (the strings themselves are always
+    returned; only their xref sites are missing)."""
     strings = []
     addrs = [s.get("vaddr") for s in (izj if isinstance(izj, list) else [])
              if isinstance(s, dict) and isinstance(s.get("vaddr"), int)][:_MAX_STRING_XREFS]
     xrefs_by_addr = {}
+    note = ""
     if addrs:
-        parts = ["aaa"]
+        if not precomputed:
+            parts = ["aaa"]
+            for a in addrs:
+                parts.append(f"s {a}")
+                parts.append(_redir("axtj", T / f"x_{a}"))
+            try:
+                _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
+            except Exception as e:                        # noqa: BLE001
+                # A per-call timeout here used to propagate and discard the WHOLE analysis (every
+                # function already built) over a best-effort xref pass. Keep the functions; a real
+                # cancel / stage deadline still propagates.
+                if not _is_local_cut(e, ctx):
+                    raise
+        done = 0
         for a in addrs:
-            parts.append(f"s {a}")
-            parts.append(_redir("axtj", T / f"x_{a}"))
-        _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
-        for a in addrs:
+            if (T / f"x_{a}").exists():
+                done += 1
             xj = _readj(T / f"x_{a}", [])
             xrefs_by_addr[a] = [hex(x.get("from")) for x in (xj if isinstance(xj, list) else [])
                                 if isinstance(x, dict) and isinstance(x.get("from"), int)]
+        if done < len(addrs):
+            note = (f"string xrefs were computed for {done}/{len(addrs)} strings (the xref pass "
+                    f"did not finish); the remaining strings are listed without their "
+                    f"referencing sites")
     for s in (izj if isinstance(izj, list) else []):
         va = s.get("vaddr")
         strings.append({"addr": hex(va) if isinstance(va, int) else "",
                         "value": s.get("string") or "",
                         "xrefs": xrefs_by_addr.get(va, [])})
-    return strings
+    return strings, note

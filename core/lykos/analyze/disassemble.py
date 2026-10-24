@@ -51,7 +51,7 @@ def _edges_from_funcs(funcs) -> list:
     return edges
 
 
-def _persist_analysis(conn, target_id: str, result: dict, target_bytes: bytes = None) -> tuple:
+def _persist_analysis(conn, target_id: str, result: dict, target_bytes: "bytes | None" = None) -> tuple:
     """Write the recovered functions / call edges / strings onto a target row. Shared by the
     stage body and the cache-hit reprojection so both project identical DB state.
 
@@ -89,15 +89,40 @@ def reproject_disassemble(store, target_id: str, run_id: str) -> bool:
     result = cached_output_json(store, run_id)
     if not isinstance(result, dict) or "functions" not in result:
         return False
-    tb = None
+    blob = None
     try:
         t = TargetDAO(store.conn).get(target_id)
         if t and t.sha256:
-            tb = open(str(store.content.path(t.sha256)), "rb").read()
+            blob = store.content.path(t.sha256)
     except Exception:                                    # noqa: BLE001 -- relabel is best-effort
-        tb = None
-    _persist_analysis(store.conn, target_id, result, target_bytes=tb)
+        blob = None
+    with _target_view(blob) as tb:
+        _persist_analysis(store.conn, target_id, result, target_bytes=tb)
     return True
+
+
+class _target_view:
+    """The target's bytes for FLIRT library-ID, MAPPED rather than read: a 100MB+ engagement binary
+    read whole sat in the worker's RSS for the entire persist pass. Yields None when there is no
+    blob or it cannot be opened (relabel is best-effort and is then skipped, as before)."""
+
+    def __init__(self, path):
+        self._path, self._m = path, None
+
+    def __enter__(self):
+        if self._path is None:
+            return None
+        try:
+            self._m = native_re._Mapped(self._path)
+            return self._m.__enter__() or None
+        except Exception:                                # noqa: BLE001 -- relabel is best-effort
+            self._m = None
+            return None
+
+    def __exit__(self, *exc):
+        if self._m is not None:
+            self._m.__exit__(*exc)
+        return False
 
 
 def disassemble_stage(ctx) -> dict:
@@ -198,12 +223,8 @@ def disassemble_stage(ctx) -> dict:
         result = ghidra.parse_result(out)
     # functions + call graph/xrefs (reachability + taint sinks for Phase 3) + strings. Hand the
     # bytes to the persist pass so FLIRT library-ID can name stripped-static libc sinks.
-    _tb = None
-    try:
-        _tb = open(str(blob), "rb").read()
-    except Exception:                                    # noqa: BLE001 -- relabel is best-effort
-        _tb = None
-    funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result, target_bytes=_tb)
+    with _target_view(blob) as _tb:
+        funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result, target_bytes=_tb)
 
     # Honest completeness bookkeeping. `analyze()` is exhaustive by default but returns a partial
     # result rather than raising when a batch times out or the function set was capped, so we
@@ -217,12 +238,19 @@ def disassemble_stage(ctx) -> dict:
     # FAILURE; say so in the note and the progress line rather than a silent clean small result.
     recovery_failed = bool(result.get("recovery_failed"))
     rec_note = result.get("recovery_error") or ""
+    # Size-tiered recovery (native backend): which pass-1 rung produced the function list, and
+    # every pass that fell short. A degradation is part of the note, never silent.
+    degradations = [d for d in (result.get("degradations") or []) if d]
+    if degradations and not rec_note:
+        rec_note = "; ".join(degradations)
     sha = ctx.put_artifact("ghidra-analysis", data=canonical_json(result))
     ctx.emit("re.done", payload={"functions": len(funcs), "call_edges": len(edges),
                                  "strings": len(strings), "total_functions": total,
                                  "partial": partial, "failed_batches": failed,
                                  "recovery_failed": recovery_failed,
                                  "note": rec_note or None,
+                                 "analysis_tier": result.get("analysis_tier"),
+                                 "degradations": degradations or None,
                                  "language": result.get("program", {}).get("language")})
     if recovery_failed:
         ctx.progress(pct=100, msg="recovery FAILED — %d functions recovered (%s); not a clean "
@@ -232,6 +260,10 @@ def disassemble_stage(ctx) -> dict:
     if partial:
         suffix = (f" — partial: {len(funcs)}/{total} functions recovered"
                   + (f", {failed} batch(es) did not finish" if failed else ""))
+    if result.get("tiered") and result.get("analysis_tier"):
+        suffix += f" [large-binary analysis: {result['analysis_tier']}]"
+    if degradations:
+        suffix += f" — {len(degradations)} degradation(s): {degradations[0]}"
     ctx.progress(pct=100, msg="%d functions, %d call edges, %d strings%s" %
                  (len(funcs), len(edges), len(strings), suffix))
     return {"output_shas": [sha], "output_kind": "ghidra-analysis"}

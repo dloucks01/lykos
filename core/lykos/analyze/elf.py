@@ -12,6 +12,7 @@ import math
 import re
 import struct
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from .. import observe
@@ -58,6 +59,43 @@ STT_FUNC = 2
 # bytes hashed. Real ELFs have a few dozen sections and never approach either bound.
 _MAX_ENTROPY_SECTIONS = 96
 _MAX_ENTROPY_BYTES = 64 << 20
+
+
+class MappedFile:
+    """Read-only view of a file for the byte-level ELF helpers (main_from_start, the SLEIGH region
+    reader, FLIRT): an mmap, so a 100MB+ target is paged in on demand instead of being copied whole
+    into the analysis process's RSS. Supports len/slicing/indexing/find/struct.unpack_from like
+    bytes -- but NOT `needle in data` (on an mmap that is not a substring test; use `.find`), and
+    no bytes-only methods (.split/.decode/.startswith) on the view itself (slices are bytes). Falls
+    back to an in-memory read when the file cannot be mapped (empty file, a FS without mmap) -- the
+    result is identical, only the memory profile differs."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._fh = None
+        self.data = b""
+
+    def __enter__(self):
+        import mmap
+        try:
+            self._fh = open(self.path, "rb")
+            self.data = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError):
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
+            self.data = self.path.read_bytes()
+        return self.data
+
+    def __exit__(self, *exc):
+        try:
+            if hasattr(self.data, "close"):
+                self.data.close()
+        except (BufferError, OSError):
+            pass                       # an exported buffer still alive: GC closes the map later
+        if self._fh is not None:
+            self._fh.close()
+        return False
 
 
 def _fits(data: bytes, base: int, entsize: int, claimed: int) -> int:
@@ -257,11 +295,13 @@ def parse(data: bytes) -> ElfInfo:
                       and re.search(rb"go1\.\d", data[:1 << 21]) is not None)
         if ".gopclntab" in by_name or ".note.go.buildid" in by_name or go_buildinfo or go_pclntab:
             info.toolchain_hint = "go"
-        elif b"/rustc/" in data or b"rust_begin_unwind" in data or b"__rust_alloc" in data \
-                or b"rust_eh_personality" in data:
+        # `.find`, not `in`: identical on bytes, and it also works on a mapped (mmap) image --
+        # `needle in mmap` is not a substring search there.
+        elif any(data.find(n) >= 0 for n in (b"/rustc/", b"rust_begin_unwind", b"__rust_alloc",
+                                              b"rust_eh_personality")):
             info.toolchain_hint = "rust"
-        elif b"libstdc++" in data or b"libc++.so" in data or b"__cxa_throw" in data \
-                or b"_ZSt" in data or b"_ZNSt" in data:
+        elif any(data.find(n) >= 0 for n in (b"libstdc++", b"libc++.so", b"__cxa_throw",
+                                              b"_ZSt", b"_ZNSt")):
             info.toolchain_hint = "c++"
         elif ".comment" in by_name:
             low = data[by_name[".comment"]["offset"]:

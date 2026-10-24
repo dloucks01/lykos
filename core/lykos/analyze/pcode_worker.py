@@ -76,6 +76,9 @@ def main(in_path: str, out_path: str) -> int:
     langid = spec.get("langid")
     instrs = spec.get("instrs") or []
     regions = spec.get("regions") or []
+    # The first `flush_first` rows are flushed one by one: a parent resuming after a native crash
+    # sets it so the next crash pinpoints the exact encoding (and only that one is skipped).
+    flush_first = int(spec.get("flush_first") or 0)
     import pypcode
     ctx = pypcode.Context(langid)
     n = 0
@@ -90,7 +93,7 @@ def main(in_path: str, out_path: str) -> int:
                 ops = []
             out.write(json.dumps({"a": hex(int(addr)), "p": ops}) + "\n")
             n += 1
-            if n % 256 == 0:                                 # flush so a later crash keeps these
+            if n % 256 == 0 or n <= flush_first:             # flush so a later crash keeps these
                 out.flush()
         for addr, hexb in regions:
             try:
