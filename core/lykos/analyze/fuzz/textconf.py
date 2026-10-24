@@ -320,3 +320,95 @@ def example_seeds(strings, *, limit: int = 8) -> list:
             seen.add(b)
             uniq.append(b)
     return uniq[:limit]
+
+
+# --- a PLAUSIBLE config with content (doc 47 R2.d / P5) -------------------------------------------
+# `seed_for` is the baseline the MUTATOR starts from; this is the file a target is GIVEN so it runs
+# at all -- a daemon that `fopen`s /etc/app/app.conf and refuses an empty one ("no listen
+# address configured") never reaches the code a campaign is aimed at. The keys still come from the
+# binary's own strings; the values are ordinary and shaped by the key's NAME (a port gets a port, a
+# directory key a directory), because a value the parser rejects is the same dead end as no file.
+
+#: `[general]` / `[server]` -- an INI section header the parser compares against.
+_SECTION = re.compile(r"^\[([A-Za-z][A-Za-z0-9 _.:-]{0,30})\]$")
+#: A key's value shaped by its name. Checked in order; the first match wins.
+_VALUE_BY_NAME = (
+    (re.compile(r"(?i)port$|_port|^port"), "8080"),
+    (re.compile(r"(?i)host|addr|address|listen|bind|server|ip$"), "127.0.0.1"),
+    (re.compile(r"(?i)(?:dir|directory|root|home|prefix|path|spool|cache)$"), "{dir}"),
+    (re.compile(r"(?i)file$|log$|pid$|pidfile|logfile|conf$|config$"), "{file}"),
+    (re.compile(r"(?i)^(?:enable|enabled|disable|debug|verbose|daemon|daemonize|foreground|"
+                r"use_|allow)"), "yes"),
+    (re.compile(r"(?i)count|num|max|min|size|limit|timeout|level|threads|workers|interval|"
+                r"retries|len|depth"), "1"),
+    (re.compile(r"(?i)user|group|owner"), "nobody"),
+    (re.compile(r"(?i)name|id$|ident"), "lykos"),
+)
+
+
+def value_for(key: str, *, dir_value: str = "/tmp", file_value: str = "/dev/null") -> str:
+    """An ordinary value for config key (or env var) `key`, shaped by its name."""
+    for rx, v in _VALUE_BY_NAME:
+        if rx.search(key or ""):
+            return v.replace("{dir}", dir_value).replace("{file}", file_value)
+    return "lykos"
+
+
+def sections_from(strings, *, limit: int = 4) -> list:
+    """INI section names (`[general]` -> "general") the binary compares against, in order."""
+    out: list = []
+    for s in strings or ():
+        m = _SECTION.match((s or "").strip())
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+            if len(out) >= limit:
+                break
+    return out
+
+
+def separator_from(strings) -> str:
+    """`key = value` vs `key=value` vs `key: value`, from the formats the binary itself prints or
+    scans (`%s = %s`, `%[^=]=%s`, `%s: %s`). "=" when nothing says otherwise."""
+    spaced = colon = 0
+    for s in strings or ():
+        s = s or ""
+        if "%s = %" in s or re.search(r"\w = %", s):
+            spaced += 1
+        elif "%s: %" in s or "%[^:]" in s:
+            colon += 1
+    if spaced and spaced >= colon:
+        return " = "
+    if colon:
+        return ": "
+    return "="
+
+
+def plausible_config(path: str, strings, *, keys=None, dir_value: str = "/tmp",
+                     file_value: str = "/dev/null", limit: int = 12) -> bytes:
+    """A config file WITH content for `path`, in the format its name implies.
+
+    `keys` are the candidate keys (default: `keys_from(strings)`); `strings` also supply INI
+    section headers and the separator. The format follows the extension -- JSON, YAML, XML or
+    line-oriented `key<sep>value` (with the first `[section]` the binary names, for .ini/.conf).
+    Never empty: an empty file is exactly what a target that checks "configured at all" rejects.
+    """
+    strings = list(strings or ())
+    keys = list(keys if keys is not None else keys_from(strings, limit=limit))[:limit]
+    ext = (path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else "")
+    vals = [(k, value_for(k, dir_value=dir_value, file_value=file_value)) for k in keys]
+    if ext == "json":
+        import json
+        return (json.dumps({k: v for k, v in vals} or {"name": "lykos"}, indent=2) + "\n").encode()
+    if ext in ("xml",):
+        body = "".join(f"  <{k}>{v}</{k}>\n" for k, v in vals if re.match(r"^[A-Za-z_][\w.-]*$", k))
+        return ('<?xml version="1.0"?>\n<config>\n' + body + "</config>\n").encode()
+    if ext in ("yaml", "yml"):
+        lines = ["# lykos: synthesized"] + ([f"{k}: {v}" for k, v in vals] or ["name: lykos"])
+        return ("\n".join(lines) + "\n").encode()
+    sep = separator_from(strings)
+    lines = ["# lykos: synthesized"]
+    secs = sections_from(strings)
+    if secs:
+        lines.append(f"[{secs[0]}]")
+    lines += [f"{k}{sep}{v}" for k, v in vals] or [f"name{sep}lykos"]
+    return ("\n".join(lines) + "\n").encode()

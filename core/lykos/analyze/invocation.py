@@ -1198,7 +1198,7 @@ _FILE_KINDS = {"config", "jar", "path"}
 _MIN_MANIFEST = b"Manifest-Version: 1.0\nCreated-By: lykos\n\n"
 
 
-def materialize(found: dict, directory, *, sample=None) -> list:
+def materialize(found: dict, directory, *, sample=None, strings=None) -> list:
     """A proposed argv with real files on disk behind every value that names one.
 
     Returns the argv; `@@` is left in place, because the campaign substitutes its own mutated
@@ -1208,6 +1208,12 @@ def materialize(found: dict, directory, *, sample=None) -> list:
     /tmp with a private tmpfs and binds back only the executable's own directory, so a file
     written anywhere else exists on the host and not inside the sandbox -- the target then
     reports "cannot open jar", which looks exactly like a wrong proposal and is not one.
+
+    `strings` (the binary's strings), when given and no `sample` is, makes a CONFIG behind a
+    non-input flag a plausible config WITH content -- keys the binary names, the separator and
+    `[section]` it uses -- instead of a bare comment: a daemon that refuses an empty config
+    ("no listen address configured") otherwise rejects a proposal that was right (doc 47 R2.d).
+    Opt-in, so a caller that does not pass it gets exactly the file it always did.
     """
     import zipfile
     d = pathlib.Path(directory)
@@ -1235,12 +1241,25 @@ def materialize(found: dict, directory, *, sample=None) -> list:
                     z.writestr("META-INF/MANIFEST.MF", _MIN_MANIFEST.decode())
             else:
                 path = d / ("lykos.conf" if kind == "config" else "lykos.dat")
-                path.write_bytes(sample if sample is not None else b"# lykos\n")
+                path.write_bytes(sample if sample is not None else
+                                 config_sample(strings) if (strings is not None
+                                                            and kind == "config")
+                                 else b"# lykos\n")
             out.append(str(path))
             i += 2
             continue
         i += 1
     return out
+
+
+def config_sample(strings, *, name: str = "lykos.conf") -> bytes:
+    """A plausible config WITH content for this binary (keys / separator / section from its own
+    strings), for a config value slot or the verification sample behind `@@`."""
+    from .fuzz import textconf
+    from .runtime_env import _good_key
+    strs = [getattr(s, "value", s) for s in (strings or ()) if getattr(s, "value", s)]
+    keys = [k for k in textconf.keys_from(strs, limit=48) if _good_key(k)][:12]
+    return textconf.plausible_config(name, strs, keys=keys)
 
 
 _REJECT = re.compile(r"(?i)\b(usage|invalid option|unrecogni[sz]ed|unknown option|"
