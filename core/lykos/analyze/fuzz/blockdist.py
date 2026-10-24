@@ -24,8 +24,13 @@ coverage), and prefers lower-scoring inputs -- directed greybox fuzzing with no 
 """
 from __future__ import annotations
 
+import bisect
 import heapq
 from typing import Iterable, Optional
+
+#: Longest instruction any supported ISA encodes (x86: 15 bytes). A site past a block's LAST
+#: recovered instruction by more than this is not in that block.
+_MAX_INSN = 16
 
 
 def _addr(x) -> Optional[int]:
@@ -93,7 +98,7 @@ def block_distance(functions, call_edges, target_sites, *, call_weight: int = 10
     block_succ = {}
     block_func = {}
     instr_block = {}
-    func_blocks = {}
+    block_last = {}                                   # block -> its last recovered instruction
     for f in functions or ():
         fa = _addr(getattr(f, "addr", None))
         if fa is None:
@@ -101,21 +106,32 @@ def block_distance(functions, call_edges, target_sites, *, call_weight: int = 10
         for ba, succ, ins in _blocks_of(f):
             block_succ[ba] = succ
             block_func[ba] = fa
-            func_blocks.setdefault(fa, []).append(ba)
             for ia in ins:
                 instr_block[ia] = ba
             instr_block.setdefault(ba, ba)             # block entry maps to itself
+            block_last[ba] = max(ins) if ins else None
+    starts = sorted(block_succ)
 
     def _block_containing(site) -> Optional[int]:
         b = instr_block.get(site)
         if b is not None:
             return b
-        # fall back: the greatest block start <= site within any function (approximate)
-        best = None
-        for ba in block_succ:
-            if ba <= site and (best is None or ba > best):
-                best = ba
-        return best
+        # Fall back to the block whose EXTENT holds the site (a site that is not itself an
+        # instruction start: a mid-instruction address, a return address). Two defects in the old
+        # fallback: it took the greatest block start <= site with NO upper bound, so a sink in
+        # code no recovered function covers -- an unanalysed function, a PLT stub, a gap -- was
+        # pinned to whatever block happened to precede it, in another function, at distance 0,
+        # and the campaign steered at a block with no path to the sink; and it was a linear scan
+        # of every block per lookup, run once per call edge (O(edges x blocks)).
+        i = bisect.bisect_right(starts, site) - 1
+        if i < 0:
+            return None
+        ba = starts[i]
+        last = block_last.get(ba)
+        end = (last + _MAX_INSN) if last is not None else ba + _MAX_INSN
+        if i + 1 < len(starts):
+            end = min(end, starts[i + 1])              # blocks do not overlap
+        return ba if site < end else None
 
     # Functions that contain a target site -> call-graph distance to them.
     target_funcs = set()

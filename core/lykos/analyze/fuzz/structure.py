@@ -217,12 +217,36 @@ def _layout(model, fields, pos=0, out=None, names=None):
         elif t == "shadow":
             pass                                       # occupies no bytes in the output
         else:
-            pos += len(model.serialize([fd]))
+            pos += _leaf_len(fd)
         out[id(fd)] = (start, pos - start)
         nm = fd["f"].get("name")
         if nm and nm not in names:
             names[nm] = fd
     return out, names, pos
+
+
+def _leaf_len(fd) -> int:
+    """Bytes a leaf field serializes to, without serializing it: `_layout` used to build every
+    leaf's bytes just to take their length, twice per mutation (the fixup's two passes) -- the
+    biggest single cost of a structure-aware mutation. Must agree with `FormatModel.serialize`."""
+    f = fd["f"]
+    t = f["type"]
+    if t in _INT:
+        return _INT[t][0]
+    if t == "magic":
+        return len(_as_bytes(fd["val"] if fd["val"] else f["value"]))
+    return len(_as_bytes(fd["val"] or b""))
+
+
+def _has_derived(spec, lengths: bool) -> bool:
+    """Does any field, at any depth, carry a value `_fix_covers` would recompute?"""
+    for f in spec:
+        if f.get("covers") or f.get("offset_of") or f.get("crc32_of") or (
+                lengths and f.get("length_of")):
+            return True
+        if isinstance(f.get("spec"), list) and _has_derived(f["spec"], lengths):
+            return True
+    return False
 
 
 def _every_field(fields):
@@ -236,7 +260,7 @@ def _every_field(fields):
                 yield from _every_field(rec)
 
 
-def _fix_covers(model, fields, lengths: bool = False) -> None:
+def _fix_covers(model, fields, lengths: bool = False, keep=frozenset()) -> None:
     """Recompute every derived field so the structure stays parseable.
 
     `covers: "rest"` spans to the end of the input; `covers: <field>` spans from the length
@@ -247,12 +271,26 @@ def _fix_covers(model, fields, lengths: bool = False) -> None:
     `length_of` is recomputed only when generating a SEED. During mutation a length that no
     longer matches what it sizes is the whole point -- driving it is how a length-prefixed
     parser gets tested -- so the fixup must not quietly put it back.
+
+    `keep` -- ids of fields a mutation round deliberately DROVE: left exactly as driven, while
+    every other derived field is still recomputed around them.
     """
+    cache = getattr(model, "_derived", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            model._derived = cache
+        except AttributeError:
+            pass
+    if lengths not in cache:
+        cache[lengths] = _has_derived(getattr(model, "spec", None) or (), lengths)
+    if not cache[lengths]:
+        return                    # nothing to recompute: skip two full layout passes
     for _ in range(2):            # an offset depends on lengths that may themselves have moved
         spans, names, total = _layout(model, fields)
         for fd in _every_field(fields):
             f = fd["f"]
-            if f["type"] not in _INT:
+            if f["type"] not in _INT or id(fd) in keep:
                 continue
             # A format that checksums its own chunks cannot be fuzzed blind: a parser rejects
             # a bad CRC before reading anything else, so every mutation is thrown away at the
@@ -509,16 +547,19 @@ class StructMutator:
         # serialize failure: a field-driver on an analyst-supplied spec can hit an edge the
         # model did not anticipate, and one bad draw must not take the campaign down with it.
         try:
-            drove_cover = False
+            self._driven = set()
             scopes = _scopes(fields)
             for _ in range(self.rng.randint(1, 3)):
-                drove_cover |= self._mutate_field(self.rng.choice(scopes)) == "cover"
-            if not drove_cover:
-                # Keep "covers: rest" lengths honest unless this round deliberately drove one.
-                # A segment length that no longer spans the segment is not a bug the parser will
-                # chase: it reads a short segment and discards the mutated tail as padding, so
-                # every other mutation in the round is thrown away before it is ever parsed.
-                _fix_covers(self.model, fields)
+                self._mutate_field(self.rng.choice(scopes))
+            # Keep every derived field (covers / offset_of / crc32_of) honest EXCEPT the ones this
+            # round deliberately drove. A segment length that no longer spans the segment is not a
+            # bug the parser will chase: it reads a short segment and discards the mutated tail
+            # as padding, so every other mutation in the round is thrown away before it is parsed.
+            # This used to be all-or-nothing -- one driven field skipped the WHOLE fixup -- so a
+            # round that drove one PNG chunk's CRC and edited another chunk's data shipped the
+            # second chunk with a stale CRC, rejected at the door; and a driven offset/size pair
+            # whose offset is itself derived (ELF e_shoff) was put straight back.
+            _fix_covers(self.model, fields, keep=self._driven)
             return self.model.serialize(fields)
         except Exception:
             _log.debug("struct-mutate: field mutate/serialize failed; falling back to byte havoc",
@@ -556,6 +597,9 @@ class StructMutator:
         else:
             off_fd["val"] = self.rng.choice(_FAR) & mask
             siz_fd["val"] = self.rng.choice(_EDGE) & mask
+        driven = getattr(self, "_driven", None)
+        if driven is not None:                          # both halves stay as constructed
+            driven.update((id(off_fd), id(siz_fd)))
 
     def _blob_by_name(self, fields, name):
         return next((fd for fd in fields if fd["f"].get("name") == name), None)
@@ -570,9 +614,15 @@ class StructMutator:
                 fd["val"] = self.byte.mutate(fd["val"] or b"", ())
         elif t in _INT:
             fd["val"] = self.rng.choice(_EDGE)
-            if (fd["f"].get("covers") == "rest" or fd["f"].get("offset_of")
-                    or fd["f"].get("crc32_of")):
-                return "cover"                          # driving it IS the interesting case
+            if fd["f"].get("covers") or fd["f"].get("offset_of") or fd["f"].get("crc32_of"):
+                # Driving a derived field IS the interesting case, so the fixup leaves it alone.
+                # Any `covers`, not only "rest": a JPEG APP1 length covers a named field, and
+                # was put back by the fixup every single time -- the length the jpeg model calls
+                # "exactly the relationship the structure mutator exists to drive" never was.
+                driven = getattr(self, "_driven", None)
+                if driven is not None:
+                    driven.add(id(fd))
+                return "cover"
             # A record that says WHERE data is and HOW MUCH of it there is is the classic
             # out-of-bounds read, and it needs both halves at once: jhead survives a GPS entry
             # with a four-billion-byte count, and survives one pointing off the end of the
@@ -1398,13 +1448,30 @@ def _token_hit(token: str, blob: str) -> bool:
 def from_spec(spec) -> FormatModel:
     """Build a model from an analyst-supplied spec (list of field dicts, e.g. from JSON).
     Magic values may arrive as plain strings or as {"b64": ...} from the GUI builder."""
+    return FormatModel(_coerce_spec(spec))
+
+
+#: Field keys whose value may be BYTES, so arrive from JSON as a str or {"b64": ...}.
+_BYTES_KEYS = ("value", "seed_value", "until")
+
+
+def _coerce_spec(spec) -> list:
+    """A JSON spec back into the model's own types, at EVERY nesting level. Only the top-level
+    magic was coerced, so a group/array's nested magic -- every chunk type in the PNG model, every
+    ZIP signature -- stayed a {"b64": ...} dict and `bytes(dict)` raised in parse; and a blob's
+    `seed_value` / `until` bytes did not survive the trip at all."""
     out = []
-    for f in spec:
+    for f in spec or ():
         f = dict(f)
-        if f.get("type") == "magic":
-            f["value"] = _coerce_value(f.get("value", b""))
+        for k in _BYTES_KEYS:
+            if k in f and (k != "value" or f.get("type") == "magic"):
+                f[k] = _coerce_value(f[k])
+        if f.get("type") == "magic" and "value" not in f:
+            f["value"] = b""
+        if isinstance(f.get("spec"), list):
+            f["spec"] = _coerce_spec(f["spec"])
         out.append(f)
-    return FormatModel(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1481,16 +1548,24 @@ _INTNAME = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
 
 
 def _jsonable_spec(spec):
-    """A builtin's field list, safe to put in a JSON response (magic values are bytes)."""
-    out = []
-    for f in spec:
-        g = dict(f)
-        if "value" in g and isinstance(g["value"], (bytes, bytearray)):
-            g["value"] = _b64safe(bytes(g["value"]))
-        if isinstance(g.get("fields"), list):
-            g["fields"] = _jsonable_spec(g["fields"])
-        out.append(g)
-    return out
+    """A builtin's field list, safe to put in a JSON response.
+
+    Bytes can sit anywhere in a builtin -- a magic's value, a blob's `seed_value`, an `until`
+    delimiter -- and at any depth, inside a group's or array's `spec`. Only a top-level `value`
+    was converted (and a `fields` key no model uses was recursed into), so `suggest_spec` on a
+    PNG, ZIP, GIF, gzip, TIFF or ELF sample returned bytes nested in a group and the API's
+    json.dumps raised: the format builder answered 500 for exactly the formats it models best."""
+    return [_jsonable(dict(f)) for f in spec]
+
+
+def _jsonable(v):
+    if isinstance(v, (bytes, bytearray)):
+        return _b64safe(bytes(v))
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return v
 
 
 # Line-oriented text is not a byte grammar, and offering to carve it into magic + blob invites
@@ -1584,57 +1659,78 @@ def _coerce_value(v):
 def describe(spec, sample: bytes) -> dict:
     """Parse a sample against a spec and report how it carves -- per-field offset/size/value,
     whether each length field matches the real blob length, and roundtrip fidelity. This is
-    exactly the model the fuzzer uses, so the preview is truthful."""
-    spec = [dict(f) for f in spec]
-    for f in spec:                                # normalize magic values from the builder
-        if f.get("type") == "magic":
-            f["value"] = _coerce_value(f.get("value", b""))
-    model = FormatModel(spec)
+    exactly the model the fuzzer uses, so the preview is truthful.
+
+    Nested scopes are walked: a group or array is reported as one row (its span and, for an
+    array, its record count) followed by its fields, with ``depth`` saying how far in. A group's
+    value used to fall into the blob branch, ``bytes(list_of_dicts)`` raised, and every builtin
+    with a group -- PNG, ZIP, JPEG, TIFF, RIFF, BMP, MPEG-TS, RTP -- previewed as a parse error."""
+    model = FormatModel(_coerce_spec(spec))
     fields_out = []
     ok = True
     err = None
     try:
         parsed = model.parse(sample or b"")
-        pos = 0
-        # index blobs by name for length checks
-        blob_len = {fd["f"].get("name"): len(fd["val"])
-                    for fd in parsed if fd["f"]["type"] not in _INT and fd["f"]["type"] != "magic"}
-        for fd in parsed:
-            f = fd["f"]
-            t = f["type"]
-            if t == "magic":
-                raw = _as_bytes(fd["val"])
-                want = _as_bytes(f.get("value", b""))
-                size = len(want)
-                fields_out.append({"type": "magic", "name": f.get("name", "magic"),
-                                   "offset": pos, "size": size,
-                                   "value": _preview_bytes(raw),
-                                   "match": raw == want})
-                if raw != want:
-                    ok = False
-                pos += size
-            elif t in _INT:
-                size = _INT[t][0]
-                lo = f.get("length_of")
-                match = None
-                if lo is not None:
-                    match = (int(fd["val"]) == blob_len.get(lo))
-                fields_out.append({"type": t, "name": f.get("name", t),
-                                   "offset": pos, "size": size, "int": int(fd["val"]),
-                                   "endian": f.get("endian", "little"),
-                                   "length_of": lo, "length_match": match})
-                pos += size
-            else:
-                data = _as_bytes(fd["val"])
-                fields_out.append({"type": "blob", "name": f.get("name", "data"),
-                                   "offset": pos, "size": len(data),
-                                   "value": _preview_bytes(data)})
-                pos += len(data)
+        spans, _names, _total = _layout(model, parsed)
+        # every blob by name, at any depth, for the length-field checks
+        blob_len = {}
+        for fd in _every_field(parsed):
+            if fd["f"]["type"] not in _INT and fd["f"]["type"] not in ("magic", "group", "array",
+                                                                        "shadow"):
+                blob_len.setdefault(fd["f"].get("name"), len(_as_bytes(fd["val"] or b"")))
+
+        def walk(fields, depth):
+            nonlocal ok
+            for fd in fields:
+                f = fd["f"]
+                t = f["type"]
+                pos, size = spans[id(fd)]
+                if t == "magic":
+                    raw = _as_bytes(fd["val"])
+                    want = _as_bytes(f.get("value", b""))
+                    fields_out.append({"type": "magic", "name": f.get("name", "magic"),
+                                       "offset": pos, "size": len(want), "depth": depth,
+                                       "value": _preview_bytes(raw), "match": raw == want})
+                    if raw != want:
+                        ok = False
+                elif t in _INT:
+                    lo = f.get("length_of")
+                    match = None
+                    if lo is not None and lo in blob_len:
+                        match = (int(fd["val"]) == blob_len.get(lo))
+                    fields_out.append({"type": t, "name": f.get("name", t),
+                                       "offset": pos, "size": _INT[t][0], "depth": depth,
+                                       "int": int(fd["val"]),
+                                       "endian": f.get("endian", "little"),
+                                       "length_of": lo, "length_match": match})
+                elif t == "group":
+                    fields_out.append({"type": "group", "name": f.get("name", "group"),
+                                       "offset": pos, "size": 0, "span": size, "depth": depth})
+                    walk(fd["val"], depth + 1)
+                elif t == "array":
+                    fields_out.append({"type": "array", "name": f.get("name", "array"),
+                                       "offset": pos, "size": 0, "span": size, "depth": depth,
+                                       "records": len(fd["val"])})
+                    for rec in fd["val"]:
+                        walk(rec, depth + 1)
+                elif t == "shadow":
+                    # carried for derivation (a CRC's plaintext), never in the file
+                    fields_out.append({"type": "shadow", "name": f.get("name", "shadow"),
+                                       "offset": pos, "size": 0, "depth": depth,
+                                       "value": _preview_bytes(_as_bytes(fd["val"] or b""))})
+                else:
+                    data = _as_bytes(fd["val"] or b"")
+                    fields_out.append({"type": "blob", "name": f.get("name", "data"),
+                                       "offset": pos, "size": len(data), "depth": depth,
+                                       "value": _preview_bytes(data)})
+
+        walk(parsed, 0)
         roundtrip = model.serialize(parsed) == (sample or b"")
     except Exception as e:                        # noqa: BLE001 - report parse failure to UI
         ok = False
         err = str(e)
         roundtrip = False
+    # leaves only: a group/array row reports `span` with size 0, so nothing is counted twice
     return {"fields": fields_out, "ok": ok, "roundtrip": roundtrip,
             "consumed": sum(f["size"] for f in fields_out), "sample_size": len(sample or b""),
             "error": err}

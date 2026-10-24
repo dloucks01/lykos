@@ -26,6 +26,11 @@ from .mutator import Mutator
 # find the pieces to vary, and anything we do not recognise is left alone.
 _TAG = re.compile(rb"<([A-Za-z_][\w.:-]*)((?:\s+[\w.:-]+\s*=\s*\"[^\"]*\")*)\s*(/?)>")
 _ATTR = re.compile(rb"([\w.:-]+)\s*=\s*\"([^\"]*)\"")
+# Regions where `<name>` is CHARACTER DATA, not a tag: a CDATA section, a comment, the DOCTYPE's
+# internal subset (an entity value may hold markup). A "tag" matched in there and mutated -- text
+# inserted after the `<raw>` inside `<![CDATA[<raw>]]>` -- edited data while the op believed it
+# was editing structure, and nesting inserted there unbalanced nothing it meant to.
+_OPAQUE = re.compile(rb"<!\[CDATA\[.*?\]\]>|<!--.*?-->|<!DOCTYPE[^\[>]*\[.*?\]\s*>", re.S)
 
 # Values chosen to break what is behind an attribute, not to look plausible. The long runs
 # straddle the buffer sizes that appear in C parsers; the rest are the classic XML-specific
@@ -38,12 +43,22 @@ _NASTY = (
 )
 # A DOCTYPE that declares an external entity: the shape of XXE, and of the expansion attacks.
 # Whether the parser resolves it is exactly what the campaign is asking.
-_XXE_DOCTYPE = (b'<!DOCTYPE root [\n'
-                b'  <!ENTITY xxe SYSTEM "file:///etc/hostname">\n'
-                b'  <!ENTITY lol "aaaaaaaaaa">\n'
-                b'  <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
-                b'  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">\n'
-                b']>\n')
+_XXE_DECLS = (b'  <!ENTITY xxe SYSTEM "file:///etc/hostname">\n'
+              b'  <!ENTITY lol "aaaaaaaaaa">\n'
+              b'  <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+              b'  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">\n')
+_XXE_DOCTYPE = b'<!DOCTYPE root [\n' + _XXE_DECLS + b']>\n'
+# An existing DOCTYPE up to where its internal subset opens (`[`) or the declaration closes (`>`):
+# name, then an optional SYSTEM/PUBLIC external id.
+_DOCTYPE_HEAD = re.compile(
+    rb"<!DOCTYPE\s+[^\s\[>]+(?:\s+(?:SYSTEM|PUBLIC)(?:\s+(?:\"[^\"]*\"|'[^']*')){1,2})?\s*")
+
+#: A mutant is never grown past this. Every operator ADDS (a 20,000-deep nest is 120 KB, an element
+#: repeated 2,048 times is 2,048 copies of it) and a kept mutant is mutated again, so a lineage
+#: compounded without limit: measured, 300 chained generations from a 70-byte seed reached
+#: 4.98 MB, and every later op re-scanned the whole document. An op that would cross the cap is
+#: skipped (truncating would break the well-formedness the mutator exists to keep).
+_MAX_DOC = 1 << 19
 
 
 def looks_like_xml(data: bytes) -> bool:
@@ -73,7 +88,42 @@ class XmlMutator:
         return bytes(r.randrange(0x20, 0x7F) for _ in range(r.randint(1, 32)))
 
     def _tags(self, data):
-        return [m for m in _TAG.finditer(data)]
+        tags = list(_TAG.finditer(data))
+        if tags and b"<!" in data:
+            spans = [(m.start(), m.end()) for m in _OPAQUE.finditer(data)]
+            if spans:
+                tags = [t for t in tags
+                        if not any(a <= t.start() < b for a, b in spans)]
+        return tags
+
+    @staticmethod
+    def _insert_inside(data, t, body):
+        """`body` as the first content of element `t`. A self-closing `<a/>` has no inside: text
+        after it lands in its PARENT, and after a self-closing ROOT it lands outside the document
+        -- which is not well-formed, so every op on `<cfg/>` used to produce a rejected input. A
+        self-closing tag is opened up instead: `<a ...>body</a>`."""
+        if t.group(3):
+            return (data[:t.start(3)] + b">" + body + b"</" + t.group(1) + b">"
+                    + data[t.end():])
+        return data[:t.end()] + body + data[t.end():]
+
+    @staticmethod
+    def _element_end(data, t):
+        """End offset of the element `t` opens: just past its matching `</name>`, counting nested
+        same-name elements. None when the close tag is not found (a fragment)."""
+        if t.group(3):
+            return t.end()
+        name = re.escape(t.group(1))
+        rx = re.compile(rb"<(/?)" + name + rb"(?=[\s/>])[^>]*?(/?)>")
+        depth = 1
+        for m in rx.finditer(data, t.end()):
+            if m.group(1):
+                depth -= 1
+                if depth == 0:
+                    return m.end()
+            elif not m.group(2):
+                depth += 1
+        return None
 
     # -- mutations ----------------------------------------------------------------------
     def _grow_attr(self, data):
@@ -113,7 +163,7 @@ class XmlMutator:
         if not tags:
             return data + inner
         t = self.rng.choice(tags)
-        return data[:t.end()] + inner + data[t.end():]
+        return self._insert_inside(data, t, inner)
 
     def _entities(self, data):
         """Declare entities and reference them. Whether the parser expands or resolves these
@@ -124,21 +174,48 @@ class XmlMutator:
             m = re.match(rb"\s*<\?xml[^>]*\?>\s*", out)
             at = m.end() if m else 0
             out = out[:at] + _XXE_DOCTYPE + out[at:]
-        tags = self._tags(out)
+        elif b"<!ENTITY lol2 " not in out:
+            # The document has its OWN DOCTYPE. Referencing &xxe; without declaring it is an
+            # undefined-entity error, so the parser stopped at the reference and the entity code
+            # under test never ran: declare ours inside the existing internal subset (or open
+            # one), and only reference when that worked.
+            m = _DOCTYPE_HEAD.search(out)
+            if m is None:
+                return None
+            at = m.end()
+            if out[at:at + 1] == b"[":
+                out = out[:at + 1] + b"\n" + _XXE_DECLS + out[at + 1:]
+            elif out[at:at + 1] == b">":
+                out = out[:at] + b" [\n" + _XXE_DECLS + b"]" + out[at:]
+            else:
+                return None
+        tags = self._tags(out)                           # element content only (see _OPAQUE)
         if tags:
             t = self.rng.choice(tags)
             ref = self.rng.choice((b"&xxe;", b"&lol2;", b"&lol1;"))
-            out = out[:t.end()] + ref + out[t.end():]
+            out = self._insert_inside(out, t, ref)
         return out
 
     def _dup_element(self, data):
-        """Repeat an element many times: list handling, and per-child allocation."""
+        """Repeat an element many times: list handling, and per-child allocation.
+
+        The WHOLE element, start tag through its matching end tag. Repeating only the start tag
+        (`<item id="x">` x 2048) left 2,048 unclosed elements -- measured with xmllint, 31 of 120
+        such mutants were well-formed -- so the per-child code this op exists to stress was
+        never reached. Copies go after the element as siblings; the root has no siblings, so its
+        copies go inside it as children."""
         tags = self._tags(data)
         if not tags:
             return None
         t = self.rng.choice(tags)
-        frag = data[t.start():t.end()]
-        return data[:t.end()] + frag * self.rng.choice((16, 256, 2048)) + data[t.end():]
+        end = self._element_end(data, t)
+        if end is None:
+            return None
+        frag = data[t.start():end]
+        copies = frag * self.rng.choice((16, 256, 2048))
+        if t.start() == tags[0].start():                 # the root element
+            return self._insert_inside(data, t, copies)
+        return data[:end] + copies + data[end:]
 
     def _text(self, data):
         """A very large text node, and the CDATA boundary."""
@@ -149,7 +226,7 @@ class XmlMutator:
         body = self.rng.choice((b"A" * self.rng.choice(_LENGTHS),
                                 b"<![CDATA[" + b"B" * 4096 + b"]]>",
                                 b"&amp;" * 2048))
-        return data[:t.end()] + body + data[t.end():]
+        return self._insert_inside(data, t, body)
 
     def mutate(self, data: bytes, corpus=()) -> bytes:
         if not looks_like_xml(data):
@@ -159,7 +236,7 @@ class XmlMutator:
         out = data
         for _ in range(self.rng.randint(1, 2)):
             got = self.rng.choice(ops)(out)
-            if got is not None:
+            if got is not None and len(got) <= max(_MAX_DOC, len(out)):
                 out = got
         # Occasionally break well-formedness on purpose: the error paths are code too, and a
         # mutator that only ever produces valid documents never tests them. Kept rare, because

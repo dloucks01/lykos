@@ -14,17 +14,32 @@ _INTERESTING32 = [0, 1, 65535, 65536, 100000, 0x7FFFFFFF, 0xFFFFFFFF]
 _MAX_LEN = 8192
 
 
+def _tok(d) -> bytes:
+    """A dictionary token as bytes. A `str` token (a mined string handed over undecoded) used to
+    reach `bytearray[pos:pos] = tok` and raise TypeError out of `mutate`, taking the campaign
+    with it."""
+    if isinstance(d, str):
+        return d.encode("latin-1", "ignore")
+    return bytes(d)
+
+
 class Mutator:
     def __init__(self, rng, dictionary=None):
         self.rng = rng
-        self.dict = [d for d in (dictionary or []) if d]
+        self.dict = [t for t in (_tok(d) for d in (dictionary or []) if d) if t]
 
     def mutate(self, data: bytes, corpus) -> bytes:
         b = bytearray(data) if data else bytearray(b"A")
+        # The cap bounds GROWTH; it must not cut an input that arrived longer than it. A real
+        # seed bigger than 8 KiB (a ZIP, a PDF, a firmware blob) used to be chopped to its first
+        # 8 KiB by every mutation -- the ZIP's central directory and the PDF's xref live at the
+        # END -- so not one mutant of it was still the format. Never shorter than the input by
+        # the cap's hand; an explicit truncate op can still shrink it.
+        cap = max(_MAX_LEN, len(b))
         for _ in range(self.rng.randint(1, 8)):
             self._op(b, corpus)
-            if len(b) > _MAX_LEN:
-                del b[_MAX_LEN:]
+            if len(b) > cap:
+                del b[cap:]
         return bytes(b)
 
     def _op(self, b: bytearray, corpus):

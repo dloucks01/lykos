@@ -82,14 +82,21 @@ def keys_from(strings, *, limit: int = 64) -> list:
     """
     out: list = []
     seen = set()
-    # strongest first: keys written beside their own separator
+    strings = list(strings or ())                 # walked twice: a generator would be spent
+    # strongest first: keys written beside their own separator. Bounded by `limit` too: this loop
+    # used to ignore it, so a binary with hundreds of `word=` strings handed the mutator hundreds
+    # of keys and a real one was drawn proportionally less often.
     for s in strings:
+        if len(out) >= limit:
+            break
         for m in _KEY_EQ.finditer(s or ""):
             t = m.group(1)
             if t in seen or not _plausible(t):
                 continue
             seen.add(t)
             out.append(t)
+            if len(out) >= limit:
+                break
     for s in strings:
         t = (s or "").strip()
         if t in seen or not _KEYISH.match(t) or not _plausible(t):
@@ -187,6 +194,13 @@ def boundary_seeds(keys, *, sep: str = "=", limit: int = 5) -> list:
     return out
 
 
+#: A mutant is never grown past this. Every op inserts or lengthens a line (one "very long line"
+#: is up to 40 x a 4 KiB value) and a kept mutant is mutated again, so a lineage compounded:
+#: measured, 300 chained generations from a 30-byte config reached 510 KB and kept growing.
+#: An op that would cross the cap is undone; the input never shrinks below what it arrived as.
+_MAX_TEXT = 1 << 18
+
+
 class KeyValueMutator:
     """Line-aware mutator with the byte Mutator's interface.
 
@@ -196,7 +210,9 @@ class KeyValueMutator:
 
     def __init__(self, rng, keys=(), dictionary=None, separators=SEPARATORS):
         self.rng = rng
-        self.keys = list(keys) or ["name", "value", "path", "port"]
+        # str keys: a bytes key (mined straight from a binary) raised AttributeError on .encode
+        self.keys = [k.decode("latin-1") if isinstance(k, (bytes, bytearray)) else str(k)
+                     for k in keys if k] or ["name", "value", "path", "port"]
         self.seps = list(separators)
         self.byte = Mutator(rng, dictionary)
 
@@ -220,24 +236,31 @@ class KeyValueMutator:
         lines = (data or b"").split(b"\n")
         if len(lines) > 4096:
             return self.byte.mutate(data, corpus)
-        r = self.rng
-        for _ in range(r.randint(1, 3)):
-            op = r.random()
-            if op < 0.45 or not lines:
-                lines.insert(r.randrange(len(lines) + 1), self._line())
-            elif op < 0.65:
-                lines[r.randrange(len(lines))] = self._line()
-            elif op < 0.8:
-                # keep the key, break the value: the key is what gets the line PARSED
-                i = r.randrange(len(lines))
-                head, sep, _ = lines[i].partition(b"=")
-                lines[i] = (head + b"=" + self._value()) if sep else self._line()
-            elif op < 0.9 and len(lines) > 1:
-                del lines[r.randrange(len(lines))]
-            else:
-                # one very long line: the `fgets` buffer itself is a boundary
-                lines[r.randrange(len(lines))] = self._line() * r.randint(4, 40)
+        cap = max(_MAX_TEXT, len(data or b""))
+        for _ in range(self.rng.randint(1, 3)):
+            before = list(lines)
+            self._op(lines)
+            if sum(len(x) for x in lines) + len(lines) - 1 > cap:
+                lines[:] = before                       # would cross the cap: undo this op
         return b"\n".join(lines)
+
+    def _op(self, lines) -> None:
+        r = self.rng
+        op = r.random()
+        if op < 0.45 or not lines:
+            lines.insert(r.randrange(len(lines) + 1), self._line())
+        elif op < 0.65:
+            lines[r.randrange(len(lines))] = self._line()
+        elif op < 0.8:
+            # keep the key, break the value: the key is what gets the line PARSED
+            i = r.randrange(len(lines))
+            head, sep, _ = lines[i].partition(b"=")
+            lines[i] = (head + b"=" + self._value()) if sep else self._line()
+        elif op < 0.9 and len(lines) > 1:
+            del lines[r.randrange(len(lines))]
+        else:
+            # one very long line: the `fgets` buffer itself is a boundary
+            lines[r.randrange(len(lines))] = self._line() * r.randint(4, 40)
 
 
 # A specimen the program DOCUMENTS for itself. Many CLI tools and prompt-driven services write
@@ -277,6 +300,8 @@ def example_seeds(strings, *, limit: int = 8) -> list:
     """
     out: list = []
     for s in strings or ():
+        if len(set(out)) >= limit:
+            break                                     # enough: the rest would be cut anyway
         if not s or not isinstance(s, str):
             continue
         for m in _EXAMPLE.finditer(s):

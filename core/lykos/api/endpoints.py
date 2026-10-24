@@ -770,9 +770,9 @@ class EndpointsMixin:
         path = self.server.content.path(sha)
         if not path.exists():
             return self._json({"error": "no artifact"}, 404)
-        # Only parse an artifact the store KNOWS is an attempt log. read_log() slurps the whole
-        # file, and any sha reaches this route -- pointed at a target binary or firmware image it
-        # read (and utf-8-decoded) up to 1 GiB per request before deciding it was not a log.
+        # Only parse an artifact the store KNOWS is an attempt log. Any sha reaches this route, and
+        # read_log() streams the whole file to judge its summary -- pointed at a target binary or
+        # firmware image it would decode up to 1 GiB per request before deciding it was not a log.
         s = self._store()
         try:
             art = s.artifacts.get(sha)

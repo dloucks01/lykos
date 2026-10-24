@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import re
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -54,6 +56,15 @@ TOO_FEW = "too_few"            # not enough attempts to judge
 
 _MIN_JUDGE = 20                # fewer attempts than this is not a pattern
 _DOMINANT = 0.90
+#: Seconds between SYNC flushes of the gzip stream. Without one, a campaign killed before
+#: `finish()` (a worker timeout, SIGKILL, a crash of the stage itself) left a gzip member with no
+#: end marker AND everything since the last 32 KiB deflate block still in the compressor, so the
+#: log of the run that most needed explaining was unreadable. A sync flush every few seconds makes
+#: every line up to it recoverable, for the cost of a few bytes of compression per flush.
+_FLUSH_S = 2.0
+#: Phases whose `new` counts are coverage gains -- the same two `AttemptLog.record` credits, so a
+#: log read back from disk is judged on the same evidence as the live tally.
+_GAIN_PHASES = ("seed", "mutate")
 
 # stderr a loader/launcher prints when the program never got to main(). Matched only on the FIRST
 # lines of stderr: a program is free to print "No such file" about its own input.
@@ -141,14 +152,21 @@ class Tally:
         return [{"rc": rc, "msg": msg, "count": k}
                 for (rc, msg), k in self.errors.get(outcome, Counter()).most_common(n)]
 
-    def verdict(self, progressed: Optional[bool] = None) -> tuple:
+    def verdict(self, progressed: Optional[bool] = None, did_not_run: bool = False) -> tuple:
         """(verdict, one-line note quoting the real error).
 
         `progressed` -- did the campaign reach ANY new coverage beyond its first attempt? Most
         mutated inputs are rejected by any parser, so "90% exit 1" is normal for a campaign that is
         also climbing coverage; only a campaign that ALSO reached nothing new is "rejecting" or
-        "timing out". A program that never started is an error loop whatever else happened."""
+        "timing out". A program that never started is an error loop whatever else happened.
+
+        `did_not_run` -- the engine STOPPED because the sandbox said, definitively, that the
+        program cannot run (a not-runnable isolation, a loader refusal). That is not a sample too
+        small to judge: the engine stops after one such attempt precisely because the answer is
+        already known, and calling it "too few" hid the loader message the operator needs."""
         t = self.total
+        if did_not_run and t and self.counts["no_start"] >= _DOMINANT * t:
+            return ERRORING, self._erroring_note()
         if t < _MIN_JUDGE:
             return TOO_FEW, f"only {t} attempt(s) -- too few to judge"
         c = self.counts
@@ -156,23 +174,10 @@ class Tally:
         def pct(k):
             return 100.0 * c[k] / t
 
-        def quote(o):
-            top = self.top(o, 1)
-            if not top:
-                return ""
-            m = top[0]
-            bits = []
-            if m["rc"] is not None:
-                bits.append(f"exit {m['rc']}")
-            if m["msg"]:
-                bits.append(f"“{m['msg']}”")
-            return (" -- " + ", ".join(bits)) if bits else ""
+        quote = self._quote
 
         if c["no_start"] >= _DOMINANT * t:
-            return ERRORING, (f"{c['no_start']:,} of {t:,} attempts ({pct('no_start'):.0f}%) never "
-                              f"reached the program -- it did not start, or the input could not be "
-                              f"delivered{quote('no_start')}. This is an error loop, not a "
-                              f"campaign: nothing was tested.")
+            return ERRORING, self._erroring_note()
         if c["timeout"] >= _DOMINANT * t and not progressed:
             return TIMING_OUT, (f"{c['timeout']:,} of {t:,} attempts ({pct('timeout'):.0f}%) hit the "
                                 f"per-attempt time limit -- the target is waiting for something "
@@ -193,8 +198,27 @@ class Tally:
         mix = ", ".join(f"{k.replace('_', ' ')} {pct(k):.0f}%" for k in OUTCOMES if c[k])
         return WORKING, f"{t:,} attempts: {mix}"
 
-    def to_dict(self, progressed: Optional[bool] = None) -> dict:
-        v, note = self.verdict(progressed)
+    def _quote(self, outcome: str) -> str:
+        top = self.top(outcome, 1)
+        if not top:
+            return ""
+        m = top[0]
+        bits = []
+        if m["rc"] is not None:
+            bits.append(f"exit {m['rc']}")
+        if m["msg"]:
+            bits.append(f"“{m['msg']}”")
+        return (" -- " + ", ".join(bits)) if bits else ""
+
+    def _erroring_note(self) -> str:
+        t, n = self.total, self.counts["no_start"]
+        return (f"{n:,} of {t:,} attempts ({100.0 * n / t:.0f}%) never "
+                f"reached the program -- it did not start, or the input could not be "
+                f"delivered{self._quote('no_start')}. This is an error loop, not a "
+                f"campaign: nothing was tested.")
+
+    def to_dict(self, progressed: Optional[bool] = None, did_not_run: bool = False) -> dict:
+        v, note = self.verdict(progressed, did_not_run)
         return {"attempts": self.total, "counts": {o: self.counts[o] for o in OUTCOMES},
                 "top_errors": {o: self.top(o) for o in OUTCOMES if self.counts[o] and o != "clean_exit"},
                 "verdict": v, "verdict_note": note}
@@ -219,6 +243,7 @@ class AttemptLog:
         self.kept = 0
         self.closed = False
         self._fh = None
+        self._last_flush = 0.0
         try:
             p = path or (Path(ctx.scratch()) / f"{engine}-attempts.jsonl.gz")
             self.path = p
@@ -275,6 +300,11 @@ class AttemptLog:
             row.update(extra)
         try:
             self._fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+            if t - self._last_flush >= _FLUSH_S:
+                # SYNC flush: everything written so far becomes decodable even if `finish()` is
+                # never reached (see _FLUSH_S); read_log() tolerates the missing end marker.
+                self._last_flush = t
+                self._fh.flush()
         except Exception:                                # noqa: BLE001 -- disk full etc: stop logging
             self._close_fh()
 
@@ -298,7 +328,9 @@ class AttemptLog:
                "kept": self.kept, "elapsed_s": round(el, 1),
                "last_gain_s": (round(self.last_gain_t, 1) if self.last_gain_t is not None else None)}
         if self.last_gain_t is not None and el > 0:
-            out["idle_tail_pct"] = round(100.0 * (el - self.last_gain_t) / el)
+            # clamped: an engine that sets `last_gain_s` itself (AFL's plot) can report a gain
+            # time from its own clock that is past ours, which read as a NEGATIVE idle tail
+            out["idle_tail_pct"] = max(0, min(100, round(100.0 * (el - self.last_gain_t) / el)))
         return out
 
     def set_value(self, *, seed: Optional[int] = None, gained: Optional[int] = None,
@@ -335,7 +367,8 @@ class AttemptLog:
         self.closed = True
         had_file = self._fh is not None
         self._close_fh()
-        payload = {"engine": self.engine, **self.tally.to_dict(self.progressed()),
+        payload = {"engine": self.engine,
+                   **self.tally.to_dict(self.progressed(), bool(extra.get("did_not_run"))),
                    "value": self.value(), **extra}
         if had_file and self.n:
             try:
@@ -355,36 +388,87 @@ class AttemptLog:
 
 
 # -- reading a stored log back (API / CLI) -------------------------------------------------------
+def _iter_lines(path_or_bytes, state: dict):
+    """Lines of a stored log, STREAMED: a long campaign's log decompresses to hundreds of MB, and
+    the old reader held all of it (plus a second whole-file read just to sniff the gzip magic) to
+    return one page of rows. A gzip stream with no end marker -- the engine was killed before
+    `finish()` -- yields every line up to the last sync flush and sets ``state["truncated"]``
+    instead of raising and losing the whole log."""
+    if isinstance(path_or_bytes, (bytes, bytearray)):
+        raw = bytes(path_or_bytes)
+        if raw[:2] != b"\x1f\x8b":
+            yield from raw.decode("utf-8", "replace").splitlines()
+            return
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        tail, pos, step = b"", 0, 1 << 20
+        try:
+            while pos < len(raw) and not d.eof:
+                tail += d.decompress(raw[pos:pos + step])
+                pos += step
+                *done, tail = tail.split(b"\n")
+                for ln in done:
+                    yield ln.decode("utf-8", "replace")
+            tail += d.flush()
+        except zlib.error:
+            state["truncated"] = True
+        if not d.eof:
+            state["truncated"] = True
+        for ln in tail.split(b"\n"):
+            # a partial final line is dropped by the JSON parse below, never mis-read
+            yield ln.decode("utf-8", "replace")
+        return
+    p = Path(path_or_bytes)
+    with open(p, "rb") as fb:
+        gz = fb.read(2) == b"\x1f\x8b"
+    raw_fh = gzip.open(p, "rb") if gz else open(p, "rb")       # noqa: SIM115 -- closed below
+    try:
+        f = io.TextIOWrapper(raw_fh, encoding="utf-8", errors="replace")
+        try:
+            for ln in f:
+                yield ln.rstrip("\n")
+        except (EOFError, zlib.error, gzip.BadGzipFile):
+            state["truncated"] = True
+    finally:
+        raw_fh.close()
+
+
 def read_log(path_or_bytes, *, outcome=None, phase=None, offset: int = 0, limit: int = 200,
              errors_only: bool = False) -> dict:
     """Parse a stored attempt log: {header, total, matched, rows[offset:offset+limit], summary}.
     `outcome`/`phase` filter (a str or a collection); `errors_only` keeps every non-clean attempt.
-    The summary is re-judged from the full stream, so it is right however the log is filtered."""
-    if isinstance(path_or_bytes, (bytes, bytearray)):
-        raw = gzip.decompress(bytes(path_or_bytes)) if bytes(path_or_bytes[:2]) == b"\x1f\x8b" \
-            else bytes(path_or_bytes)
-        lines = raw.decode("utf-8", "replace").splitlines()
-    else:
-        p = Path(path_or_bytes)
-        with (gzip.open(p, "rt", encoding="utf-8") if p.read_bytes()[:2] == b"\x1f\x8b"
-              else open(p, encoding="utf-8")) as f:
-            lines = f.read().splitlines()
+    The summary is re-judged from the full stream, so it is right however the log is filtered.
+    Streamed (bounded memory: one page of rows); ``truncated`` is true when the log ended without
+    its gzip end marker -- the engine was stopped abruptly -- and the rows are what survived."""
+    offset = max(0, int(offset or 0))
+    limit = max(0, int(limit or 0))
     want_o = {outcome} if isinstance(outcome, str) else set(outcome or ())
     want_p = {phase} if isinstance(phase, str) else set(phase or ())
     header, rows, total, matched, new_sum = {}, [], 0, 0, 0
     tally = Tally()
-    for i, ln in enumerate(lines):
+    state = {"truncated": False}
+    first = True
+    for ln in _iter_lines(path_or_bytes, state):
         if not ln.strip():
             continue
         try:
             r = json.loads(ln)
         except ValueError:
+            first = False
             continue
-        if i == 0 and r.get("log") == "lykos-fuzz-attempts":
+        if not isinstance(r, dict):
+            first = False
+            continue
+        if first and r.get("log") == "lykos-fuzz-attempts":
             header = r
+            first = False
             continue
+        first = False
         total += 1
-        new_sum += int(r.get("new") or 0)
+        if r.get("ph") in _GAIN_PHASES:
+            try:
+                new_sum += int(r.get("new") or 0)
+            except (TypeError, ValueError):
+                pass
         tally.add(r.get("o") or "error_exit", r.get("rc"),
                   r.get("err", "") if r.get("o") != "clean_exit" else "")
         if want_o and r.get("o") not in want_o:
@@ -397,4 +481,5 @@ def read_log(path_or_bytes, *, outcome=None, phase=None, offset: int = 0, limit:
             rows.append(r)
         matched += 1
     return {"header": header, "total": total, "matched": matched, "offset": offset,
-            "rows": rows, "summary": tally.to_dict(progressed=new_sum > 1)}
+            "rows": rows, "truncated": state["truncated"],
+            "summary": tally.to_dict(progressed=new_sum > 1)}

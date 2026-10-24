@@ -21,6 +21,7 @@ own coverage ratchet grows it from there.
 """
 from __future__ import annotations
 
+import heapq
 import time
 from typing import Callable, Iterable, Optional
 
@@ -38,36 +39,51 @@ def greedy_minset(coverage: dict, sizes: Optional[dict] = None) -> list:
     Returns the selected keys, in selection order, whose block-sets union to the SAME total the
     whole corpus covers. ``sizes`` (``{key -> weight}``, e.g. input length) breaks ties toward the
     smaller/cheaper input. Keys with empty coverage are dropped. Deterministic: on a full tie the
-    lower key wins.
+    lower key wins -- by the keys' own order, whatever their type (see `_ranks`).
+
+    LAZY greedy (Minoux): a key's marginal gain only ever shrinks as coverage grows, so a stale
+    gain is an upper bound and only the heap's top needs re-measuring. Same selection as the eager
+    form, which rebuilt ``remaining[k] - covered`` for EVERY key on EVERY pick -- O(n^2 * |set|),
+    measured 6.0 s against 0.64 s here on a 2,000-input corpus of 300-block traces.
     """
     sizes = sizes or {}
+    keys = [k for k, v in coverage.items() if v]
+    rank = _ranks(keys)
     universe = set()
-    for v in coverage.values():
-        universe |= v
-    remaining = {k: set(v) for k, v in coverage.items() if v}
+    for k in keys:
+        universe |= coverage[k]
+    # (-gain, size, rank) ascending == the old max over (gain, -size, -rank)
+    heap = [(-len(coverage[k]), sizes.get(k, 0), rank[k], i) for i, k in enumerate(keys)]
+    heapq.heapify(heap)
     covered: set = set()
     selected: list = []
-    while covered != universe and remaining:
-        # most new blocks; tie-break smaller size, then lower key (for stable output)
-        best = max(remaining,
-                   key=lambda k: (len(remaining[k] - covered), -sizes.get(k, 0), -_ordkey(k)))
-        gain = remaining[best] - covered
+    while heap and len(covered) < len(universe):
+        _neg, sz, rk, i = heapq.heappop(heap)
+        k = keys[i]
+        gain = len(coverage[k] - covered)
         if not gain:
-            break
-        selected.append(best)
-        covered |= remaining[best]
-        del remaining[best]
+            continue                                   # nothing left to add: never selectable
+        fresh = (-gain, sz, rk, i)
+        if heap and fresh > heap[0]:
+            heapq.heappush(heap, fresh)                # someone may now beat it: re-queue
+            continue
+        selected.append(k)
+        covered |= coverage[k]
     return selected
 
 
-def _ordkey(k):
-    """A numeric ordering for the tie-break, whatever the key type."""
-    if isinstance(k, (int, float)):
-        return k
+def _ranks(keys) -> dict:
+    """key -> its position in a deterministic total order of the keys.
+
+    The tie-break used to be ``hash(k)`` for a non-numeric key, and str/bytes hashing is salted
+    per process (PYTHONHASHSEED): two runs over the same corpus kept DIFFERENT seeds on a tie,
+    which is exactly what "deterministic" promised not to do. Natural order when the keys are
+    mutually comparable (ints, strs), else (type name, repr)."""
     try:
-        return hash(k) & 0xFFFFFFFF
+        order = sorted(keys)
     except TypeError:
-        return 0
+        order = sorted(keys, key=lambda k: (type(k).__name__, repr(k)))
+    return {k: i for i, k in enumerate(order)}
 
 
 def block_coverage(exe, inputs, blocks, *, mode: str = "stdin", base_argv=(),
@@ -143,7 +159,8 @@ def distill(inputs: list, cover_sets: list, *, keep_idx: Iterable[int] = ()) -> 
     keep = set(keep_idx)
     coverage = {i: cover_sets[i] for i in range(len(inputs)) if cover_sets[i]}
     sizes = {i: len(inputs[i]) for i in range(len(inputs))}
-    picked = set(greedy_minset(coverage, sizes))
+    order = greedy_minset(coverage, sizes)             # once: it was computed twice
+    picked = set(order)
     # Anything with no measured coverage is kept (absence of evidence is not redundancy); so are the
     # forced-keep crashers. Only inputs that HAD coverage and were not picked are dropped.
     kept_idx = [i for i in range(len(inputs))
@@ -155,7 +172,7 @@ def distill(inputs: list, cover_sets: list, *, keep_idx: Iterable[int] = ()) -> 
         total_blocks |= c
     return {
         "kept": kept, "kept_idx": kept_idx, "dropped": dropped,
-        "order": greedy_minset(coverage, sizes),
+        "order": order,
         "stats": {"in": len(inputs), "out": len(kept), "dropped": dropped,
                   "blocks_preserved": len(total_blocks),
                   "measured": sum(1 for c in cover_sets if c)},

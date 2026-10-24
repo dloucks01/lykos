@@ -1793,9 +1793,14 @@ async function _doPreview(){
     if(f.type==="magic"){ vl=`"${esc((f.value&&f.value.ascii)||"")}" <span style="color:var(--faint)">${esc((f.value&&f.value.hex)||"")}</span>`;
       badge=f.match?`<span class="pvbadge ok">magic ✓</span>`:`<span class="pvbadge no">magic ✗</span>`; }
     else if(f.type==="blob"){ vl=`${f.size} bytes <span style="color:var(--faint)">${esc((f.value&&f.value.ascii)||"")}</span>`; }
+    // nested scopes: a group/array row reports its span (its leaves follow, indented); a shadow
+    // field is carried for derivation (e.g. a CRC's plaintext) and is never in the file
+    else if(f.type==="group"){ vl=`spans ${Number(f.span)||0} bytes`; }
+    else if(f.type==="array"){ vl=`${Number(f.records)||0} records, spans ${Number(f.span)||0} bytes`; }
+    else if(f.type==="shadow"){ vl=`<span style="color:var(--faint)">not in file · ${esc((f.value&&f.value.ascii)||"")}</span>`; }
     else { vl=`= ${f.int} <span style="color:var(--faint)">(${esc(f.endian||"")})</span>`;
       if(f.length_of!=null) badge=f.length_match?`<span class="pvbadge ok">length ✓ matches ${esc(f.length_of)}</span>`:`<span class="pvbadge no">length ✗ ≠ ${esc(f.length_of)}</span>`; }
-    return `<div class="pvfield"><span class="off">@${f.offset} +${f.size}</span><span class="ty">${esc(f.type)}</span><span class="nm">${esc(f.name||"")}</span><span class="vl">${vl}</span>${badge}</div>`;
+    return `<div class="pvfield" style="padding-left:${Math.min(6,Number(f.depth)||0)*14}px"><span class="off">@${f.offset} +${f.size}</span><span class="ty">${esc(f.type)}</span><span class="nm">${esc(f.name||"")}</span><span class="vl">${vl}</span>${badge}</div>`;
   }).join("");
   const rt=r.roundtrip?`<span class="pvbadge ok">roundtrip ✓</span>`:`<span class="pvbadge no">roundtrip ✗</span>`;
   const cov=r.consumed===r.sample_size?`<span class="pvbadge ok">covers all ${r.sample_size} B</span>`:`<span class="pvbadge no">carved ${r.consumed} / ${r.sample_size} B</span>`;

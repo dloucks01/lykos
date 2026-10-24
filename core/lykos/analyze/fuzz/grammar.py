@@ -22,6 +22,7 @@ no AFL++ custom-mutator glue, no dependency and deterministic given the RNG. It 
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Optional
 
@@ -95,7 +96,24 @@ def compile_grammar(spec: dict) -> dict:
             for kind, val in prod:
                 if kind == "ref" and val not in rules:
                     raise ValueError(f"grammar: rule {name!r} references undefined {val!r}")
-    return {"start": start, "rules": rules, "_minlen": _min_lengths(rules)}
+    minlen = _min_lengths(rules)
+    # A rule with NO terminating derivation (`a -> %a%`, or a cycle with no exit) can never bottom
+    # out: past the depth budget `generate` follows the cheapest production, which here recurses
+    # forever. It used to surface as a RecursionError deep in a campaign, swallowed into byte
+    # havoc on every call -- a grammar campaign that silently was not one. Fail at build time.
+    stuck = sorted(n for n, c in minlen.items() if c == float("inf"))
+    if stuck:
+        raise ValueError(f"grammar: rule(s) {', '.join(map(repr, stuck))} can never terminate "
+                         f"(every production recurses)")
+    return {"start": start, "rules": rules, "_minlen": minlen,
+            "_minprod": _min_productions(rules, minlen)}
+
+
+def _min_productions(rules: dict, minlen: dict) -> dict:
+    """rule -> its cheapest-to-terminate production (the one `generate` takes past its budget).
+    Precomputed: it was re-derived with a min() over every production on every expansion."""
+    return {n: min(prods, key=lambda p: sum(minlen[v] for k, v in p if k == "ref"))
+            for n, prods in rules.items()}
 
 
 def _min_lengths(rules: dict) -> dict:
@@ -118,26 +136,39 @@ def generate(grammar: dict, rng, *, max_depth: int = _MAX_DEPTH, max_len: int = 
 
     ``inject`` (optional list of byte tokens) lets corpus/dictionary fragments be planted at literal
     slots occasionally, so a grammar can carry real magic/keyword values the target compares.
+
+    Near ``max_len`` the derivation is not cut off mid-structure (which emitted an unbalanced
+    ``{"a":[[1,`` -- an input the parser rejects at the syntax layer, the very thing a grammar is
+    for avoiding): from three quarters of the budget on it finishes along the cheapest
+    productions, exactly as past the depth budget, so the open structure closes inside the
+    remaining quarter. ``max_len`` stays a hard limit; only a grammar whose minimal completion
+    does not fit is still cut.
     """
     rules = grammar["rules"]
-    minlen = grammar.get("_minlen") or _min_lengths(rules)
+    minprod = grammar.get("_minprod")
+    if minprod is None:
+        minprod = _min_productions(rules, grammar.get("_minlen") or _min_lengths(rules))
+    hard = max_len
+    soft = (3 * max_len) // 4
     out = bytearray()
 
     def expand(name, depth):
-        if len(out) >= max_len:
+        if len(out) >= hard:
             return
-        prods = rules[name]
-        if depth <= 0:
-            prod = min(prods, key=lambda p: sum(minlen[v] for k, v in p if k == "ref"))
+        if depth <= 0 or len(out) >= soft:
+            prod = minprod[name]
         else:
-            prod = rng.choice(prods)
+            prod = rng.choice(rules[name])
         for kind, val in prod:
-            if len(out) >= max_len:
+            if len(out) >= hard:
                 return
             if kind == "lit":
                 if inject and rng.random() < 0.15:
                     out.extend(rng.choice(inject))
                 out.extend(val)
+                if len(out) > hard:
+                    del out[hard:]                     # max_len is a hard limit
+                    return
             else:
                 expand(val, depth - 1)
 
@@ -157,7 +188,7 @@ class GrammarMutator:
         self.rng = rng
         self.grammar = grammar
         self.byte = Mutator(rng, dictionary)
-        self.dictionary = list(dictionary or [])
+        self.dictionary = list(self.byte.dict)        # normalized to bytes (a str token raised)
 
     def mutate(self, data: bytes = b"", corpus=()) -> bytes:
         try:
@@ -168,7 +199,8 @@ class GrammarMutator:
             inject = None
             if r < 0.55:
                 pool = list(self.dictionary)
-                pool += [c for c in list(corpus)[:16] if 0 < len(c) <= 64]
+                # islice, not list(corpus)[:16]: that copied the WHOLE corpus on every exec
+                pool += [c for c in itertools.islice(corpus or (), 16) if 0 < len(c) <= 64]
                 inject = pool or None
             return generate(self.grammar, self.rng, inject=inject)
         except Exception:
@@ -207,7 +239,11 @@ _BUILTINS = {
         "elems": ["%val%", "%val%,%elems%"],
         "str": ['"a"', '"key"', '"%chars%"'],
         "chars": ["a", "x", "\\\\", "\\\"", "%chars%%chars%"],
-        "num": ["0", "1", "-1", "1e9", "%num%%num%"],
+        # Valid JSON numbers only: `%num%%num%` produced "0-1" and "1e91e9" -- 2.4% of all output
+        # rejected at the tokenizer, the syntax-layer waste a grammar exists to avoid.
+        "num": ["0", "1", "-1", "1e9", "%nz%%digits%", "-%nz%%digits%", "%nz%%digits%e%nz%"],
+        "nz": ["1", "7", "9"],
+        "digits": ["0", "9", "%digits%%digits%"],
     }},
     # balanced s-expressions / nested parens (stresses recursive-descent stacks)
     "sexpr": {"start": "s", "rules": {
