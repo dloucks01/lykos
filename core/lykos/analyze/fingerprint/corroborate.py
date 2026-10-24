@@ -22,9 +22,13 @@ TOOL = "cve-corroborate"
 TOOL_VERSION = "cve-corroborate-1"
 
 # CWE classes that are all "memory corruption" for the purpose of matching a crash to a CVE.
+# Deliberately NOT here: CWE-20 (improper input validation -- a catch-all that NVD stamps on
+# logic, injection and DoS bugs alike) and CWE-369 (divide-by-zero, a SIGFPE, not a corruption).
+# In the family they let any demonstrated memory crash "corroborate" every input-validation CVE and
+# a SIGFPE corroborate a heap overflow CVE; they now match only their own exact class.
 _MEM = {"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125", "CWE-126", "CWE-127",
-        "CWE-787", "CWE-788", "CWE-416", "CWE-415", "CWE-476", "CWE-824", "CWE-822", "CWE-190",
-        "CWE-131", "CWE-191", "CWE-20", "CWE-369"}
+        "CWE-129", "CWE-787", "CWE-788", "CWE-416", "CWE-415", "CWE-476", "CWE-824", "CWE-822",
+        "CWE-190", "CWE-131", "CWE-191"}
 _CVE_DETECTORS = {"cve_fingerprint", "cve_source"}
 # a finding that was actually demonstrated at runtime
 _DEMO_STATES = {"confirmed", "poc-backed"}

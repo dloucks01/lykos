@@ -15,16 +15,24 @@ DETECT_STAGE = "detect_cwe"
 # The detectors this stage owns -- the ones whose sites it recomputes and must replace (not
 # accumulate) on a re-run. Dynamic/crash channels (concolic, root_cause, fuzz...) are NOT here, so
 # reset_candidate_sites/prune_empty_findings never touch their findings.
+# Every detector registered in detectors.py must be here: one that is missing keeps the sites an
+# earlier run filed forever, so a precision fix (a false positive the new logic no longer emits)
+# never leaves the board. unchecked_privdrop / world_writable_perms / privilege_drop_order /
+# format_string / int_overflow_alloc were missing until detect-5.
 _STATIC_DETECTORS = ("dangerous_api", "stack_frame", "hardcoded_secrets", "weak_crypto", "weak_random",
                      "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
-                     "int_overflow_check", "scanf_bounded_overflow", "heap_fptr_call", "lang_sinks")
+                     "int_overflow_check", "int_overflow_alloc", "scanf_bounded_overflow",
+                     "heap_fptr_call", "lang_sinks", "unchecked_privdrop", "world_writable_perms",
+                     "privilege_drop_order", "format_string", "array_index")
 TOOL = "detect"
 # -2: CWE-121 gated on the copy destination resolving to the stack frame. -3: re-detection is
 # idempotent. -4: the gate is arg0-only (scanf/sscanf no longer suppressed), works on x86-64/arm/
 # aarch64 with register tracing, and re-detection preserves poc-backed sites + prunes 0-site
 # orphans. Each bump invalidates the content-addressed cache so a target analyzed under older logic
-# is re-analyzed instead of reprojecting stale findings.
-TOOL_VERSION = "detect-4"
+# is re-analyzed instead of reprojecting stale findings. -5: static CWE-129 (array_index), scanf
+# widths matched per destination, privilege-drop order per path with raises excluded, and the
+# logic/auth detectors' stale sites reset on re-detection.
+TOOL_VERSION = "detect-5"
 
 
 # Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
@@ -100,6 +108,10 @@ _ADD_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT"}
 # allocators whose size argument a wrapping narrow arithmetic makes too small (P1.4)
 _ALLOC_NAMES = {"malloc", "calloc", "realloc", "reallocarray", "alloca", "valloc",
                 "aligned_alloc", "memalign", "pvalloc"}
+# allocator -> the argument indices that carry its SIZE
+_ALLOC_SIZE_ARGS = {"malloc": (0,), "alloca": (0,), "valloc": (0,), "pvalloc": (0,),
+                    "calloc": (0, 1), "realloc": (1,), "reallocarray": (1, 2),
+                    "aligned_alloc": (1,), "memalign": (1,)}
 
 
 def _reg_name(tok):
@@ -136,12 +148,15 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8,
     if width >= ptr_bytes:
         return out                           # not narrower than a pointer: cannot wrap past it
     alloc_sites = alloc_sites or {}
-    # the registers an allocator takes its size in: arg0 (malloc/alloca/valloc), and arg1
-    # (realloc) / arg0-1 (calloc). Checking the first two argument registers covers them.
-    size_regs = set()
-    for ri in (0, 1):
-        if argregs and ri < len(argregs):
-            size_regs |= set(argregs[ri])
+
+    # the registers THIS allocator takes its size in. Checking arg0 and arg1 for every allocator
+    # read a stale narrow product left in the second argument register as `malloc`'s size.
+    def size_regs_for(sink):
+        regs = set()
+        for ri in _ALLOC_SIZE_ARGS.get(sink, (0,)):
+            if argregs and ri < len(argregs):
+                regs |= set(argregs[ri])
+        return regs
     for faddr, ir in (func_irs or {}).items():
         if only is not None and faddr not in only:
             continue
@@ -167,11 +182,15 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8,
                             produced[outk] = mnem
                         # allocation-size shape allows a const multiplier (`n * elemsize`); it
                         # is confined to allocator size args below, so it does not add noise.
+                        rn = _reg_name(outk)
                         if nonconst:
                             reghold[outk] = mnem
-                            rn = _reg_name(outk)
                             if rn:
                                 reghold[rn] = mnem
+                        else:
+                            reghold.pop(outk, None)
+                            if rn:
+                                reghold.pop(rn, None)
                     elif mnem in ("COPY", "INT_ZEXT", "INT_SEXT", "SUBPIECE") and outk and args:
                         src = args[0]
                         held = src in reghold or (_reg_name(src) in reghold if _reg_name(src) else False)
@@ -213,9 +232,17 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8,
                                                      f"{i.get('addr')} in {fn}")}],
                         })
                         break
+                    elif outk:
+                        # any other definition (a LOAD, a mask, a wider add) replaces the value:
+                        # a register is no longer carrying the narrow product it once held
+                        reghold.pop(outk, None)
+                        rn = _reg_name(outk)
+                        if rn:
+                            reghold.pop(rn, None)
                 # allocation-size wrap: this instruction is an allocator call whose size argument
                 # is carrying a narrow product/sum (P1.4).
                 sink = alloc_sites.get(i.get("addr"))
+                size_regs = size_regs_for(sink) if sink else set()
                 if sink and size_regs:
                     m = next((reghold[r] for r in size_regs if r in reghold), None)
                     if m is not None:
@@ -644,6 +671,18 @@ def detect_stage(ctx) -> dict:
         if full.ir:
             func_irs[f.addr] = full.ir
 
+    # The image is MAPPED (not read whole into memory -- a 100MB target), lazily, once, and only
+    # if a detector needs a constant from it (a rodata format literal, a global array's st_size);
+    # the view is released after the detector pass.
+    from ..elf import MappedFile
+    _mapped = MappedFile(ctx.content.path(target.sha256))
+    _image_view: list = []
+
+    def _image_once():
+        if not _image_view:
+            _image_view.append(_mapped.__enter__())
+        return _image_view[0]
+
     dctx = DetectContext(
         target_id=target.id, case_id=target.case_id,
         call_edges=edges,
@@ -652,7 +691,10 @@ def detect_stage(ctx) -> dict:
         mitigations=target.mitigations or {}, frames=frames,
         func_irs=func_irs, bits=int(getattr(target, "bits", 0) or 0),
         arch=getattr(target, "arch", "") or "",
-        toolchain=getattr(target, "toolchain_hint", "") or "")
+        toolchain=getattr(target, "toolchain_hint", "") or "",
+        # read lazily, once, and only by a detector that needs an image constant (a rodata
+        # format literal, a global array's st_size)
+        image=_image_once)
 
     ctx.progress(msg="running CWE detectors")
     # Two detectors are OPT-IN, and the reason is measured rather than felt. On jhead they are
@@ -690,6 +732,12 @@ def detect_stage(ctx) -> dict:
             # half). Skip the failing detector, keep the rest.
             ctx.emit("detect.detector_error", level="warn",
                      payload={"detector": name, "error": str(e)[:160]})
+    if _image_view:
+        dctx.cache.clear()                        # drop views into the mapping before it closes
+        try:
+            _mapped.__exit__(None, None, None)
+        except Exception:                         # noqa: BLE001
+            observe.absorbed(_log, "releasing the image mapping")
     cands = correlate(cands, dctx)
 
     # inter-procedural data-flow taint over P-Code: flag sink sites whose argument
@@ -718,8 +766,9 @@ def detect_stage(ctx) -> dict:
     # nothing. Measured on libcrypto: 13,529 functions against a ceiling of 6,000, reported as
     # `derefs: 0`.
     #
-    # The ceiling stays (it is there for runtime), but it is now reported, and raisable for a
-    # deliberate deep run.
+    # The ceiling stays (it is there for runtime), but past it the engine now analyses the RANKED
+    # top-N instead of nothing; what that leaves out is reported (`detect.taint_ranked`), and the
+    # cap is raisable for a deliberate deep run.
     taint_cap = int(p_det.get("max_taint_functions") or taint._MAX_FUNCS)
     taint_skipped = None
     buffer_only = set()                   # (b) sink sites reached ONLY from a seeded buffer param
@@ -733,16 +782,6 @@ def detect_stage(ctx) -> dict:
                      f"channel, the dereference channel and bounds corroboration did not run. "
                      f"Findings below are rule-channel only and cannot be promoted past "
                      f"candidate.")}
-        ctx.emit("detect.taint_skipped", payload=taint_skipped)
-        tainted_sites = set()
-    elif len(func_irs) > taint_cap:
-        taint_skipped = {
-            "functions": len(func_irs), "cap": taint_cap,
-            "note": (f"{len(func_irs)} functions exceeds the data-flow ceiling of {taint_cap}, "
-                     f"so taint, the dereference channel and bounds corroboration did not "
-                     f"run. Findings below are rule-channel only and cannot be promoted past "
-                     f"candidate. Raise it with params.max_taint_functions for a deep run, or "
-                     f"analyse a component rather than the whole image.")}
         ctx.emit("detect.taint_skipped", payload=taint_skipped)
         tainted_sites = set()
     else:
@@ -761,10 +800,29 @@ def detect_stage(ctx) -> dict:
         except Exception:
             observe.absorbed(_log, "keeping the default")
             heap_regions = {}
+        # Over `taint_cap` functions the analysis runs on the RANKED top-N (taint ranks by
+        # reachability from the input sources) instead of being dropped whole; `rk` reports what
+        # that selection left out.
+        rk: dict = {}
         tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,
                                               max_funcs=taint_cap, skipped_out=oversized,
-                                              heap_regions=heap_regions)
+                                              heap_regions=heap_regions, ranked_out=rk)
+        if rk:
+            ctx.emit("detect.taint_ranked", payload={**rk, "cap": taint_cap})
+            if rk.get("skipped_reachable", 0) > 0:
+                # Only when functions the input CAN reach were left out is part of the program
+                # rule-channel only -- an over-cap binary whose unanalysed remainder taint could
+                # never reach lost nothing.
+                taint_skipped = {
+                    "functions": rk.get("total", len(func_irs)), "cap": taint_cap,
+                    "analyzed": rk.get("analyzed"),
+                    "skipped_reachable": rk["skipped_reachable"],
+                    "note": (f"{rk.get('note') or ''} Findings in the {rk['skipped_reachable']} "
+                             f"unanalysed reachable function(s) are rule-channel only and cannot "
+                             f"be promoted past candidate. Raise params.max_taint_functions for "
+                             f"a deep run, or analyse a component rather than the whole "
+                             f"image.").strip()}
         # (b) BUFFER-POINTER SEED: a parser reached only via a callback/dispatch gets no source->
         # sink flow, so its sinks are invisible. Re-run with the ranked parser entries' buffer
         # params seeded as attacker-controlled; the NEW sites (not already reached by a real source)
@@ -794,7 +852,14 @@ def detect_stage(ctx) -> dict:
                          f"per-function ceiling (largest {max(oversized)}) and were not "
                          f"analysed for data flow. Findings inside them, if any, are "
                          f"rule-channel only.")})
-    guards = bounds.classify_derefs(func_irs, derefs, target.arch)
+    try:
+        guards = bounds.classify_derefs(func_irs, derefs, target.arch)
+    except Exception as e:                               # noqa: BLE001
+        # A degenerate IR in one function must not sink the stage (every finding above would be
+        # lost); the dereference ranking is skipped and the skip is REPORTED.
+        ctx.emit("detect.channel_error", level="warn",
+                 payload={"channel": "deref-guards", "error": str(e)[:160]})
+        guards = {}
     n_guarded = sum(1 for v in guards.values() if v.get("verdict") == bounds.GUARDED)
     cands += _deref_candidates(derefs, dctx.functions, guards)
     # only where attacker data demonstrably lands: a function that dereferences input, or one
@@ -845,8 +910,15 @@ def detect_stage(ctx) -> dict:
     # "this program calls memcpy". A copy whose length is a compile-time constant that FITS
     # the recovered destination is not a defect, and saying so turns that noise into inventory.
     ctx.progress(msg="bounds analysis on copy sinks")
-    verdicts = bounds.classify_program(func_irs, dctx.call_edges, frames, target.arch,
-                                       bits=target.bits or 64)
+    try:
+        verdicts = bounds.classify_program(func_irs, dctx.call_edges, frames, target.arch,
+                                           bits=target.bits or 64)
+    except Exception as e:                               # noqa: BLE001
+        # Same rule as a failing detector: the copy sites keep their rule-channel verdicts, and the
+        # bounds channel's absence is reported rather than read as "nothing was bounded".
+        ctx.emit("detect.channel_error", level="warn",
+                 payload={"channel": "bounds", "error": str(e)[:160]})
+        verdicts = {}
     for c in cands:
         v = verdicts.get(c.get("site_addr"))
         # stack_buffer_overflow reports the same strcpy sites at CWE-121/high, so a bounds

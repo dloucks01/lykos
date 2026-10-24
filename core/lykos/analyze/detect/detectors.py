@@ -34,6 +34,66 @@ class DetectContext:
     bits: int = 0                                     # target word size (32/64), for arg-passing ABI
     arch: str = "x86"                                 # target arch; the CWE-121 dest gate is x86-only
     toolchain: str = ""                               # source language / toolchain (go, rust, c++, ...)
+    # zero-arg callable returning the target's bytes (or None). Read lazily, only by detectors that
+    # need a constant from the image (a rodata format string, a global array's st_size).
+    image: object = None
+    cache: dict = field(default_factory=dict)         # per-run memo for the image-derived views
+
+
+def _image_sections(ctx: "DetectContext") -> list:
+    """The target's ELF section headers (with the bytes) -- [] when there is no readable ELF image.
+    Memoised on the context."""
+    if "sections" not in ctx.cache:
+        secs, data = [], None
+        try:
+            data = ctx.image() if callable(ctx.image) else None
+            if data and data[:4] == b"\x7fELF":
+                from ..elf import _raw_sections
+                secs = _raw_sections(data, data[4] == 2, "<" if data[5] == 1 else ">")
+        except Exception:                                 # noqa: BLE001 -- degenerate image
+            secs = []
+        ctx.cache["sections"] = (secs, data)
+    return ctx.cache["sections"]
+
+
+def _rodata_cstr(ctx: "DetectContext", vaddr, limit: int = 512):
+    """The NUL-terminated string at virtual address `vaddr` in an allocated, file-backed section of
+    the image (`.rodata` et al.), or None. Lets a short literal the string extractor skipped (a
+    two-byte `%d`) still be read where the code references it."""
+    v = _naddr(vaddr)
+    if v is None:
+        return None
+    secs, data = _image_sections(ctx)
+    for sec in secs:
+        # SHF_ALLOC and not SHT_NOBITS (.bss has no bytes in the file)
+        if not (sec["flags"] & 2) or sec["type"] == 8 or not sec["addr"]:
+            continue
+        if sec["addr"] <= v < sec["addr"] + sec["size"]:
+            off = sec["offset"] + (v - sec["addr"])
+            end = data.find(b"\x00", off, min(len(data), off + limit))
+            if end < 0:
+                return None
+            try:
+                return data[off:end].decode("ascii")
+            except UnicodeDecodeError:
+                return None
+    return None
+
+
+def _global_objects(ctx: "DetectContext") -> dict:
+    """{name: (vaddr, st_size)} for the image's OBJECT symbols -- the exact extent of a global array
+    (a compile-time fact from the symbol table, unlike a recovered stack frame). {} when stripped."""
+    if "objects" not in ctx.cache:
+        objs = {}
+        try:
+            _secs, data = _image_sections(ctx)
+            if data:
+                from ..poc.exploit import elf_objects_sized
+                objs = elf_objects_sized(data) or {}
+        except Exception:                                 # noqa: BLE001
+            objs = {}
+        ctx.cache["objects"] = objs
+    return ctx.cache["objects"]
 
 
 def _cand(cwe, title, severity, detector, evidence, *, function_addr=None,
@@ -251,6 +311,41 @@ def _naddr(a):
         return None
 
 
+def _as_int(v, default=None):
+    """An int from a decompiler field that may arrive as an int, a decimal / hex string (`"-0x10"`),
+    or None. `default` when it is none of those -- a degenerate frame record must not sink a
+    whole detector (the stage drops a detector that raises, which files nothing for the target)."""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    try:
+        return int(str(v).strip(), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _blocks_of(ir):
+    """The IR's blocks that are well-formed dicts (an IR may be None or carry a junk block)."""
+    return [b for b in ((ir or {}).get("blocks") or []) if isinstance(b, dict)]
+
+
+def _frame_vars(frame):
+    """(offset -> size, name -> offset) for a decompiler frame, skipping records whose offset is
+    unreadable."""
+    vsize, names = {}, {}
+    for v in ((frame or {}).get("vars") or []):
+        if not isinstance(v, dict):
+            continue
+        off = _as_int(v.get("offset"))
+        if off is None:
+            continue
+        vsize[off] = _as_int(v.get("size"), 0) or 0
+        if v.get("name"):
+            names[v["name"]] = off
+    return vsize, names
+
+
 # a memory operand naming the ADDRESS OF a stack local. The stack pointer (esp/rsp/sp) is always
 # the frame; a frame pointer (ebp/rbp/x29) counts only with a NEGATIVE displacement (a positive one
 # is an incoming argument at rbp+8...). An index register is allowed, so `[rbp + rcx - 0x20]`
@@ -267,6 +362,22 @@ _DEST_REG64 = "rdi"                                   # SysV first integer arg
 _X86_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
              "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"}
+# every x86-64 register view -> its full 64-bit register (`eax`/`ax`/`al` -> `rax`, `r8d` -> `r8`)
+_X86_CANON = {}
+for _q, _d, _w, _b in (("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"),
+                       ("rcx", "ecx", "cx", "cl"), ("rdx", "edx", "dx", "dl"),
+                       ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+                       ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl")):
+    for _a in (_q, _d, _w, _b):
+        _X86_CANON[_a] = _q
+for _n in range(8, 16):
+    for _a in (f"r{_n}", f"r{_n}d", f"r{_n}w", f"r{_n}b"):
+        _X86_CANON[_a] = f"r{_n}"
+
+
+def _x86_aliases(reg: str) -> set:
+    c = _X86_CANON.get((reg or "").lower())
+    return {a for a, q in _X86_CANON.items() if q == c} if c else {reg}
 _ARITH = re.compile(r"\s*(add|sub|xor|and|or|imul|mul|shl|shr|sar|neg|inc|dec|lea)\s+", re.I)
 
 
@@ -520,15 +631,18 @@ def stack_buffer_overflow(ctx: DetectContext):
             sinks_by_func[e.src_addr].append((n, e.site_addr))
     out = []
     for addr, frame in ctx.frames.items():
-        bufs = [v for v in (frame.get("vars") or []) if v.get("is_buffer")]
+        bufs = [v for v in ((frame or {}).get("vars") or [])
+                if isinstance(v, dict) and v.get("is_buffer")]
         sinks = sinks_by_func.get(addr, [])
         if not bufs or not sinks:
             continue
-        buf = min(bufs, key=lambda v: v.get("size", 1 << 30))   # tightest buffer = worst case
-        # distance from the buffer to the saved return address in Ghidra frame coords
-        ret_off = frame.get("ret_offset")
-        off_to_ret = (ret_off - int(buf.get("offset", 0))) if ret_off is not None \
-            else abs(int(buf.get("offset", 0))) + 8
+        # tightest buffer = worst case (a size the decompiler left unreadable sorts last)
+        buf = min(bufs, key=lambda v: _as_int(v.get("size"), 1 << 30))
+        # distance from the buffer to the saved return address in Ghidra frame coords; unknown
+        # (not a made-up 8) when the buffer's offset is unreadable
+        ret_off, b_off = _as_int(frame.get("ret_offset")), _as_int(buf.get("offset"))
+        off_to_ret = (None if b_off is None else
+                      (ret_off - b_off) if ret_off is not None else abs(b_off) + 8)
         # Defect grain, like every other sink detector: one finding per unbounded copy
         # routine, each occurrence a SITE. Keying on the function address made every call
         # site its own high-severity finding -- seven near-identical rows on jhead, which was
@@ -566,8 +680,10 @@ def stack_buffer_overflow(ctx: DetectContext):
                       "detail": f"{n}() called in a function owning a fixed-size stack buffer"}],
                     function_addr=addr, site_addr=site,
                     site_detail=(f"{n}() at {site} into {buf.get('name')} "
-                                 f"({buf.get('type')}, {buf.get('size')} B); ~{off_to_ret} "
-                                 f"bytes from the buffer to the saved return address"),
+                                 f"({buf.get('type')}, {buf.get('size')} B); "
+                                 + (f"~{off_to_ret} bytes from the buffer to the saved return "
+                                    f"address" if off_to_ret is not None else
+                                    "distance to the saved return address unknown")),
                     dedup_key=f"CWE-121:stack_frame:{n}", confidence=0.55))
     return out
 
@@ -710,6 +826,9 @@ def _imm_into_reg(ir: dict, site_addr, regs) -> "Optional[int]":
         if m and m.group(1) in regs:
             v = m.group(2)
             return int(v, 16) if v.lower().startswith("0x") else int(v)
+        z = re.match(r"^xor\s+(\w+)\s*,\s*(\w+)\s*$", t)
+        if z and z.group(1) in regs and z.group(1) == z.group(2):
+            return 0                                  # `xor edi, edi` -- the -O2 zeroing idiom
         # the register written by any other instruction before we found a literal -> value is not a
         # constant we can read; stop rather than reach past the real definition.
         parts = t.split(None, 1)
@@ -757,41 +876,154 @@ def world_writable_perms(ctx: DetectContext):
 # Dropping the user id before the group id is a classic revocation-order bug: once setuid() has
 # relinquished root, the process may no longer have the privilege to call setgid(), which then fails
 # -- silently -- and the process keeps the privileged GROUP. The correct order is setgroups/setgid
-# THEN setuid. Arch-agnostic: it reasons over call-site ADDRESSES, not disassembly.
+# THEN setuid.
+#
+# Two refinements over a bare "first uid call precedes first gid call" address comparison:
+#   * a call whose id arguments are provably the constant 0 / -1 (`seteuid(0)`, `setuid(0)`,
+#     `setreuid(-1, 0)`) is a privilege RAISE (or a no-op for root), not a drop. Counting it as a drop
+#     fabricated the finding on the `seteuid(0); setgid(g); setuid(u)` restore-then-drop idiom, and a
+#     raise between a temporary drop and a setgid() makes that setgid succeed, so it also bounds the
+#     path search below. Read from the x86-64 argument registers; elsewhere nothing is excluded.
+#   * the ordering is decided PER PATH over the function's CFG when it is available: a uid drop is
+#     wrong-order when a gid call is reachable after it (forward edges only, so a loop back-edge is
+#     not a path) and no gid drop reaches it first. A function-wide `min()` let a correct branch mask
+#     a wrong-order branch (`if (a) {setgid; setuid;} else {setuid; setgid;}`). With no CFG the
+#     address comparison is the fallback.
 _SETUID_FAM = {"setuid", "setreuid", "setresuid", "seteuid"}
 _SETGID_FAM = {"setgid", "setregid", "setresgid", "setegid", "setgroups", "initgroups"}
+# id-argument registers (x86-64 SysV) of the calls whose all-0/-1 constant form is a raise / no-op.
+# setgroups/initgroups are absent: `setgroups(0, NULL)` CLEARS the groups -- that is a drop.
+_ID_ARG_REGS = {"setuid": ("edi",), "seteuid": ("edi",), "setreuid": ("edi", "esi"),
+                "setresuid": ("edi", "esi", "edx"), "setgid": ("edi",), "setegid": ("edi",),
+                "setregid": ("edi", "esi"), "setresgid": ("edi", "esi", "edx")}
+_ID_UNCHANGED = {0xffffffff, 0xffffffffffffffff}        # (uid_t)-1: "leave this id unchanged"
+
+
+def _is_priv_raise(ir, name: str, site) -> bool:
+    """True when every id argument of this set*id call is a constant 0 or -1 with at least one 0 --
+    i.e. the call sets an id TO root (a raise, or a no-op for a root process), never a drop.
+    Indeterminate (computed) arguments return False: the call is kept as a drop."""
+    regs = _ID_ARG_REGS.get(name)
+    if not regs or not ir:
+        return False
+    vals = []
+    for r in regs:
+        v = _imm_into_reg(ir, site, (r, _X86_CANON[r]))
+        if v is None or (v != 0 and v not in _ID_UNCHANGED):
+            return False
+        vals.append(v)
+    return 0 in vals
+
+
+def _wrong_order_paths(ir, uid_sites, gid_sites, raise_sites):
+    """Per-path ordering over the function CFG. Returns (uid_site, gid_site) for the first uid drop
+    after which a gid call is reachable (no raise in between) and that no gid drop precedes, or None
+    when none exists. Returns False when the CFG does not hold every site (caller falls back)."""
+    blocks = (ir or {}).get("blocks") or []
+    kind = {a: "uid" for a in uid_sites}
+    kind.update({a: "gid" for a in gid_sites})
+    kind.update({a: "raise" for a in raise_sites})
+    events, succ, where = {}, {}, {}
+    for b in blocks:
+        ba = _naddr(b.get("addr"))
+        if ba is None:
+            continue
+        ev = []
+        for i in b.get("instructions") or []:
+            ia = _naddr(i.get("addr"))
+            if ia in kind:
+                ev.append((ia, kind[ia]))
+                where[ia] = (ba, len(ev) - 1)
+        events[ba] = ev
+        # forward edges only: a back-edge (to a lower address) is a loop, not a fresh path
+        succ[ba] = [s for s in (_naddr(x) for x in (b.get("succ") or [])) if s is not None and s > ba]
+    if any(a not in where for a in kind):
+        return False
+
+    def reach(src, want, stop, first_only=True):
+        """Sites of kind `want` reachable after `src`; a `stop` event ends that path, and so does
+        the first `want` when `first_only`."""
+        found = []
+        ba, k = where[src]
+        todo, seen = [(ba, k + 1)], set()
+        while todo:
+            blk, start = todo.pop()
+            ended = False
+            for a, kd in events.get(blk, [])[start:]:
+                if kd == want:
+                    found.append(a)
+                    if first_only:
+                        ended = True
+                        break
+                    continue
+                if kd in stop:
+                    ended = True
+                    break
+            if ended:
+                continue
+            for s in succ.get(blk, []):
+                if s not in seen:
+                    seen.add(s)
+                    todo.append((s, 0))
+        return found
+
+    preceded = set()
+    for g in gid_sites:
+        preceded.update(reach(g, "uid", (), first_only=False))
+    for u in sorted(uid_sites):
+        if u in preceded:
+            continue
+        after = reach(u, "gid", ("raise",))
+        if after:
+            return u, min(after)
+    return None
 
 
 @register_detector
 def privilege_drop_order(ctx: DetectContext):
-    """Flag a function whose FIRST user-id drop precedes its first group-id drop (CWE-696)."""
+    """Flag a function in which a user-id drop precedes a group-id drop on some path (CWE-696)."""
     uid_by_fn: dict = defaultdict(list)
     gid_by_fn: dict = defaultdict(list)
+    raise_by_fn: dict = defaultdict(list)
+    x64 = _is_x86(ctx.arch) and ctx.bits == 64
+    irs = {_naddr(k): v for k, v in (ctx.func_irs or {}).items()}
     for e in ctx.call_edges:
         n = normalize(e.dst_name)
         fa, sa = _naddr(e.src_addr), _naddr(e.site_addr)
-        if fa is None or sa is None:
+        if fa is None or sa is None or (n not in _SETUID_FAM and n not in _SETGID_FAM):
             continue
-        if n in _SETUID_FAM:
+        if x64 and _is_priv_raise(irs.get(fa), n, sa):
+            raise_by_fn[fa].append(sa)                    # sets an id TO root: not a drop
+        elif n in _SETUID_FAM:
             uid_by_fn[fa].append(sa)
-        elif n in _SETGID_FAM:
+        else:
             gid_by_fn[fa].append(sa)
     out = []
     for fa, uids in uid_by_fn.items():
         gids = gid_by_fn.get(fa)
-        if not gids or min(uids) >= min(gids):           # no gid drop, or gid already dropped first
+        if not gids:
             continue
+        pair = _wrong_order_paths(irs.get(fa), uids, gids, raise_by_fn.get(fa, []))
+        if pair is False:                                 # no usable CFG: address order
+            if min(uids) >= min(gids):                    # gid already dropped first
+                continue
+            pair, how = (min(uids), min(gids)), "static address order"
+        elif pair is None:
+            continue
+        else:
+            how = "a gid call is reachable after the uid drop on the CFG"
+        u, g = pair
         out.append(_cand(
             "CWE-696",
             "Privileges dropped in the wrong order (setuid before setgid)",
             "medium", "privilege_drop_order",
             [{"channel": "pattern", "detail": (
-                f"this function drops the user id (uid-drop at {min(uids):#x}) BEFORE the group id "
-                f"(gid-drop at {min(gids):#x}). Once the uid is relinquished the process may lack "
+                f"this function drops the user id (uid-drop at {u:#x}) BEFORE the group id "
+                f"(gid-drop at {g:#x}; {how}). Once the uid is relinquished the process may lack "
                 "the privilege to drop the gid, which then fails silently and leaves the process in "
                 "the privileged group -- CWE-696 / CERT POS36-C. Correct order is setgroups/setgid "
-                "then setuid. Static ordering: confirm both calls lie on the same execution path.")}],
-            function_addr=hex(fa), site_addr=hex(min(uids)),
+                "then setuid. Static ordering: confirm the path is feasible.")}],
+            function_addr=hex(fa), site_addr=hex(u),
             dedup_key=f"CWE-696:privilege_drop_order:{fa:#x}", confidence=0.5))
     return out
 
@@ -806,7 +1038,124 @@ def privilege_drop_order(ctx: DetectContext):
 _SCANF_VARIANTS = {"scanf": ("rdi", "rsi"), "sscanf": ("rsi", "rdx"), "fscanf": ("rsi", "rdx")}
 _SCANF_STR_WIDTH = re.compile(r"%\*?(\d+)[hlLjztq]*[s\[]")     # %16s / %20[..] -> the width int
 _R2_STR_SYM = re.compile(r"\bstr\.(\S+)")
-_SYM_WIDTH = re.compile(r"(\d+)(?:s|\[)")                      # a width in an r2 str. flag name
+# The variadic (pointer) argument registers, in order, for each variant -- the i-th CONSUMING
+# conversion of the format writes through the i-th of these. Conversions past the register window
+# are passed on the stack and are not tracked (skipped, never guessed).
+_SCANF_ARGREGS = {"scanf": ("rsi", "rdx", "rcx", "r8", "r9"),
+                  "sscanf": ("rdx", "rcx", "r8", "r9"), "fscanf": ("rdx", "rcx", "r8", "r9")}
+# one scanf conversion: `%%`, or [*][width][m][length]<conv>, where a scanset `[...]` may open with
+# `^` and/or a literal `]`.
+_SCANF_SPEC = re.compile(r"%(?:(%)|(\*)?(\d*)(m)?(?:hh|h|ll|l|L|j|z|t|q)?"
+                         r"(\[\^?\]?[^\]]*\]|[diouxXaAeEfFgGsScCpn]))")
+
+
+def _scanf_conversions(fmt: str):
+    """The ordered argument-consuming conversions of a scanf format, as `(arg_index, width, conv,
+    alloc)`. `%%` and `%*...` consume no argument. None when the format uses positional `%n$`
+    arguments (the order is then not the textual order, so nothing is mapped rather than guessed)."""
+    if "$" in fmt:
+        return None
+    out = []
+    k = 0
+    for m in _SCANF_SPEC.finditer(fmt):
+        if m.group(1) or m.group(2):                  # %% or an assignment-suppressed %*...
+            continue
+        conv = m.group(5)
+        out.append((k, int(m.group(3)) if m.group(3) else None, conv[0], bool(m.group(4))))
+        k += 1
+    return out
+
+
+_LEA_ABS = re.compile(r"^\s*lea\s+(\w+)\s*,\s*(?:[a-z]+\s+)?\[\s*(0x[0-9a-f]+)\s*\]\s*$", re.I)
+_MOV_ABS = re.compile(r"^\s*mov\s+(\w+)\s*,\s*(0x[0-9a-f]{4,})\s*$", re.I)
+
+
+_ARG_CLOBBER = {"rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"}
+
+
+def _reg_def(texts, reg: str, hops: int = 1):
+    """The instruction body that last DEFINES `reg` at the end of `texts`, following up to `hops`
+    reg-to-reg `mov` copies -- each hop resumes the backward scan from the copy itself, so in
+    `lea rdx,[rbp-0x80]; ...; mov rcx,rdx; mov rdx,rax` the value of rcx is the lea, not the later
+    redefinition of rdx. Any view of the register (`edx` for `rdx`) counts as a write. A call in
+    between clobbers a caller-saved register. None when no definition is found."""
+    cur = _x86_aliases(reg)
+    end, h = len(texts), 0
+    while True:
+        for k in range(end - 1, -1, -1):
+            body = (texts[k] or "").split(";")[0].strip()
+            mnem, ops = _ops(body)
+            if mnem == "call":
+                if {_X86_CANON.get(r) for r in cur} & _ARG_CLOBBER:
+                    return None
+                continue
+            if mnem == "xchg" and any(o.lower() in cur for o in ops):
+                return None
+            if not ops or ops[0].lower() not in cur or mnem in _NO_WRITE:
+                continue
+            if mnem == "mov" and len(ops) == 2 and ops[1].lower() in _X86_CANON and h < hops:
+                cur, end, h = _x86_aliases(ops[1].lower()), k, h + 1
+                break
+            return body
+        else:
+            return None
+
+
+def _addr_for_reg(texts, reg: str):
+    """The absolute constant ADDRESS `reg` holds at the end of `texts` -- `lea rdi, [0x402004]`
+    (r2's rendering of a resolved rip-relative operand) or a non-PIE `mov edi, 0x402004` --
+    following one reg-to-reg move hop. None otherwise."""
+    body = _reg_def(texts, reg)
+    for rx in (_LEA_ABS, _MOV_ABS):
+        m = rx.match(body or "")
+        if m:
+            return int(m.group(2), 16)
+    return None
+
+
+def _format_at(ctx, texts, reg: str):
+    """(format string, r2 flag name) for the format argument in `reg` at the end of `texts`: the
+    literal read from the image at the address the register holds, else the flag name (resolved by
+    the caller against the extracted strings). (None, None) when neither is recoverable."""
+    a = _addr_for_reg(texts, reg)
+    if a is not None:
+        v = _rodata_cstr(ctx, a)
+        if v is None:
+            for s in ctx.strings or []:
+                if _naddr(getattr(s, "addr", None)) == a:
+                    v = getattr(s, "value", None)
+                    break
+        if v is not None:
+            return v, None
+    return None, _str_flag_for_reg(texts, reg)
+
+
+def _r2_flagify(v: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "_", v)
+
+
+def _resolve_scanf_format(sym: str, strings):
+    """The REAL format string an r2 `str.<sym>` flag names, recovered from the binary's strings: r2
+    builds the flag by replacing non-alphanumerics (`%16s %u` -> `_16s__u`), so a string whose
+    flagified form equals the (flagified) symbol is that format. Returns the conversion list when
+    every matching string agrees on it, else None (ambiguous or not found -- never guessed)."""
+    key = _r2_flagify(sym)
+    convs = None
+    for s in strings or []:
+        v = getattr(s, "value", "") or ""
+        if "%" not in v:
+            continue
+        fv = _r2_flagify(v)
+        # exact, or r2 truncated a long flag name (only trusted for a long, specific prefix)
+        if fv != key and not (len(key) >= 24 and fv.startswith(key)):
+            continue
+        c = _scanf_conversions(v)
+        if c is None:
+            return None
+        if convs is not None and c != convs:
+            return None                                   # two different formats share the flag
+        convs = c
+    return convs
 
 
 def _norm_call(text: str):
@@ -823,23 +1172,11 @@ def _norm_call(text: str):
 def _str_flag_for_reg(texts, reg: str):
     """The r2 `str.<flag>` name whose ADDRESS `reg` holds at the end of `texts`, following one
     reg-to-reg move hop (`lea rdx,str.x; mov rdi,rdx` -- the -O0 arg set-up). None otherwise."""
-    cur = reg
-    for _ in range(2):
-        for t in reversed(texts):
-            body = t.split(";")[0]
-            m = re.match(r"\s*lea\s+" + re.escape(cur) + r"\s*,\s*(.+)$", body, re.I)
-            if m:
-                sym = _R2_STR_SYM.search(m.group(1))
-                return sym.group(1) if sym else None
-            mv = re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*([a-z0-9]+)\s*$", body, re.I)
-            if mv and mv.group(1).lower() in _X86_REGS:
-                cur = mv.group(1).lower()
-                break
-            if re.match(r"\s*(mov|lea|add|sub|xor|pop)\s+" + re.escape(cur) + r"\b", body, re.I):
-                return None
-        else:
-            return None
-    return None
+    m = re.match(r"lea\s+\w+\s*,\s*(.+)$", _reg_def(texts, reg) or "", re.I)
+    if not m:
+        return None
+    sym = _R2_STR_SYM.search(m.group(1))
+    return sym.group(1) if sym else None
 
 
 def _stack_slot_for_reg(texts, reg: str, slot_names=None):
@@ -852,45 +1189,37 @@ def _stack_slot_for_reg(texts, reg: str, slot_names=None):
     `lea rax, qword [var_18h]` -- rather than a literal `[rbp - 0x18]`, and without the mapping the
     address of the buffer is simply not recovered (the whole slot comes back None). The offset is
     taken from the frame table, never parsed out of the name's digits."""
-    cur = reg
-    for _ in range(2):                                    # at most one mov hop then the lea
-        for t in reversed(texts):
-            body = t.split(";")[0]
-            m = re.match(r"\s*lea\s+" + re.escape(cur) + r"\s*,\s*\[\s*rbp\s*-\s*(0x[0-9a-f]+|\d+)\s*\]",
-                         body, re.I)
-            if m:
-                return -int(m.group(1), 0)
-            if slot_names:                                # &frame-local via the named operand
-                mn = re.match(r"\s*lea\s+" + re.escape(cur) +
-                              r"\s*,\s*(?:[a-z]+\s+)?\[\s*([A-Za-z_][\w.]*)\s*\]", body, re.I)
-                if mn and mn.group(1) in slot_names:
-                    return int(slot_names[mn.group(1)])
-            mv = re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*([a-z0-9]+)\s*$", body, re.I)
-            if mv and mv.group(1).lower() in _X86_REGS:
-                cur = mv.group(1).lower()
-                break                                     # re-scan for the new source register
-            if re.match(r"\s*(mov|lea|add|sub|xor|pop)\s+" + re.escape(cur) + r"\b", body, re.I):
-                return None                               # reg was defined by something else
-        else:
-            return None
-    return None
+    body = _reg_def(texts, reg)                           # at most one mov hop, then the lea
+    mnem, ops = _ops(body or "")
+    if mnem != "lea" or len(ops) != 2:
+        return None
+    slot = _frame_slot(_mem_terms(ops[1], slot_names))
+    return slot[1] if slot and slot[0] == "RBP" and slot[1] < 0 else None
 
 
 def _memset_size_for_slot(texts, slot: int, slot_names=None):
     """Size of a `memset(&local, 0, IMM)` on `slot` earlier in the function (r2: `lea rax,[rbp-K];
     mov rdi,rax; mov edx,IMM; ...; call memset`). This is the buffer's zeroed extent -- a tighter,
     more reliable size than a decompiler frame var that merges the local with adjacent slots (rizin
-    reports a padded 24 for a `char[16]` that abuts the saved rbp). None if not found."""
-    edx = None
-    for t in texts:
-        body = t.split(";")[0]
-        m = re.match(r"\s*mov\s+(?:edx|rdx)\s*,\s*(0x[0-9a-f]+|\d+)\s*$", body, re.I)
+    reports a padded 24 for a `char[16]` that abuts the saved rbp). None if not found.
+
+    Each memset is read at ITS OWN position (identical `call memset` texts used to all resolve to the
+    first one), its size must be the immediate that reaches THAT call (a size r2 renders as a symbol
+    -- `mov edx, elf_phdr` for 0x40 -- used to leave an earlier memset's size standing), and when
+    the slot is cleared more than once the LARGEST extent wins: a partial clear understates the
+    buffer, and an understated size is a fabricated overflow."""
+    best = None
+    for k, t in enumerate(texts):
+        if _norm_call(t.split(";")[0]) != "memset":
+            continue
+        pre = texts[:k]
+        if _stack_slot_for_reg(pre, "rdi", slot_names) != slot:
+            continue
+        m = re.match(r"(?:mov|movabs)\s+(?:edx|rdx)\s*,\s*(0x[0-9a-f]+|\d+)\s*$",
+                     _reg_def(pre, "rdx", hops=0) or "", re.I)
         if m:
-            edx = int(m.group(1), 0)
-        if _norm_call(body) == "memset" and edx is not None:
-            if _stack_slot_for_reg(texts[:texts.index(t)], "rdi", slot_names) == slot:
-                return edx
-    return None
+            best = max(best or 0, int(m.group(1), 0))
+    return best
 
 
 @register_detector
@@ -903,19 +1232,14 @@ def scanf_bounded_overflow(ctx: DetectContext):
     for s in (ctx.strings or []):
         for m in _SCANF_STR_WIDTH.finditer(getattr(s, "value", "") or ""):
             real_widths.add(int(m.group(1)))
-    if not real_widths:
-        return []
     out = []
     for faddr, ir in ctx.func_irs.items():
         frame = ctx.frames.get(faddr) or {}
-        vsize = {int(v.get("offset", 1)): int(v.get("size", 0))
-                 for v in (frame.get("vars") or []) if v.get("offset") is not None}
-        # name -> frame offset, so a `lea rax, [var_18h]` operand resolves to its slot (the
-        # disassembly names locals; it rarely spells out `[rbp - 0x18]`).
-        slot_names = {v["name"]: int(v["offset"]) for v in (frame.get("vars") or [])
-                      if v.get("name") and v.get("offset") is not None}
+        # offset -> size, and name -> frame offset so a `lea rax, [var_18h]` operand resolves to
+        # its slot (the disassembly names locals; it rarely spells out `[rbp - 0x18]`).
+        vsize, slot_names = _frame_vars(frame)
         flat = [(i.get("addr"), (i.get("text") or ""))
-                for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
+                for b in _blocks_of(ir) for i in (b.get("instructions") or [])]
         texts = [t for _, t in flat]
         for idx, (addr, text) in enumerate(flat):
             variant = _norm_call(text)
@@ -923,38 +1247,686 @@ def scanf_bounded_overflow(ctx: DetectContext):
                 continue
             fmt_reg, buf_reg = _SCANF_VARIANTS[variant]
             pre = texts[:idx]
-            # the format string flag feeding the format register -> its declared widths
-            sym = _str_flag_for_reg(pre, fmt_reg)
-            widths = {int(w) for w in _SYM_WIDTH.findall(sym)} & real_widths if sym else set()
-            if not widths:
+            # the format feeding the format register: the literal itself when the register holds
+            # its address (read from the image), else the r2 `str.` flag naming it
+            fmt, sym = _format_at(ctx, pre, fmt_reg)
+            if fmt is None and not sym:
                 continue
-            slot = _stack_slot_for_reg(pre, buf_reg, slot_names)
-            if slot is None:
-                continue
-            # Prefer the memset-zeroed extent: it is the exact buffer size, whereas a decompiler
-            # frame var often merges the buffer with the slots above it (rizin pads a char[16] that
-            # abuts the saved rbp to 24, which would hide the off-by-one). Fall back to the frame
-            # size when the buffer is not memset.
-            size = _memset_size_for_slot(pre, slot, slot_names) or vsize.get(slot)
-            if not size:
-                continue
-            n = max(widths)
-            if n + 1 <= size:                             # width + NUL fits -> genuinely safe
-                continue
-            off = "off-by-one NUL" if n + 1 == size + 1 and n == size else f"{n + 1 - size}-byte"
-            kind = "single-NUL off-by-one" if n == size else "overflow"
-            out.append(_cand(
-                "CWE-787",
-                f"Width-bounded {variant}() overflows its stack buffer ({kind})",
-                "high", "scanf_bounded_overflow",
-                [{"channel": "pattern",
-                  "detail": (f"{variant}(\"%{n}s\", &buf) at {addr} writes {n}+1 bytes into a "
-                             f"{size}-byte stack buffer at rbp{slot} ({off} past the end)")}],
-                function_addr=faddr, site_addr=addr,
-                site_detail=(f"{variant} %{n}s into a {size}-byte buffer (rbp{slot}); "
-                             f"writes {n + 1} bytes"),
-                dedup_key=f"CWE-787:scanf_bounded_overflow:{variant}", confidence=0.6))
+            # Each width bounds ITS OWN destination: `scanf("%4s %64s", small, big)` writes at most
+            # 5 bytes into `small` and 65 into `big`. The conversions are mapped to their argument
+            # registers in order from the REAL format string. Applying the largest width to the
+            # first buffer (the earlier shape) asserted a HIGH overflow on a correctly-sized
+            # `small`. When the real string cannot be recovered, only a format whose FIRST
+            # conversion is the bounded string (`%16s...` -> flag `_16s...`) is mapped, to the
+            # first argument -- anything else is skipped rather than guessed.
+            # A literal read from the image IS the format (no corroboration needed); a width
+            # recovered through a flag name must also appear in a real extracted format string.
+            convs = (_scanf_conversions(fmt) if fmt is not None
+                     else _resolve_scanf_format(sym, ctx.strings))
+            checks = []                                   # (width, dest register)
+            if convs is not None:
+                regs = _SCANF_ARGREGS[variant]
+                for k, w, conv, alloc in convs:
+                    if w is None or alloc or conv not in ("s", "[") or k >= len(regs):
+                        continue
+                    if fmt is not None or w in real_widths:
+                        checks.append((w, regs[k]))
+            elif sym:
+                m0 = re.match(r"_(\d+)[hlLjztq]*s", sym)
+                if m0 and int(m0.group(1)) in real_widths:
+                    checks.append((int(m0.group(1)), buf_reg))
+            for n, dreg in checks:
+                slot = _stack_slot_for_reg(pre, dreg, slot_names)
+                if slot is None:
+                    continue
+                # Prefer the memset-zeroed extent: it is the exact buffer size, whereas a decompiler
+                # frame var often merges the buffer with the slots above it (rizin pads a char[16]
+                # that abuts the saved rbp to 24, which would hide the off-by-one). Fall back to the
+                # frame size when the buffer is not memset.
+                size = _memset_size_for_slot(pre, slot, slot_names) or vsize.get(slot)
+                if not size:
+                    continue
+                if n + 1 <= size:                         # width + NUL fits -> genuinely safe
+                    continue
+                off = "off-by-one NUL" if n == size else f"{n + 1 - size}-byte"
+                kind = "single-NUL off-by-one" if n == size else "overflow"
+                out.append(_cand(
+                    "CWE-787",
+                    f"Width-bounded {variant}() overflows its stack buffer ({kind})",
+                    "high", "scanf_bounded_overflow",
+                    [{"channel": "pattern",
+                      "detail": (f"{variant}(\"%{n}s\", &buf) at {addr} writes {n}+1 bytes into a "
+                                 f"{size}-byte stack buffer at rbp{slot} ({off} past the end)")}],
+                    function_addr=faddr, site_addr=addr,
+                    site_detail=(f"{variant} %{n}s into a {size}-byte buffer (rbp{slot}); "
+                                 f"writes {n + 1} bytes"),
+                    dedup_key=f"CWE-787:scanf_bounded_overflow:{variant}", confidence=0.6))
     return out
+
+
+# ------------------------------------- improper validation of an array index (CWE-129) ----------
+# An integer the attacker supplies -- parsed by atoi/strtol, converted by scanf("%d"), or read raw
+# with read() -- is used to index a FIXED-SIZE array (a stack local or a global object) with no
+# dominating check that keeps it inside the array. Three verdicts, each of which holds whatever the
+# input turns out to be (the universal-contract principle):
+#   unchecked -- no dominating comparison bounds the index from above on SOME path to the access;
+#                any array size is exceeded by a large enough value.
+#   signed    -- the only bound is an upper one on a SIGNED value (`if (i < 10)`): i = -1 indexes
+#                below the array whatever its size.
+#   bound     -- the bound is both-sided but admits an index >= the element count (`i <= 16` on a
+#                16-element array). Only asserted for a GLOBAL array, whose extent is the symbol
+#                table's st_size; a recovered stack frame is not trusted for a size (bounds.py).
+# Everything that could make the claim false is a SKIP, never a guess: an index slot that is
+# written anywhere else or whose address escapes (a callee may clamp it), a dominating branch that
+# reads the index and cannot be evaluated (a variable bound, a validator call), arithmetic the
+# tracker does not model, an unknown array base. Precision over recall: this sees the -O0 frame-slot
+# shape across blocks and the -O2 register shape within a block / into its sole successor.
+# x86-64 only (the argument registers and operand syntax are ISA-specific).
+_INT_PARSERS = {"atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull", "strtoimax",
+                "strtoumax", "strtoq", "strtouq"}
+_RAW_READS = {"read": "rsi", "recv": "rsi", "recvfrom": "rsi", "fread": "rdi", "pread": "rsi",
+              "pread64": "rsi"}
+_CALLER_SAVED = {"rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"}
+_SIZE_PFX = re.compile(r"^(byte|word|dword|qword|xmmword|ymmword|tbyte)\s+(ptr\s+)?", re.I)
+_NUM = re.compile(r"^(0x[0-9a-f]+|\d+)$", re.I)
+_NO_WRITE = {"cmp", "test", "push", "call", "jmp", "ret", "nop", "endbr64", "leave", "bt"}
+
+
+def _ops(body: str):
+    parts = body.split(None, 1)
+    if not parts:
+        return "", []
+    mnem = parts[0].lower()
+    if len(parts) == 1:
+        return mnem, []
+    ops, depth, cur = [], 0, ""
+    for ch in parts[1]:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            ops.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        ops.append(cur.strip())
+    return mnem, ops
+
+
+def _mem_terms(op: str, slot_names=None):
+    """`dword [rbp + rax*4 - 0x60]` -> (width, [(reg, scale)], disp, [symbols]); None if `op` is not
+    a memory operand or holds something unparseable. A rizin-named local (`[var_14h]`) is mapped
+    to `rbp + offset` through the frame table."""
+    m = re.search(r"\[([^\]]*)\]", op or "")
+    if not m:
+        return None
+    w = _SIZE_PFX.match(op.strip())
+    width = w.group(1).lower() if w else None
+    inner = m.group(1).replace(" ", "").lower()
+    if not inner:
+        return None
+    regs, disp, syms = [], 0, []
+    for sign, term in re.findall(r"([+-]?)([^+-]+)", inner):
+        neg = sign == "-"
+        if "*" in term:
+            a, b = term.split("*", 1)
+            r, k = (a, b) if a in _X86_CANON else (b, a)
+            if r not in _X86_CANON or not _NUM.match(k) or neg:
+                return None
+            regs.append((_X86_CANON[r], int(k, 0)))
+        elif term in _X86_CANON:
+            if neg:
+                return None
+            regs.append((_X86_CANON[term], 1))
+        elif _NUM.match(term):
+            disp += -int(term, 0) if neg else int(term, 0)
+        elif slot_names and term in slot_names and not neg:
+            regs.append(("rbp", 1))
+            disp += int(slot_names[term])
+        elif re.match(r"^[a-z_.$][\w.$@]*$", term) and not neg:
+            syms.append(term)
+        else:
+            return None
+    return width, regs, disp, syms
+
+
+def _frame_slot(terms):
+    """(BASE, disp) when the operand is a plain frame slot (`[rbp - 0x14]`, `[rsp + 0xc]`)."""
+    if not terms:
+        return None
+    _w, regs, disp, syms = terms
+    if len(regs) == 1 and regs[0][1] == 1 and regs[0][0] in ("rbp", "rsp") and not syms:
+        return (regs[0][0].upper(), disp)
+    return None
+
+
+def _global_base(ctx, addr=None, sym=None):
+    """(name, base addr, st_size, offset into it) for a global OBJECT at `addr`/`sym`, else None.
+    Only a symbol-table object is a fixed-size array with a known extent; a bare address that lies
+    in a file-backed or .bss data section is still a fixed global (extent unknown)."""
+    objs = _global_objects(ctx)
+    if sym:
+        n = sym[4:] if sym.startswith("obj.") else None
+        if n and n in objs:
+            a, sz = objs[n]
+            return n, a, sz, 0
+        if n:
+            return n, None, None, 0
+        return None
+    if addr is None:
+        return None
+    for n, (a, sz) in objs.items():
+        if a <= addr < a + max(sz, 1):
+            return n, a, sz, addr - a
+    secs, _data = _image_sections(ctx)
+    for sec in secs:
+        if (sec["flags"] & 2) and not (sec["flags"] & 4) and sec["addr"] and \
+                sec["addr"] <= addr < sec["addr"] + sec["size"] and \
+                sec.get("name") in (".data", ".bss", ".rodata"):
+            return None, addr, None, 0
+    return None
+
+
+class _IdxTracker:
+    """Register -> symbolic value across one basic block, for the shapes an array access is built
+    from. Values: ("idx", scale, off, src) = index*scale + off; ("fa", BASE, disp) = a frame address;
+    ("ga", addr, name) = a global address; ("ptr", base, scale, off, src) = &array[index]."""
+
+    def __init__(self, ctx, slots, slot_names, state=None):
+        self.ctx, self.slots, self.slot_names = ctx, slots, slot_names
+        self.st = dict(state or {})
+
+    def _val(self, reg):
+        return self.st.get(_X86_CANON.get(reg, reg))
+
+    def _set(self, reg, v):
+        c = _X86_CANON.get(reg)
+        if c:
+            if v is None:
+                self.st.pop(c, None)
+            else:
+                self.st[c] = v
+
+    def addr_of(self, terms):
+        """The symbolic address a memory operand computes, or None."""
+        if not terms:
+            return None
+        _w, regs, disp, syms = terms
+        if len(syms) > 1:
+            return None
+        idx, base = None, None
+        if syms:
+            g = _global_base(self.ctx, sym=syms[0])
+            if g is None:
+                return None
+            base = ("global", g[0], g[1], g[2], g[3] + disp)
+            disp = 0
+        for r, k in regs:
+            v = self.st.get(r)
+            if r in ("rbp", "rsp") and k == 1 and base is None and v is None:
+                base = ("stack", r.upper(), None)          # disp is the array base
+                continue
+            if v and v[0] == "idx" and idx is None:
+                idx = (v[1] * k, v[2] * k, v[3])
+                continue
+            if v and k == 1 and base is None and v[0] == "fa":
+                base, disp = ("stack", v[1], None), disp + v[2]
+                continue
+            if v and k == 1 and base is None and v[0] == "ga":
+                gb = self._gbase(v)
+                if gb is None:
+                    return None
+                base, disp = ("global", gb[0], gb[1], gb[2], gb[3] + disp), 0
+                continue
+            if v and k == 1 and base is None and idx is None and v[0] == "ptr":
+                return ("ptr", v[1], v[2], v[3] + disp, v[4])
+            return None
+        if base is None and idx is None and not regs and disp:
+            g = _global_base(self.ctx, addr=disp)
+            return ("ga", disp, g[0] if g else None) if g else None
+        if base is None and idx is not None and disp >= 0x1000:
+            g = _global_base(self.ctx, addr=disp)     # non-PIE `[rax*4 + 0x404060]`
+            if g is not None:
+                base = ("global", g[0], g[1], g[2], g[3])
+        if base is None:
+            return ("idx",) + idx if idx else None
+        if base[0] == "stack":
+            base = ("stack", base[1], disp)
+            if base[1] == "RBP" and disp >= 0:
+                return None                                # rbp+K is an incoming argument
+            if idx is None:
+                return ("fa", base[1], disp)
+            return ("ptr", base, idx[0], idx[1], idx[2])
+        if idx is None:
+            return ("ga", base[2], base[1]) if base[4] == 0 else None
+        return ("ptr", base, idx[0], idx[1] + base[4], idx[2])
+
+    def _gbase(self, ga):
+        """The global object a ("ga", addr, name) value points into."""
+        if ga[1] is not None:
+            return _global_base(self.ctx, addr=ga[1])
+        return _global_base(self.ctx, sym="obj." + ga[2]) if ga[2] else None
+
+    def step(self, mnem, ops, call_name=None, reg_source=None):
+        """Advance over one instruction; returns the &array[index] access it performs, if any:
+        (ptr value, 'write'|'read')."""
+        hit = None
+        if mnem not in ("lea", "nop", "endbr64"):
+            for i, op in enumerate(ops):
+                t = _mem_terms(op, self.slot_names)
+                if not t:
+                    continue
+                a = self.addr_of(t)
+                if a and a[0] == "ptr" and a[1][0] in ("stack", "global"):
+                    write = i == 0 and mnem not in ("cmp", "test", "push")
+                    hit = (a, "write" if write else "read")
+        if mnem == "call":
+            for r in _CALLER_SAVED:
+                self.st.pop(r, None)
+            if reg_source is not None:
+                self.st["rax"] = ("idx", 1, 0, reg_source)
+            return hit
+        if mnem == "cdqe":
+            return hit                                     # rax <- sext(eax): same index value
+        if mnem in ("cdq", "cqo"):
+            self.st.pop("rdx", None)
+            return hit
+        if mnem in ("div", "idiv", "mul") or (mnem == "imul" and len(ops) == 1):
+            self.st.pop("rax", None)                        # implicit rdx:rax result
+            self.st.pop("rdx", None)
+            return hit
+        if not ops:
+            return hit
+        dst = ops[0].lower()
+        dreg = dst if dst in _X86_CANON else None
+        src = ops[1].lower() if len(ops) > 1 else None
+        if mnem in ("mov", "movsxd", "movsx", "movzx") and dreg:
+            if src in _X86_CANON:
+                narrow = src not in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp") and \
+                    not re.match(r"^(e[a-z]{2}|r\d+d?)$", src)
+                self._set(dreg, None if narrow else self._val(src))
+                return hit
+            t = _mem_terms(src, self.slot_names)
+            if t is not None:
+                s = _frame_slot(t)
+                if s in self.slots and t[0] in ("dword", "qword", None):
+                    self._set(dreg, ("idx", 1, 0, self.slots[s]))
+                else:
+                    self._set(dreg, None)
+                return hit
+            if src and _NUM.match(src):
+                v = int(src, 0)
+                g = _global_base(self.ctx, addr=v) if v >= 0x1000 else None
+                self._set(dreg, ("ga", v, g[0]) if g else None)
+                return hit
+            if src and src.startswith("obj."):
+                g = _global_base(self.ctx, sym=src)
+                self._set(dreg, ("ga", g[1], g[0]) if g else None)
+                return hit
+            self._set(dreg, None)
+            return hit
+        if mnem == "lea" and dreg:
+            a = self.addr_of(_mem_terms(src, self.slot_names)) if src else None
+            self._set(dreg, a if a and a[0] in ("idx", "fa", "ga", "ptr") else None)
+            return hit
+        v = self._val(dreg) if dreg else None
+        imm = int(src, 0) if src and _NUM.match(src) else None
+        if dreg and v and mnem in ("shl", "sal") and imm is not None and v[0] == "idx" and imm < 16:
+            self._set(dreg, ("idx", v[1] << imm, v[2] << imm, v[3]))
+            return hit
+        if dreg and v and mnem in ("add", "sub") and imm is not None:
+            d = imm if mnem == "add" else -imm
+            if v[0] == "idx":
+                self._set(dreg, ("idx", v[1], v[2] + d, v[3]))
+            elif v[0] == "ptr":
+                self._set(dreg, ("ptr", v[1], v[2], v[3] + d, v[4]))
+            elif v[0] == "fa":
+                self._set(dreg, ("fa", v[1], v[2] + d))
+            else:
+                self._set(dreg, None)
+            return hit
+        if dreg and mnem == "add" and src in _X86_CANON:
+            w = self._val(src)
+            pair = {x[0]: x for x in (v, w) if x}
+            if v and w and set(pair) == {"idx", "fa"}:
+                i, f = pair["idx"], pair["fa"]
+                self._set(dreg, None if f[1] == "RBP" and f[2] >= 0 else
+                          ("ptr", ("stack", f[1], f[2]), i[1], i[2], i[3]))
+            elif v and w and set(pair) == {"idx", "ga"}:
+                i, gb = pair["idx"], self._gbase(pair["ga"])
+                self._set(dreg, ("ptr", ("global", gb[0], gb[1], gb[2], gb[3]), i[1],
+                                 i[2] + gb[3], i[3]) if gb else None)
+            else:
+                self._set(dreg, None)
+            return hit
+        if dreg and mnem == "imul" and len(ops) == 3 and _NUM.match(ops[2]):
+            s = self._val(ops[1].lower())
+            k = int(ops[2], 0)
+            self._set(dreg, ("idx", s[1] * k, s[2] * k, s[3]) if s and s[0] == "idx" else None)
+            return hit
+        if mnem in ("xchg",):
+            for o in ops:
+                self._set(o.lower(), None)
+            return hit
+        if dreg and mnem not in _NO_WRITE:
+            self._set(dreg, None)
+        return hit
+
+
+def _block_flat(ir):
+    out = []
+    for b in (ir or {}).get("blocks", []) or []:
+        for j, i in enumerate(b.get("instructions") or []):
+            body = (i.get("text") or "").split(";")[0].strip()
+            out.append((b.get("addr"), j, i.get("addr"), body))
+    return out
+
+
+def _index_slot_sources(ctx, ir, slot_names):
+    """Frame slots that hold an attacker-supplied integer, keyed (BASE, disp) -> source dict.
+    A slot qualifies only when its sole writer is that source (plus constant initialisers before a
+    pointer-filled source) and its address is taken nowhere else -- otherwise a later clamp or a
+    callee could bound it unseen, and the slot is dropped."""
+    flat = _block_flat(ir)
+    cands = {}
+    leas: dict = defaultdict(list)                        # slot -> [instruction addrs taking &slot]
+    writes: dict = defaultdict(list)                      # slot -> [(addr, imm-or-None)]
+    for k, (_b, _j, addr, body) in enumerate(flat):
+        mnem, ops = _ops(body)
+        if not ops:
+            continue
+        if mnem == "lea" and len(ops) == 2:
+            s = _frame_slot(_mem_terms(ops[1], slot_names))
+            if s:
+                leas[s].append(_naddr(addr))
+        elif mnem not in _NO_WRITE:
+            s = _frame_slot(_mem_terms(ops[0], slot_names))
+            if s:
+                imm = ops[1] if len(ops) > 1 and _NUM.match(ops[1]) and mnem == "mov" else None
+                writes[s].append((_naddr(addr), imm))
+    texts = [body for (_b, _j, _a, body) in flat]
+    for k, (blk, _j, addr, body) in enumerate(flat):
+        name = _norm_call(body)
+        if not name:
+            continue
+        a = _naddr(addr)
+        if name in _INT_PARSERS:
+            # the parser's argument must not be a constant string (atoi("5") is no input)
+            if _addr_for_reg(texts[:k], "rdi") is not None or _str_flag_for_reg(texts[:k], "rdi"):
+                continue
+            for (b2, _j2, a2, body2) in flat[k + 1:k + 4]:
+                if b2 != blk:
+                    break
+                mnem, ops = _ops(body2)
+                if mnem == "mov" and len(ops) == 2 and ops[1].lower() in ("eax", "rax"):
+                    s = _frame_slot(_mem_terms(ops[0], slot_names))
+                    if s:
+                        cands[s] = {"source": name, "source_site": hex(a), "slot": s,
+                                    "store": _naddr(a2), "kind": "parsed", "block": blk}
+                    break
+                if mnem in ("cdqe", "nop") or (mnem == "mov" and ops and
+                                               _X86_CANON.get(ops[0].lower()) != "rax"):
+                    continue
+                break
+        elif name in _SCANF_VARIANTS:
+            fmt_reg = _SCANF_VARIANTS[name][0]
+            fmt, sym = _format_at(ctx, texts[:k], fmt_reg)
+            convs = (_scanf_conversions(fmt) if fmt is not None
+                     else (_resolve_scanf_format(sym, ctx.strings) if sym else None))
+            regs = _SCANF_ARGREGS[name]
+            for i, w, conv, alloc in (convs or []):
+                if conv not in "diouxX" or alloc or i >= len(regs):
+                    continue
+                s = _stack_slot_for_reg(texts[:k], regs[i], slot_names)
+                s = ("RBP", s) if s is not None else _rsp_slot_for_reg(texts[:k], regs[i])
+                if s:
+                    cands[s] = {"source": f"{name} %{conv}", "source_site": hex(a), "slot": s,
+                                "kind": "pointer", "block": blk}
+        elif name in _RAW_READS:
+            s = _stack_slot_for_reg(texts[:k], _RAW_READS[name], slot_names)
+            s = ("RBP", s) if s is not None else _rsp_slot_for_reg(texts[:k], _RAW_READS[name])
+            if s:
+                cands[s] = {"source": name, "source_site": hex(a), "slot": s, "kind": "pointer",
+                            "block": blk}
+    out = {}
+    for s, c in cands.items():
+        src = _naddr(c["source_site"])
+        if c["kind"] == "parsed":
+            if leas.get(s) or [w for w in writes.get(s, []) if w[0] != c["store"]]:
+                continue
+        else:
+            if len(leas.get(s, [])) != 1:
+                continue                                  # &slot also handed to someone else
+            if any(w[1] is None or w[0] > src for w in writes.get(s, [])):
+                continue                                  # re-written after the input arrives
+        out[s] = c
+    return out
+
+
+def _rsp_slot_for_reg(texts, reg: str):
+    """(`RSP`, disp) when `reg` holds `rsp + disp` (`lea rsi, [rsp + 0xc]`, the -O2 &local)."""
+    for t in reversed(texts):
+        mnem, ops = _ops(t.split(";")[0].strip())
+        if not ops or _X86_CANON.get(ops[0].lower()) != _X86_CANON.get(reg):
+            continue
+        if mnem == "lea" and len(ops) == 2:
+            s = _frame_slot(_mem_terms(ops[1]))
+            return s if s and s[0] == "RSP" else None
+        if mnem not in _NO_WRITE:
+            return None
+    return None
+
+
+def _touches(instrs, slot, slot_names):
+    """Does this block READ the index slot? (`lea` only takes its address -- the block that calls
+    `read(fd, &i, 4)` and branches on read's return is not a check on i.)"""
+    for i in instrs:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if mnem == "lea":
+            continue
+        for op in ops:
+            if _frame_slot(_mem_terms(op, slot_names)) == slot:
+                return True
+    return False
+
+
+def _ends_in_cond_jump(instrs):
+    if not instrs:
+        return False
+    mnem, _ops_ = _ops((instrs[-1].get("text") or "").split(";")[0].strip())
+    return mnem.startswith("j") and mnem != "jmp"
+
+
+def _slot_check(blocks, site_block, slot, dom, slot_names):
+    """What dominating checks prove about a frame-slot index at `site_block`: ("unchecked",), or
+    ("bounded", bound, nonneg), or None when a dominating branch reads the index but cannot be
+    evaluated (a variable bound, a validator call) -- the claim is then not made."""
+    from . import bounds
+    by_addr = {b.get("addr"): b for b in blocks}
+    bases = ("RBP", "RSP")
+    for d in dom.get(site_block, ()):
+        if d == site_block:
+            continue
+        ins = (by_addr.get(d) or {}).get("instructions") or []
+        if _ends_in_cond_jump(ins) and _touches(ins, slot, slot_names) and \
+                bounds.branch_predicate(ins, slot, bases) is None:
+            return None
+    g = bounds.guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
+    if g is None:
+        return ("unchecked",)
+    return ("bounded", g["bound"], bool(g["nonneg"]))
+
+
+def _reg_check(pred_block, after_idx, regs, site_block, dom):
+    """The same question for an index held in a REGISTER across the edge from its source block
+    (`call strtol; cmp eax, 0xf; ja ...` -> the access in the successor)."""
+    from . import bounds
+    ins = pred_block.get("instructions") or []
+    if not _ends_in_cond_jump(ins):
+        return ("unchecked",)
+    reaching = dom.get(site_block, ())
+    after = ins[after_idx + 1:]
+    for r in regs:
+        got = bounds.branch_predicate(after, ("reg", r.upper()), ("RBP", "RSP"))
+        if got is None:
+            continue
+        e = bounds._edge_pred_bound(got, pred_block.get("succ") or [], reaching, site_block)
+        if e is None:
+            return ("unchecked",)
+        return ("bounded", e[0], bool(e[1]))
+    return None                                            # the branch is not readable on the index
+
+
+def _index_verdict(check, base, scale, off):
+    """(verdict, oob index values) for a check on an index into `base`, or None when in bounds or
+    undecidable. `scale`/`off` describe the byte offset index*scale + off."""
+    if check[0] == "unchecked":
+        n = None
+        if base[0] == "global" and base[3]:
+            n = max(1, base[3] // max(scale, 1))
+        return "unchecked", ([n, -1] if n else [-1])
+    bound, nonneg = check[1], check[2]
+    if not nonneg:
+        return "signed", [-1]
+    if off < 0:
+        return None                                        # needs the exact lower bound
+    if base[0] == "global" and base[3] and scale > 0:
+        last = bound * scale + off + scale                 # one past the last byte touched
+        if last > base[3]:
+            return "bound", [bound]
+    return None
+
+
+_IDX_TITLES = {
+    "unchecked": "Array index from input used without a bounds check",
+    "signed": "Array index checked only from above (a negative index reaches the array)",
+    "bound": "Array index bound admits an index past the end of the array",
+}
+
+
+@register_detector
+def array_index(ctx: DetectContext):
+    if not (_is_x86(ctx.arch) and ctx.bits == 64) or not ctx.func_irs:
+        return []
+    from . import bounds
+    out = []
+    for faddr, ir in ctx.func_irs.items():
+        # the dominator / guard machinery keys every block by its address: a block without one
+        # (a degenerate decompiler record) is dropped rather than allowed to sink the detector
+        blocks = [b for b in ((ir or {}).get("blocks") or []) if isinstance(b, dict) and b.get("addr")]
+        if not blocks or len(blocks) > 2000:
+            continue
+        ir = {"blocks": blocks}
+        frame = ctx.frames.get(faddr) or {}
+        _vs, slot_names = _frame_vars(frame)
+        slots = _index_slot_sources(ctx, ir, slot_names)
+        dom = bounds.dominators(blocks)
+        preds: dict = defaultdict(list)
+        for b in blocks:
+            for sc in b.get("succ") or []:
+                preds[sc].append(b.get("addr"))
+        by_addr = {b.get("addr"): b for b in blocks}
+        # block -> (its end-of-block index registers, the input call in it if any). An index
+        # carried in a register flows only into a block whose SOLE predecessor computed it.
+        tail: dict = {}
+        for b in blocks:
+            ba = b.get("addr")
+            ins = b.get("instructions") or []
+            seed, pred = {}, None
+            ps = preds.get(ba, [])
+            if len(ps) == 1 and ps[0] in tail and ps[0] != ba:
+                pred = ps[0]
+                seed = dict(tail[pred][0])
+            tr = _IdxTracker(ctx, slots, slot_names, seed)
+            here = None                                    # (call index, source) in THIS block
+            for j, i in enumerate(ins):
+                body = (i.get("text") or "").split(";")[0].strip()
+                mnem, ops = _ops(body)
+                rsrc = None
+                if mnem == "call" and _norm_call(body) in _INT_PARSERS:
+                    pre = [(x.get("text") or "") for x in ins[:j]]
+                    if _addr_for_reg(pre, "rdi") is None and not _str_flag_for_reg(pre, "rdi"):
+                        rsrc = {"source": _norm_call(body), "source_site": i.get("addr"),
+                                "slot": None, "kind": "register"}
+                        here = (j, rsrc)
+                hit = tr.step(mnem, ops, reg_source=rsrc)
+                if not hit:
+                    continue
+                (_p, base, scale, off, src), access = hit
+                if src.get("slot"):
+                    if src["block"] != ba and src["block"] not in dom.get(ba, ()):
+                        continue                          # the input does not reach on every path
+                    check = _slot_check(blocks, ba, src["slot"], dom, slot_names)
+                elif here is not None and src is here[1]:
+                    check = ("unchecked",)                 # same block: no branch in between
+                elif pred is not None and tail[pred][1] is not None and src is tail[pred][1][1]:
+                    check = _reg_check(by_addr[pred], tail[pred][1][0], ["rax"], ba, dom)
+                else:
+                    check = None                           # carried further than one edge
+                if check is None:
+                    continue
+                v = _index_verdict(check, base, scale, off)
+                if v is None:
+                    continue
+                verdict, oob = v
+                out.append(_array_index_cand(faddr, i.get("addr"), base, scale, off, src, access,
+                                             check, verdict, oob))
+            live = {r: v for r, v in tr.st.items() if v[0] == "idx"}
+            if live:
+                tail[ba] = (live, here)
+    return out
+
+
+def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict, oob):
+    if base[0] == "global":
+        name = base[1] or (f"data_{base[2]:x}" if base[2] is not None else "global")
+        label = name
+        where = (f"global array {name}" + (f" @ {base[2]:#x}" if base[2] is not None else "")
+                 + (f" ({base[3]} bytes, {base[3] // scale} x {scale}-byte elements)"
+                    if base[3] and scale else " (extent not in the symbol table)"))
+        arr = {"kind": "global", "name": base[1], "addr": hex(base[2]) if base[2] is not None else None,
+               "size": base[3], "elements": (base[3] // scale) if base[3] and scale else None,
+               "element_size": scale}
+    else:
+        name = f"{base[1].lower()}{base[2]:+#x}"
+        label = f"{faddr}:{name}"
+        where = f"stack array at {name} ({scale}-byte elements; extent not asserted)"
+        arr = {"kind": "stack", "frame_base": base[1].lower(), "frame_offset": base[2],
+               "size": None, "elements": None, "element_size": scale}
+    slot = src.get("slot")
+    sname = src["source"] if " " in src["source"] else src["source"] + "()"
+    idx_from = (f"{sname} at {src['source_site']}"
+                + (f", held in {slot[0].lower()}{slot[1]:+#x}" if slot else ""))
+    expr = f"index*{scale}" + (f"{off:+d}" if off else "")
+    if verdict == "unchecked":
+        why = "no dominating check bounds it from above on this path"
+    elif verdict == "signed":
+        why = (f"the only dominating check is a SIGNED upper bound (index <= {check[1]}) and "
+               f"nothing excludes a negative index")
+    else:
+        why = (f"the dominating check admits index <= {check[1]}, past the array's "
+               f"{arr['elements']} elements")
+    detail = (f"{access} of {where} at {site}: the index comes from input ({idx_from}) and {why}. "
+              f"Address = base + {expr}. An index of {', '.join(str(x) for x in oob)} "
+              f"{'writes' if access == 'write' else 'reads'} outside the array "
+              f"(CWE-129). Static: the path to this access is not proven feasible.")
+    data = {"array": arr, "index": {"source": src["source"], "source_site": src["source_site"],
+                                    "slot": (f"{slot[0].lower()}{slot[1]:+#x}" if slot else None),
+                                    "expr": expr, "element_offset": off},
+            "access": access, "check": {"verdict": verdict,
+                                        "bound": check[1] if check[0] == "bounded" else None,
+                                        "nonneg": check[2] if check[0] == "bounded" else False},
+            "oob_index": oob}
+    cand = _cand(
+        "CWE-129", _IDX_TITLES[verdict], "high" if access == "write" else "medium", "array_index",
+        [{"channel": "pattern", "detail": detail, "array_index": data}],
+        function_addr=faddr, site_addr=site,
+        site_detail=(f"{access} {name}[{expr}] from {sname}; {verdict}"
+                     + (f" (bound {check[1]})" if check[0] == "bounded" else "")),
+        dedup_key=f"CWE-129:array_index:{label}:{verdict}", confidence=0.5)
+    return cand
 
 
 # ---------------------------------------------------------------- format string (CWE-134) --------
@@ -1057,10 +2029,9 @@ def format_string(ctx: DetectContext):
     out = []
     for faddr, ir in ctx.func_irs.items():
         frame = ctx.frames.get(faddr) or {}
-        slot_names = {v["name"]: int(v["offset"]) for v in (frame.get("vars") or [])
-                      if v.get("name") and v.get("offset") is not None}
+        _vs, slot_names = _frame_vars(frame)
         flat = [(i.get("addr"), (i.get("text") or ""))
-                for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
+                for b in _blocks_of(ir) for i in (b.get("instructions") or [])]
         texts = [t for _, t in flat]
         for idx, (addr, text) in enumerate(flat):
             name = _norm_call(text)
@@ -1140,7 +2111,7 @@ def heap_fptr_call(ctx: DetectContext):
     out = []
     for faddr, ir in ctx.func_irs.items():
         flat = [(i.get("addr"), (i.get("text") or ""))
-                for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
+                for b in _blocks_of(ir) for i in (b.get("instructions") or [])]
         texts = [t for _, t in flat]
         seen_here = False
         for idx, (addr, text) in enumerate(flat):

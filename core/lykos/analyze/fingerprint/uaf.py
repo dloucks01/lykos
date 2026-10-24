@@ -19,7 +19,7 @@ import logging
 import re
 from pathlib import Path
 
-from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
+from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
 
@@ -53,11 +53,37 @@ def _uses(line: str, var: str) -> "str | None":
                      (rf"\b{v}\s*\[", "index p[]")):
         if re.search(rx, line):
             return kind
-    # passed to a call: `foo(.. p ..)` where p is not immediately preceded by & (address-of)
+    # passed to a call: `foo(.. p ..)` where p is not immediately preceded by & (address-of). The
+    # parenthesis that encloses it must be a CALL's: `if (p)`, `while (p != NULL)`, `sizeof(p)`
+    # read the pointer's VALUE (or nothing at all) and never touch the freed memory -- counting
+    # them made `free(p); if (p == NULL) ...` a use-after-free.
     for m in re.finditer(rf"(?<![&\w]){v}\b", line):
         lhs = line[:m.start()]
-        if "(" in lhs and not re.search(rf"\b{v}\s*=(?!=)", line):
+        fn = _enclosing_call(lhs)
+        if fn and fn not in _NOT_CALLS and not re.search(rf"\b{v}\s*=(?!=)", line):
             return "call arg"
+    return None
+
+
+# keywords / operators that take a parenthesised expression without calling anything
+_NOT_CALLS = {"if", "while", "for", "switch", "return", "sizeof", "alignof", "_Alignof",
+              "typeof", "__typeof__", "decltype", "assert"}
+
+
+def _enclosing_call(lhs: str) -> "str | None":
+    """The name before the innermost still-open `(` at the end of `lhs` (the callee whose argument
+    list the next token sits in), or None when there is no open parenthesis or no name before it
+    (a cast or grouping)."""
+    depth = 0
+    for k in range(len(lhs) - 1, -1, -1):
+        c = lhs[k]
+        if c == ")":
+            depth += 1
+        elif c == "(":
+            if depth == 0:
+                m = re.search(r"([A-Za-z_]\w*)\s*$", lhs[:k])
+                return m.group(1) if m else None
+            depth -= 1
     return None
 
 
@@ -94,12 +120,15 @@ def _scan_text(name: str, lines: list) -> list:
                 findings.append(_mk(name, fi, i, var, dealloc, "CWE-416", "Use-after-free",
                                     f"freed by {dealloc}() at line {fi + 1}, then used ({how})"))
                 freed.pop(var, None)
-        # 2) record new frees on this line
+        # 2) record new frees on this line -- unless the free's own block RETURNS on the same line
+        # (`if (err) { free(p); return -1; }`): that path never reaches the code below, so a later
+        # `use(p)` on the fall-through is not a use-after-free. The multi-line form of this is
+        # handled by the exit rule in 4); this is its one-line twin.
         fm = _FREE.search(ln)
-        if fm:
+        if fm and not _returns_after(ln, fm.end()):
             freed[fm.group(1)] = (i, fm.group(0).split("(")[0].strip())
         dm = _DELETE.search(ln)
-        if dm:
+        if dm and not _returns_after(ln, dm.end()):
             freed[dm.group(1)] = (i, "delete")
         # 3) track function scope: on leaving the function body (brace depth back to 0), dangling
         # state does not carry into the next function -- a free in `void a(p){free(p);}` must not
@@ -119,6 +148,31 @@ def _scan_text(name: str, lines: list) -> list:
 
 
 _EXIT = re.compile(r"(return|goto|break|continue)\b")
+
+
+def _returns_after(line: str, pos: int) -> bool:
+    """True when, after `pos` on this line, an UNCONDITIONAL `return` statement follows in the SAME
+    brace block as the code at `pos`: `free(p); return;` / `{ free(p); return -1; }`. Not when the
+    block closes first (`{ free(p); } else { return; }`), when the return is nested in a deeper
+    block (`free(p); if (e) { return; }`), or when it is the body of a braceless conditional
+    (`free(p); if (e) return;` -- the `return` follows `)`, not a statement boundary). Only `return`
+    counts: a `break`/`goto` on the same line may land on a later use (a loop exit, a cleanup label
+    that frees again), so it is not treated as leaving the path."""
+    rest = line[pos:]
+    depth = 0
+    for m in re.finditer(r"[{}]|\breturn\b", rest):
+        tok = m.group(0)
+        if tok == "{":
+            depth += 1
+        elif tok == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif depth == 0:
+            before = rest[:m.start()].rstrip()
+            if before and before[-1] in ";{}":
+                return True
+    return False
 
 
 def _mk(name, free_line, use_line, var, dealloc, cwe, label, detail_tail) -> dict:

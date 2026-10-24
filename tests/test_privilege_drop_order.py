@@ -67,8 +67,10 @@ def pool(store):
 
 
 @pytest.mark.parametrize("body,expect", [
-    ("setuid(0); setgid(0);", True),    # wrong order
-    ("setgid(0); setuid(0);", False),   # correct order
+    # non-zero ids: setuid(0)/setgid(0) set an id TO root -- a raise/no-op, not a drop
+    ("setuid(1000); setgid(1000);", True),    # wrong order
+    ("setgid(1000); setuid(1000);", False),   # correct order
+    ("seteuid(0); setgid(1000); setuid(1000);", False),   # restore root, then drop correctly
 ])
 def test_privilege_drop_order_e2e(store, case, pool, gcc, tmp_path, body, expect):
     if sandbox.host_arch() != "x86-64":

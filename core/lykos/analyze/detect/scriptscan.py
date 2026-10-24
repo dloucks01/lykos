@@ -56,8 +56,12 @@ _SINKS = {
          "CWE-95", "Code injection (eval/exec)", "critical"),
         (re.compile(r"\bpickle\.loads?\s*\(|\byaml\.load\s*\((?![^)]*Safe)|\bmarshal\.loads?\s*\(|"
                     r"\bcPickle\.loads?\s*\("), "CWE-502", "Insecure deserialization", "high"),
-        (re.compile(r"\.execute(?:many)?\s*\(\s*(?:f['\"]|['\"][^'\"]*%|['\"][^'\"]*\"\s*\+|"
-                    r"[^,)]*%\s|[^,)]*\+)"), "CWE-89", "SQL injection", "critical"),
+        # `%`-FORMATTING of the query (`"... %s" % x`, the `%` AFTER the literal) is injection; a
+        # `%s` INSIDE the literal followed by a parameter tuple (`"... %s", (x,)`) is the DB-API's
+        # own parameterised placeholder -- the safe form -- and must not read as SQL injection.
+        (re.compile(r"\.execute(?:many)?\s*\(\s*(?:f['\"]|['\"][^'\"]*['\"]\s*%|"
+                    r"['\"][^'\"]*\"\s*\+|[^,)]*%\s|[^,)]*\+)"), "CWE-89", "SQL injection",
+         "critical"),
         (re.compile(r"\bopen\s*\(|\bos\.open\s*\(|\bos\.remove\s*\(|\bshutil\.(?:copy|move)\s*\("),
          "CWE-22", "Path traversal", "high"),
     ],
@@ -86,7 +90,10 @@ _SINKS = {
     "ruby": [
         (re.compile(r"\bsystem\s*\(|`[^`]*#\{|\bexec\s*\(|\bIO\.popen\s*\(|%x\{|\bOpen3\."),
          "CWE-78", "OS command injection", "critical"),
-        (re.compile(r"(?<!\.)\beval\s*\(|\binstance_eval\b|\bclass_eval\b|\bsend\s*\("),
+        # `send`/`public_send` dispatch a method BY NAME -- dangerous only when that name is not a
+        # literal: `obj.send(:save)` / `obj.send("save")` are ordinary calls, not code injection.
+        (re.compile(r"(?<!\.)\beval\s*\(|\binstance_eval\b|\bclass_eval\b|"
+                    r"\b(?:public_)?send\s*\(\s*(?![:'\"])"),
          "CWE-95", "Code injection (eval)", "critical"),
         (re.compile(r"\.execute\s*\(|\bwhere\s*\(\s*['\"][^'\"]*#\{|\bfind_by_sql\s*\("),
          "CWE-89", "SQL injection", "high"),

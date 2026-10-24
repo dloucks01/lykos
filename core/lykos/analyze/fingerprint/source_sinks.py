@@ -21,7 +21,7 @@ import logging
 import re
 from pathlib import Path
 
-from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
+from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
 
@@ -103,6 +103,22 @@ def _strip_comments(text: str) -> str:
     return _COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
 
 
+# keywords that can directly precede a CALL (`return printf(f)`, `else system(c)`); any other
+# identifier (or a `*`) right before the sink name makes it a declaration / definition
+# (`int printf(const char *fmt, ...)`, `static void syslog(int pri, const char *f)`), not a call.
+_CALL_PREFIX_KW = {"return", "else", "do", "case", "goto", "sizeof", "typeof", "__typeof__"}
+
+
+def _is_declaration(prefix: str) -> bool:
+    p = prefix.rstrip()
+    if not p:
+        return False
+    if p.endswith("*"):
+        return True
+    m = re.search(rf"({_IDENT})$", p)
+    return bool(m) and m.group(1) not in _CALL_PREFIX_KW
+
+
 def _is_literal(arg: str) -> bool:
     """True if the argument is (or wraps, via i18n) a string literal -- the safe case."""
     a = arg.strip()
@@ -133,14 +149,24 @@ def scan_source(root: Path) -> list:
         lines = text.splitlines()
         lit_vars = set(_LIT_ASSIGN.findall(text))          # locals assigned a string literal
         for i, ln in enumerate(lines):
+            if ln.lstrip().startswith("#"):
+                continue                # a macro body forwards its PARAMETER; the call site decides
             for m in _CALL.finditer(ln):
                 fn = m.group(1)
+                if _is_declaration(ln[:m.start()]) or ln[:m.start()].rstrip().endswith((".", "->")):
+                    continue            # a prototype/definition, or a same-named member function
                 args = _split_args(_balanced_arg(ln, ln.index("(", m.end() - 1)))
                 pos = _CMDI.get(fn, _FMT.get(fn))
                 if pos is None or pos >= len(args):
                     continue
                 arg = args[pos]
                 if _is_literal(arg) or arg in lit_vars:
+                    continue
+                # the v* family takes a va_list: `vfprintf(stderr, fmt, ap)` is the body of a
+                # printf-style WRAPPER forwarding its own format parameter -- the correct pattern,
+                # whose callers decide the format (the binary format_string detector excludes the
+                # v* family for the same reason)
+                if fn.startswith("v") and re.fullmatch(_IDENT, arg):
                     continue
                 # a bare numeric / sizeof / NULL is not a tainted string either
                 if re.fullmatch(r"(?:NULL|0|nullptr)", arg):

@@ -19,7 +19,7 @@ import tarfile
 from pathlib import Path
 
 from ... import observe
-from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
+from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
 from . import scan

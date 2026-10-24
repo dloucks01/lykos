@@ -18,7 +18,7 @@ import logging
 import re
 from pathlib import Path
 
-from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
+from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
 
@@ -39,7 +39,9 @@ _ALLOC = re.compile(r"\b(malloc|realloc|aligned_alloc|alloca|valloc|pvPortMalloc
                     r"kmalloc|kzalloc|vmalloc|OPENSSL_malloc)\s*\(")
 # risky arithmetic: a product / shift / sum where an operand is a NON-constant identifier.
 _IDENT = r"[A-Za-z_]\w*"
-_MUL = re.compile(rf"\b{_IDENT}\s*[*]\s*{_IDENT}\b|\b{_IDENT}\s*<<\s*{_IDENT}\b")
+# `sizeof *p` is the canonical SAFE allocation size, not a product -- `sizeof` is never the left
+# operand of a risky multiply.
+_MUL = re.compile(rf"\b(?!sizeof\b){_IDENT}\s*[*]\s*{_IDENT}\b|\b{_IDENT}\s*<<\s*{_IDENT}\b")
 _ADD = re.compile(rf"\b{_IDENT}\s*[+]\s*{_IDENT}\b")
 # tokens that mean "an overflow guard is present" in the window around the site. Each must be
 # distinctive enough not to appear in ordinary prose -- a bare "overflow" matched the comment
@@ -50,6 +52,14 @@ _GUARD = ("SIZE_MAX", "SSIZE_MAX", "INT_MAX", "UINT_MAX", "UINT32_MAX", "UINT64_
           "reallocarray")
 _GUARD_BACK = 40        # lines before the site that an overflow check may sit in
 _CONST_ONLY = re.compile(r"^\s*(?:sizeof\s*\([^)]*\)|\d+|0[xX][0-9a-fA-F]+|[-+*<>()\s])+\s*$")
+_MACRO = re.compile(r"^(?:sizeof|[A-Z][A-Z0-9_]*)$")    # an ALL_CAPS compile-time constant
+_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+
+
+def _strip_comments(text: str) -> str:
+    """Blank out C comments, preserving line structure: a commented-out `malloc(a * b)` is not an
+    allocation, and a `SIZE_MAX` in a TODO comment is not a guard."""
+    return _COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
 
 
 def _balanced_arg(text: str, open_paren: int) -> str:
@@ -74,10 +84,13 @@ def _risky_arith(expr: str) -> "str | None":
         m = rx.search(expr)
         if m:
             frag = m.group(0)
-            # at least one operand must be a variable (not sizeof / not a bare number / not a
-            # single ALL_CAPS constant used alone)
-            if not _CONST_ONLY.match(frag):
-                return frag
+            # at least one operand must be a variable (not sizeof / not a bare number / not an
+            # ALL_CAPS compile-time constant: `COUNT * ELEM_SIZE` cannot be steered by input)
+            if _CONST_ONLY.match(frag):
+                continue
+            if all(_MACRO.match(t) for t in re.findall(_IDENT, frag)):
+                continue
+            return frag
     return None
 
 
@@ -97,7 +110,7 @@ def scan_source(root: Path) -> list:
         try:
             if p.stat().st_size > _MAX_FILE:
                 continue
-            lines = p.read_text("utf-8", "replace").splitlines()
+            lines = _strip_comments(p.read_text("utf-8", "replace")).splitlines()
         except OSError:
             continue
         n += 1

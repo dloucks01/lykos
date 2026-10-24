@@ -1695,6 +1695,62 @@ def _bitfield(mnem, a, b):
     return None
 
 
+def _stores_slot(blk, slot, bases) -> bool:
+    """Does this block STORE to the frame slot `slot` = (base, displacement)? Width-aware: the
+    displacement is read signed at its declared width, the same as the guard evaluator reads it."""
+    base_set = {_canon_reg(b) for b in (bases or ())}
+    regaddr: dict = {}
+    for ins in blk.get("instructions", []) or []:
+        for pc in ins.get("pcode", []) or []:
+            try:
+                mnem, _i, outk, toks = _parse(pc)
+            except Exception:
+                observe.absorbed(_log, "skipping this item")
+                continue
+            if mnem == "STORE" and len(toks) >= 4:
+                if regaddr.get(_key(toks[2])) == slot:
+                    return True
+                continue
+            if outk is None:
+                continue
+            hit = None
+            if mnem == "INT_ADD" and len(toks) >= 3:
+                for rk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
+                    if rk and rk[0] == "reg" and _canon_reg(rk[1]) in base_set:
+                        d = _const_tok(dtok)
+                        if d is not None:
+                            hit = (_canon_reg(rk[1]), d)
+                            break
+            elif mnem == "COPY" and len(toks) >= 2:
+                hit = regaddr.get(_key(toks[1]))
+            if hit:
+                regaddr[outk] = hit
+            else:
+                regaddr.pop(outk, None)
+    return False
+
+
+def _between(blocks, src, dst) -> set:
+    """Blocks on some path src -> ... -> dst (excluding src, including dst)."""
+    succ = {b["addr"]: list(b.get("succ", []) or []) for b in blocks}
+    pred = _preds(blocks)
+    fwd, todo = set(), list(succ.get(src, ()))
+    while todo:
+        x = todo.pop()
+        if x in fwd or x not in succ:
+            continue
+        fwd.add(x)
+        todo.extend(succ.get(x, ()))
+    back, todo = set(), [dst]
+    while todo:
+        x = todo.pop()
+        if x in back:
+            continue
+        back.add(x)
+        todo.extend(pred.get(x, ()))
+    return (fwd & back) | {dst}
+
+
 def guard_bound(blocks, site_block, slot, bases=(), dom=None):
     """What the dominating guards prove about `slot` on every path reaching `site_block`.
 
@@ -1720,6 +1776,15 @@ def guard_bound(blocks, site_block, slot, bases=(), dom=None):
         got = branch_predicate(blk.get("instructions", []) or [], slot, bases)
         if got is None:
             continue                                  # unreadable condition -> no claim
+        # The check bounds the value the slot held AT THE CHECK. A store to the slot on any path
+        # from the check to the use (`n = a(); if (n > 64) return; n = b(); memcpy(buf, s, n)`)
+        # replaces that value, and trusting the stale bound would demote a real overflow to
+        # "bounded". The site's own block is included whole (a store after the use is harmless
+        # but cannot be told apart here; the cost is a verdict left unknown, never a hidden bug).
+        if isinstance(slot, tuple) and len(slot) == 2 and slot[0] != "reg" and \
+                any(_stores_slot(by_addr[x], slot, bases) for x in _between(blocks, d, site_block)
+                    if x in by_addr):
+            continue
         target, (_tag, rel, k, signed) = got
         succ = blk.get("succ", []) or []
         # Which way did control go to reach the copy? A guard block can have MORE than two

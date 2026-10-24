@@ -8,6 +8,7 @@ CWE = {
     "CWE-121": ("Stack-based Buffer Overflow", "high"),
     "CWE-122": ("Heap-based Buffer Overflow", "high"),
     "CWE-125": ("Out-of-bounds Read", "high"),
+    "CWE-129": ("Improper Validation of Array Index", "high"),
     "CWE-416": ("Use After Free", "high"),
     "CWE-476": ("NULL Pointer Dereference", "medium"),
     "CWE-787": ("Out-of-bounds Write", "high"),
@@ -50,6 +51,8 @@ CWE_DESC = {
                "control flow.",
     "CWE-122": "A heap-allocated buffer is overflowed, corrupting heap metadata or neighbouring allocations.",
     "CWE-125": "Code reads memory before the start or past the end of a buffer, leaking data or crashing.",
+    "CWE-129": "An array is indexed with a value from input that is not checked against the array's bounds (or "
+               "only from one side), so the access reads or writes outside the array.",
     "CWE-416": "Memory is used after it has been freed, letting an attacker control the freed contents.",
     "CWE-476": "A NULL pointer is dereferenced, typically crashing the program (denial of service).",
     "CWE-787": "Code writes past the bounds of a buffer, corrupting memory and often enabling code execution.",

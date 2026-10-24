@@ -123,7 +123,6 @@ def embedded_audit_stage(ctx) -> dict:
     import io
     import tarfile
 
-    from ...db.dao import ArtifactDAO
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("embedded_audit requires a target_id")
