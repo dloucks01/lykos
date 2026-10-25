@@ -7,9 +7,9 @@ import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import { api, waitForRun } from "./api.js";
 import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
-import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction, failedTargets } from "./util.js";
+import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction, failedTargets, operatorSettings } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview, CurationFilter,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, CurationFilter,
   RunSignalsStrip, DoctorPanel, SeedsField, BuildFoot,
 } from "./components.js";
 
@@ -178,6 +178,7 @@ function App() {
   const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
   const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
   const [patchDiff, setPatchDiff] = useState(null);   // patch_diff (changed-function localization) result
+  const [scans, setScans] = useState({});             // operator scans: {variant|weggli|diff: {running,data,error}}
   const [harnessRun, setHarnessRun] = useState(null); // on-demand harness (deep fn fuzzing) status
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [budgetMin, setBudgetMin] = useState(_ro.budgetMin ?? "");   // Autopilot budget in MINUTES ("" = size-aware default)
@@ -221,6 +222,8 @@ function App() {
   const [seeds, setSeeds] = useState([]);             // operator seed files stored in the case
   const [seedBusy, setSeedBusy] = useState(false);
   const [doctor, setDoctor] = useState(null);         // engine readiness on this host
+  const [selftest, setSelftest] = useState(null);     // the tool's own validation gates (background)
+  const [selftestHist, setSelftestHist] = useState(null);
   const [buildInfo, setBuildInfo] = useState(null);   // which build is serving (footer)
   useEffect(() => { try { localStorage.setItem(CURFILTER_KEY, curFilter); } catch {} }, [curFilter]);
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
@@ -263,7 +266,7 @@ function App() {
     setActiveTid(null); setTab("findings"); setViz(null); setCgFocus(null);
     setRunSignals(null); setTriageByT({}); setSeeds([]);
     setCodeFn(null); setEvidence(null); setFuncBrowse(null);
-    setDisasmFn(null); setDisasmSel({}); setDiffVerify(null); setPatchDiff(null); setHarnessRun(null);
+    setDisasmFn(null); setDisasmSel({}); setDiffVerify(null); setPatchDiff(null); setScans({}); setHarnessRun(null);
     fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
     curLocal.current = new Map();
     setBg(null); bgPollRef.current++; bgEventsAfter.current = -1;
@@ -412,6 +415,30 @@ function App() {
     }
   }, []);
   useEffect(() => { loadDoctor(false); }, [loadDoctor]);
+
+  // Self-test: start one gate, then poll its progress until it finishes (they take minutes).
+  const selftestPoll = useRef(0);
+  const pollSelftest = useCallback(async () => {
+    const token = ++selftestPoll.current;
+    for (;;) {
+      let st;
+      try { st = await api.selftest(); } catch (e) { st = { state: "error", error: e.message || String(e) }; }
+      if (token !== selftestPoll.current) return;
+      setSelftest(st);
+      if (!st || !st.running) return;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }, []);
+  const startSelftest = useCallback(async (kind, options) => {
+    try { await api.startSelftest(kind, options); }
+    catch (e) { setSelftest((cur) => ({ ...(cur || {}), kind, error: e.message || String(e) })); return; }
+    pollSelftest();
+  }, [pollSelftest]);
+  const loadSelftestHistory = useCallback(async () => {
+    try { setSelftestHist(await api.selftestHistory()); }
+    catch (e) { setSelftestHist({ error: e.message || String(e) }); }
+  }, []);
+  useEffect(() => { pollSelftest(); }, [pollSelftest]);   // pick up a self-test already running
 
   // Keyboard-first modal behaviour, for the three overlays app.js owns (code view, evidence
   // inspector, function browser). Escape closes the top-most open one; when a modal opens focus
@@ -720,26 +747,8 @@ function App() {
       // Operator invocation: how the binary is really run. argv is a shell string with @@ for the
       // input file (the server shlex-splits it, like the CLI's --argv); the channel overrides the
       // autopilot's guess. Both optional -- blank/"auto" lets discovery decide, as today.
-      const overrides = {};
-      if (invArgv.trim()) overrides.argv = invArgv.trim();
-      if (invMode && invMode !== "auto") overrides.input_mode = invMode;
-      // Target's OWN libraries (a directory holding its loader + .so files). Sets QEMU_LD_PREFIX so
-      // afl-qemu / concolic run the binary against its own glibc -- the symbol-lookup->handshake fix,
-      // straight from the GUI (no CLI, no env var to set on the air-gap laptop).
-      if (sysroot.trim()) overrides.sysroot = sysroot.trim();
-      // Deep seed discovery: let the autopilot synthesize parser-buffer seeds for daemon targets
-      // whose entry it cannot seed (candidate-tier). Normal auto-seeding runs either way.
-      if (deepSeed) overrides.deep_seed = true;
-      // Operator seed files (CLI --seed): by hash; the server resolves them to the case store.
-      if (seeds.length) overrides.seed_shas = seeds.map((x) => x.sha256);
-      // Per-stage on/off. Each unchecked engine is skipped for this run; the server validates
-      // against a safe allowlist (never triage/disassembly). The rest of the pipeline is unaffected.
-      const skipStages = [];
-      if (!blackBox) skipStages.push("fuzz");
-      if (!covFuzz) skipStages.push("coverage_fuzz");
-      if (!dirFuzz) skipStages.push("directed_fuzz");
-      if (!concolicOn) skipStages.push("concolic");
-      if (!libfuzzerOn) skipStages.push("libfuzzer");
+      const { overrides, skipStages } = operatorSettings({ invArgv, invMode, sysroot, deepSeed, seeds,
+        blackBox, covFuzz, dirFuzz, concolicOn, libfuzzerOn });
       await api.startBackground(caseId, targets.map((t) => t.id), secs, overrides, converge, skipStages);
       setRan(true);
       pollBackground(caseId);
@@ -897,9 +906,10 @@ function App() {
       });
       if (ev.kind === "verification") setVerifications((cur) => ({ ...cur, [ev.input_sha]: ev.verification }));
     };
-    const overrides = {};
-    if (invArgv.trim()) overrides.argv = invArgv.trim();
-    if (invMode && invMode !== "auto") overrides.input_mode = invMode;
+    // The same operator settings the server run gets: invocation, uploaded seeds, engine switches.
+    const { overrides, skipStages } = operatorSettings({ invArgv, invMode, sysroot, deepSeed, seeds,
+      blackBox, covFuzz, dirFuzz, concolicOn, libfuzzerOn });
+    if (skipStages.length) overrides.skip_stages = skipStages;
     try {
       await runAutopilotCase(ctrl, emit, { targetIds: ids, caseId, overrides });
     } catch (e) {
@@ -909,7 +919,8 @@ function App() {
       setRunning(false);
       ctrlRef.current = null;
     }
-  }, [targets, caseId, advice, pushLog, refreshResults, invArgv, invMode]);
+  }, [targets, caseId, advice, pushLog, refreshResults, invArgv, invMode, sysroot, deepSeed, seeds,
+      blackBox, covFuzz, dirFuzz, concolicOn, libfuzzerOn]);
 
   const onCancel = useCallback(() => {
     if (ctrlRef.current) cancelAutopilot(ctrlRef.current);
@@ -1004,6 +1015,21 @@ function App() {
       setPatchDiff({ key, data: (out && out.output) || { leads: 0, changed: 0 } });
       refreshResults(caseId, targets);
     } catch (e) { setPatchDiff({ key, error: e.message || String(e) }); }
+  }, [caseId, targets, refreshResults]);
+
+  // Operator scans (the Scans tab): variant hunt, source-pattern scan, differential test. Each is a
+  // stage run like any other; the result is read back from its output and findings refreshed.
+  const SCAN_STAGE = { variant: "variant_scan", weggli: "weggli_scan", diff: "diff_test" };
+  const runScan = useCallback(async (kind, { targetId, params } = {}) => {
+    setScans((cur) => ({ ...cur, [kind]: { running: true } }));
+    try {
+      const run = await api.createRun(SCAN_STAGE[kind], targetId ? { targetId, params } : { caseId, params });
+      const done = await waitForRun(run.run_id);
+      if (done && done.status && done.status !== "done") throw new Error(done.error || done.status);
+      const out = await api.runOutput(run.run_id);
+      setScans((cur) => ({ ...cur, [kind]: { data: (out && out.output) || { applicable: false, note: "the scan returned nothing" } } }));
+      refreshResults(caseId, targets);
+    } catch (e) { setScans((cur) => ({ ...cur, [kind]: { error: e.message || String(e) } })); }
   }, [caseId, targets, refreshResults]);
 
   // Operator-initiated DEEP FUNCTION FUZZING (the harness stage: T1 rank -> T2 drive -> T4
@@ -1236,6 +1262,7 @@ function App() {
     taint: { label: "Taint", n: taintFindings.length },
     cves: { label: "CVEs", n: cveFindings.length },
     diff: { label: "Diff" },
+    scans: { label: "Scans" },
     console: { label: "Console", n: consoleLines.length },
   };
   const groupDefs = [
@@ -1249,7 +1276,7 @@ function App() {
       ...(taintFindings.length ? ["taint"] : []),
       ...(cveFindings.length ? ["cves"] : []),
     ] },
-    { id: "diff", label: "Diff", tabs: ["diff"] },
+    { id: "diff", label: "Diff & scans", tabs: ["diff", "scans"] },
     { id: "console", label: "Console", tabs: ["console"], n: consoleLines.length },
   ].filter((g) => g.tabs.length);
   const activeGroup = groupDefs.find((g) => g.tabs.includes(tab)) || groupDefs[0];
@@ -1276,6 +1303,7 @@ function App() {
             <${DropZone} onFiles=${(fl) => onFiles(fl, false)} busy=${uploading} />
             ${uploading ? html`<div class="center"><${Spinner} label="Uploading and triaging…" /></div>` : null}
             <${DoctorPanel} doctor=${doctor} onRefresh=${() => loadDoctor(true)} compact=${true} />
+            <${SelftestPanel} st=${selftest} history=${selftestHist} onStart=${startSelftest} onHistory=${loadSelftestHistory} />
             ${recentCases.length ? html`
               <div class="card recent">
                 <div class="recent-head">Recent analyses</div>
@@ -1486,6 +1514,9 @@ function App() {
               </div>
             ` : tab === "diff" ? html`
               <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} onVerify=${runPocDiff} verify=${diffVerify} onPatchDiff=${runPatchDiff} patch=${patchDiff} /></div>
+            ` : tab === "scans" ? html`
+              <div class="wb-panel"><${ScansPanel} targets=${targets} activeId=${_atid} seeds=${seeds}
+                scans=${scans} onRun=${runScan} /></div>
             ` : tab === "console" ? html`
               <div class="wb-panel">
                 <!-- Lead with the persistent, whole-run live header (every phase, not just fuzzing),
@@ -1507,6 +1538,7 @@ function App() {
                 <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
                 <${UnavailablePanel} items=${unavailable} />
                 <${DoctorPanel} doctor=${doctor} onRefresh=${() => loadDoctor(true)} />
+                <${SelftestPanel} st=${selftest} history=${selftestHist} onStart=${startSelftest} onHistory=${loadSelftestHistory} />
               </div>
             ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}
           </main>

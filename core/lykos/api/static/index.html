@@ -807,6 +807,17 @@
     border-radius: 9px; padding: 8px; }
   .dis-body { flex: 1 1 0; min-width: 0; border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; }
   .dis-h { margin-bottom: 8px; }
+  /* Self-test */
+  .selftest summary { cursor: pointer; }
+  .selftest-out { font-family: var(--mono); font-size: .76rem; max-height: 320px; overflow: auto; white-space: pre;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-top: 8px; }
+  /* Scans (variant hunt / source patterns / differential test) */
+  .scans .scan-h { font-size: .92rem; margin: 18px 0 8px; } .scans .scan-h:first-child { margin-top: 0; }
+  .scans .muted { color: var(--muted); font-size: .8rem; font-weight: 400; }
+  .scan-in { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; color: var(--ink);
+    font: inherit; font-size: .86rem; padding: 6px 10px; min-width: 0; flex: 1 1 180px; }
+  .scan-in.scan-num { flex: 0 0 90px; }
+  .scan-wrap label { display: inline-flex; gap: 4px; align-items: center; }
   /* Diff */
   .diff-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .diff-sel { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; color: var(--ink);

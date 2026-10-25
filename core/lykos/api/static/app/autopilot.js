@@ -21,6 +21,11 @@
 import { api, waitForRun } from "./api.js";
 import { stageLabel } from "./util.js";
 
+// Stages that take operator seeds, and engines the operator may switch off -- both mirror the
+// server (api/endpoints.py _SEEDED_STAGES, api/autopilot.py _skippable).
+const SEEDED = new Set(["fuzz", "coverage_fuzz", "directed_fuzz"]);
+const SKIPPABLE = new Set(["fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer", "concolic"]);
+
 const DYNAMIC_BACKENDS = new Set([
   "fuzz", "coverage_fuzz", "directed_fuzz", "concolic", "dynamic_run", "firmware_carve",
 ]);
@@ -57,6 +62,10 @@ const DYNAMIC_BACKENDS = new Set([
 // they need operator input the in-tab run does not have: harness is started from the Code tab's
 // function view, and patch_diff needs a second build picked as the baseline to diff against:
 // not-in-tab: harness, patch_diff
+//
+// operator scans, started from the Scans panel with the operator's choices (a function name, a
+// set of implementations to compare); the source-pattern scan reads an archived source tree:
+// not-in-tab: variant_scan, weggli_scan, diff_test
 // -------------------------------------------------------------------------------------
 
 const PIPELINE = [
@@ -335,6 +344,18 @@ export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = 
   const ovArgv = typeof overrides.argv === "string" ? shellSplit(overrides.argv)
     : (Array.isArray(overrides.argv) ? overrides.argv : null);
   const ovMode = overrides.input_mode || null;
+  // Operator seeds (CLI --seed): hashes of seeds uploaded into this case. The server resolves them
+  // to the case store for the fuzzers -- the same channel the server autopilot uses.
+  const ovSeeds = Array.isArray(overrides.seed_shas) && overrides.seed_shas.length
+    ? overrides.seed_shas : null;
+  // Engines the operator switched OFF (the same allowlist the server enforces).
+  const skip = new Set((overrides.skip_stages || []).filter((x) => SKIPPABLE.has(x)));
+  if (ovSeeds) emit({ kind: "info", message: `Seeding the fuzzers with ${ovSeeds.length} operator seed${ovSeeds.length === 1 ? "" : "s"}.` });
+  if (skip.size) emit({ kind: "info", message: `Switched off for this run: ${[...skip].map(stageLabel).join(", ")}.` });
+  if (overrides.sysroot || overrides.deep_seed) {
+    // These set the server's run environment, which only the server autopilot owns.
+    emit({ kind: "info", message: "The target-libraries directory and deep seed discovery apply to the server Autopilot (▶ Run Autopilot) only; this in-tab run does not use them." });
+  }
 
   // What to do (advice) and what is possible at all (capabilities).
   let advice = null, caps = null;
@@ -353,7 +374,7 @@ export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = 
       }
     }
   }
-  const canRun = (stage, core) => (core || !caps) ? true : available.has(stage);
+  const canRun = (stage, core) => !skip.has(stage) && ((core || !caps) ? true : available.has(stage));
 
   // The recommended dynamic backend, and the command line read off the binary. Passed to every
   // dynamic stage so a target that needs `-c @@` is actually driven, not fuzzed on argv it
@@ -365,8 +386,12 @@ export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = 
   if (advice && advice.input_mode && dynParams.input_mode == null) dynParams.input_mode = advice.input_mode;
   if (ovMode) dynParams.input_mode = ovMode;                 // operator fact beats the advice guess
   if (ovArgv) dynParams.argv = ovArgv;
-  const chosenBackend = advice && DYNAMIC_BACKENDS.has(advice.backend) ? advice.backend
+  let chosenBackend = advice && DYNAMIC_BACKENDS.has(advice.backend) ? advice.backend
     : (available.has("coverage_fuzz") ? "coverage_fuzz" : "fuzz");
+  if (skip.has(chosenBackend)) {
+    // The recommended engine is switched off: fall back to the other search engine, if it is on.
+    chosenBackend = ["coverage_fuzz", "fuzz"].find((b) => !skip.has(b) && (!caps || available.has(b))) || null;
+  }
 
   const run = async (stage, params, core) => {
     if (ctrl.cancelled || !canRun(stage, core)) return;
@@ -374,6 +399,7 @@ export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = 
     const merged = { ...params };
     if (ovArgv) merged.argv = ovArgv;
     if (ovMode) merged.input_mode = ovMode;
+    if (ovSeeds && SEEDED.has(stage)) merged.seed_shas = ovSeeds;
     await runStage(ctrl, emit, stage, { targetId, caseId, params: merged });
     emit({ kind: "refresh" });
   };

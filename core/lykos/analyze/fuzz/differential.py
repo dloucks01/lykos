@@ -29,6 +29,7 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -167,14 +168,19 @@ class DiffStats:
     # Per program: executions that produced NO verdict (never ran / timed out). A campaign in
     # which one implementation never ran compared nothing, and must not read as "identical".
     inconclusive: dict = field(default_factory=dict)
+    stopped: Optional[str] = None          # why the campaign ended early, if it did
 
 
 def differential_campaign(programs, seeds, *, rng, iterations: int = 2000, timeout: float = 5.0,
                           compare: str = "status", mutator=None,
-                          max_findings: int = 64) -> DiffStats:
+                          max_findings: int = 64, deadline: Optional[float] = None,
+                          should_stop=None) -> DiffStats:
     """δ-diversity-guided differential fuzzing over ``programs`` (>=2). Mutate ``seeds``, run every
     program, keep inputs that produce a NEW outcome-combination, and record every input on which the
-    implementations disagreed. Returns DiffStats. Requires at least two programs."""
+    implementations disagreed. Returns DiffStats. Requires at least two programs.
+
+    ``deadline`` (a time.monotonic() value) and ``should_stop`` (a callable) end the campaign early;
+    ``stats.stopped`` then says why, so a short campaign is never read as a complete one."""
     programs = list(programs)
     if len(programs) < 2:
         raise ValueError("differential testing needs >= 2 programs")
@@ -185,6 +191,12 @@ def differential_campaign(programs, seeds, *, rng, iterations: int = 2000, timeo
     stats = DiffStats()
     n = max(1, iterations)
     for _ in range(n):
+        if deadline is not None and time.monotonic() >= deadline:
+            stats.stopped = "time budget reached"
+            break
+        if should_stop is not None and should_stop():
+            stats.stopped = "cancelled"
+            break
         base = corpus[rng.randrange(len(corpus))]
         data = mut.mutate(base, corpus)
         oc = outcomes_for(programs, data, compare=compare, timeout=timeout)

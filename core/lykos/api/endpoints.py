@@ -60,6 +60,13 @@ _MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MEMBERS = 20_000
 
 
+#: Stage params that name a server-side path or tool binary: CLI-only (see `_create_run`).
+_CLI_ONLY_PARAMS = frozenset({"seed_files", "seed_dir", "afl_path", "gdb_path", "symqemu_path",
+                              "angr_python", "unicorn_python"})
+#: Stages that take operator seeds (`seed_shas` from the browser, resolved to `seed_files`).
+_SEEDED_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "diff_test"})
+
+
 class BundleRejected(Exception):
     """An archive upload that would exceed the expansion ceilings. Carries the HTTP status."""
 
@@ -1026,6 +1033,20 @@ class EndpointsMixin:
         mod, fn = entry
         return getattr(import_module(mod, __package__), fn)
 
+    def _seed_params(self, cid, params):
+        """Resolve `seed_shas` (seeds uploaded into THIS case) to their store paths as
+        `seed_files` -- the same resolution the server autopilot uses. An unknown hash is
+        refused: a run the operator seeded must not quietly run unseeded."""
+        if not params or "seed_shas" not in params:
+            return params, None
+        paths, err = self._resolve_seed_shas(cid, params["seed_shas"])
+        if err:
+            return params, err
+        out = {k: v for k, v in params.items() if k != "seed_shas"}
+        if paths:
+            out["seed_files"] = paths
+        return out, None
+
     def _create_run(self):
         from ..jobs.registry import reproject_cache_hit
         body = self._json_body()
@@ -1044,6 +1065,17 @@ class EndpointsMixin:
                 return self._json({"error": "stage and target_id must be strings"}, 400)
             if params is not None and not isinstance(params, dict):
                 return self._json({"error": "params must be an object"}, 400)
+            # Server-side PATHS and tool binaries are a CLI-only channel. From a browser they let a
+            # request copy any file the server can read into the case as a seed, or pick which
+            # binary a stage executes. Refused (not dropped), so a caller knows why.
+            cli_only = sorted(k for k in (params or {}) if k in _CLI_ONLY_PARAMS)
+            if cli_only:
+                return self._json({"error": "server-side path parameters are CLI-only; upload "
+                                            "seeds to the case and pass seed_shas",
+                                   "params": cli_only}, 400)
+            if params and "seed_shas" in params and stage not in _SEEDED_STAGES:
+                return self._json({"error": f"stage {stage!r} takes no seeds",
+                                   "stages": sorted(_SEEDED_STAGES)}, 400)
 
             if stage in self._CASE_STAGES:            # case-scoped: no target needed
                 cid = body.get("case_id")
@@ -1058,6 +1090,9 @@ class EndpointsMixin:
                     return self._json({"error": f"stage {stage!r} requires a case_id"}, 400)
                 if not s.cases.get(cid):
                     return self._json({"error": "no case"}, 404)
+                params, err = self._seed_params(cid, params)
+                if err:
+                    return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._CASE_STAGES[stage])
                 run = fn(q, cid) if stage in ("link_case", "ipc_model", "cross_taint") \
                     else fn(q, cid, params=params)
@@ -1067,6 +1102,9 @@ class EndpointsMixin:
                 target = s.targets.get(target_id)
                 if not target:
                     return self._json({"error": "no target"}, 404)
+                params, err = self._seed_params(target.case_id, params)
+                if err:
+                    return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._TARGET_STAGES[stage])
                 run = fn(q, target) if stage in (_INGEST, "disassemble", "detect_cwe") \
                     else fn(q, target, params=params)

@@ -85,12 +85,15 @@ _TARGET = {
     "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
     "poc_diff": ("..analyze.poc", "enqueue_poc_diff"),
     "patch_diff": ("..analyze.patch_diff_stage", "enqueue_patch_diff"),
+    "variant_scan": ("..analyze.scan_stages", "enqueue_variant_scan"),
+    "weggli_scan": ("..analyze.scan_stages", "enqueue_weggli_scan"),
 }
 _CASE = {
     "link_case": ("..analyze.link", "enqueue_link"),
     "ipc_model": ("..analyze.link", "enqueue_ipc"),
     "cross_taint": ("..analyze.link", "enqueue_cross_taint"),
     "whole_system": ("..analyze.link", "enqueue_whole_system"),
+    "diff_test": ("..analyze.scan_stages", "enqueue_diff_test"),
 }
 #: In the dispatch table (so the API and CLI can run them) but deliberately NOT scheduled by the
 #: autopilot: each needs an operator decision a run does not have. Listed so the plan does not show
@@ -98,6 +101,9 @@ _CASE = {
 _ON_DEMAND = {
     "harness": "started from the Code tab's function view on the functions the operator picks",
     "patch_diff": "needs a second build chosen as the baseline to diff against",
+    "variant_scan": "needs the vulnerable function named by the operator (from the Scans panel)",
+    "weggli_scan": "an operator source-pattern scan, started from the Scans panel",
+    "diff_test": "needs the operator to pick 2+ implementations of the same thing to compare",
 }
 # Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing

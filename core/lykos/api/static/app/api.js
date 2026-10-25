@@ -189,6 +189,11 @@ export const api = {
   doctor: (refresh = false) => _req("GET", `/doctor${refresh ? "?refresh=1" : ""}`),
   // Which build is serving (commit / stamp / code date), for the footer.
   version: () => _req("GET", "/version"),
+  // The tool's own validation gates (`lykos archgate` / `realgate` / `eval`), one at a time in the
+  // background; poll selftest() for progress and the verdict. selftestHistory() = `lykos dashboard`.
+  selftest: () => _req("GET", "/selftest"),
+  startSelftest: (kind, options = {}) => _req("POST", "/selftest", { kind, options }),
+  selftestHistory: () => _req("GET", "/selftest/history"),
 };
 
 // Poll a run until it reaches a terminal status. Resolves with the final run record.

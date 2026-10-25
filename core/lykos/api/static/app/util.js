@@ -518,3 +518,28 @@ export function runSignalChips(signals, bg, targets) {
   }
   return chips;
 }
+
+// The operator's run settings, as both autopilots take them. One builder, so the in-tab run and
+// the server run cannot drift apart (the in-tab one used to drop the seeds and engine switches).
+//   argv/input_mode -- how the binary is really run (argv: a shell string, @@ = the input file)
+//   sysroot         -- the target's own libraries directory (QEMU_LD_PREFIX for afl-qemu/concolic)
+//   deep_seed       -- synthesize parser-buffer seeds for daemon targets (candidate-tier)
+//   seed_shas       -- operator seeds uploaded into the case (CLI --seed), resolved server-side
+//   skipStages      -- engines switched off for this run (the server enforces an allowlist)
+export function operatorSettings({ invArgv = "", invMode = "", sysroot = "", deepSeed = false,
+  seeds = [], blackBox = true, covFuzz = true, dirFuzz = true, concolicOn = true,
+  libfuzzerOn = true } = {}) {
+  const overrides = {};
+  if (invArgv.trim()) overrides.argv = invArgv.trim();
+  if (invMode && invMode !== "auto") overrides.input_mode = invMode;
+  if (sysroot.trim()) overrides.sysroot = sysroot.trim();
+  if (deepSeed) overrides.deep_seed = true;
+  if (seeds.length) overrides.seed_shas = seeds.map((x) => x.sha256);
+  const skipStages = [];
+  if (!blackBox) skipStages.push("fuzz");
+  if (!covFuzz) skipStages.push("coverage_fuzz");
+  if (!dirFuzz) skipStages.push("directed_fuzz");
+  if (!concolicOn) skipStages.push("concolic");
+  if (!libfuzzerOn) skipStages.push("libfuzzer");
+  return { overrides, skipStages };
+}

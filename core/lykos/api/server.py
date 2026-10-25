@@ -27,6 +27,7 @@ from . import ws
 from .autopilot import AutopilotMixin
 from .endpoints import EndpointsMixin
 from .ops import OpsMixin
+from .selftest import SelftestMixin
 from .serializers import (
     _call_edge,
     _case,
@@ -187,7 +188,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
 _log = logging.getLogger(__name__)
 
 
-class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, BaseHTTPRequestHandler):
+class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # Socket timeout: a client that opens a connection and then dribbles (or never sends) its
@@ -424,6 +425,10 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, BaseHTTPRequestHandler):
                 return self._get_version()
             if path == "/doctor":
                 return self._get_doctor(qs)
+            if path == "/selftest":
+                return self._get_selftest()
+            if path == "/selftest/history":
+                return self._get_selftest_history()
             m = _CASE_RUN_SIGNALS.match(path)
             if m:
                 return self._get_run_signals(m.group(1))
@@ -651,6 +656,8 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, BaseHTTPRequestHandler):
                 return self._upload_seed(m.group(1))
             if path == "/runs":
                 return self._create_run()
+            if path == "/selftest":
+                return self._start_selftest()
             m = _RUN_CANCEL.match(path)
             if m:
                 return self._cancel_run(m.group(1))

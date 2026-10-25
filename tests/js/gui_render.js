@@ -337,6 +337,55 @@ function renderInfo(vnode) {
   ck("RunScorecard falls back to the first card rather than rendering nothing",
     info.threw.length === 0 && /14,737/.test(info.all));
 
+  // ---- ScanResult: the operator scans (variant hunt / source patterns / differential test) ----
+  info = renderInfo(h(C.ScanResult, { kind: "variant", st: { data: { applicable: true,
+    function: "parse_header", reference: "a", matched: 1, note: "A match is a CANDIDATE",
+    results: [
+      { target_id: "b", filename: "b", scanned: true, functions: 9,
+        hits: [{ name: "parse_header", addr: "0x401136", similarity: 0.97 }] },
+      { target_id: "c", filename: "c", scanned: true, functions: 4, hits: [] },
+      { target_id: "d", filename: "d", scanned: false, note: "no recovered functions (not disassembled)", hits: [] }] } } }));
+  ck("ScanResult(variant) renders without throwing", info.threw.length === 0);
+  ck("ScanResult(variant) names the match, the clean target and the UNSCANNED one distinctly",
+    /MATCH/.test(info.all) && /0\.97/.test(info.all) && /no match/.test(info.all)
+    && /not scanned/.test(info.all) && /not disassembled/.test(info.all));
+  ck("ScanResult(variant) says a match is a candidate", /CANDIDATE/.test(info.all));
+  info = renderInfo(h(C.ScanResult, { kind: "weggli", st: { data: { applicable: true, queries_run: 30,
+    findings: [{ name: "strcpy-into-stack", cwe: "CWE-121", severity: "high", why: "w", count: 2,
+                 files: ["a.c", "b.c", "c.c", "d.c", "e.c"] }] } } }));
+  ck("ScanResult(weggli) lists the pattern, its CWE and files (capped)",
+    info.threw.length === 0 && /CWE-121/.test(info.all) && /strcpy-into-stack/.test(info.all)
+    && /\+1 more/.test(info.all) && /candidate findings/.test(info.all));
+  info = renderInfo(h(C.ScanResult, { kind: "diff", st: { data: { applicable: true, compared: true,
+    execs: 40, delta_diversity: 3, note: "Each disagreement is a candidate bug",
+    inconclusive: { lenient: 2 },
+    discrepancies: [{ kind: "status", input: "58", partitions: { reject: ["strict"], ok: ["lenient"] } }] } } }));
+  ck("ScanResult(diff) shows the disagreement and which side did what",
+    info.threw.length === 0 && /1\s+disagreement/.test(info.all) && /\[reject\] strict/.test(info.all));
+  ck("ScanResult(diff) names inconclusive runs instead of counting them as agreement",
+    /Inconclusive runs/.test(info.all) && /lenient ×2/.test(info.all));
+  info = renderInfo(h(C.ScanResult, { kind: "diff", st: { data: { applicable: false, note: "differential testing needs 2+ targets" } } }));
+  ck("ScanResult shows a decline's reason", /needs 2\+ targets/.test(info.all));
+  info = renderInfo(h(C.ScanResult, { kind: "weggli", st: { error: "boom" } }));
+  ck("ScanResult shows a failure", /source-pattern scan\s+failed:\s+boom/.test(info.all));
+
+  // ---- SelftestPanel: the tool's own gates, from the GUI ----
+  info = renderInfo(h(C.SelftestPanel, { st: null, onStart() {}, onHistory() {} }));
+  ck("SelftestPanel offers every gate and says they check the tool, not a target",
+    info.threw.length === 0 && /Architecture gate/.test(info.all) && /Real-program gate/.test(info.all)
+    && /Detection benchmark/.test(info.all) && /not a target/.test(info.all));
+  info = renderInfo(h(C.SelftestPanel, { st: { state: "done", running: false, kind: "archgate",
+    result: { verdict: "FAIL", reason: "aarch64 lost L3", table: "arch level" } }, onStart() {} }));
+  ck("SelftestPanel shows a gate's verdict, reason and table",
+    /FAIL/.test(info.all) && /aarch64 lost L3/.test(info.all) && /arch level/.test(info.all)
+    && info.classes.some((c) => /dv-vuln/.test(c)));
+  info = renderInfo(h(C.SelftestPanel, { st: { state: "error", running: false, kind: "eval", error: "no compiler" }, onStart() {} }));
+  ck("SelftestPanel shows a failed self-test as a failure", /self-test failed/.test(info.all) && /no compiler/.test(info.all));
+  info = renderInfo(h(C.SelftestPanel, { st: null, onStart() {}, history: { runs: 3, path: "eval-history.jsonl",
+    text: "static/candidate recall 1.0", regressions: [{}] } }));
+  ck("SelftestPanel shows the benchmark history and flags a regression",
+    /3\s+recorded run/.test(info.all) && /recall 1\.0/.test(info.all) && /1\s+series regressed/.test(info.all));
+
   console.log(pass ? "ALL PASS" : "FAILURES ABOVE");
   process.exit(pass ? 0 : 1);
 })().catch((e) => { console.log("FAIL  harness threw: " + (e && e.stack || e)); process.exit(1); });

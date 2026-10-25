@@ -1678,6 +1678,117 @@ export function DiffPanel({ targets, findings, onVerify, verify, onPatchDiff, pa
     </div>`;
 }
 
+// Operator scans (were CLI-only: variant-scan, weggli-scan, diff-test). Each runs as a stage on
+// the case and shows its own result here; matches are CANDIDATES and say so. `scans` holds one
+// {running, data, error} per kind; `onRun(kind, opts)` starts one.
+const _SCAN_WHAT = { variant: "variant hunt", weggli: "source-pattern scan", diff: "differential test" };
+export function ScanResult({ kind, st }) {
+  if (!st) return null;
+  const what = _SCAN_WHAT[kind] || kind;
+  if (st.running) return html`<${Spinner} label=${`Running ${what}…`} />`;
+  if (st.error) return html`<div class="cat-intro">${what} failed: ${st.error}</div>`;
+  const r = st.data;
+  if (!r) return null;
+  if (r.applicable === false) return html`<div class="cat-intro">${r.note || "Not applicable here."}</div>`;
+  if (kind === "variant") return html`
+    <div class="diff-verify-list">
+      <div class="dvr muted">${r.function} from ${r.reference} — ${r.matched} of ${(r.results || []).length} target(s) match. ${r.note}</div>
+      ${(r.results || []).map((x) => html`<div class="dvr" key=${x.target_id}>
+        ${!x.scanned ? html`<span class="muted">not scanned</span> ${x.filename} — ${x.note}`
+          : x.hits.length ? html`<b>MATCH</b> ${x.filename} — ${x.hits[0].name || "(unnamed)"} @ ${x.hits[0].addr}, similarity ${x.hits[0].similarity}${x.hits.length > 1 ? ` (+${x.hits.length - 1} more)` : ""}`
+          : html`<span class="muted">no match</span> ${x.filename} (${x.functions} functions)`}
+      </div>`)}
+    </div>`;
+  if (kind === "weggli") {
+    const fs = r.findings || [];
+    return html`
+      <div class="diff-verify-list">
+        <div class="dvr muted">${fs.length} pattern(s) matched over ${r.queries_run} queries${fs.length ? " — filed as candidate findings (see Overview)" : ""}.${r.note ? " " + r.note : ""}</div>
+        ${fs.map((f, i) => html`<div class="dvr" key=${i} title=${f.why}>
+          [${f.severity}] ${f.cwe} ${f.name} ×${f.count}: ${f.files.slice(0, 4).join(", ")}${f.files.length > 4 ? ` (+${f.files.length - 4} more)` : ""}
+        </div>`)}
+      </div>`;
+  }
+  const ds = r.discrepancies || [], inc = Object.entries(r.inconclusive || {});
+  return html`
+    <div class=${`diff-verify ${r.compared ? (ds.length ? "dv-vuln" : "dv-fixed") : ""}`}>
+      ${r.execs} input(s), ${r.delta_diversity} distinct behaviour combination(s), ${ds.length} disagreement(s). ${r.note}
+    </div>
+    ${inc.length ? html`<div class="cat-intro">Inconclusive runs (never started or timed out — not counted): ${inc.map(([n, c]) => `${n} ×${c}`).join(", ")}</div>` : null}
+    <div class="diff-verify-list">
+      ${ds.slice(0, 40).map((x, i) => html`<div class="dvr" key=${i}>
+        <b>${x.kind}</b> on <code>${x.input.slice(0, 48)}${x.input.length > 48 ? "…" : ""}</code> —
+        ${Object.entries(x.partitions).map(([o, names]) => `[${o}] ${names.join(", ")}`).join("  ")}
+      </div>`)}
+    </div>`;
+}
+export function ScansPanel({ targets, activeId, seeds, scans, onRun }) {
+  const ts = targets || [];
+  const sc = scans || {};
+  const [ref, setRef] = useState(activeId || (ts[0] && ts[0].id));
+  const [fn, setFn] = useState("");
+  const [thr, setThr] = useState("0.9");
+  const [src, setSrc] = useState(activeId || (ts[0] && ts[0].id));
+  const [cpp, setCpp] = useState(false);
+  const [picked, setPicked] = useState(() => ts.slice(0, 2).map((t) => t.id));
+  const [mode, setMode] = useState("stdin");
+  const [compare, setCompare] = useState("status");
+  const [iters, setIters] = useState("2000");
+  const [useSeeds, setUseSeeds] = useState(true);
+  const opt = (t) => html`<option value=${t.id} key=${t.id}>${t.filename}</option>`;
+  const toggle = (id) => setPicked((cur) => cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
+  const nSeeds = (seeds || []).length;
+  return html`
+    <div class="fnp scans">
+      <h3 class="scan-h">Variant hunt <span class="muted">— find a known-vulnerable function in the other builds (N-day)</span></h3>
+      <div class="diff-bar">
+        <span class="muted">reference</span>
+        <select class="diff-sel" value=${ref} onChange=${(e) => setRef(e.target.value)}>${ts.map(opt)}</select>
+        <input class="scan-in" placeholder="function name, e.g. parse_header" value=${fn}
+          onInput=${(e) => setFn(e.target.value)} />
+        <span class="muted">similarity ≥</span>
+        <input class="scan-in scan-num" type="number" min="0" max="1" step="0.05" value=${thr}
+          onInput=${(e) => setThr(e.target.value)} />
+        <button class="btn small" style="margin-left:auto" disabled=${!fn.trim() || ts.length < 2 || (sc.variant && sc.variant.running)}
+          title=${ts.length < 2 ? "add the other builds to this case first" : "scan every other target in the case"}
+          onClick=${() => onRun("variant", { targetId: ref, params: { function: fn.trim(), threshold: Number(thr) || 0.9 } })}>Hunt variants</button>
+      </div>
+      <${ScanResult} kind="variant" st=${sc.variant} />
+
+      <h3 class="scan-h">Source patterns <span class="muted">— the weggli vulnerability-pattern pack over the uploaded source</span></h3>
+      <div class="diff-bar">
+        <span class="muted">target</span>
+        <select class="diff-sel" value=${src} onChange=${(e) => setSrc(e.target.value)}>${ts.map(opt)}</select>
+        <label class="muted"><input type="checkbox" checked=${cpp} onChange=${(e) => setCpp(e.target.checked)} /> C++</label>
+        <button class="btn small" style="margin-left:auto" disabled=${!src || (sc.weggli && sc.weggli.running)}
+          onClick=${() => onRun("weggli", { targetId: src, params: { cpp } })}>Scan source</button>
+      </div>
+      <${ScanResult} kind="weggli" st=${sc.weggli} />
+
+      <h3 class="scan-h">Differential test <span class="muted">— fuzz 2+ implementations of the same thing and report where they disagree</span></h3>
+      <div class="diff-bar scan-wrap">
+        ${ts.map((t) => html`<label class="muted" key=${t.id}><input type="checkbox" checked=${picked.includes(t.id)} onChange=${() => toggle(t.id)} /> ${t.filename}</label>`)}
+      </div>
+      <div class="diff-bar">
+        <span class="muted">input via</span>
+        <select class="diff-sel" value=${mode} onChange=${(e) => setMode(e.target.value)}>
+          <option value="stdin">stdin</option><option value="file">file</option><option value="arg">argument</option></select>
+        <span class="muted">compare</span>
+        <select class="diff-sel" value=${compare} onChange=${(e) => setCompare(e.target.value)}>
+          <option value="status">accept / reject / crash</option><option value="output">also the output bytes</option></select>
+        <span class="muted">inputs</span>
+        <input class="scan-in scan-num" type="number" min="1" max="100000" value=${iters} onInput=${(e) => setIters(e.target.value)} />
+        ${nSeeds ? html`<label class="muted"><input type="checkbox" checked=${useSeeds} onChange=${(e) => setUseSeeds(e.target.checked)} /> seed with the ${nSeeds} uploaded seed${nSeeds === 1 ? "" : "s"}</label>` : null}
+        <button class="btn small" style="margin-left:auto" disabled=${picked.length < 2 || (sc.diff && sc.diff.running)}
+          title=${picked.length < 2 ? "pick at least two implementations" : ""}
+          onClick=${() => onRun("diff", { params: { target_ids: picked, mode, compare,
+            iterations: Number(iters) || 2000,
+            ...(useSeeds && nSeeds ? { seed_shas: seeds.map((x) => x.sha256) } : {}) } })}>Compare</button>
+      </div>
+      <${ScanResult} kind="diff" st=${sc.diff} />
+    </div>`;
+}
+
 // The crash TRIAGE view (roadmap P1). A run can record hundreds of crashing inputs that are a
 // handful of bugs; the server groups them with the prove loop's own bucket key (sanitizer defect
 // key / fault PC / signal+channel) and ranks the groups by the best VERIFIED level, then
@@ -1817,6 +1928,39 @@ export function DoctorPanel({ doctor, onRefresh, compact }) {
           </tr>`))}
       </tbody></table></details>
     </div>`;
+}
+
+// Self-test: lykos's own validation gates, from the GUI (were CLI-only). They check the TOOL, not
+// a target, take minutes, and cannot be stopped once started -- the panel says so up front.
+const _SELFTESTS = [
+  { kind: "archgate", label: "Architecture gate", what: "every ISA still reaches its PoC level (lykos archgate)" },
+  { kind: "realgate", label: "Real-program gate", what: "detect → PoC → attribution on real programs (lykos realgate)" },
+  { kind: "eval", opts: { stage: "static" }, label: "Detection benchmark", what: "static detection precision/recall on the bundled corpus (lykos eval)" },
+  { kind: "eval", opts: { stage: "dynamic" }, label: "Crash-reproduction benchmark", what: "fuzzing reproduces the corpus's crashes (lykos eval --stage dynamic)" },
+];
+export function SelftestPanel({ st, history, onStart, onHistory }) {
+  const running = !!(st && st.running);
+  const res = st && st.result;
+  const tone = res ? (res.verdict === "PASS" ? "ok" : res.verdict === "SKIP" ? "warn" : "bad") : "";
+  return html`
+    <details class="card selftest">
+      <summary class="doctor-title">Self-test — check this lykos build</summary>
+      <div class="cat-intro">These validate the tool itself, not a target. Each takes minutes and runs to completion once started; one at a time.</div>
+      <div class="diff-bar">
+        ${_SELFTESTS.map((t, i) => html`<button class="btn small" key=${i} title=${t.what} disabled=${running}
+          onClick=${() => onStart(t.kind, t.opts || {})}>${t.label}</button>`)}
+        ${onHistory ? html`<button class="btn small ghost" style="margin-left:auto" onClick=${onHistory}
+          title="the recorded detection-quality history (lykos dashboard)">Benchmark history</button>` : null}
+      </div>
+      ${st && st.state === "running" ? html`<${Spinner} label=${`Running ${st.kind}${st.options && st.options.stage ? ` (${st.options.stage})` : ""}…`} />` : null}
+      ${st && st.error ? html`<div class="banner err">${st.kind} self-test failed: ${st.error}</div>` : null}
+      ${res ? html`<div class=${`diff-verify ${tone === "ok" ? "dv-fixed" : tone === "bad" ? "dv-vuln" : ""}`}>
+        ${st.kind}: ${res.verdict} — ${res.reason}</div>
+        <pre class="selftest-out">${res.table}</pre>` : null}
+      ${st && st.lines && st.lines.length && !res ? html`<pre class="selftest-out">${st.lines.slice(-20).join("\n")}</pre>` : null}
+      ${history ? html`<div class="cat-intro">Benchmark history (${history.runs || 0} recorded run(s), ${history.path})${(history.regressions || []).length ? html` — <b>${history.regressions.length} series regressed</b>` : ""}</div>
+        <pre class="selftest-out">${history.error || history.text || "no history recorded yet"}</pre>` : null}
+    </details>`;
 }
 
 // Operator seed files (the CLI's `--seed`): real example inputs -- a config, a sample document, a

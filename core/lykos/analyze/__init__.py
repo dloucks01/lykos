@@ -21,6 +21,7 @@ from .libfuzzer_stage import register as _register_libfuzzer
 from .link import register as _register_link
 from .patch_diff_stage import register as _register_patch_diff
 from .poc import register as _register_poc
+from .scan_stages import register as _register_scans
 from .symbolic import register as _register_symbolic
 from .unpack import register as _register_unpack
 
@@ -35,6 +36,7 @@ def register() -> None:
     _register_libfuzzer()
     _register_poc()
     _register_patch_diff()
+    _register_scans()
     _register_symbolic()
     _register_debug()
     _register_link()

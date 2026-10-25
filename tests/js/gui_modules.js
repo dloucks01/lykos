@@ -266,6 +266,37 @@ const ck = (n, cond) => { pass = pass && !!cond; console.log(`${cond ? "PASS" : 
     posted.includes("replay")
     && events.some((e) => e.kind === "verification" && e.verification && e.verification.deterministic === true));
 
+  // ---------- in-tab parity: operator seeds + engine switches reach the in-tab run ----------
+  posted.length = 0;
+  for (const k of Object.keys(postedParams)) delete postedParams[k];
+  const pev = [];
+  await ap.runAutopilot(ap.newController(), (e) => pev.push(e), { targetId: "T1", caseId: "C1",
+    overrides: { seed_shas: ["5eed"], skip_stages: ["coverage_fuzz", "concolic", "triage"],
+                 sysroot: "/opt/libs" } });
+  ck("in-tab: a switched-off recommended engine falls back to the other search engine",
+    !posted.includes("coverage_fuzz") && posted.includes("fuzz"));
+  ck("in-tab: operator seeds reach every seeded fuzzer, by hash",
+    JSON.stringify(postedParams.fuzz?.seed_shas) === '["5eed"]'
+    && JSON.stringify(postedParams.directed_fuzz?.seed_shas) === '["5eed"]');
+  ck("in-tab: seeds are not handed to stages that take none",
+    postedParams.debug_monitor && !("seed_shas" in postedParams.debug_monitor)
+    && !("seed_shas" in (postedParams.root_cause || {})));
+  ck("in-tab: a switched-off engine is not run, and core stages cannot be switched off",
+    !posted.includes("concolic") && posted.includes("disassemble"));
+  ck("in-tab: the run says what it was seeded with and what was switched off",
+    pev.some((e) => e.kind === "info" && /1 operator seed/.test(e.message))
+    && pev.some((e) => e.kind === "info" && /Switched off/.test(e.message)));
+  ck("in-tab: server-only settings are named as not applying here, not silently ignored",
+    pev.some((e) => e.kind === "info" && /server Autopilot/.test(e.message)));
+
+  ck("operatorSettings builds the same overrides for both autopilots",
+    JSON.stringify(util.operatorSettings({ invArgv: " -c @@ ", invMode: "file", sysroot: "",
+      deepSeed: true, seeds: [{ sha256: "aa" }], covFuzz: false, libfuzzerOn: false }))
+    === JSON.stringify({ overrides: { argv: "-c @@", input_mode: "file", deep_seed: true,
+      seed_shas: ["aa"] }, skipStages: ["coverage_fuzz", "libfuzzer"] }));
+  ck("operatorSettings: 'auto' and blanks send nothing",
+    JSON.stringify(util.operatorSettings({ invMode: "auto" })) === '{"overrides":{},"skipStages":[]}');
+
   // ---------- runAutopilotCase: multi-target + the cross-binary analyses ----------
   // Two binaries in one case. Each gets its own deep pipeline; then the case-level stages that
   // look ACROSS binaries (link_case, ipc_model, cross_taint, whole_system) run once for the case.

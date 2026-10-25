@@ -341,6 +341,100 @@ def test_a_browser_can_no_longer_hand_the_autopilot_a_server_path():
     assert "seed_files" not in out and "seed_dir" not in out and out["argv"] == ["-c", "@@"]
 
 
+def test_runs_refuse_server_paths_and_resolve_uploaded_seeds(api):
+    """POST /runs is what the in-tab autopilot uses. A server path (seed_files/seed_dir) or a tool
+    binary path from a browser is refused; uploaded seeds go by hash and are resolved to the
+    case store, exactly as the server autopilot does."""
+    sock, cs = api
+    cid, tid = _case_with_target(sock, cs)
+    for bad in ({"seed_files": ["/etc/shadow"]}, {"seed_dir": "/root"}, {"afl_path": "/tmp/x"},
+                {"gdb_path": "/tmp/x"}, {"angr_python": "/tmp/py"}):
+        code, err = _jreq(sock, "POST", "/runs", {"stage": "fuzz", "target_id": tid,
+                                                  "params": bad})
+        assert code == 400 and err["params"] == list(bad), (bad, err)
+    code, err = _jreq(sock, "POST", "/runs", {"stage": "fuzz", "target_id": tid,
+                                              "params": {"seed_shas": ["0" * 64]}})
+    assert code == 400 and "not in this case" in err["error"]
+    code, err = _jreq(sock, "POST", "/runs", {"stage": "dynamic_run", "target_id": tid,
+                                              "params": {"seed_shas": ["0" * 64]}})
+    assert code == 400 and "takes no seeds" in err["error"]
+
+    code, up = _req(sock, "POST", f"/cases/{cid}/seeds", b"key=value\n",
+                    {"Content-Type": "application/octet-stream", "X-Filename": "conf.ini"})
+    assert code == 201
+    code, run = _jreq(sock, "POST", "/runs", {"stage": "fuzz", "target_id": tid,
+                                              "params": {"seed_shas": [up["sha256"]],
+                                                         "input_mode": "file"}})
+    assert code == 201, run
+    from lykos.casestore import CaseStore, ContentStore
+    st = CaseStore.open(cs)
+    try:
+        params = st.runs.get(run["run_id"]).params
+    finally:
+        st.close()
+    assert "seed_shas" not in params and params["input_mode"] == "file"
+    assert params["seed_files"] == [str(ContentStore(cs).path(up["sha256"]))]
+
+
+# --------------------------------------------------------------------------- self-test
+def test_selftest_runs_one_gate_at_a_time_and_reports_its_verdict(api, monkeypatch):
+    from lykos.api import selftest
+    gate_open = __import__("threading").Event()
+
+    def fake_run(kind, opts):
+        selftest._line(f"checking {kind}")
+        gate_open.wait(5)
+        return {"passed": False, "verdict": "FAIL", "reason": "aarch64 lost L3",
+                "table": "arch  level\naarch64 L2", "report": {"path": __import__("pathlib").Path("/x")}}
+    monkeypatch.setattr(selftest, "_run", fake_run)
+    monkeypatch.setitem(selftest._JOB, "thread", None)
+    sock, _cs = api
+    code, err = _jreq(sock, "POST", "/selftest", {"kind": "bogus"})
+    assert code == 400 and "unknown self-test" in err["error"]
+    code, ok = _jreq(sock, "POST", "/selftest", {"kind": "archgate", "options": {"only": ["x86-64"]}})
+    assert code == 202 and ok["started"]
+    code, busy = _jreq(sock, "POST", "/selftest", {"kind": "realgate"})
+    assert code == 409 and "already running" in busy["error"]
+    code, st = _jreq(sock, "GET", "/selftest")
+    assert st["running"] and st["kind"] == "archgate" and st["options"] == {"only": ["x86-64"]}
+    gate_open.set()
+    for _ in range(100):
+        st = _jreq(sock, "GET", "/selftest")[1]
+        if not st["running"]:
+            break
+        time.sleep(0.05)
+    assert st["state"] == "done" and st["result"]["verdict"] == "FAIL"
+    assert st["result"]["report"]["path"] == "/x"                # JSON-safe
+    assert "checking archgate" in st["lines"]
+    code, h = _jreq(sock, "GET", "/selftest/history")
+    assert code == 200 and "text" in h and "regressions" in h
+
+
+def test_a_failing_selftest_is_an_error_not_a_pass(api, monkeypatch):
+    from lykos.api import selftest
+
+    def boom(kind, opts):
+        raise RuntimeError("no cross compiler")
+    monkeypatch.setattr(selftest, "_run", boom)
+    monkeypatch.setitem(selftest._JOB, "thread", None)
+    sock, _cs = api
+    assert _jreq(sock, "POST", "/selftest", {"kind": "eval", "options": {"stage": "static"}})[0] == 202
+    for _ in range(100):
+        st = _jreq(sock, "GET", "/selftest")[1]
+        if not st["running"]:
+            break
+        time.sleep(0.05)
+    assert st["state"] == "error" and "no cross compiler" in st["error"] and st["result"] is None
+
+
+def test_a_selftest_selection_matching_nothing_is_refused_not_a_vacuous_pass():
+    from lykos.api import selftest
+    from lykos.eval import realgate
+    with pytest.raises(ValueError, match="no case matches"):
+        selftest._only(realgate.MATRIX, ["typo"])
+    assert selftest._only(realgate.MATRIX, None) == realgate.MATRIX
+
+
 # --------------------------------------------------------------------------- doctor / version
 def test_version_endpoint(api):
     sock, _cs = api
