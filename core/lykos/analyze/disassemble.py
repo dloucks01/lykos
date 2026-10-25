@@ -19,7 +19,9 @@ TOOL = "ghidra"
 # geometry-inferred buffers. This is the content-addressed cache key (compute_cache_key includes
 # tool_version), so the bump forces a re-analysis of any binary previously disassembled under the
 # old capped logic instead of reprojecting its stale, truncated function set.
-TOOL_VERSION = "ghidra-headless-2"
+# -3: native frames carry `coords` (frame-pointer numbering), which the bounds detector needs to
+# map a copy destination to the right variable -- older cached analyses lack it.
+TOOL_VERSION = "ghidra-headless-3"
 _TIMEOUT = 1800
 
 

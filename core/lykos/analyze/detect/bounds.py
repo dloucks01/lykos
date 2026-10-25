@@ -19,6 +19,7 @@ call's own basic block, which is where argument set-up lives in unoptimised code
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from ... import observe
 from .taint import ARCH_ABI, _arch_key, _key, _parse
@@ -347,6 +348,29 @@ def _ghidra_offset(frame: dict, base: str, disp: int, word: int, ak: str) -> int
     return disp - frame_delta(frame, word)
 
 
+# Frame pointers of the ISAs where a frame-pointer-numbered (`coords == "fp"`) frame was measured.
+_FP_COORDS_MEASURED = {"x86-64": "RBP", "x86": "EBP"}
+
+
+def frame_offset(frame: dict, base: str, disp: int, word: int, ak: str,
+                 base_offs: Optional[dict] = None) -> int:
+    """A base-register displacement in the coordinates the frame table numbers its variables in.
+
+    The native (rizin) backend numbers variables from the FRAME POINTER itself (`coords == "fp"`):
+    measured on x86-64 and i386 -O0, every buffer's reported offset equals its RBP/EBP
+    displacement. Translating those with Ghidra's entry-SP numbering shifted the destination one
+    word onto the neighbouring variable. Other ISAs keep the Ghidra rule until measured."""
+    fp = _FP_COORDS_MEASURED.get(ak)
+    if fp and (frame or {}).get("coords") == "fp":
+        if base == fp:
+            return disp
+        if base_offs and base in base_offs and fp in base_offs:
+            return base_offs[base] - base_offs[fp] + disp
+    if base_offs and base in base_offs:
+        return base_offs[base] + disp
+    return _ghidra_offset(frame, base, disp, word, ak)
+
+
 def _capacity(frame: dict, base: str, offset: int):
     """(buffer name, its size), or None when we do not actually know the destination.
 
@@ -432,10 +456,7 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
     if not dst or dst[0] != "frame":
         return {"verdict": UNKNOWN, "why": "destination is not a recovered stack buffer"}
     word = (bits or 64) // 8
-    if base_offs and dst[1] in base_offs:
-        goff = base_offs[dst[1]] + dst[2]
-    else:
-        goff = _ghidra_offset(frame, dst[1], dst[2], word, ak)
+    goff = frame_offset(frame, dst[1], dst[2], word, ak, base_offs)
     cap = _capacity(frame, dst[1], goff)
     if cap is None:
         cap = _capacity_buffer(frame, dst[2])     # calibrate: buffer at the un-translated disp
@@ -496,10 +517,10 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                         "why": (f"{why}, exceeding {name} ({room} bytes, confirmed by its memset) "
                                 f"-- overflow")}
             # A guard that still permits a copy PAST the frame below the destination is a real
-            # concern (surfaced, never asserted -- the recovered size may be a fragment). Within
-            # the frame it is safe: the decompiler splits one buffer into several locals, so a
-            # bound that overruns the recovered variable yet fits the frame below it is the guard
-            # proving containment of a fragmented buffer, not an overflow.
+            # concern (surfaced, never asserted -- the recovered size may be a fragment). A bound
+            # past the recovered variable but within the frame is NOT proven safe either: the
+            # decompiler may have fragmented one buffer, or the copy may overrun the adjacent
+            # locals. That stays UNKNOWN (the finding keeps its severity), never SAFE.
             if gmax > room and gmax > headroom:
                 return {"verdict": SUSPECT, **common,
                         "why": (f"{why}, but that exceeds the {headroom}-byte frame below {name} "
@@ -515,9 +536,11 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                                 f"overflows")}
             if gmax <= room:
                 return {"verdict": SAFE, **common, "why": f"{why}; {name} holds {room}"}
-            return {"verdict": SAFE, **common,
-                    "why": f"{why}; fits the {headroom}-byte frame below {name} "
-                           f"(recovered {room}, likely a fragment)"}
+            return {"verdict": UNKNOWN, **common,
+                    "why": (f"{why}, which exceeds {name} ({room} bytes recovered) but fits the "
+                            f"{headroom}-byte frame below it -- either the decompiler split one "
+                            f"buffer, or the copy can overrun the adjacent locals; not proven "
+                            f"safe")}
         return {"verdict": UNKNOWN, "buffer": name, "capacity": room,
                 "why": f"length is not a compile-time constant ({name}, {room} bytes)"}
     n = ln[1]
@@ -770,8 +793,7 @@ def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_b
     if not dst or dst[0] != "frame":
         return None                                   # not a recovered stack destination
     word = (bits or 64) // 8
-    goff = (base_offs[dst[1]] + dst[2]) if (base_offs and dst[1] in base_offs) \
-        else _ghidra_offset(frame, dst[1], dst[2], word, ak)
+    goff = frame_offset(frame, dst[1], dst[2], word, ak, base_offs)
     cap = _capacity(frame, dst[1], goff)
     if cap is None:
         cap = _capacity_buffer(frame, dst[2])     # calibrate: buffer at the un-translated disp

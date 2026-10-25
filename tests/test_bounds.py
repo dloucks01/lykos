@@ -820,3 +820,49 @@ def test_confirmed_overflow_requires_a_second_source_agreeing_on_the_size():
     # no second source at all -> the existing conservative verdict, never confirmed
     v3 = bounds.classify_site(blk, "0x100c", "memcpy", _FRAME, "x86-64")
     assert v3["verdict"] != bounds.CONFIRMED, v3
+
+
+# ------------------------------------------- native (rizin) frames number from the frame pointer
+# rizin reports a variable at its RBP displacement (x86-64 -O0: RBP-0x90 is the var at -144),
+# where Ghidra numbers from the return slot. Applying Ghidra's one-word shift to a native frame
+# put the destination on the 8-byte pointer spill below the buffer.
+_NATIVE_FRAME = {"ret_offset": 0, "coords": "fp", "frame_size": 152, "vars": [
+    {"name": "n", "size": 4, "offset": -4, "is_buffer": False},
+    {"name": "buf", "size": 140, "offset": -144, "is_buffer": True},
+    {"name": "src", "size": 8, "offset": -152, "is_buffer": False, "type": "void *"}]}
+_NATIVE_DISP = "0xffffffffffffff70"      # -0x90
+
+
+def test_a_native_frame_resolves_the_destination_without_a_shift():
+    v = bounds.classify_site(_copy_block(_NATIVE_DISP, 64), "0x100c", "memcpy", _NATIVE_FRAME,
+                             "x86-64")
+    assert v["verdict"] == bounds.SAFE and v["buffer"] == "buf" and v["capacity"] == 140
+    # the same table read with Ghidra's numbering lands on the neighbouring pointer slot
+    ghidra = {k: x for k, x in _NATIVE_FRAME.items() if k != "coords"}
+    w = bounds.classify_site(_copy_block(_NATIVE_DISP, 64), "0x100c", "memcpy", ghidra, "x86-64")
+    assert w.get("buffer") == "src"
+
+
+def test_frame_offset_rules():
+    nf = {"coords": "fp"}
+    assert bounds.frame_offset(nf, "RBP", -0x90, 8, "x86-64") == -0x90
+    assert bounds.frame_offset(nf, "EBP", -0x28, 4, "x86") == -0x28
+    # an SP-addressed destination is converted to frame-pointer numbering via the prologue
+    assert bounds.frame_offset(nf, "RSP", 0x18, 8, "x86-64",
+                               {"RSP": -0xa8, "RBP": -8}) == -0xa8 + 8 + 0x18
+    # Ghidra frames and unmeasured ISAs keep the old rule
+    assert bounds.frame_offset({}, "RBP", -0x90, 8, "x86-64") == -0x98
+    assert bounds.frame_offset({}, "RBP", -0x90, 8, "x86-64", {"RBP": -8}) == -0x98
+    assert bounds.frame_offset(nf, "X29", -0x10, 8, "aarch64") == \
+        bounds.frame_offset({}, "X29", -0x10, 8, "aarch64")
+
+
+def test_a_guard_past_the_buffer_but_inside_the_frame_is_not_proven_safe():
+    """`if (n < 64)` against a 16-byte recovered buffer with frame headroom: either the
+    decompiler split one buffer, or the copy overruns the adjacent locals. Neither is proven,
+    so the finding keeps its severity (UNKNOWN) instead of being demoted as SAFE."""
+    small = {"ret_offset": 0, "vars": [{"name": "buf", "size": 16, "offset": -0x1020,
+                                        "is_buffer": True, "type": "char[16]"}]}
+    v = _classify(_lt64_unsigned(), frame=small)
+    assert v["verdict"] == bounds.UNKNOWN and v["bound"] == 63 and "not proven safe" in v["why"]
+    assert _classify(_lt64_unsigned())["verdict"] == bounds.SAFE     # 63 < 64: still proven

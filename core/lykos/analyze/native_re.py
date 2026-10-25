@@ -649,6 +649,12 @@ def _infer_buffers(vars_: list) -> list:
     return vars_
 
 
+# rizin numbers stack variables from the FRAME POINTER itself (x86-64 -O0: RBP-0x90 is the variable
+# it reports at -144), not from the return slot as Ghidra does. Frames say so, so the bounds
+# detector does not shift a frame-pointer destination by a word onto the neighbouring variable.
+FRAME_COORDS = "fp"
+
+
 def _frame_and_vars(afvj: dict) -> tuple:
     """Turn rizin/r2 afvj (reg/bp/sp variable lists) into the schema's params + frame.vars +
     geometry. is_buffer = the recovered type is an array ('[' in the type) OR a large stack slot."""
@@ -664,7 +670,8 @@ def _frame_and_vars(afvj: dict) -> tuple:
         if isinstance(off, int) and off < 0:
             local_size = max(local_size, -off)
     frame = {"frame_size": local_size, "local_size": local_size,
-             "param_size": 0, "ret_offset": 0, "vars": _infer_buffers(vars_)}
+             "param_size": 0, "ret_offset": 0, "vars": _infer_buffers(vars_),
+             "coords": FRAME_COORDS}
     return params, frame
 
 
@@ -688,7 +695,8 @@ def _frame_vars_rizin(meta: dict) -> tuple:
         if r.get("arg"):
             params.append({"name": r.get("name"), "type": r.get("type")})
     frame = {"frame_size": local_size, "local_size": local_size,
-             "param_size": 0, "ret_offset": 0, "vars": _infer_buffers(vars_)}
+             "param_size": 0, "ret_offset": 0, "vars": _infer_buffers(vars_),
+             "coords": FRAME_COORDS}
     return params, frame
 
 
