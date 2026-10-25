@@ -324,8 +324,10 @@ def target_verdict(t: dict) -> dict:
     nothing_executed = never_ran or hv == "none" or (
         hv == "unrecorded" and not ex.get("executions_recorded")
         and not ex.get("executions_attempted"))
+    gate_closed = bool((ex.get("runtime_env") or {}).get("gate_closed"))
     out = {"level": best_lvl, "built_level": built_lvl if built_lvl > best_lvl else "",
-           "engine_health": hv, "nothing_executed": bool(nothing_executed)}
+           "engine_health": hv, "nothing_executed": bool(nothing_executed),
+           "gate_closed": gate_closed}
     if best_lvl == "L3":
         out.update(label="Exploited — working exploit demonstrated (L3)", tone="critical")
     elif best_lvl == "L2":
@@ -337,6 +339,9 @@ def target_verdict(t: dict) -> dict:
         if nothing_executed:
             lab += ("; no dynamic engine executed the target, so nothing could escalate past L0 "
                     "(a tooling outcome, not evidence the findings are false)")
+        elif gate_closed:
+            lab += ("; the target never got past its startup gate (a config, data dir or env var "
+                    "that could not be supplied), so dynamic analysis measured only that exit")
         elif hv == "degraded":
             lab += "; dynamic analysis was degraded (see engine health)"
         out.update(label=lab, tone=worst_sev or "medium")
@@ -346,6 +351,10 @@ def target_verdict(t: dict) -> dict:
     elif nothing_executed:
         out.update(label=("Inconclusive — no dynamic engine executed the target; static review "
                           "only, not a clean result"), tone="medium")
+    elif gate_closed:
+        out.update(label=("Inconclusive — the target never got past its startup gate (it needs a "
+                          "config, data dir or env var that could not be supplied); not a clean "
+                          "result"), tone="medium")
     elif hv == "degraded":
         out.update(label=("No defects demonstrated — but dynamic analysis was degraded (an "
                           "engine failed; see engine health)"), tone="medium")
@@ -354,6 +363,9 @@ def target_verdict(t: dict) -> dict:
                           "nothing beyond its seeds"), tone="low")
     else:
         out.update(label="No defects demonstrated", tone="info")
+    if gate_closed and nothing_executed and not best_lvl:
+        out["label"] += ("; the target also stops at a startup gate (a config, data dir or env "
+                         "var that could not be supplied)")
     if out["built_level"]:
         out["label"] += (f" (a PoC was built at {out['built_level']} but did not verify, so "
                          f"that level is not claimed)")
@@ -369,7 +381,8 @@ def has_execution_gaps(t: dict) -> bool:
     return bool(ex.get("did_not_run_count") or ex.get("failed_stages")
                 or ex.get("stages_skipped_for_budget")
                 or (base is not None and not base.get("ran"))
-                or eh.get("verdict") in ("none", "degraded") or eh.get("failed"))
+                or eh.get("verdict") in ("none", "degraded") or eh.get("failed")
+                or (ex.get("runtime_env") or {}).get("gate_closed"))
 
 
 def build_report(
@@ -482,6 +495,13 @@ def build_report(
         # needs a config/args, a campaign that never reached the parser. Carried into the report so
         # a blocked run is never mistaken for a clean one.
         execution["diagnostics"] = _diagnostics(store, case_id, t.id)
+        # What the target needed to START, and whether it got it. A startup gate nothing could
+        # open means every dynamic result for this target measured that early exit.
+        _renv = _runtime_env_state(store, case_id, t.id)
+        if _renv:
+            execution["runtime_env"] = _renv
+            if _renv["gate_closed"]:
+                execution["diagnostics"].append({"stage": "runtime_env", "note": _GATE_NOTE})
         crash_by_input: dict[str, Any] = {}
         for d in crashes:
             if d.input_sha and d.input_sha not in crash_by_input:
@@ -685,6 +705,41 @@ def _diagnostics(store, case_id: str, target_id: str) -> list:
     except Exception:                                    # noqa: BLE001 -- the report must render
         return out
     return out
+
+
+_GATE_NOTE = ("the target exits at a startup gate (it needs a config file, data directory or "
+              "environment variable) that could not be supplied, so every dynamic result for it "
+              "measured that early exit -- set the invocation (e.g. `-c @@` with a config as the "
+              "seed) and re-run")
+
+
+def _runtime_env_state(store, case_id: str, target_id: str) -> Optional[dict]:
+    """The target's latest runtime-environment result, or None when it needed nothing (or was never
+    probed). `gate_closed` is True when the target was found gated and nothing opened the gate."""
+    try:
+        from ..db.dao import EventDAO
+        pls = EventDAO(store.conn).payloads_of_type("runtime_env", case_id=case_id,
+                                                    target_id=target_id)
+    except Exception:                                    # noqa: BLE001 -- the report must render
+        return None
+    if not pls:
+        return None
+    p = pls[-1]                                          # a reuse event carries the same record
+    applied, gated = bool(p.get("applied")), bool(p.get("gated"))
+    if not (applied or gated):
+        return None
+    sup = []
+    for x in (p.get("supplied") or [])[:12]:
+        if not isinstance(x, dict):
+            sup.append(str(x)[:200])
+        elif x.get("kind") == "env":
+            sup.append(f"env {x.get('name')}={x.get('value')}"[:200])
+        else:
+            sup.append(f"{x.get('kind')} {x.get('at') or x.get('path')}"[:200])
+    return {"applied": applied, "gate_closed": gated and not applied, "note": p.get("note") or "",
+            "supplied": sup,
+            "degraded": [f"{d.get('path')}: {d.get('why')}" for d in (p.get("degraded") or [])
+                         if isinstance(d, dict)][:12]}
 
 
 def _scorecard(store, case_id: str, target_id: str) -> dict:

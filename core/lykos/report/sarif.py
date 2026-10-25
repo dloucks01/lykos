@@ -235,6 +235,10 @@ def _target_notifications(t: dict, a_idx: int, uri: str) -> tuple:
             failed = True
         note(lvl, f"{t.get('filename')}: {e.get('engine')} {e.get('status')}"
                   + (f" -- {e['reason']}" if e.get("reason") else ""), "lykos/engine")
+    if (ex.get("runtime_env") or {}).get("gate_closed"):
+        note("warning", f"{t.get('filename')}: the target never got past its startup gate (a "
+                        "config, data dir or env var that could not be supplied); every dynamic "
+                        "result for it measured that early exit", "lykos/startup-gate")
     base = ex.get("baseline")
     if base is not None and not base.get("ran"):
         failed = True

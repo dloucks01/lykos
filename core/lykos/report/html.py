@@ -427,6 +427,15 @@ def _target_html(t: dict) -> str:
             p.append(f'<li><span class="diag-stage">{esc(d.get("stage"))}</span> '
                      f'{esc(d.get("note"))}</li>')
         p.append('</ul></div>')
+    renv = ex.get("runtime_env") or {}
+    if renv.get("applied"):
+        # The results above ran WITH this environment; a reader reproducing them needs it too.
+        p.append('<p class="muted"><b>Runtime environment supplied to every run</b> (inside the '
+                 'sandbox; recorded in each PoC bundle): '
+                 + esc("; ".join(renv.get("supplied") or []) or renv.get("note") or "") + '.')
+        if renv.get("degraded"):
+            p.append(' Could not be supplied: ' + esc("; ".join(renv["degraded"])) + '.')
+        p.append('</p>')
     p.append(_engine_health_html(t))
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '

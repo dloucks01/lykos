@@ -254,3 +254,68 @@ def test_html_tolerates_missing_and_null_fields_and_does_not_double_escape():
     assert target_verdict(rep["targets"][0])["level"] == "L1"
     assert to_pdf(rep)[:5] == b"%PDF-"
     to_sarif(rep)
+
+
+# ---- runtime environment / startup gate -------------------------------------------------------
+
+def _renv_event(store, case, t, **payload):
+    run = store.runs.create(case.id, "dynamic_run", target_id=t.id, status="done")
+    store.events.append("runtime_env", case_id=case.id, run_id=run.id, payload=payload)
+
+
+def test_an_unopened_startup_gate_is_inconclusive_in_every_renderer(store, case):
+    t = _target(store, case)
+    _scorecard(store, case, t, {"verdict": "ok", "engines": [
+        {"engine": "coverage_fuzz", "status": "ok", "execs": 5000}]})
+    _renv_event(store, case, t, applied=False, gated=True, note="gate held", supplied=[],
+                degraded=[])
+    rep = build_report(store, case.id)
+    tt = rep["targets"][0]
+    assert tt["execution"]["runtime_env"]["gate_closed"] is True
+    assert tt["execution"]["has_gaps"] is True
+    v = tt["verdict"]
+    assert v["gate_closed"] and v["label"].startswith("Inconclusive") and "startup gate" in v["label"]
+    assert "No defects demonstrated" not in v["label"]
+    assert any(d["stage"] == "runtime_env" for d in tt["execution"]["diagnostics"])
+    assert "startup gate" in to_html(rep)
+    assert to_pdf(rep)[:5] == b"%PDF-"
+    notes = json.dumps(to_sarif(rep))
+    assert "lykos/startup-gate" in notes
+    # with a static finding the label still says the dynamic side only measured the gate
+    _finding(store, case, t)
+    lab = target_verdict(build_report(store, case.id)["targets"][0])["label"]
+    assert lab.startswith("Static findings only") and "startup gate" in lab
+
+
+def test_a_supplied_environment_is_shown_and_is_not_a_gap(store, case):
+    t = _target(store, case)
+    _renv_event(store, case, t, applied=True, gated=True, note="",
+                supplied=[{"kind": "env", "name": "APP_HOME", "value": "/opt/app"},
+                          {"kind": "file", "at": "/etc/app.conf"}],
+                degraded=[{"path": "/var/lib/app", "why": "not creatable"}])
+    rep = build_report(store, case.id)
+    tt = rep["targets"][0]
+    renv = tt["execution"]["runtime_env"]
+    assert renv["applied"] and not renv["gate_closed"]
+    assert renv["supplied"] == ["env APP_HOME=/opt/app", "file /etc/app.conf"]
+    assert not tt["verdict"]["gate_closed"] and "startup gate" not in tt["verdict"]["label"]
+    assert not any(d["stage"] == "runtime_env" for d in tt["execution"]["diagnostics"])
+    html = to_html(rep)
+    assert "Runtime environment supplied" in html and "APP_HOME=/opt/app" in html
+    assert "/var/lib/app: not creatable" in html
+    assert to_pdf(rep)[:5] == b"%PDF-"
+
+
+def test_a_target_that_needed_nothing_has_no_runtime_env_entry(store, case):
+    t = _target(store, case)
+    _renv_event(store, case, t, applied=False, gated=False, note="nothing needed")
+    tt = build_report(store, case.id)["targets"][0]
+    assert "runtime_env" not in tt["execution"]
+    assert not tt["verdict"]["gate_closed"]
+
+
+def test_never_executed_still_mentions_an_unopened_gate(store, case):
+    t = _target(store, case)
+    _renv_event(store, case, t, applied=False, gated=True, note="gate held")
+    v = build_report(store, case.id)["targets"][0]["verdict"]
+    assert v["nothing_executed"] and "startup gate" in v["label"]

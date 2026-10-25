@@ -213,6 +213,14 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
         for d in (ex.get("diagnostics") or [])[:6]:
             L += _flow(f'Why {d.get("stage")} did little: {d.get("note")}', "HO", 8.5, 0, 1,
                        (0.5, 0.35, 0.3))
+        renv = ex.get("runtime_env") or {}
+        if renv.get("applied"):
+            txt = ("Runtime environment supplied to every run (inside the sandbox; recorded in "
+                   "each PoC bundle): " + ("; ".join(renv.get("supplied") or [])
+                                          or renv.get("note") or ""))
+            if renv.get("degraded"):
+                txt += ". Could not be supplied: " + "; ".join(renv["degraded"])
+            L += _flow(txt, "HO", 8.5, 0, 1, (0.4, 0.4, 0.45))
         L += _health_lines(t)
 
         findings = t.get("findings") or []
