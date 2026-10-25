@@ -850,6 +850,84 @@ def _runtimeconfig_json() -> str:
         "framework": {"name": "Microsoft.NETCore.App", "version": ver}}}, indent=2)
 
 
+_BUNDLE_NAMES = {"target.bin", "input.bin", "control.bin", "runner.sh", "meta.json", "README.txt",
+                 "stderr.txt", "PRIMITIVE.txt", "RUNTIME_ENV.txt", "exploit.py"}
+
+
+def _runtime_env_parts(renv) -> tuple:
+    """(runner.sh setup lines, extra files, RUNTIME_ENV.txt) for a target that needed a confirmed
+    runtime environment to start (analyze.runtime_env). The variables are exported and the
+    cwd-relative files placed by runner.sh; an ABSOLUTE path is shipped and described but never
+    written by the runner -- that would change the replaying host, which is the operator's call."""
+    setup: list = []
+    files: dict = {}
+    lines = ["RUNTIME ENVIRONMENT",
+             "===================",
+             "The target needs this to get past its startup gate. lykos found it, confirmed it",
+             "(the target ran further with it and every item is needed), and supplied it inside",
+             "the sandbox for every run, so the finding was demonstrated WITH it.", ""]
+    if renv.env:
+        lines.append("Environment variables (runner.sh exports these):")
+        for k, v in sorted(renv.env.items()):
+            setup.append(f"export {k}={shlex.quote(str(v))}")
+            lines.append(f"  {k}={v}")
+        lines.append("")
+    rel_ok = []
+    for i, (src, rel) in enumerate(renv.rel_files):
+        if rel in _BUNDLE_NAMES or rel.startswith("runtime_env/"):
+            continue
+        name = f"runtime_env/rel-{i}-{pathlib.PurePath(rel).name}"
+        try:
+            files[name] = pathlib.Path(src).read_bytes()
+        except OSError:
+            continue
+        rel_ok.append((name, rel))
+    for rel in renv.rel_dirs:
+        setup.append(f"mkdir -p ./{shlex.quote(rel)}")
+    for name, rel in rel_ok:
+        parent = str(pathlib.PurePath(rel).parent)
+        if parent not in ("", "."):
+            setup.append(f"mkdir -p ./{shlex.quote(parent)}")
+        setup.append(f"cp ./{shlex.quote(name)} ./{shlex.quote(rel)}")
+    if rel_ok or renv.rel_dirs:
+        lines.append("Relative to the working directory (runner.sh creates these in poc/):")
+        lines += [f"  {rel}  <- {name}" for name, rel in rel_ok]
+        lines += [f"  {rel}/  (directory)" for rel in renv.rel_dirs]
+        lines.append("")
+    absent = []
+    for i, (src, dst) in enumerate(renv.files):
+        name = f"runtime_env/abs-{i}-{pathlib.PurePath(dst).name}"
+        try:
+            files[name] = pathlib.Path(src).read_bytes()
+        except OSError:
+            continue
+        absent.append(f"  {dst}  <- {name}")
+    absent += [f"  {d}/  (directory)" for d in renv.dirs]
+    if absent:
+        lines += ["At absolute paths -- runner.sh does NOT create these (it never writes outside",
+                  "poc/). Place them inside the replay VM first, or the target may stop at the",
+                  "same startup gate and the reproducer will not reach the defect:"]
+        lines += absent
+        lines.append("")
+    if renv.degraded:
+        lines.append("Could not be supplied during analysis:")
+        lines += [f"  {d.get('path')}: {d.get('why')}" for d in renv.degraded]
+        lines.append("")
+    setup_sh = ("# the target's runtime environment (see RUNTIME_ENV.txt)\n"
+                + "".join(x + "\n" for x in setup)) if setup else ""
+    return setup_sh, files, ("\n".join(lines) + "\n").encode()
+
+
+def _runtime_env_for(meta: dict, target_bytes: bytes):
+    """The applied runtime environment this process knows for the bundled target, or None."""
+    try:
+        from .. import runtime_env
+        return (runtime_env.for_sha(meta.get("target_sha256"))
+                or runtime_env.for_sha(hashlib.sha256(target_bytes).hexdigest()))
+    except Exception:                                    # noqa: BLE001 -- bundle without it
+        return None
+
+
 def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
@@ -962,6 +1040,11 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         prim_line = (f"\nPrimitive: {primitive.get('type')} at control offset "
                      f"{primitive.get('offset')} (confirmed={primitive.get('confirmed')}). "
                      "See PRIMITIVE.txt.\n")
+    _renv = _runtime_env_for(meta, target_bytes) if runtime == "native" else None
+    _renv_setup, _renv_files, _renv_txt = (_runtime_env_parts(_renv) if _renv is not None
+                                           else ("", {}, b""))
+    if _renv is not None:
+        extra_files = {**(extra_files or {}), **_renv_files, "RUNTIME_ENV.txt": _renv_txt}
     files = ["target.bin  - the exact analyzed binary (self-contained; runs anywhere)"
              if runtime == "native" else
              "target.bin  - the exact analyzed " + ("jar" if runtime == "jar" else "class")
@@ -984,6 +1067,9 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
     files += ["runner.sh   - runs the reproducer for you",
               "meta.json   - machine-readable details (target hash, arch, offset, tool)",
               "PRIMITIVE.txt / stderr.txt - the primitive description and captured diagnostics"]
+    if _renv is not None:
+        files += ["RUNTIME_ENV.txt / runtime_env/ - the config/dirs/variables the target needs "
+                  "to start (runner.sh supplies the variables and relative files)"]
     what_success = (f"runner.sh prints REPRODUCED and exits 0: control.bin terminates and "
                     f"input.bin is still running at {(hang or {}).get('factor')}x the control's "
                     f"runtime (floor {(hang or {}).get('limit_s')}s), then is killed"
@@ -1031,12 +1117,17 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         # own measured rate justifies. The marker is the detector's own report line, because a
         # sanitizer's exit code belongs to the detector and other things exit non-zero too.
         _race = (primitive or {}).get("race")
-        _add(tar, "poc/runner.sh",
-             _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
-                     sanitizer=sanitizer, guard_page=guard_page, exec_name=exec_name,
-                     retries=int((primitive or {}).get("retries") or 0) if _race else 0,
-                     marker=_race_marker(primitive) if _race else "", hang=hang,
-                     mem_cap_mb=mem_cap_mb, trailing_newline=_nl), mode=0o755)
+        _rsh = _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
+                       sanitizer=sanitizer, guard_page=guard_page, exec_name=exec_name,
+                       retries=int((primitive or {}).get("retries") or 0) if _race else 0,
+                       marker=_race_marker(primitive) if _race else "", hang=hang,
+                       mem_cap_mb=mem_cap_mb, trailing_newline=_nl)
+        if _renv_setup:
+            # right after the cd, before the channel's own setup: an env-channel input of the
+            # same name is exported later and wins
+            _cd = b'cd "$(dirname "$0")"\n'
+            _rsh = _rsh.replace(_cd, _cd + _renv_setup.encode(), 1)
+        _add(tar, "poc/runner.sh", _rsh, mode=0o755)
         # LABEL THE BINARY THIS BUNDLE ACTUALLY SHIPS. `meta["target_sha256"]` is written by the
         # caller and names the INGESTED target, which is no longer always the binary exploited:
         # for a source drop the ingested target is the ASan+UBSan build and the chain is built
@@ -1070,6 +1161,8 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
             _m["hang"] = dict(hang)
         if mem_cap_mb:
             _m["mem_cap_mb"] = int(mem_cap_mb)
+        if _renv is not None:
+            _m["runtime_env"] = _renv.summary()
         if _nul_cut:
             _m["input_truncated_at_nul"] = ("input.bin holds the bytes before the first NUL: an "
                                             f"{mode} value is a C string, so that is all the "

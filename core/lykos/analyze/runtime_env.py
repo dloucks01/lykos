@@ -504,6 +504,8 @@ class RuntimeEnv:
     result: dict = field(default_factory=dict)
     runs: int = 0
     traced: bool = False
+    #: the baseline stopped at a missing-resource gate (whether or not it could be opened)
+    gated: bool = False
 
     def bwrap_args(self, *, cwd: str = "/tmp") -> list:
         """bwrap arguments that expose this environment inside the sandbox. Goes AFTER the
@@ -544,7 +546,7 @@ class RuntimeEnv:
         return {"applied": self.applied, "note": self.note, "supplied": list(self.supplied),
                 "degraded": list(self.degraded), "env": dict(self.env) if self.applied else {},
                 "runs": self.runs, "traced": self.traced, "baseline": dict(self.baseline),
-                "result": dict(self.result)}
+                "result": dict(self.result), "gated": bool(self.gated or self.applied)}
 
 
 # --- sandbox capability probes ---------------------------------------------------------------------
@@ -1188,6 +1190,7 @@ def _prepare(exe, *, argv, data, strings, scratch, arch, endianness, bits, timeo
             add(_env_item(dict(e, why=(f"{e.get('via', 'getenv')}(\"{e['name']}\")"
                                        if e["source"] == "call-site"
                                        else "env-shaped string in a getenv importer")), root))
+        renv0.gated = True
         if not items:
             renv0.note = ("the target exits early (" + (base.view()["says"] or f"rc {base.rc}")
                           + ") but no env var, path or directory it needs was recovered")
@@ -1341,6 +1344,235 @@ def bwrap_args_for(exe_or_dir, *, cwd: str = "/tmp") -> list:
     return r.bwrap_args(cwd=cwd) if r is not None else []
 
 
+def setenv_args(renv: Optional[RuntimeEnv], skip=()) -> list:
+    """`--setenv NAME VALUE` bwrap arguments for an applied environment's variables, for a runner
+    whose own process environment the sandbox does not control (`isolate_prefix` callers).
+    `skip` names variables the caller sets itself (an env-channel input): theirs must win."""
+    if renv is None or not renv.applied:
+        return []
+    skip = set(skip or ())
+    a: list = []
+    for k, v in renv.env.items():
+        if k not in skip:
+            a += ["--setenv", str(k), str(v)]
+    return a
+
+
+# --- persistence: one confirmed environment per target, shared by every stage ----------------------
+# Discovery costs up to `max_runs` executions, so it runs ONCE per target (the first stage that
+# executes it) and the result is recorded in the case dir. Every later `stage_target` -- in this
+# process or a worker -- adopts that record for the directory it staged into, so the campaign, the
+# PoC builders, the debuggers and the exploit ladder all run the target with the same environment
+# without probing again. The record carries the synthesized file CONTENTS (they are small text
+# configs), and each process restages them under its own temp root: the case store itself is never
+# a bind source, and a removed stage scratch cannot leave a dangling bind behind.
+
+_RECORD_DIR = "runtime_env"
+_RECORD_VERSION = 1
+_MAX_RECORD_FILE = 1 << 20                               # a synthesized config is a few hundred bytes
+_BY_SHA: dict = {}                                       # target sha256 -> applied RuntimeEnv
+_LOADED: dict = {}                                       # record path -> (mtime_ns, RuntimeEnv|None)
+_ENSURE_LOCKS: dict = {}
+_PROC_ROOT: Optional[str] = None
+
+
+def to_record(renv: RuntimeEnv, *, argv=()) -> dict:
+    """A JSON-safe record of `renv`, file contents included, from which `from_record` rebuilds an
+    equivalent environment anywhere."""
+    import base64
+
+    def _blob(src):
+        try:
+            with open(src, "rb") as fh:
+                data = fh.read(_MAX_RECORD_FILE + 1)
+        except OSError:
+            return None
+        return base64.b64encode(data[:_MAX_RECORD_FILE]).decode("ascii")
+
+    return {"version": _RECORD_VERSION, "argv": [str(a) for a in argv],
+            "applied": bool(renv.applied), "note": renv.note, "env": dict(renv.env),
+            "files": [{"dst": dst, "b64": _blob(src)} for src, dst in renv.files],
+            "rel_files": [{"dst": rel, "b64": _blob(src)} for src, rel in renv.rel_files],
+            "dirs": list(renv.dirs), "rel_dirs": list(renv.rel_dirs),
+            "overlays": list(renv.overlays), "tmpfs": list(renv.tmpfs),
+            "supplied": list(renv.supplied), "degraded": list(renv.degraded),
+            "baseline": dict(renv.baseline), "result": dict(renv.result),
+            "runs": int(renv.runs), "traced": bool(renv.traced), "gated": bool(renv.gated)}
+
+
+def from_record(rec: dict, root) -> RuntimeEnv:
+    """Rebuild a RuntimeEnv from `to_record` output, writing its files under `root`. A file whose
+    content did not survive makes the environment NOT applied (and says why): binding a missing
+    source would make bwrap refuse every run, which reads as a sandbox failure."""
+    import base64
+    root = Path(root)
+    r = RuntimeEnv(root=str(root), env=dict(rec.get("env") or {}),
+                   dirs=list(rec.get("dirs") or []), rel_dirs=list(rec.get("rel_dirs") or []),
+                   overlays=list(rec.get("overlays") or []), tmpfs=list(rec.get("tmpfs") or []),
+                   supplied=list(rec.get("supplied") or []),
+                   degraded=list(rec.get("degraded") or []), applied=bool(rec.get("applied")),
+                   note=str(rec.get("note") or ""), baseline=dict(rec.get("baseline") or {}),
+                   result=dict(rec.get("result") or {}), runs=int(rec.get("runs") or 0),
+                   traced=bool(rec.get("traced")), gated=bool(rec.get("gated")))
+    if not r.applied:
+        return r
+    fdir = root / "files"
+    for key, out in (("files", r.files), ("rel_files", r.rel_files)):
+        for i, f in enumerate(rec.get(key) or []):
+            if not isinstance(f, dict) or f.get("b64") is None or not f.get("dst"):
+                r.applied = False
+                r.note = f"recorded environment is incomplete (no content for {f!r:.80})"
+                return r
+            fdir.mkdir(parents=True, exist_ok=True)
+            src = fdir / f"{key}-{i}-{os.path.basename(str(f['dst']).rstrip('/')) or 'file'}"
+            src.write_bytes(base64.b64decode(f["b64"]))
+            out.append((str(src), str(f["dst"])))
+    return r
+
+
+def record_path(case_root, sha256: str) -> Path:
+    return Path(case_root) / _RECORD_DIR / f"{sha256}.json"
+
+
+def _proc_root() -> str:
+    """This process's restaging root (removed at exit)."""
+    global _PROC_ROOT
+    if _PROC_ROOT is None or not os.path.isdir(_PROC_ROOT):
+        import atexit
+        _PROC_ROOT = tempfile.mkdtemp(prefix="lykos-renv-")
+        atexit.register(shutil.rmtree, _PROC_ROOT, True)
+    return _PROC_ROOT
+
+
+def save(case_root, sha256: str, renv: RuntimeEnv, *, argv=()) -> None:
+    """Record `renv` for target `sha256` in the case dir (atomic). Never raises."""
+    import json
+    try:
+        p = record_path(case_root, sha256)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(to_record(renv, argv=argv), sort_keys=True))
+        os.replace(tmp, p)
+        with _REG_LOCK:
+            _LOADED.pop(str(p), None)
+    except Exception:                                    # noqa: BLE001 -- recording is best-effort
+        _log.debug("runtime_env record not saved", exc_info=True)
+
+
+def load(case_root, sha256: str) -> Optional[tuple]:
+    """(record dict, RuntimeEnv restaged in this process) for target `sha256`, or None when no
+    record exists. Cached on the record's mtime, so asking on every staging costs one stat."""
+    import json
+    p = record_path(case_root, sha256)
+    try:
+        mt = p.stat().st_mtime_ns
+    except OSError:
+        return None
+    key = str(p)
+    with _REG_LOCK:
+        hit = _LOADED.get(key)
+    if hit is not None and hit[0] == mt:
+        return hit[1]
+    try:
+        rec = json.loads(p.read_text())
+        if not isinstance(rec, dict) or rec.get("version") != _RECORD_VERSION:
+            return None
+        root = Path(_proc_root()) / hashlib.sha1(f"{key}:{mt}".encode()).hexdigest()[:16]
+        out = (rec, from_record(rec, root))
+    except Exception:                                    # noqa: BLE001 -- a bad record is no record
+        _log.debug("runtime_env record unreadable: %s", p, exc_info=True)
+        return None
+    with _REG_LOCK:
+        _LOADED[key] = (mt, out)
+    return out
+
+
+def for_sha(sha256: Optional[str]) -> Optional[RuntimeEnv]:
+    """The applied environment known in this process for target `sha256`, or None."""
+    if not sha256 or not _BY_SHA:
+        return None
+    with _REG_LOCK:
+        return _BY_SHA.get(sha256)
+
+
+def adopt(case_root, sha256: str, *where) -> Optional[RuntimeEnv]:
+    """Register the recorded environment of target `sha256` (if any, and applied) for every dir in
+    `where`. Called by `ContentStore.stage_target`, so every staged copy of a target that needed
+    an environment gets it. Cheap when there is no record (one failed stat). Never raises."""
+    try:
+        got = load(case_root, sha256)
+        if got is None or not got[1].applied:
+            return None
+        renv = got[1]
+        register(renv, *where)
+        with _REG_LOCK:
+            _BY_SHA[sha256] = renv
+        return renv
+    except Exception:                                    # noqa: BLE001
+        _log.debug("runtime_env adopt failed", exc_info=True)
+        return None
+
+
+def ensure(ctx, target, argv=(), *, strings=None, exec_timeout: float = 2.0,
+           also=(), budget_s: float = 90.0) -> Optional[RuntimeEnv]:
+    """Discover the target's runtime environment once per case and supply it to every stage.
+
+    The first call for a target (per argv) probes it (`prepare`), records the result in the case
+    dir and emits a `runtime_env` event; later calls -- from any stage, in any process -- reuse the
+    record. An applied environment is registered for this stage's scratch and every dir in `also`
+    (and, via `stage_target`, for every later staged copy). An applied record is reused under any
+    argv (a startup gate is the program's, not the invocation's); a record that applied nothing
+    is re-probed only when the argv differs. Returns the environment in effect, or None. Never
+    raises."""
+    try:
+        case_root = getattr(ctx.content, "root", None)
+        sha = target.sha256
+        argv = [str(a) for a in argv]
+        if case_root is None:
+            return None
+        key = str(record_path(case_root, sha))
+        with _REG_LOCK:
+            lock = _ENSURE_LOCKS.setdefault(key, threading.Lock())
+        with lock:
+            got = load(case_root, sha)
+            if got is not None and (got[0].get("argv") == argv or got[1].applied):
+                renv = got[1]
+                if renv.applied:
+                    register(renv, ctx.scratch(), *also)
+                    with _REG_LOCK:
+                        _BY_SHA[sha] = renv
+                    try:
+                        ctx.emit("runtime_env", payload=dict(renv.summary(), reused=True))
+                    except Exception:                    # noqa: BLE001
+                        pass
+                return renv if renv.applied else None
+            from . import invocation as invmod
+            d = Path(ctx.scratch()) / "renvprobe"
+            d.mkdir(parents=True, exist_ok=True)
+            data = ctx.content.path(sha).read_bytes()
+            if data[:4] != b"\x7fELF":
+                return None                              # discovery reads ELF call sites only
+            exe = ctx.content.stage_target(target, d, invmod.exec_name_for(data) or "target.bin")
+            renv = prepare(exe, argv=argv, data=data, strings=strings, scratch=d,
+                           arch=getattr(target, "arch", None),
+                           endianness=getattr(target, "endianness", None),
+                           bits=getattr(target, "bits", None),
+                           timeout=max(2.0, 2.0 * float(exec_timeout or 0)), budget_s=budget_s)
+            try:
+                ctx.emit("runtime_env", payload=renv.summary())
+            except Exception:                            # noqa: BLE001
+                _log.debug("runtime_env event not emitted", exc_info=True)
+            save(case_root, sha, renv, argv=argv)        # (any prior record applied nothing)
+            # Re-adopt from the record: the probe's staged files live in this stage's scratch,
+            # which is removed when the stage ends; the restaged copy outlives it.
+            if renv.applied:
+                return adopt(case_root, sha, ctx.scratch(), *also) or renv
+            return None
+    except Exception:                                    # noqa: BLE001 -- discovery never blocks a stage
+        _log.debug("runtime_env ensure failed", exc_info=True)
+        return None
+
+
 # --- the stage-side entry point -----------------------------------------------------------------------
 
 def stage_hook(ctx, target, exe, argv=(), *, strings=None, exec_timeout: float = 2.0,
@@ -1361,6 +1593,9 @@ def stage_hook(ctx, target, exe, argv=(), *, strings=None, exec_timeout: float =
         _log.debug("runtime_env event not emitted", exc_info=True)
     if renv.applied:
         register(renv, exe, ctx.scratch(), *also)
+        if getattr(target, "sha256", None):
+            with _REG_LOCK:
+                _BY_SHA[target.sha256] = renv
     return renv
 
 

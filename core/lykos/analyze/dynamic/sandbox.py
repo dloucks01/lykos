@@ -302,8 +302,10 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     runner = _batch_runner_path()
     inner = [py, runner, mode, str(timeout), str(exe),
              *[argv_bytes(a).decode("latin-1") for a in base_argv]]
+    renv = _runtime_env(exe)
     cmd = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
-           + ["--ro-bind", exedir, exedir, "--"] + inner)
+           + ["--ro-bind", exedir, exedir]
+           + (renv.bwrap_args(cwd="/tmp") if renv is not None else []) + ["--"] + inner)
     blocks = list(blocks)
     blob = bytearray(struct.pack("<II", len(payloads), len(blocks)))
     if blocks:
@@ -322,6 +324,10 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
         _prior = env.get("ASAN_OPTIONS", "")
         env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
             f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
+    if renv is not None and renv.env:
+        # inherited by the tracer and, through execv, by the target
+        env = dict(env if env is not None else os.environ)
+        env.update({str(k): str(v) for k, v in renv.env.items()})
     guarded = False
     if guard_page:
         # The batch runner applies this in the forked child, scoped to the target and never to
@@ -1079,8 +1085,20 @@ def _bwrap_probe_fresh() -> bool:
         return False
 
 
+def _runtime_env(exe_or_dir):
+    """The confirmed runtime environment registered for a staged exe (or its dir), or None.
+    See `analyze.runtime_env`: a config file / data dir / env var the target needs before it runs
+    at all, found and confirmed once per target and applied to every contained run of it."""
+    try:
+        from .. import runtime_env as _renv
+        r = _renv.for_exe(exe_or_dir)
+    except Exception:                                    # noqa: BLE001 -- never blocks a run
+        return None
+    return r if (r is not None and r.applied) else None
+
+
 def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: str = "",
-                   aslr: bool = False) -> list:
+                   aslr: bool = False, env_skip=()) -> list:
     """bwrap argv prefix that contains a target for the debug/PoC paths that spawn it directly
     (the gdb stub, the native gdb tools, the leak harness). Read-only root (with /home and /root
     masked), tmpfs /tmp, pid namespace and die-with-parent, plus the target's own directory
@@ -1093,6 +1111,10 @@ def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: s
     gdb tool binds the read-only dir holding its script and input file; a tracer that writes a
     log binds that dir writable. They come AFTER the exedir bind, so a later rw bind wins over an
     earlier ro bind of the same path (bwrap is last-wins).
+
+    A runtime environment registered for `exedir` (`analyze.runtime_env`) is applied: its files
+    and dirs are exposed inside the sandbox and its variables set with `--setenv` -- except the
+    names in `env_skip`, which the caller sets itself (an env-channel input wins).
 
     Returns [] when bwrap is unusable, so the caller runs unwrapped (rlimits still apply)."""
     if not _bwrap_usable():
@@ -1109,6 +1131,11 @@ def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: s
     # dir -- pass it (usually == exedir, which rw_binds also makes writable) for such a target.
     if chdir:
         cmd += ["--chdir", str(chdir)]
+    renv = _runtime_env(exedir)
+    if renv is not None:
+        from .. import runtime_env as _renvmod
+        cmd += renv.bwrap_args(cwd=str(chdir) if chdir else "/tmp")
+        cmd += _renvmod.setenv_args(renv, skip=env_skip)
     # Disable ASLR INSIDE the namespace (bwrap's user namespace drops the parent's
     # ADDR_NO_RANDOMIZE on some kernels). `aslr=True` leaves it on for the rare caller that wants
     # real randomization. No-op when setarch is absent -- the caller's personality preexec, where
@@ -2456,6 +2483,15 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # this the input had nowhere to go and the crash "did not reproduce".
         env = dict(env if env is not None else os.environ)
         env.update({str(k): v for k, v in env_overrides.items()})
+    # The target's confirmed runtime environment (config file, data dirs, env vars it needs to get
+    # past its startup gate -- see analyze.runtime_env). Without it every execution of such a
+    # target measures the gate. An env-channel input of the same name wins.
+    renv = _runtime_env(exe)
+    if renv is not None and renv.env:
+        env = dict(env if env is not None else os.environ)
+        for _k, _v in renv.env.items():
+            if not (env_overrides and _k in env_overrides):
+                env[str(_k)] = str(_v)
     guarded = False
     if guard_page:
         # Here the preload goes in as LD_PRELOAD: `run` execs the target itself (under bwrap or
@@ -2496,6 +2532,8 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
+    renv_args: list = []
+    bare_cmd = inner
     if _bwrap_usable():
         # The exe is staged under /tmp (ctx.scratch()), which _BWRAP_ARGS masks with a tmpfs,
         # so the guest binary vanishes inside the sandbox. Bind its directory back in
@@ -2535,7 +2573,11 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # Native targets: disable ASLR inside the namespace (the parent personality does not
         # survive bwrap's user namespace on some kernels). Emulated targets keep qemu's own guest
         # layout, so setarch on the host qemu process is not applied here.
-        cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + _norandom_prefix(aslr or emu is not None) + inner
+        renv_args = (renv.bwrap_args(cwd=exedir if rel_interp else "/tmp")
+                     if renv is not None else [])
+        _tail = ["--"] + _norandom_prefix(aslr or emu is not None) + inner
+        cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + renv_args + _tail
+        bare_cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + _tail
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
     if guarded:
         # The tag is what makes the crash REPRODUCIBLE later: a fault that needs the guard-page
@@ -2552,7 +2594,21 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # root this way. An empty per-run dir contains that; it is removed once the result is captured.
     rundir = tempfile.mkdtemp(prefix="lykos-run-")
     try:
+        if renv is not None:
+            # the cwd-relative part, for the unwrapped tier (the wrapped one binds it)
+            try:
+                renv.populate_cwd(rundir)
+            except OSError:
+                pass
         rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env, cwd=rundir)
+        if (renv_args and not timed and err.startswith(b"bwrap:")):
+            # The environment was confirmed on this host, but bwrap refused its binds/overlays
+            # now (a removed source, an overlay this mount no longer allows). Run without it
+            # rather than report bwrap's own refusal as the target's output, and say so.
+            _log.warning("runtime environment for %s not applied: %s", exe,
+                         err[:200].decode("utf-8", "replace").strip())
+            cmd = bare_cmd
+            rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env, cwd=rundir)
 
         # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
         # back to rlimits-only and stop trying bwrap this session.

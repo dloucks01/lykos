@@ -187,6 +187,14 @@ class ContentStore:
                              rel, exe, e)
         if deps:
             _make_runnable(exe, workdir)                  # cwd-independent interp/libc resolution
+        # A target that needs a config file / data dir / env var to start (found and confirmed
+        # once per target by analyze.runtime_env) gets it in EVERY stage that runs this copy: the
+        # sandbox applies whatever is registered for the staged dir.
+        try:
+            from .analyze import runtime_env
+            runtime_env.adopt(self.root, target.sha256, workdir)
+        except Exception:                                 # noqa: BLE001 -- never blocks staging
+            _log.debug("runtime environment not adopted for %s", exe, exc_info=True)
         return exe
 
 

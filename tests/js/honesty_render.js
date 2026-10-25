@@ -105,6 +105,14 @@ function info(vnode) {
   ck("hangs are a CWE-835 chip", by("hangs") && /1 hang\/DoS input \(CWE-835\)/.test(by("hangs").label));
   ck("lease renewals are counted", by("lease") && /×3/.test(by("lease").label));
   ck("multi-target chips name their target", /^a\.bin: /.test(by("cap-T1").label));
+  const renv = U.runSignalChips({ runtime_env: [
+    { target_id: "T1", applied: true, supplied: ["file /etc/app.conf", "env APP_HOME=/tmp"], degraded: [] },
+    { target_id: "T2", applied: false, note: "the target exits early (cannot open /etc/x.conf) but no env var, path or directory it needs was recovered", supplied: [], degraded: [] }] }, null, targets);
+  const r1 = renv.find((c) => c.key === "renv-T1"), r2 = renv.find((c) => c.key === "renv-T2");
+  ck("a supplied runtime env is an info chip with its items",
+    r1 && r1.tone === "info" && /runtime env supplied \(2 items\)/.test(r1.label) && r1.detail.includes("file /etc/app.conf"));
+  ck("an unopened startup gate is a warn chip saying results measured the gate",
+    r2 && r2.tone === "warn" && /startup gate not opened/.test(r2.label) && r2.detail.some((d) => /measured that early exit/.test(d)));
   const failRec = U.runSignalChips({ recovery: [{ target_id: "T1", recovery_failed: true, note: "rizin crashed" }] }, null, targets);
   ck("a failed recovery is BAD, not a degradation", failRec[0] && failRec[0].tone === "bad" && /recovery FAILED/.test(failRec[0].label));
 

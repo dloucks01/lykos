@@ -145,6 +145,32 @@ def test_degraded_sandbox_ranked_taint_tiered_recovery_capped_hang_and_lease_are
     assert out["level"] == "warn"
 
 
+def test_runtime_env_supplied_is_info_and_an_unopened_gate_is_a_warning():
+    applied = {"applied": True, "gated": True, "note": "with 2 supplied item(s) it exits 0",
+               "supplied": [{"kind": "file", "path": "/etc/a.conf", "at": "/etc/a.conf",
+                             "why": "fopen"},
+                            {"kind": "env", "name": "A_HOME", "value": "/tmp"}],
+               "degraded": []}
+    out = runsignals.summarize([_row(1, "runtime_env", applied, run_target="T1")],
+                               filenames={"T1": "a.bin"})
+    e = out["runtime_env"][0]
+    assert e["applied"] and e["filename"] == "a.bin"
+    assert e["supplied"] == ["file /etc/a.conf (fopen)", "env A_HOME=/tmp"]
+    assert out["level"] == "ok"                              # supplied cleanly: informational
+    gate = {"applied": False, "gated": True, "note": "the target exits early (x)",
+            "supplied": [], "degraded": [{"path": "/opt/x", "why": "cannot overlay"}]}
+    out = runsignals.summarize([_row(1, "runtime_env", gate, run_target="T2")])
+    assert out["runtime_env"][0]["degraded"] == ["/opt/x: cannot overlay"]
+    assert out["level"] == "warn"
+    # a target that needed nothing is no signal, and the latest event per target stands
+    plain = {"applied": False, "gated": False, "note": "runs without"}
+    assert runsignals.summarize([_row(1, "runtime_env", plain, run_target="T1")])[
+        "runtime_env"] == []
+    assert runsignals.summarize([_row(1, "runtime_env", gate, run_target="T1"),
+                                 _row(2, "runtime_env", applied, run_target="T1")])[
+        "runtime_env"][0]["applied"]
+
+
 def test_a_later_clean_recovery_supersedes_a_degraded_one():
     rows = [_row(1, "re.done", {"analysis_tier": "aa", "partial": True}, run_target="T1"),
             _row(2, "re.done", {"analysis_tier": "aaa", "partial": False}, run_target="T1")]

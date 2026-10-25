@@ -499,6 +499,18 @@ export function runSignalChips(signals, bg, targets) {
       label: `${hangs.length} hang/DoS input${hangs.length === 1 ? "" : "s"} (CWE-835)`,
       detail: hangs.map((h) => `${multi ? `${nm(h.target_id, h.filename)}: ` : ""}input ${String(h.input_sha || "").slice(0, 12)} via ${h.mode || "?"} did not terminate${h.timeout ? ` within ${h.timeout}s` : ""} (${_ENGINE_NAME[h.engine] || h.engine})`) });
   }
+  for (const e of sig.runtime_env || []) {
+    if (e.applied) {
+      const n = (e.supplied || []).length;
+      chips.push({ key: `renv-${e.target_id}`, tone: (e.degraded || []).length ? "warn" : "info",
+        label: `${pre(e.target_id, e.filename)}runtime env supplied (${n} item${n === 1 ? "" : "s"})`,
+        detail: [`the target stops at a startup gate without these; lykos confirmed each one and supplied it inside the sandbox to every run`, ...(e.supplied || []), ...(e.degraded || []).map((d) => `not supplied: ${d}`)] });
+    } else {
+      chips.push({ key: `renv-${e.target_id}`, tone: "warn",
+        label: `${pre(e.target_id, e.filename)}startup gate not opened`,
+        detail: [e.note || "the target exits early on a missing resource and nothing supplied got it further", "every dynamic result for this target measured that early exit — set the invocation field (e.g. -c @@ with a config as the seed) and re-run", ...(e.degraded || []).map((d) => `not supplied: ${d}`)] });
+    }
+  }
   if (sig.lease_renewed && sig.lease_renewed.count) {
     chips.push({ key: "lease", tone: "info",
       label: `lease renewed ×${sig.lease_renewed.count}`,

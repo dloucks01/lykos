@@ -115,8 +115,14 @@ def _env_cmd(exe: str, argv: list, env: dict):
     env_overrides replay reproduces)."""
     exedir = str(Path(exe).resolve().parent)
     rel = sandbox._relative_interp(exe)
+    # The target's confirmed runtime environment (analyze.runtime_env) is the BASE the fuzzed
+    # variables sit on: `env -i` below would otherwise strip the very variable that gets the
+    # target past its startup gate. A fuzzed name of the same variable wins.
+    renv = sandbox._runtime_env(exe)
+    if renv is not None and renv.env:
+        env = {**{str(k): str(v) for k, v in renv.env.items()}, **env}
     prefix = sandbox.isolate_prefix(exedir, net=False, rw_binds=([exedir] if rel else ()),
-                                    chdir=(exedir if rel else ""))
+                                    chdir=(exedir if rel else ""), env_skip=tuple(env))
     envbin = shutil.which("env") if prefix else None
     if prefix and (not envbin or "=" in exe):
         # No `env` to scope the variables (or an exe path `env` would parse as an assignment):
@@ -129,6 +135,11 @@ def _env_cmd(exe: str, argv: list, env: dict):
     # Unwrapped: never inherit the worker's cwd -- a target that writes relative paths would
     # litter (or clobber) the directory lykos runs from.
     cwd = exedir if rel else tempfile.mkdtemp(prefix="lykos-envfuzz-")
+    if renv is not None:
+        try:
+            renv.populate_cwd(cwd)
+        except OSError:
+            pass
     return [exe] + [str(a) for a in argv], env, cwd, "rlimits-only"
 
 

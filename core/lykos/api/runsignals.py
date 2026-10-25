@@ -6,8 +6,9 @@ analysis aborted (`autopilot.target_error`, and `target_errors`/`failed_targets`
 data-flow that analysed only the ranked top-N of the reachable functions (`detect.taint_ranked`),
 a large binary recovered at a shallower tier (`re.done` `analysis_tier`/`degradations`), a crash
 corpus bigger than the prove loop will take (`autopilot.crashes_capped`), inputs that hang the
-target (`<prefix>.hang`, CWE-835), and a lease renewed under write contention
-(`job.lease_renewed`).
+target (`<prefix>.hang`, CWE-835), a lease renewed under write contention
+(`job.lease_renewed`), and what the target needed supplied to start -- or a startup gate nothing
+could open (`runtime_env`).
 
 The GUI's live tail only sees events that arrive WHILE it is polling, so a reopened case -- or a
 tab opened after the event -- would show none of these and present the run as clean. This reads
@@ -37,6 +38,7 @@ SIGNAL_TYPES = (
     "autopilot.target_error", "autopilot.done", "autopilot.error",
     "coverage.isolation", "net_fuzz.isolation", "env_fuzz.isolation",
     "detect.taint_ranked", "re.done", "autopilot.crashes_capped", "job.lease_renewed",
+    "runtime_env",
 )
 _TERMINAL = ("autopilot.done", "autopilot.error")
 #: Ceiling on cached rows per case. Only `job.lease_renewed` / `*.hang` can be numerous; the
@@ -91,6 +93,16 @@ def _target_of(row: dict) -> Optional[str]:
     return (row.get("payload") or {}).get("target_id") or row.get("run_target")
 
 
+def _renv_item(x) -> str:
+    """One supplied runtime-environment item, as the operator reads it."""
+    if not isinstance(x, dict):
+        return str(x)[:200]
+    if x.get("kind") == "env":
+        return f"env {x.get('name')}={x.get('value')}"[:200]
+    at = x.get("at") or x.get("path")
+    return f"{x.get('kind')} {at}" + (f" ({x.get('why')})" if x.get("why") else "")[:200]
+
+
 def _engine_of(etype: str) -> str:
     return etype.rsplit(".", 1)[0]
 
@@ -116,7 +128,7 @@ def summarize(rows: list[dict], *, running: bool = False,
                                       "runs_seen": len(terminals)},
                            "outcome": None, "target_errors": [], "failed_targets": [],
                            "isolation": [], "taint": [], "recovery": [], "crashes_capped": [],
-                           "hangs": [], "lease_renewed": None}
+                           "hangs": [], "lease_renewed": None, "runtime_env": []}
     # ---- run-scoped -------------------------------------------------------------------
     iso_seen: dict = {}
     capped: dict = {}
@@ -171,6 +183,7 @@ def summarize(rows: list[dict], *, running: bool = False,
     taint: dict = {}
     recov: dict = {}
     hangs: dict = {}
+    renv: dict = {}
     for r in rows:
         t, p = r["type"], r["payload"]
         tid = _target_of(r)
@@ -191,6 +204,18 @@ def summarize(rows: list[dict], *, running: bool = False,
                            "functions": p.get("functions"),
                            "total_functions": p.get("total_functions"),
                            "note": p.get("note")} if issue else None)
+        elif t == "runtime_env":
+            # What the target needed to START (a config file, a data dir, an env var) and was
+            # given -- or a startup gate nothing could open, in which case every dynamic result
+            # for this target measured the gate. A target that needed nothing is no signal.
+            # (A reuse event carries the same record, so the latest one stands.)
+            renv[tid] = ({"target_id": tid, "filename": fname(tid),
+                          "applied": bool(p.get("applied")), "note": p.get("note"),
+                          "supplied": [_renv_item(x) for x in (p.get("supplied") or [])][:12],
+                          "degraded": [f"{d.get('path')}: {d.get('why')}"
+                                       for d in (p.get("degraded") or [])
+                                       if isinstance(d, dict)][:12]}
+                         if (p.get("applied") or p.get("gated")) else None)
         elif t.endswith(".hang"):
             sha = p.get("input_sha")
             if sha and sha not in hangs:
@@ -199,12 +224,14 @@ def summarize(rows: list[dict], *, running: bool = False,
     out["taint"] = [v for v in taint.values() if v]
     out["recovery"] = [v for v in recov.values() if v]
     out["hangs"] = list(hangs.values())
+    out["runtime_env"] = [v for v in renv.values() if v]
     # ---- overall tone -------------------------------------------------------------------
     bad = bool(out["target_errors"] or out["failed_targets"]
                or (out["outcome"] or {}).get("outcome") == "error"
                or any(x["recovery_failed"] for x in out["recovery"]))
     warn = bool(out["isolation"] or out["crashes_capped"] or out["lease_renewed"]
                 or any((x.get("skipped_reachable") or 0) > 0 for x in out["taint"])
-                or out["recovery"])
+                or out["recovery"]
+                or any(not x["applied"] or x["degraded"] for x in out["runtime_env"]))
     out["level"] = "bad" if bad else ("warn" if warn else "ok")
     return out

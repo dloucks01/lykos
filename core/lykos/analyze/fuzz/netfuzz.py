@@ -235,6 +235,15 @@ def _spawn_server(exe: str, argv: list, mem_mb: int = 1024) -> "subprocess.Popen
     cwd = None
     if not prefix:
         cwd = exedir if rel else tempfile.mkdtemp(prefix="lykos-netfuzz-")
+        # the wrapped tier gets the confirmed runtime environment from isolate_prefix; unwrapped,
+        # only its variables and cwd-relative files can be supplied (never a host path)
+        renv = sandbox._runtime_env(exe)
+        if renv is not None:
+            env = {**(env if env is not None else os.environ), **renv.env}
+            try:
+                renv.populate_cwd(cwd)
+            except OSError:
+                pass
     try:
         proc = subprocess.Popen(prefix + [exe] + [str(a) for a in argv],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

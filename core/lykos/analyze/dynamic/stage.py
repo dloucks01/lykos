@@ -300,6 +300,15 @@ def dynamic_stage(ctx) -> dict:
     # mask the case store (other targets' extracted secrets) inside the sandbox; the target is
     # copied out to scratch above, so it never needs to reach the store.
     sandbox.protect_dir(getattr(ctx.content, "root", None))
+    if params.get("runtime_env", True) and mode != "env":
+        # The first execution of the target: find out (once per case) whether it needs a config
+        # file, a data dir or an env var to get past its startup gate, and supply it from here on
+        # -- to this run and, via stage_target, to every later stage. Skipped for an env-channel
+        # replay, whose environment IS the input.
+        from .. import runtime_env
+        ctx.progress(msg="checking what the target needs to start")
+        runtime_env.ensure(ctx, target, prefix, exec_timeout=min(timeout, 2.0),
+                           also=[exe.parent], budget_s=float(params.get("runtime_env_s", 45)))
     ctx.progress(msg="detonating in sandbox")
     res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=target.arch,
                       endianness=target.endianness, bits=target.bits,
@@ -350,7 +359,8 @@ def register() -> None:
                    tool=TOOL, tool_version=TOOL_VERSION, timeout=300,
                    # P5.4: the keys dynamic_run understands; a typo now fails the run loud instead
                    # of silently running with the default (input_b64 vs input, argv vs args, ...).
-                   param_schema={"input_mode", "argv", "input_b64", "env"})
+                   param_schema={"input_mode", "argv", "input_b64", "env", "runtime_env",
+                                 "runtime_env_s"})
 
 
 def enqueue_dynamic(queue, target, *, params=None, force: bool = True):

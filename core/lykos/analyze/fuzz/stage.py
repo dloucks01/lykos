@@ -2284,6 +2284,14 @@ def fuzz_stage(ctx) -> dict:
     # service that takes a config path behind a flag; without it the input is appended.
     base_argv = [str(a) for a in (p.get("argv") or [])]
     auto_argv, wants_config, door = None, False, {}
+    if p.get("runtime_env", True):
+        # BEFORE argv discovery: a target that exits at an environment gate (a missing config
+        # file, data dir or env var) answers every usage probe the same way, and that reads as an
+        # argv refusal. Found once per case (usually by the baseline run) and reused here; the
+        # argv probe's own staged copy is registered too, since it is not staged via stage_target.
+        from .. import runtime_env
+        runtime_env.ensure(ctx, target, base_argv, exec_timeout=exec_timeout,
+                           also=[ctx.scratch() / "argvprobe"])
     if not base_argv and p.get("discover_argv", True):
         base_argv, auto_argv, wants_config, door = _discover_argv(ctx, target, exec_timeout)
     elif any(a for a in base_argv):
