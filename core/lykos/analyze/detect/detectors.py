@@ -2254,29 +2254,42 @@ def _a64_scan_function(ctx, faddr, blocks, out):
                 reg[dst] = ("gapage", c) if c is not None else None
                 continue
             if mnem == "add" and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
-                v = reg.get(_a64_canon(ops[1]))
                 imm = int(ops[2].lstrip("#"), 0)
+                sreg = _a64_canon(ops[1])
+                if sreg in ("sp", "x29"):
+                    reg[dst] = ("sa", "SP", imm)               # &local: a stack array base
+                    continue
+                v = reg.get(sreg)
                 if v and v[0] == "gapage":
                     g = _global_base(ctx, addr=v[1] + imm)
                     reg[dst] = ("ga", g[1], g[0], g[2]) if (g and g[1] is not None) else None
                 elif v and v[0] == "idx":
                     reg[dst] = ("idx", v[1], v[2] + imm, v[3])
+                elif v and v[0] == "sa":
+                    reg[dst] = ("sa", v[1], v[2] + imm)
                 else:
                     reg[dst] = None
                 continue
+            if mnem in ("lsl", "lsls") and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                v = reg.get(_a64_canon(ops[1]))                # a stack array scales the index HERE
+                sh = int(ops[2].lstrip("#"), 0)                # (`lsl x0,x0,#2`), not in the operand
+                reg[dst] = ("idx", v[1] << sh, v[2] << sh, v[3]) if (v and v[0] == "idx") else None
+                continue
             mm = _a64_mem(ops[-1], names)
             if mm and mm[0] == "indexed":                      # an array access
-                base, idx = reg.get(mm[1]), reg.get(mm[2])
+                base = reg.get(mm[1]) if mm[1] not in ("sp", "x29") else ("sa", "SP", 0)
+                idx = reg.get(mm[2])
                 store = mnem.startswith("st")
-                if base and base[0] == "ga" and idx and idx[0] == "idx":
+                if base and base[0] in ("ga", "sa") and idx and idx[0] == "idx":
                     scale, off = idx[1] * mm[3], idx[2] * mm[3]
-                    gbase = ("global", base[2], base[1], base[3])
+                    abase = (("global", base[2], base[1], base[3]) if base[0] == "ga"
+                             else ("stack", base[1], base[2]))
                     src = idx[3]
                     chk = check_for(src, ba, pred, mm[2])
-                    v = _index_verdict(chk, gbase, scale, off) if chk else None
+                    v = _index_verdict(chk, abase, scale, off) if chk else None
                     if v is not None:
                         verdict, oob = v
-                        out.append(_array_index_cand(faddr, i.get("addr"), gbase, scale, off,
+                        out.append(_array_index_cand(faddr, i.get("addr"), abase, scale, off,
                                                      src, "write" if store else "read", chk,
                                                      verdict, oob))
                 if not store:
@@ -2559,15 +2572,47 @@ def _arm32_scan_function(ctx, faddr, blocks, out, call_names):
                 else:
                     reg[dst] = None
                 continue
-            if mnem == "add" and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+            if mnem in ("lsl", "lsls") and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                v = reg.get(_arm32_canon(ops[1]))              # arm32 scales the index explicitly
+                sh = int(ops[2].lstrip("#"), 0)
+                reg[dst] = ("idx", v[1] << sh, v[2] << sh, v[3]) if (v and v[0] == "idx") else None
+                continue
+            if mnem in ("mov", "cpy") and len(ops) == 3:       # `mov rD, rS, lsl #s` inline shift
+                m = re.search(r"lsl\s*#?(0x[0-9a-fA-F]+|\d+)", ops[2].lower())
                 v = reg.get(_arm32_canon(ops[1]))
-                imm = int(ops[2].lstrip("#"), 0)
-                reg[dst] = ("idx", v[1], v[2] + imm, v[3]) if (v and v[0] == "idx") else None
+                sh = int(m.group(1), 0) if m else None
+                reg[dst] = (("idx", v[1] << sh, v[2] << sh, v[3])
+                            if (sh is not None and v and v[0] == "idx") else None)
+                continue
+            if mnem in ("add", "sub") and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                v = reg.get(_arm32_canon(ops[1]))
+                d = int(ops[2].lstrip("#"), 0) * (1 if mnem == "add" else -1)
+                if v and v[0] == "idx":
+                    reg[dst] = ("idx", v[1], v[2] + d, v[3])
+                elif v and v[0] == "ptr":
+                    reg[dst] = ("ptr", v[1], v[2], v[3] + d, v[4])
+                else:
+                    reg[dst] = None
+                continue
+            if mnem == "add" and len(ops) >= 3 and _arm32_isreg(ops[1]) and _arm32_isreg(ops[2]):
+                # `add rD, <frame base>, <idx>` (optionally `, lsl #s`): a stack array element pointer
+                sh = 0
+                if len(ops) >= 4:
+                    m = re.search(r"lsl\s*#?(0x[0-9a-fA-F]+|\d+)", ops[3].lower())
+                    sh = int(m.group(1), 0) if m else 0
+                a, b2 = _arm32_canon(ops[1]), _arm32_canon(ops[2])
+                fb = a if a in ("sp", "r11") else (b2 if b2 in ("sp", "r11") else None)
+                iv = reg.get(b2) if a in ("sp", "r11") else reg.get(a)
+                if fb and iv and iv[0] == "idx":
+                    sb = ("stack", "R11" if fb == "r11" else "SP", 0)
+                    reg[dst] = ("ptr", sb, iv[1] << sh, iv[2] << sh, iv[3])
+                else:
+                    reg[dst] = None
                 continue
             mm = _arm32_mem(ops[-1], names)
+            store = mnem in ("str", "strb", "strh")
             if mm and mm[0] == "indexed":
                 base, idx = reg.get(mm[1]), reg.get(mm[2])
-                store = mnem in ("str", "strb", "strh")
                 if base and base[0] == "ga" and idx and idx[0] == "idx":
                     scale, off = idx[1] * mm[3], idx[2] * mm[3]
                     gbase = ("global", base[2], base[1], base[3])
@@ -2581,11 +2626,23 @@ def _arm32_scan_function(ctx, faddr, blocks, out, call_names):
                 if not store:
                     reg[dst] = None
                 continue
+            if mm and mm[0] == "base" and reg.get(mm[1]) and reg[mm[1]][0] == "ptr":
+                p = reg[mm[1]]                                 # a stack array element pointer + disp
+                src = p[4]
+                chk = check_for(src, ba, pred, mm[1])
+                v = _index_verdict(chk, p[1], p[2], p[3] + mm[2]) if chk else None
+                if v is not None:
+                    verdict, oob = v
+                    out.append(_array_index_cand(faddr, i.get("addr"), p[1], p[2], p[3] + mm[2], src,
+                                                 "write" if store else "read", chk, verdict, oob))
+                if not store:
+                    reg[dst] = None
+                continue
             if mnem in ("ldr", "ldrb", "ldrh", "ldrsb", "ldrsh") and mm and mm[0] == "slot" \
                     and mm[1] in slots:
                 reg[dst] = ("idx", 1, 0, slots[mm[1]])
                 continue
-            if mnem == "mov" and len(ops) == 2 and _arm32_isreg(ops[1]):
+            if mnem in ("mov", "cpy") and len(ops) == 2 and _arm32_isreg(ops[1]):
                 reg[dst] = reg.get(_arm32_canon(ops[1]))
                 continue
             if mnem not in _ARM32_NO_IDX_WRITE and _arm32_isreg(ops[0]):

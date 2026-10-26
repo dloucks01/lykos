@@ -458,3 +458,77 @@ def test_arm32_array_index_single_function(store, case, pool, arm32_gcc, tmp_pat
     assert {"unchk", "param_unchk"} <= set(got), (opt, got)   # these reproduce whatever the opt
     if opt == "-O0":
         assert set(got) == set(expected), got                # -O0 (plain branches) gets all four
+
+
+# ----------------------------------------------------------------- ARM stack arrays (compiled) ---
+_STACK_SRC = r"""
+#include <stdlib.h>
+#define NI __attribute__((noinline))
+NI int unchk_local(char *s){ int b[16]; int k = atoi(s); b[k] = 1; return b[0]; }  /* unchecked */
+NI int chk_local(char *s){ int b[16]; int k = atoi(s); if (k>=0 && k<16) b[k]=2; return b[0]; }  /* safe */
+int main(int c, char **v){ return unchk_local(v[1]) + chk_local(v[1]); }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_aarch64_stack_array_index(store, case, pool, a64_gcc, tmp_path, opt):
+    """CWE-129 into a STACK array on aarch64: `add xB, sp, #off; str wN, [xB, xI, lsl #s]` (the
+    index scaled by `lsl`). Extent is unknown, so only unchecked/signed are claimed -- the
+    bounds-checked local stays silent. No false positive on the checked case."""
+    c = tmp_path / "s.c"; c.write_text(_STACK_SRC)
+    out = tmp_path / "s"
+    if subprocess.run([a64_gcc, opt, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o",
+                       str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="s")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "aarch64":
+        pytest.skip("backend did not identify aarch64")
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if d:
+                got.setdefault(names.get(d["function"]), set()).add((d["check"]["verdict"],
+                                                                     d["array"]["kind"]))
+    assert got == {"unchk_local": {("unchecked", "stack")}}, got      # chk_local must stay silent
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_arm32_stack_array_index(store, case, pool, arm32_gcc, tmp_path, monkeypatch, opt):
+    """CWE-129 into a STACK array on arm32, where the element pointer is built explicitly
+    (`mov r3,r3,lsl #2; add r3,r3,fp; str r2,[r3,#-off]` at -O0; `add r0,sp,r0,lsl #2; str [r0]`
+    at -O2) -- a `ptr` value the scanner folds into a stack base. Checked local stays silent."""
+    monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
+    c = tmp_path / "s.c"; c.write_text(_STACK_SRC)
+    out = tmp_path / "s"
+    if subprocess.run([arm32_gcc, opt, "-marm", "-fno-stack-protector", "-no-pie", "-w", str(c),
+                       "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="s")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "arm" or store.targets.get(t.id).bits != 32:
+        pytest.skip("backend did not identify arm32")
+    one = FunctionDAO(store.conn).get(next(iter(FunctionDAO(store.conn).list_by_target(t.id))).id)
+    if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", []) for i in b.get("instructions", [])):
+        pytest.skip("this backend emits no P-Code for arm32")
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if d:
+                got.setdefault(names.get(d["function"]), set()).add((d["check"]["verdict"],
+                                                                     d["array"]["kind"]))
+    assert got == {"unchk_local": {("unchecked", "stack")}}, got
