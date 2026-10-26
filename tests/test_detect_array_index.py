@@ -377,15 +377,16 @@ def a64_gcc():
     return cc
 
 
-def test_aarch64_array_index_single_function(store, case, pool, a64_gcc, tmp_path):
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_aarch64_array_index_single_function(store, case, pool, a64_gcc, tmp_path, opt):
     """CWE-129 on aarch64 (single function): an input/parameter index into a GLOBAL array via
     `str/ldr wN,[xB,xI,lsl #s]`. The P-Code dominating-check analysis (reused unchanged) reads the
     aarch64 `cmp;b.cond` guards, so a checked/clamped/in-bounds access stays silent while unchecked,
-    signed-only and past-the-end ones are flagged. Built at -O0 (the index is spilled to a slot;
-    an -O2 register-only index is not yet followed -- silent, not wrong)."""
+    signed-only and past-the-end ones are flagged. Both the -O0 slot-spilled index and the -O2
+    register-only index (the strtol result / a parameter in w0, carried across the check edge)."""
     c = tmp_path / "a.c"; c.write_text(_A64_SRC)
     out = tmp_path / "a"
-    if subprocess.run([a64_gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o",
+    if subprocess.run([a64_gcc, opt, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o",
                        str(out)], capture_output=True).returncode != 0:
         pytest.skip("cannot cross-compile the aarch64 fixture")
     t = ingest(store, case.id, out, filename="a")
