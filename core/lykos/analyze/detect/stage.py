@@ -7,7 +7,7 @@ from ... import observe
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from . import bounds, scriptscan, taint
-from .catalog import entry_seed_params
+from .catalog import entry_seed_params, normalize
 from .detectors import DETECTORS, DetectContext, correlate
 
 _log = logging.getLogger(__name__)
@@ -291,6 +291,19 @@ def _is_runtime_fn(name) -> bool:
     return bool(name) and str(name).startswith(_RUNTIME_PREFIXES)
 
 
+def drop_import_stub_edges(functions, edges) -> list:
+    """Ghidra models each PLT stub as a function named after its import that "calls" it (`memcpy`
+    at the stub -> external memcpy). That jump is not a call site in the program: filed as one,
+    it is a copy with no recoverable destination or bound, so every guarded memcpy/strcpy kept an
+    unbounded, taint-marked phantom site and stayed corroborated (5 false positives on the
+    benchmark under Ghidra; the native backend has no such edge). Only an EXTERNAL edge from a
+    function of the same name is dropped -- a recursive call is internal and always kept."""
+    fname = {f.addr: normalize(f.name or "") for f in functions}
+    return [e for e in edges
+            if not (e.external and e.dst_name and fname.get(e.src_addr)
+                    and fname[e.src_addr] == normalize(e.dst_name))]
+
+
 def _program_only(ctx, target, functions):
     """(functions, call_edges, dropped) restricted to the program's own code where possible."""
     from ..elf import program_ranges
@@ -301,6 +314,7 @@ def _program_only(ctx, target, functions):
     if runtime:
         functions = [f for f in functions if f.addr not in runtime]
         edges = [e for e in edges if e.src_addr not in runtime]
+    edges = drop_import_stub_edges(functions, edges)
     try:
         blob = ctx.content.path(target.sha256).read_bytes()
         ranges = program_ranges(blob)

@@ -267,6 +267,41 @@ def test_a_check_both_of_whose_edges_reach_the_copy_constrains_nothing():
     assert bounds.guard_bound(_blocks(g), "0x2000", _SLOT, bases=("RBP",)) is None
 
 
+def _store_slot(value, addr="0x4000"):
+    """`mov dword [rbp-4], value` as gcc -O0 P-Code: the constant goes through a temporary."""
+    return _i(addr, [f"INT_ADD reg:RBP:8 const:{_SLOT_DISP}:8 -> unique:0x8f00:8",
+                     f"COPY const:{value:#x}:4 -> unique:0xd500:4",
+                     "STORE const:0x1b1:8 unique:0x8f00:8 unique:0xd500:4"],
+              f"MOV dword ptr [RBP-4],{value:#x}")
+
+
+def _side_path(*instrs):
+    """`if (n > 63) { ... }` falling back into the copy: the violating edge goes to 0x4000,
+    which then joins the copy at 0x2000."""
+    g = _x86_guard(63, "JA", "0x4000", "0x2000")
+    return _blocks(g) + [{"addr": "0x4000", "succ": ["0x2000"], "instructions": list(instrs)}]
+
+
+def test_a_check_whose_failing_edge_still_reaches_the_copy_bounds_nothing():
+    """`if (n > 63) log(); memcpy(b, s, n)`: the safe edge dominates the copy, but the failing
+    edge reaches it too. This used to read as `at most 63 bytes` -- a real overflow, hidden."""
+    assert bounds.guard_bound(_side_path(), "0x2000", _SLOT, bases=("RBP",)) is None
+
+
+def test_a_clamp_on_the_failing_edge_keeps_the_bound():
+    """`if (n > 63) n = 63;` -- the failing edge reaches the copy, but with n replaced by a
+    constant that satisfies the check. (A guard used to be dropped for ANY store between it and
+    the copy, which flagged this, the commonest safe pattern, as an overflow.)"""
+    got = bounds.guard_bound(_side_path(_store_slot(63)), "0x2000", _SLOT, bases=("RBP",))
+    assert got is not None and got["bound"] == 63
+
+
+def test_a_store_that_breaks_the_check_is_not_a_clamp():
+    """`if (n > 63) n = 256;` replaces n with a value the check rejects: no bound."""
+    assert bounds.guard_bound(_side_path(_store_slot(256)), "0x2000", _SLOT,
+                              bases=("RBP",)) is None
+
+
 # ------------------------------------------------------- signed lengths are not bounded
 # `if (n < 64) memcpy(buf, s, n)` on an `int` reads as a careful bounds check and is not one:
 # n = -1 passes it, and memcpy's size_t parameter takes that as 0xFFFFFFFFFFFFFFFF. Measured

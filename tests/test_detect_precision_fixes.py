@@ -400,3 +400,19 @@ def test_over_the_taint_cap_the_stage_runs_ranked_and_reports_it(store, case, gc
     hits = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "array_index"]
     assert hits and any(e.get("array_index", {}).get("array", {}).get("elements") == 10
                         for f in hits for e in f.evidence)
+
+
+def test_a_ghidra_plt_stub_is_not_a_call_site():
+    """Ghidra models the `memcpy` PLT stub as a function `memcpy` that calls the external
+    memcpy. Filed as a copy site, that phantom kept every guarded memcpy corroborated. Only the
+    external self-named edge goes; a recursive call (internal) stays."""
+    from types import SimpleNamespace as N
+
+    from lykos.analyze.detect.stage import drop_import_stub_edges
+    fns = [N(addr="0x10b0", name="memcpy"), N(addr="0x1200", name="main"),
+           N(addr="0x1300", name="walk")]
+    edges = [N(src_addr="0x10b0", dst_name="memcpy", external=True),         # the stub
+             N(src_addr="0x1200", dst_name="memcpy", external=False),        # the real call
+             N(src_addr="0x1300", dst_name="walk", external=False)]          # recursion
+    kept = drop_import_stub_edges(fns, edges)
+    assert [e.src_addr for e in kept] == ["0x1200", "0x1300"]

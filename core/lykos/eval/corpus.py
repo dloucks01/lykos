@@ -162,6 +162,16 @@ int main(int c, char**v){ char b[64];
            write(1,b,n); }
   return 0; }
 """, note="memcpy length clamped to the destination size before the copy"),
+    Case("memcpy_guard_logs_only", "CWE-120", "bad", r"""
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int c, char**v){ char b[64];
+  if(c>1){ size_t n=strlen(v[1]); if(n > sizeof b) fputs("input too long\n", stderr);
+           memcpy(b, v[1], n); write(1,b,1); }
+  return 0; }
+""", note="the length check only LOGS -- both of its edges reach the copy, so it bounds nothing "
+         "(guard_bound used to read it as `at most 64 bytes`)"),
     Case("memcpy_ptr_len_guarded", "CWE-120", "good", r"""
 #include <string.h>
 #include <unistd.h>

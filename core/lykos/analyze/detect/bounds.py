@@ -1752,6 +1752,85 @@ def _stores_slot(blk, slot, bases) -> bool:
     return False
 
 
+def _slot_store_values(blk, slot, bases) -> list:
+    """The values this block STORES to the frame slot, in order: an int for a constant store,
+    None for anything else. [] when the block does not store to it. Same address tracking as
+    _stores_slot."""
+    base_set = {_canon_reg(b) for b in (bases or ())}
+    regaddr: dict = {}
+    consts: dict = {}                                    # temp -> the constant it was COPYed
+    out: list = []
+    for ins in blk.get("instructions", []) or []:
+        for pc in ins.get("pcode", []) or []:
+            try:
+                mnem, _i, outk, toks = _parse(pc)
+            except Exception:
+                observe.absorbed(_log, "skipping this item")
+                continue
+            if mnem == "STORE" and len(toks) >= 4:
+                if regaddr.get(_key(toks[2])) == slot:
+                    v = _const_tok(toks[3])
+                    out.append(v if v is not None else consts.get(_key(toks[3])))
+                continue
+            if outk is None:
+                continue
+            c = _const_tok(toks[1]) if mnem == "COPY" and len(toks) >= 2 else None
+            if c is not None:
+                consts[outk] = c
+            else:
+                consts.pop(outk, None)
+            hit = None
+            if mnem == "INT_ADD" and len(toks) >= 3:
+                for rk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
+                    if rk and rk[0] == "reg" and _canon_reg(rk[1]) in base_set:
+                        d = _const_tok(dtok)
+                        if d is not None:
+                            hit = (_canon_reg(rk[1]), d)
+                            break
+            elif mnem == "COPY" and len(toks) >= 2:
+                hit = regaddr.get(_key(toks[1]))
+            if hit:
+                regaddr[outk] = hit
+            else:
+                regaddr.pop(outk, None)
+    return out
+
+
+def _satisfies(c, rel: str, k: int, signed) -> bool:
+    """Does the constant `c` satisfy `value REL k`? (An unsigned compare reads both as unsigned.)"""
+    if c is None:
+        return False
+    if signed is False:
+        c, k = c & 0xFFFFFFFFFFFFFFFF, k & 0xFFFFFFFFFFFFFFFF
+    return {"lt": c < k, "le": c <= k, "gt": c > k, "ge": c >= k, "eq": c == k,
+            "ne": c != k}.get(rel, False)
+
+
+def _clamps(blk, slot, bases, rel, k, signed) -> bool:
+    """The block stores to the slot, and every store is a constant that satisfies the guard
+    (`if (n > 64) n = 64;` -- the value leaving the block obeys `n <= 64` whatever came in)."""
+    vals = _slot_store_values(blk, slot, bases)
+    return bool(vals) and all(_satisfies(v, rel, k, signed) for v in vals)
+
+
+def _escapes_to(blocks, start, guard, site, barrier) -> bool:
+    """Can control get from `start` to `site` without passing a `barrier` block (a clamp) or
+    re-entering the guard (which checks again)?"""
+    succ = {b["addr"]: list(b.get("succ", []) or []) for b in blocks}
+    seen, todo = set(), [start]
+    while todo:
+        x = todo.pop()
+        if x in seen or x == guard:
+            continue
+        seen.add(x)
+        if x == site:
+            return True
+        if x in barrier:
+            continue
+        todo.extend(succ.get(x, ()))
+    return False
+
+
 def _between(blocks, src, dst) -> set:
     """Blocks on some path src -> ... -> dst (excluding src, including dst)."""
     succ = {b["addr"]: list(b.get("succ", []) or []) for b in blocks}
@@ -1798,15 +1877,6 @@ def guard_bound(blocks, site_block, slot, bases=(), dom=None):
         got = branch_predicate(blk.get("instructions", []) or [], slot, bases)
         if got is None:
             continue                                  # unreadable condition -> no claim
-        # The check bounds the value the slot held AT THE CHECK. A store to the slot on any path
-        # from the check to the use (`n = a(); if (n > 64) return; n = b(); memcpy(buf, s, n)`)
-        # replaces that value, and trusting the stale bound would demote a real overflow to
-        # "bounded". The site's own block is included whole (a store after the use is harmless
-        # but cannot be told apart here; the cost is a verdict left unknown, never a hidden bug).
-        if isinstance(slot, tuple) and len(slot) == 2 and slot[0] != "reg" and \
-                any(_stores_slot(by_addr[x], slot, bases) for x in _between(blocks, d, site_block)
-                    if x in by_addr):
-            continue
         target, (_tag, rel, k, signed) = got
         succ = blk.get("succ", []) or []
         # Which way did control go to reach the copy? A guard block can have MORE than two
@@ -1817,10 +1887,30 @@ def guard_bound(blocks, site_block, slot, bases=(), dom=None):
         if (target in reaching) and other:
             continue                                  # both edges reach it: no constraint
         if target in reaching:
-            holds = rel
+            holds, viol = rel, [x for x in succ if x != target]
         elif other:
-            holds = _NEGATE[rel]
+            holds, viol = _NEGATE[rel], [target]
         else:
+            continue
+        frame_slot = isinstance(slot, tuple) and len(slot) == 2 and slot[0] != "reg"
+        # Only a CLAMP -- a constant store that itself satisfies the check -- keeps the bound.
+        clamp = ({x for x in _between(blocks, d, site_block) | set(viol) if x in by_addr
+                  and _clamps(by_addr[x], slot, bases, holds, k, signed)} if frame_slot else set())
+        # The edge that VIOLATES the check must not reach the copy. That the other edge
+        # dominates it is not enough: `if (n > 64) log(); memcpy(b, s, n)` reaches the copy
+        # both ways and bounds nothing -- trusting it hid a real overflow. A path that passes a
+        # clamp (`if (n > 64) n = 64;`) is bounded again, so it does not count.
+        if any(_escapes_to(blocks, v, d, site_block, clamp) for v in viol):
+            continue
+        # The check bounds the value the slot held AT THE CHECK. A store to the slot on any path
+        # from the check to the use (`n = a(); if (n > 64) return; n = b(); memcpy(buf, s, n)`)
+        # replaces that value, and trusting the stale bound would demote a real overflow to
+        # "bounded" -- unless the store is a clamp. The site's own block is included whole (a
+        # store after the use is harmless but cannot be told apart here; the cost is a verdict
+        # left unknown, never a hidden bug).
+        if frame_slot and any(_stores_slot(by_addr[x], slot, bases)
+                              for x in _between(blocks, d, site_block)
+                              if x in by_addr and x not in clamp):
             continue
         # A dominating lower bound is what makes a signed upper bound trustworthy. This runs
         # before the zero-test rejection below, because `n >= 0` compares against exactly 0.
