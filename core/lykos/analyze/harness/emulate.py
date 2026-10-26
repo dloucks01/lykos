@@ -14,10 +14,9 @@ next increments. Pure-Python, no persistent-mode afl (so it is testable off the 
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
-
-from ..elf import parse as parse_elf
 
 _log = __import__("logging").getLogger(__name__)
 
@@ -72,57 +71,205 @@ def available() -> bool:
         return False
 
 
-def _map_segments(uc, data: bytes) -> None:
-    """Map the ELF's PT_LOAD segments into the emulator (page-aligned, RWX for simplicity)."""
-    from unicorn import UC_PROT_ALL
-    info = parse_elf(data)
-    loaded = 0
-    for s in getattr(info, "segments", None) or []:
-        # elf.parse may not expose segments; fall back to the section/program-header walk below.
-        pass
-    # Walk program headers directly (stdlib struct) -- elf.parse focuses on sections/dynamic.
+# R_X86_64_* relocation types the loader applies.
+_R_64, _R_GLOB_DAT, _R_JUMP_SLOT, _R_RELATIVE = 1, 6, 7, 8
+_MAX_RELOCS = 2_000_000              # pathological-table guard
+#: Where a PIE runs in the emulator: the base Linux itself uses with ASLR off. Results are
+#: translated back to the decompiler's coordinates (run_function's `load_base`).
+_PIE_BASE = 0x555555554000
+#: Synthetic entry points for imported functions reached through a GOT slot rather than a PLT stub
+#: (`-fno-plt`, `__libc_start_main`): each slot is pointed at one, and reaching it runs the same
+#: libc emulation a PLT call gets. Without them every such call jumped to 0 and "faulted".
+_STUB_ADDR = 0x0000EE0000000000
+_PLANS: "OrderedDict" = OrderedDict()   # id(data) -> (data, plan); see _load_plan
+
+
+def _load_plan(data: bytes) -> dict:
+    """How to lay the image out in the emulator -- which pages to map, the RELOCATED bytes to
+    write there, the import stubs and the PLT map -- computed once per image and reused by every
+    execution of a campaign.
+
+    A PIE runs where a loader puts it, with its dynamic relocations applied. The emulator used to
+    map it at its link address (0) without relocating it, which broke three ways, all measured:
+      * the Ghidra backend rebases a PIE (0x100000 on this toolchain), so every function it named
+        lay outside the mapped image -- the first instruction "faulted", and the harness filed a
+        high-severity control-flow corruption for every function it drove, harmless ones included;
+      * an lld-linked PIE leaves RELATIVE slots zero (GNU ld happens to pre-fill them), so pointer
+        tables and vtables read as NULL;
+      * lld puts .rodata in the first page, which the loader-at-0 had to unmap so a NULL deref
+        would still fault -- so every string literal read "faulted" as an out-of-bounds read."""
+    key = id(data)
+    hit = _PLANS.get(key)
+    if hit is not None and hit[0] is data:
+        _PLANS.move_to_end(key)
+        return hit[1]
+    plan = _build_plan(data)
+    _PLANS[key] = (data, plan)                           # holding `data` keeps its id unique
+    while len(_PLANS) > 4:
+        _PLANS.popitem(last=False)
+    return plan
+
+
+def _build_plan(data: bytes) -> dict:
     import struct
     if data[:4] != b"\x7fELF" or len(data) < 64:
         raise ValueError("not an ELF")
-    is64 = data[4] == 2
-    en = "<" if data[5] == 1 else ">"
-    if not is64:
+    if data[4] != 2:
         raise ValueError("harness executor is x86-64 only for now")
+    en = "<" if data[5] == 1 else ">"
     e_type = struct.unpack_from(en + "H", data, 0x10)[0]
+    base = _PIE_BASE if e_type == 3 else 0
     e_phoff = struct.unpack_from(en + "Q", data, 0x20)[0]
     e_phentsize, e_phnum = struct.unpack_from(en + "HH", data, 0x36)
-    page0_exec = False
+    loads, dyn = [], None
     for i in range(e_phnum):
         off = e_phoff + i * e_phentsize
-        p_type = struct.unpack_from(en + "I", data, off)[0]
-        if p_type != 1:                                  # PT_LOAD
-            continue
-        p_flags = struct.unpack_from(en + "I", data, off + 4)[0]
-        p_offset = struct.unpack_from(en + "Q", data, off + 8)[0]
-        p_vaddr = struct.unpack_from(en + "Q", data, off + 16)[0]
-        p_filesz = struct.unpack_from(en + "Q", data, off + 32)[0]
-        p_memsz = struct.unpack_from(en + "Q", data, off + 40)[0]
-        base = p_vaddr & ~(_PAGE - 1)
-        end = (p_vaddr + max(p_memsz, p_filesz) + _PAGE - 1) & ~(_PAGE - 1)
-        if base < _PAGE and (p_flags & 1):               # PF_X: code lives in the first page
-            page0_exec = True
-        _map_gaps(uc, base, max(_PAGE, end - base), UC_PROT_ALL)
-        seg = data[p_offset:p_offset + p_filesz]
-        if seg:
-            uc.mem_write(p_vaddr, seg)
-        loaded += 1
-    if not loaded:
+        p_type, p_flags = struct.unpack_from(en + "II", data, off)
+        p_offset, p_vaddr, _pa, p_filesz, p_memsz = struct.unpack_from(en + "QQQQQ", data, off + 8)
+        if p_type == 1:                                  # PT_LOAD
+            loads.append((p_vaddr, p_offset, p_filesz, p_memsz, p_flags))
+        elif p_type == 2:                                # PT_DYNAMIC
+            dyn = (p_offset, p_filesz)
+    if not loads:
         raise ValueError("no PT_LOAD segments to map")
-    # A PIE is linked at 0, so its header segment maps the NULL page -- and a NULL dereference
-    # then quietly read ELF-header bytes and carried on instead of faulting. Real PIEs never run
-    # at 0. With separate-code (the modern default) page 0 holds only headers/dynsym, which code
-    # never reads, so it is unmapped and a NULL deref faults as it does on a real system. A layout
-    # that puts CODE in page 0 keeps it (unmapping it would break the function itself).
-    if e_type == 3 and not page0_exec:
-        try:
-            uc.mem_unmap(0, _PAGE)
-        except Exception:                                # noqa: BLE001 -- page 0 was not mapped
-            pass
+    images = [bytearray(data[o:o + fs]) for (_v, o, fs, _m, _f) in loads]
+    extra: list = []                                     # slots past a segment's file bytes (.bss)
+    stubs: dict = {}                                     # import name -> synthetic entry
+
+    def file_off(va: int, n: int = 8):
+        for v, o, fs, _m, _f in loads:
+            if v <= va and va + n <= v + fs:
+                return o + (va - v)
+        return None
+
+    def put(va: int, value: int) -> None:
+        blob = struct.pack(en + "Q", value & 0xFFFFFFFFFFFFFFFF)
+        for i, (v, _o, fs, _m, _f) in enumerate(loads):
+            if v <= va and va + 8 <= v + fs:
+                images[i][va - v:va - v + 8] = blob
+                return
+        extra.append((base + va, blob))
+
+    def slot(va: int) -> int:
+        o = file_off(va)
+        return struct.unpack_from(en + "Q", data, o)[0] if o is not None else 0
+
+    applied = 0
+    tags: dict = {}
+    if dyn is not None:
+        o, sz = dyn
+        for k in range(0, max(0, min(sz, len(data) - o) - 15), 16):
+            t, v = struct.unpack_from(en + "qQ", data, o + k)
+            if t == 0:
+                break
+            tags.setdefault(t, v)
+    symtab = file_off(tags[6], 24) if 6 in tags else None
+    strtab = file_off(tags[5], 1) if 5 in tags else None
+
+    def sym(idx: int):
+        """(defined, value, is_function, is_weak, name) of dynamic symbol `idx`, or None."""
+        if symtab is None:
+            return None
+        so = symtab + idx * 24
+        if so + 24 > len(data):
+            return None
+        st_name, st_info = struct.unpack_from(en + "IB", data, so)
+        shndx = struct.unpack_from(en + "H", data, so + 6)[0]
+        value = struct.unpack_from(en + "Q", data, so + 8)[0]
+        name = ""
+        if strtab is not None and st_name:
+            a = strtab + st_name
+            name = data[a:data.find(b"\x00", a)].decode("latin-1", "ignore")
+        return (shndx != 0, value, (st_info & 0xF) in (0, 2, 10), (st_info >> 4) == 2, name)
+
+    tables = [(tags.get(7), tags.get(8, 0))]             # DT_RELA / DT_RELASZ
+    if tags.get(20, 7) == 7:                             # DT_PLTREL is RELA on x86-64
+        tables.append((tags.get(23), tags.get(2, 0)))    # DT_JMPREL / DT_PLTRELSZ
+    for va, size in tables:
+        ro = file_off(va, max(24, size)) if va else None
+        if ro is None:
+            continue
+        for k in range(0, size - 23, 24):
+            if applied >= _MAX_RELOCS:
+                break
+            r_off, r_info, r_add = struct.unpack_from(en + "QQq", data, ro + k)
+            typ, sidx = r_info & 0xFFFFFFFF, r_info >> 32
+            if typ == _R_RELATIVE:
+                if e_type == 3:
+                    put(r_off, base + r_add)
+            elif typ in (_R_64, _R_GLOB_DAT, _R_JUMP_SLOT):
+                s = sym(sidx) if sidx else None
+                if s is None:
+                    continue
+                defined, value, is_fn, weak, name = s
+                if defined and value:
+                    if e_type == 3:
+                        put(r_off, base + value + (r_add if typ == _R_64 else 0))
+                elif typ == _R_JUMP_SLOT:
+                    cur = slot(r_off)                    # lazy slot -> its own PLT stub
+                    if cur and e_type == 3:
+                        put(r_off, cur + base)
+                elif is_fn and name and not weak:
+                    # An import reached through its GOT slot: point it at a synthetic entry. A
+                    # weak one stays 0 -- the loader leaves an absent weak symbol NULL, and code
+                    # tests for that (`if (__gmon_start__) ...`).
+                    if name not in stubs:
+                        stubs[name] = _STUB_ADDR + 16 * len(stubs)
+                    put(r_off, stubs[name] + (r_add if typ == _R_64 else 0))
+                else:
+                    continue
+            else:
+                continue                                 # IRELATIVE/TLS/...: not modelled
+            applied += 1
+    # DT_RELR (packed relative): the slot already holds the link-time value; add the base.
+    rv, rsz = tags.get(36), tags.get(35, 0)
+    ro = file_off(rv, max(8, rsz)) if rv else None
+    if ro is not None and e_type == 3:
+        where = 0
+        for k in range(0, rsz - 7, 8):
+            ent = struct.unpack_from(en + "Q", data, ro + k)[0]
+            if not ent & 1:
+                where = ent
+                put(where, slot(where) + base)
+                where += 8
+            else:
+                for bit in range(63):
+                    if (ent >> (bit + 1)) & 1:
+                        put(where + bit * 8, slot(where + bit * 8) + base)
+                where += 63 * 8
+            applied += 1
+            if applied >= _MAX_RELOCS:
+                break
+    regions, writes = [], []
+    lo_img, hi_img = None, None
+    for (v, _o, fs, ms, _fl), img in zip(loads, images):
+        lo = (base + v) & ~(_PAGE - 1)
+        hi = (base + v + max(ms, fs) + _PAGE - 1) & ~(_PAGE - 1)
+        lo_img = lo if lo_img is None else min(lo_img, lo)
+        hi_img = hi if hi_img is None else max(hi_img, hi)
+        regions.append((lo, max(_PAGE, hi - lo)))
+        if img:
+            writes.append((base + v, bytes(img)))
+    if stubs:
+        size = (16 * len(stubs) + _PAGE - 1) & ~(_PAGE - 1)
+        regions.append((_STUB_ADDR, size))
+        writes.append((_STUB_ADDR, b"\xc3" * size))     # `ret`: never runs (the hook stops first)
+    plt = {base + a: n for a, n in _plt_map(data).items()}
+    plt.update({a: n for n, a in stubs.items()})
+    return {"e_type": e_type, "base": base, "span": (lo_img, hi_img), "regions": regions,
+            "writes": writes + extra, "relocations": applied, "stubs": len(stubs), "plt": plt}
+
+
+def _map_segments(uc, data: bytes) -> dict:
+    """Map the ELF's PT_LOAD segments into the emulator (page-aligned, RWX for simplicity): a PIE
+    at _PIE_BASE with its dynamic relocations applied, plus the import stubs. Returns the plan."""
+    from unicorn import UC_PROT_ALL
+    plan = _load_plan(data)
+    for lo, size in plan["regions"]:
+        _map_gaps(uc, lo, size, UC_PROT_ALL)
+    for addr, blob in plan["writes"]:
+        uc.mem_write(addr, blob)
+    return plan
 
 
 def _map_gaps(uc, base: int, size: int, prot) -> None:
@@ -385,13 +532,14 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
 
 
 def _setup(elf_bytes: bytes, res: HarnessResult):
-    """Create the emulator, map the ELF + stack/input/heap/sentinel/TLS, set the fake stack canary.
-    Returns (uc, plt, heap) on success or None (with res.note set) on a mapping failure."""
+    """Create the emulator, map the ELF (a PIE at _PIE_BASE, relocated) + stack/input/heap/
+    sentinel/TLS, set the fake stack canary. Returns (uc, plan, heap) on success or None (with
+    res.note set) on a mapping failure."""
     from unicorn import UC_ARCH_X86, UC_MODE_64, UC_PROT_ALL, Uc
     from unicorn.x86_const import UC_X86_REG_FS_BASE
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
     try:
-        _map_segments(uc, elf_bytes)
+        plan = _map_segments(uc, elf_bytes)
         uc.mem_map(_STACK_TOP - _STACK_SZ, _STACK_SZ, UC_PROT_ALL)
         uc.mem_map(_INPUT_ADDR, _INPUT_SZ, UC_PROT_ALL)
         uc.mem_map(_SENTINEL & ~(_PAGE - 1), _PAGE, UC_PROT_ALL)
@@ -405,7 +553,7 @@ def _setup(elf_bytes: bytes, res: HarnessResult):
     # __stack_chk_fail). Without this every canary-protected function faults at 0x28 on entry.
     uc.reg_write(UC_X86_REG_FS_BASE, _TLS_ADDR)
     uc.mem_write(_TLS_ADDR + 0x28, b"\x11\x22\x33\x44\x55\x66\x77\x00")
-    return uc, _plt_map(elf_bytes), {"next": _HEAP_ADDR}
+    return uc, plan, {"next": _HEAP_ADDR}
 
 
 def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap, *,
@@ -514,6 +662,14 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
             if res.crashed:
                 break
             cur = retaddr
+        if res.crashed and res.access == "fetch" and res.fault_addr == func_addr:
+            # The function's own entry is not mapped: the address and the loaded image disagree
+            # (a decompiler base the loader was not given). Nothing the input did; never a fault.
+            res.crashed = False
+            res.note = (res.note + "; " if res.note else "") + (
+                f"function entry {func_addr:#x} is not in the loaded image -- address/image "
+                "mismatch, not a fault")
+            break
         if (res.crashed and res.artifact_null and res.fault_addr is not None
                 and res.fault_addr < _NULL_PAGE):
             # A NULL-page fault after a stub returned a NULL the real callee would not have
@@ -533,32 +689,54 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
     return res
 
 
+def _shift_for(plan: dict, load_base: int) -> int:
+    """Emulator address minus decompiler address. 0 for a fixed-address executable."""
+    return plan["base"] - load_base if plan["e_type"] == 3 else 0
+
+
+def _to_decompiler(res: HarnessResult, plan: dict, shift: int) -> HarnessResult:
+    """Report addresses inside the image in the decompiler's coordinates (what the function table,
+    the finding sites and the crash dedup keys use). Addresses outside it -- the input buffer, the
+    heap, a wild pointer -- are runtime values and stay as they are."""
+    if not shift:
+        return res
+    lo, hi = plan["span"]
+
+    def back(a):
+        return a - shift if (a is not None and lo <= a < hi) else a
+    res.fault_pc = back(res.fault_pc)
+    res.fault_addr = back(res.fault_addr)
+    res.blocks = {back(b) for b in res.blocks}
+    return res
+
+
 def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
-                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS) -> HarnessResult:
+                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS,
+                 load_base: int = 0) -> HarnessResult:
     """Execute ONE function with `input_bytes` as its buffer argument; report fault + coverage.
 
     `arg_shape`: "ptr_len" -> rdi=&input, rsi=len; "ptr" -> rdi=&input. Reaching the sentinel
     return means the function returned cleanly; an access to unmapped memory means it faulted
     (a memory-safety bug reached by driving this one function). A single-message `run_sequence`.
+
+    `load_base`: where the DECOMPILER placed a PIE (0 for the native backend, 0x100000 for
+    Ghidra). `func_addr` is in those coordinates and so is every address reported back.
     """
-    res = HarnessResult()
-    setup = _setup(elf_bytes, res)
-    if setup is None:
-        return res
-    uc, plt, heap = setup
-    return _drive_messages(uc, func_addr, [input_bytes], res, plt, heap,
-                           arg_shape=arg_shape, max_insns=max_insns)
+    return run_sequence(elf_bytes, func_addr, [input_bytes], arg_shape=arg_shape,
+                        max_insns=max_insns, load_base=load_base)
 
 
 def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
-                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS) -> HarnessResult:
+                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS,
+                 load_base: int = 0) -> HarnessResult:
     """Drive a stateful function with a SEQUENCE of messages in one emulator state (T6).
 
     A dispatch-style parser transitions between states as it consumes messages; a bug can live in
     a state only reachable after a specific prefix (e.g. after a HELLO then an AUTH). Each message
     is a fresh call with its own stack and input buffer, but globals and the heap carry over, so a
     later call sees the state the earlier calls established. Coverage is cumulative; the result's
-    `seq_index` says which message faulted. With a single message this is exactly `run_function`."""
+    `seq_index` says which message faulted. With a single message this is exactly `run_function`.
+    `load_base` as for run_function."""
     res = HarnessResult()
     if not messages:
         res.note = "empty sequence"
@@ -566,6 +744,8 @@ def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
     setup = _setup(elf_bytes, res)
     if setup is None:
         return res
-    uc, plt, heap = setup
-    return _drive_messages(uc, func_addr, list(messages), res, plt, heap,
-                           arg_shape=arg_shape, max_insns=max_insns)
+    uc, plan, heap = setup
+    shift = _shift_for(plan, load_base)
+    _drive_messages(uc, func_addr + shift, list(messages), res, plan["plt"], heap,
+                    arg_shape=arg_shape, max_insns=max_insns)
+    return _to_decompiler(res, plan, shift)

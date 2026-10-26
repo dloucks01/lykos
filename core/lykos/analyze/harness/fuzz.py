@@ -127,7 +127,8 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
                   arg_shape: str = "ptr_len", budget_execs: int = 20000,
                   budget_seconds: float = 60.0, max_crashes: int = 8, max_oracle: int = 2,
                   dictionary: Optional[list] = None, sequence: bool = False,
-                  seq_sep: bytes = b"\n", max_messages: int = 6, seed: int = 1337) -> FuzzResult:
+                  seq_sep: bytes = b"\n", max_messages: int = 6, seed: int = 1337,
+                  load_base: int = 0) -> FuzzResult:
     """Coverage-guided fuzz of one function. Returns crashing inputs + the corpus it built.
 
     `dictionary` (T4): the function's own constant operands -- magic values, length limits, opcodes
@@ -138,7 +139,10 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
     `sequence` (T6): drive each candidate as an ORDERED SEQUENCE of messages (the flat buffer split
     on `seq_sep`, capped at `max_messages`) through `run_sequence`, so state a stateful parser only
     enters after a specific message prefix becomes reachable. The crash reproducer is the whole
-    buffer plus the separator convention; `HarnessResult.seq_index` says which message faulted."""
+    buffer plus the separator convention; `HarnessResult.seq_index` says which message faulted.
+
+    `load_base`: where a PIE is loaded -- the decompiler's image base, so `func_addr` and every
+    reported address share its coordinates (see emulate._load_plan)."""
     rng = random.Random(seed)
     fr = FuzzResult()
     corpus = [bytes(s) for s in (seeds or [b"\x00\x00\x00\x00\x00\x00\x00\x00"]) if s is not None]
@@ -150,8 +154,8 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
     def _drive(buf: bytes) -> HarnessResult:
         if sequence:
             return run_sequence(elf_bytes, func_addr, _split_messages(buf, seq_sep, max_messages),
-                                arg_shape=arg_shape)
-        return run_function(elf_bytes, func_addr, buf, arg_shape=arg_shape)
+                                arg_shape=arg_shape, load_base=load_base)
+        return run_function(elf_bytes, func_addr, buf, arg_shape=arg_shape, load_base=load_base)
 
     seen_crash_sites: set = set()
     exec_errors = 0

@@ -8,8 +8,12 @@ must still establish. The finding says exactly that and does NOT claim a program
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import elf
+from ..debug.rootcause import image_base
 from ..detect.catalog import DANGEROUS, SOURCES, normalize
 from ..dynamic import sandbox
 from ..fuzz.runner import invocation
@@ -70,6 +74,89 @@ def _drive_shape(rf) -> str:
     return "ptr" if rf.ptr_len == 1 else "ptr_len"
 
 
+def _decompiler_base(conn, target, data: bytes) -> Optional[int]:
+    """Where the decompiler placed the image: 0 for a fixed-address executable; for a PIE, derived
+    from the entry function (Ghidra rebases a PIE to 0x100000, the native backend keeps 0). None
+    when a PIE gives nothing to anchor on."""
+    try:
+        info = elf.parse(data)
+    except Exception:                                    # noqa: BLE001 -- not parseable: no PIE logic
+        return 0
+    if info.elf_type != "dyn":
+        return 0
+    return image_base(FunctionDAO(conn).list_by_target(target.id), info.entry)
+
+
+def _locate_program_crash(ctx, target, exe, mode, base_argv, inp: bytes, lead: dict,
+                          timeout: float) -> tuple:
+    """(in_function, detail): does the PROGRAM-level crash on this input happen in the function
+    the harness drove? A whole-program crash on the same bytes is not, by itself, the same bug --
+    the input can fault the program long before (or after) the function, at another site.
+
+    Captured under the ptrace helper and symbolised exactly as root_cause does. It counts as
+    this function's crash when
+      * the function is on the crashing stack (the faulting instruction is in it, or it is a
+        caller of the code that faulted), or
+      * the harness saw a control-flow fault in it, the program ENTERED it on this input
+        (a breakpoint at its entry was hit), and the program then faulted at a PC outside
+        every mapped module -- the smashed-return shape, whose stack is no longer walkable.
+    Anything else -- including a crash the debugger cannot reproduce or locate -- is not
+    attributed, and the finding stays where the function-level evidence put it."""
+    import sys
+
+    from ..debug.rootcause import _to_int, build_slice, rebase_delta
+    from ..poc.capture import make_capture, materialize_helper
+    fa = _to_int(lead.get("function_addr"))
+    name = lead.get("func_name") or (f"0x{fa:x}" if fa is not None else "the function")
+    if sandbox.host_arch() != "x86-64":
+        return False, ("the crash site could not be located (the ptrace capture needs an x86-64 "
+                       "host)")
+    try:
+        cap_fn = make_capture(ctx, materialize_helper(), exe, mode, base_argv, timeout,
+                              sys.executable)
+        cap = cap_fn(inp)
+    except Exception as e:                               # noqa: BLE001 -- unlocated, not promoted
+        return False, f"the crash site could not be located ({type(e).__name__}: {str(e)[:80]})"
+    if not cap.get("ok") or not cap.get("signal_name"):
+        return False, ("the crash did not reproduce under the debugger, so its site is unknown"
+                       + (f" ({str(cap.get('reason'))[:80]})" if cap.get("reason") else ""))
+    functions = FunctionDAO(ctx.conn).list_by_target(target.id)
+    try:
+        info = elf.parse(exe.read_bytes())
+        entry, pie = info.entry, info.elf_type == "dyn"
+    except Exception:                                    # noqa: BLE001 -- frames match absolutely
+        entry, pie = None, False
+    maps = cap.get("maps") or []
+    frames = build_slice(cap, functions, [], [], maps, str(exe), None, entry)["backtrace"]
+
+    def where(fr) -> str:
+        a = fr.get("addr")
+        sym = fr.get("symbol") or fr.get("module") or "?"
+        return f"{sym} (pc 0x{a:x})" if isinstance(a, int) else sym
+
+    for depth, fr in enumerate(frames):
+        if fa is not None and _to_int(fr.get("func_addr")) == fa:
+            how = ("the faulting instruction is in" if depth == 0
+                   else f"frame {depth} of the crashing stack is")
+            return True, f"{how} {name} ({cap.get('signal_name')})"
+    top = frames[0] if frames else {}
+    if lead.get("access") == "fetch" and fa is not None and top.get("module") == "??":
+        # runtime minus decompiler address: 0 for a fixed-address image (rebase_delta is only
+        # meaningful for a PIE -- for ET_EXEC it returns the module's load address)
+        delta = rebase_delta(maps, str(exe), functions, entry) if pie else 0
+        if delta is not None:
+            try:
+                hit = cap_fn(inp, breakpoints=[fa + delta]).get("breakpoint_hit")
+            except Exception:                            # noqa: BLE001 -- unlocated, not promoted
+                hit = None
+            if hit:
+                return True, (f"the program entered {name} on this input and then jumped to an "
+                              f"unmapped pc ({where(top)}) -- the control-flow corruption the "
+                              "harness demonstrated in this function")
+    return False, (f"the program faulted in {where(top) if top else 'an unknown location'}, not "
+                   f"in {name} -- a different site, so it does not demonstrate this finding")
+
+
 def _replay_against_program(ctx, target, p, leads) -> int:
     """THE HARNESS -> L3 BRIDGE (honest). A harness crash is demonstrated at the FUNCTION level; to
     climb the ladder it must become a PROGRAM-level fact. For each function-level crashing input, run
@@ -123,19 +210,33 @@ def _replay_against_program(ctx, target, p, leads) -> int:
                         "seed for concolic/directed_fuzz")))
         if r.crashed:
             prog_crashes += 1
-            # raise the finding to confirmed: a second, PROGRAM-LEVEL channel now agrees.
-            fd.upsert(target.id, target.case_id, {
-                "cwe": lead["cwe"], "title": lead["title"], "severity": lead["severity"],
-                "detector": "harness", "state": "confirmed",
-                "confidence": max(lead.get("confidence", 0.8), 0.9),
-                "site_addr": lead.get("site_addr"), "function_addr": lead.get("function_addr"),
-                "dedup_key": lead["dedup_key"],
-                "evidence": [{"channel": "harness-replay", "detail": (
-                    f"the function-level crashing input {sha[:12]} ({len(inp)} B) ALSO faults the "
-                    f"whole program when delivered over '{mode}' ({r.signal_name or 'crash'}) -- a "
-                    "program-level crash. This promotes the lead from function-level to a real "
-                    "program crash the exploit ladder can escalate (root_cause -> build_poc -> "
-                    "poc_primitive -> build_exploit).")}]})
+            ours, located = _locate_program_crash(ctx, target, exe, mode, base_argv, inp, lead,
+                                                  max(exec_timeout, 5.0))
+            base = {"cwe": lead["cwe"], "title": lead["title"], "severity": lead["severity"],
+                    "detector": "harness", "channel": "harness-replay", "run_id": ctx.run_id,
+                    "site_addr": lead.get("site_addr"),
+                    "function_addr": lead.get("function_addr"), "dedup_key": lead["dedup_key"]}
+            if ours:
+                # raise the finding to confirmed: a second, PROGRAM-LEVEL channel now agrees.
+                fd.upsert(target.id, target.case_id, {**base, "state": "confirmed",
+                    "confidence": max(lead.get("confidence", 0.8), 0.9),
+                    "evidence": [{"channel": "harness-replay", "detail": (
+                        f"the function-level crashing input {sha[:12]} ({len(inp)} B) ALSO faults "
+                        f"the whole program when delivered over '{mode}' "
+                        f"({r.signal_name or 'crash'}), and {located}. This promotes the lead from "
+                        "function-level to a program crash at this function, which the exploit "
+                        "ladder can escalate (root_cause -> build_poc -> poc_primitive -> "
+                        "build_exploit).")}]})
+            else:
+                # The program crashed, but not provably HERE: the crash row still feeds the ladder
+                # (root_cause attributes it on its own), the finding keeps its function-level state.
+                fd.upsert(target.id, target.case_id, {**base, "state": "corroborated",
+                    "confidence": lead.get("confidence", 0.8),
+                    "evidence": [{"channel": "harness-replay", "detail": (
+                        f"the function-level crashing input {sha[:12]} ({len(inp)} B) also crashes "
+                        f"the whole program over '{mode}' ({r.signal_name or 'crash'}), but {located}"
+                        ". Not promoted: the program crash is recorded for root_cause to attribute, "
+                        "and this finding stays function-level.")}]})
     return prog_crashes
 
 
@@ -175,6 +276,14 @@ def harness_stage(ctx) -> dict:
         return {"supported": True, "findings": 0, "note": note}
 
     data = ctx.content.path(target.sha256).read_bytes()
+    load_base = _decompiler_base(ctx.conn, target, data)
+    if load_base is None:
+        note = ("cannot establish where the decompiler placed this position-independent image "
+                "(no entry function to anchor it), so harness addresses would not match the "
+                "function table -- declined rather than driving the wrong code")
+        ctx.emit("harness.done", payload={"supported": False, "note": note})
+        ctx.progress(pct=100, msg="harness: image base unknown")
+        return {"supported": False, "findings": 0, "note": note}
     execs = int(p.get("harness_execs", 8000))
     per_sec = float(p.get("harness_seconds", 20.0))
     fd = FindingDAO(ctx.conn)
@@ -198,7 +307,8 @@ def harness_stage(ctx) -> dict:
         ctx.progress(msg=f"harness-fuzzing {label} ({shape}, {len(dict_words)} dict)")
         try:
             fr = fuzz_function(data, rf.addr, arg_shape=shape, budget_execs=execs,
-                               budget_seconds=per_sec, dictionary=dict_words)
+                               budget_seconds=per_sec, dictionary=dict_words,
+                               load_base=load_base)
         except Exception as e:                           # noqa: BLE001 -- one function must not sink the stage
             ctx.emit("harness.progress", payload={"func": hex(rf.addr), "error": str(e)[:120]})
             continue
@@ -230,7 +340,8 @@ def harness_stage(ctx) -> dict:
                     "reachable-if-driven lead for a daemon whose entry path a concolic/reachability "
                     "pass must still connect. Not a program-level verified PoC.")}]})
             prog_leads.append({"sha": sha, "input": inp, "cwe": cwe, "title": title,
-                               "severity": "high", "confidence": 0.8,
+                               "severity": "high", "confidence": 0.8, "access": r.access,
+                               "func_name": label,
                                "site_addr": pc if r.fault_pc is not None else None,
                                "function_addr": hex(rf.addr), "dedup_key": dedup})
             findings += 1
@@ -242,7 +353,7 @@ def harness_stage(ctx) -> dict:
             single_sites = {(c["result"].fault_pc, c["result"].access) for c in fr.crashes}
             try:
                 sfr = fuzz_function(data, rf.addr, arg_shape=shape, dictionary=dict_words,
-                                    sequence=True,
+                                    sequence=True, load_base=load_base,
                                     budget_execs=int(p.get("harness_seq_execs", 3000)),
                                     budget_seconds=float(p.get("harness_seq_seconds", 8.0)))
             except Exception as e:                           # noqa: BLE001 -- never sink the stage
@@ -266,7 +377,8 @@ def harness_stage(ctx) -> dict:
                     dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}"
                     title = f"Harness-demonstrated {kind} in {label} (stateful sequence)"[:200]
                     prog_leads.append({"sha": sha, "input": inp, "cwe": cwe, "title": title,
-                                       "severity": "high", "confidence": 0.8,
+                                       "severity": "high", "confidence": 0.8, "access": r.access,
+                                       "func_name": label,
                                        "site_addr": pc if r.fault_pc is not None else None,
                                        "function_addr": hex(rf.addr), "dedup_key": dedup})
                     fd.upsert(target.id, target.case_id, {
