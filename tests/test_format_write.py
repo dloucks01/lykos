@@ -125,7 +125,7 @@ def fmt_loop_bin(gcc, tmp_path_factory, x86_64_only):
     return out
 
 
-def test_format_auto_got_to_shell(store, case, pool, fmt_loop_bin):
+def test_format_auto_got_to_shell(store, case, pool, fmt_loop_bin, tmp_path):
     """P-item: fully-AUTO format-string -> shell, no analyst params and no win. The stage leaks libc
     via a %s read of a GOT slot, overwrites printf@GOT with system, and sends "/bin/sh" so the loop's
     next printf becomes system("/bin/sh"). strategy=auto; confirmed by a spawned shell."""
@@ -137,6 +137,10 @@ def test_format_auto_got_to_shell(store, case, pool, fmt_loop_bin):
     assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
     assert any(pc.level == "L3" and pc.verified
                for pc in PocDAO(store.conn).list_by_target(t.id)), "no confirmed L3 format->shell"
+    # The bundle shipped a dummy shell comment; it now re-leaks libc and drives the shell.
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 @pytest.fixture
@@ -157,7 +161,7 @@ def fmt_fgets_bin(gcc, tmp_path_factory, x86_64_only):
     return out
 
 
-def test_format_auto_got_to_shell_fgets(store, case, pool, fmt_fgets_bin):
+def test_format_auto_got_to_shell_fgets(store, case, pool, fmt_fgets_bin, tmp_path):
     """Regression: an fgets-based printf(user) sink reached L2 but the auto format->shell chain wrote
     its overwrite and "/bin/sh" without a trailing newline, so fgets never returned and the shell
     never spawned ("format GOT->system did not spawn a shell"). With the line terminator it confirms."""
@@ -169,6 +173,9 @@ def test_format_auto_got_to_shell_fgets(store, case, pool, fmt_fgets_bin):
     assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
     assert any(pc.level == "L3" and pc.verified
                for pc in PocDAO(store.conn).list_by_target(t.id)), "no confirmed L3 format->shell (fgets)"
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_format_write_refuses_got_overwrite_under_full_relro(store, case, pool, fmt_bin_fullrelro):
