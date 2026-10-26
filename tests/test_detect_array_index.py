@@ -249,13 +249,13 @@ int main(int argc, char **argv) {
     set_const(3);
     clampi(atoi(argv[1]));
     second(1, atoi(argv[1]));
-    outer(atoi(argv[1]));                       /* two calls deep: not followed */
+    outer(atoi(argv[1]));                       /* two calls deep: forwarded param, now followed */
     return 0;
 }
 """
 # callee -> the verdict the detector must reach; every other function must stay silent
 _PARAM_EXPECT = {"set_unchecked": "unchecked", "put": "bound", "sgn": "signed",
-                 "second": "unchecked"}
+                 "second": "unchecked", "inner": "unchecked"}
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
@@ -293,3 +293,55 @@ def test_an_input_index_passed_to_another_function(store, case, pool, gcc, tmp_p
             if via:
                 assert names.get(via["caller"]) == "main" and "passed as argument" in e["detail"]
     assert got == {k: {v} for k, v in _PARAM_EXPECT.items()}, got
+
+
+_DEEP_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define CALLEE __attribute__((noipa))
+CALLEE void leaf(int i) { table[i] = 1; }          /* indexes the forwarded param */
+CALLEE void mid(int i)  { leaf(i); }               /* forwards it on (hop 2) */
+CALLEE void top(int i)  { mid(i); }                /* forwards it on (hop 1) */
+CALLEE void safe_leaf(int i) { table[i] = 2; }
+CALLEE void safe_top(int i) { if (i >= 0 && i < 10) safe_leaf(i); }   /* a bound on the way */
+int main(int argc, char **argv) {
+    top(atoi(argv[1]));            /* main -> top -> mid -> leaf: three edges, unchecked */
+    safe_top(atoi(argv[2]));       /* bounded before the forward: must stay silent */
+    return 0;
+}
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_an_input_index_forwarded_across_several_calls(store, case, pool, gcc, tmp_path, opt):
+    """main parses an index and it is forwarded top -> mid -> leaf (three call edges) before it
+    indexes `table`. The join follows the parameter across every edge; `leaf` is flagged unchecked.
+    `safe_top` bounds the index before forwarding it to `safe_leaf`, which must stay silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "deep.c"
+    c.write_text(_DEEP_SRC)
+    out = tmp_path / "deep"
+    if subprocess.run([gcc, opt, "-fno-stack-protector", "-no-pie", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="deep")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if not d:
+                continue
+            fn = names.get(d["function"])
+            got.setdefault(fn, set()).add(d["check"]["verdict"])
+            via = d["index"].get("via_call")
+            if fn == "leaf":
+                assert via and names.get(via["caller"]) == "main" and via.get("hops", 1) >= 2, via
+    assert got == {"leaf": {"unchecked"}}, got

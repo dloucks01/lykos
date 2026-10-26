@@ -1863,7 +1863,7 @@ def _combine_checks(caller, callee):
     return ("bounded", min(caller[1], callee[1]), bool(caller[2] or callee[2]))
 
 
-def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out):
+def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail=None):
     """Pass 1 of array_index over ONE function (see array_index)."""
     from . import bounds
     ir = {"blocks": blocks}
@@ -1930,16 +1930,26 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out):
                         rsrc = {"source": _norm_call(body), "source_site": i.get("addr"),
                                 "slot": None, "kind": "register"}
                         origin[id(rsrc)] = (ba, j)
+            # A `call`, or a TAIL `jmp <func>` (how -O2 forwards a parameter: `outer: jmp inner`),
+            # that passes an input index as an argument, unscaled. Two kinds, both recorded so pass
+            # 2 can chain them: a value the caller PARSED itself (kind != param) is an entry into
+            # the cross-function join; the caller's OWN parameter forwarded on (kind == param) is a
+            # middle edge -- following it is how a register-carried index crosses MORE THAN ONE edge.
+            callee = None
+            if mnem == "call":
                 callee = targets.get(_naddr(i.get("addr")))
-                if callee is not None:
-                    passed = {}
-                    for k, r in enumerate(_ARG_REGS):
-                        v = tr.st.get(r)
-                        if v and v[0] == "idx" and v[1] == 1 and v[2] == 0 and \
-                                v[3].get("kind") != "param":
-                            passed[k] = (v[3], check_for(v[3], ba, pred))
-                    if passed:
-                        calls.append((faddr, i.get("addr"), callee, passed))
+            elif mnem == "jmp" and ops and resolve_tail is not None:
+                callee = resolve_tail(ops[0])                 # a tail call leaves `faddr` for callee
+                if callee == _naddr(faddr):
+                    callee = None                             # a self-loop jmp, not a tail call
+            if callee is not None:
+                passed = {}
+                for k, r in enumerate(_ARG_REGS):
+                    v = tr.st.get(r)
+                    if v and v[0] == "idx" and v[1] == 1 and v[2] == 0:
+                        passed[k] = (v[3], check_for(v[3], ba, pred))
+                if passed:
+                    calls.append((faddr, i.get("addr"), callee, passed))
             hit = tr.step(mnem, ops, reg_source=rsrc)
             if not hit:
                 continue
@@ -1978,29 +1988,83 @@ def array_index(ctx: DetectContext):
     calls: list = []                       # (caller, call site, callee addr, {k: (src, check)})
     targets = {_naddr(e.site_addr): _naddr(e.dst_addr) for e in (ctx.call_edges or [])
                if getattr(e, "dst_addr", None) and not getattr(e, "external", False)}
+    # Resolve a tail `jmp` operand to a function entry: the decompiler does not record a call edge
+    # for a tail call, so a forwarded parameter at -O2 (`outer: jmp sym.inner`) is invisible through
+    # `targets` alone. Match the operand against the known function entries, by name or by address.
+    func_entries = {_naddr(a) for a in ctx.func_irs}
+    fn_by_name: dict = {}
+    for f in (ctx.functions or []):
+        nm, ad = getattr(f, "name", None), getattr(f, "addr", None)
+        if nm and ad is not None:
+            fn_by_name[normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", nm))] = _naddr(ad)
+
+    def resolve_tail(operand):
+        tok = (operand or "").strip()
+        if not tok or re.search(r"[\[\]+*]", tok):            # a memory / computed jmp is not a tail call
+            return None
+        if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", tok):
+            a = _naddr(tok)
+            return a if a in func_entries else None
+        a = fn_by_name.get(normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", tok)))
+        return a if (a is not None and a in func_entries) else None
+
     for faddr, ir in ctx.func_irs.items():
         # the dominator / guard machinery keys every block by its address: a block without one
         # (a degenerate decompiler record) is dropped rather than allowed to sink the detector
         blocks = [b for b in ((ir or {}).get("blocks") or []) if isinstance(b, dict) and b.get("addr")]
         if not blocks or len(blocks) > 2000:
             continue
-        _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out)
-    # Pass 2: an input value handed to a function that indexes with that parameter.
+        _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail)
+    # Pass 2: an input value handed to a function that indexes with that parameter -- following a
+    # forwarded parameter across MORE THAN ONE call edge. Index the calls by callee and by the
+    # caller-PARAMETER each argument carries, then walk from every PARSED-input pass, combining the
+    # check at each edge, to the access that indexes the parameter at the end of the chain.
+    #
+    #   main: i=atoi(argv[1]); f(i)   -->   f(p): g(p)   -->   g(q): table[q]
+    #
+    # `forwards[(func, param)]` = the calls that pass func's parameter `param` onward (to callee
+    # arg k', with the check func applies first); `summaries[func]` = the accesses func indexes
+    # with a parameter. A visited set and a depth bound keep a recursive/mutually-recursive call
+    # graph finite; the join stays silent (never a false finding) when any edge's check is
+    # undecidable, since `_combine_checks(None, ...)` is None.
+    forwards: dict = defaultdict(list)
+    seeds = []                                            # (caller, call_site, callee, k, src, check)
     for caller, call_site, callee, passed in calls:
-        for (cfaddr, site, base, scale, off, k, access, cchk) in summaries.get(callee, ()):
-            if k not in passed:
-                continue
-            src, caller_check = passed[k]
-            check = _combine_checks(caller_check, cchk)
-            if check is None:
-                continue
-            v = _index_verdict(check, base, scale, off)
-            if v is None:
-                continue
-            verdict, oob = v
-            via = dict(src, via={"caller": caller, "call_site": call_site, "argument": k + 1})
-            out.append(_array_index_cand(cfaddr, site, base, scale, off, via, access, check,
-                                         verdict, oob))
+        for k, (src, chk) in passed.items():
+            if src.get("kind") == "param":
+                # keyed by (normalised function addr, its parameter index) so the walk, which
+                # arrives with a `_naddr`-normalised callee, matches it (summaries use `_naddr` too)
+                forwards[(_naddr(caller), src["param"])].append((call_site, callee, k, chk))
+            else:
+                seeds.append((caller, call_site, callee, k, src, chk))
+
+    def _emit(cfaddr, site, base, scale, off, access, check, src, chain):
+        v = _index_verdict(check, base, scale, off)
+        if v is None:
+            return
+        verdict, oob = v
+        first = chain[0]
+        via = dict(src, via={"caller": first[0], "call_site": first[1], "argument": first[2] + 1,
+                             "hops": len(chain)})
+        out.append(_array_index_cand(cfaddr, site, base, scale, off, via, access, check,
+                                     verdict, oob))
+
+    def _walk(func, param, check, src, chain, visited):
+        if check is None or len(chain) > 6:               # undecidable edge, or too deep -> stop
+            return
+        if (func, param) in visited:                      # a cycle in the call graph -> stop
+            return
+        visited = visited | {(func, param)}
+        for (cfaddr, site, base, scale, off, k, access, cchk) in summaries.get(func, ()):
+            if k == param:
+                _emit(cfaddr, site, base, scale, off, access, _combine_checks(check, cchk),
+                      src, chain)
+        for (call_site, callee, k, chk) in forwards.get((func, param), ()):
+            _walk(callee, k, _combine_checks(check, chk), src, chain + [(func, call_site, k)],
+                  visited)
+
+    for caller, call_site, callee, k, src, chk in seeds:
+        _walk(callee, k, chk, src, [(caller, call_site, k)], set())
     return out
 
 
@@ -2028,6 +2092,8 @@ def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict
     if via:
         idx_from += (f", passed as argument {via['argument']} by the call at {via['call_site']} "
                      f"in {via['caller']}")
+        if via.get("hops", 1) > 1:
+            idx_from += f" and forwarded through {via['hops']} call(s) to this access"
     expr = f"index*{scale}" + (f"{off:+d}" if off else "")
     if verdict == "unchecked":
         why = "no dominating check bounds it from above on this path"
