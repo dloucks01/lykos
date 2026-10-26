@@ -425,7 +425,8 @@ def canary_overread_bin(tmp_path_factory):
     return exe
 
 
-def test_exploit_stage_auto_defeats_canary_via_overread(store, case, pool, canary_overread_bin):
+def test_exploit_stage_auto_defeats_canary_via_overread(store, case, pool, canary_overread_bin,
+                                                        tmp_path):
     """strategy=auto defeats a stack canary leaked by a buffer OVER-READ (no format-string sink):
     the stage fills the buffer, harvests the raw spilled canary word, discovers the offsets, writes
     the canary back and ret2libc's past it to a confirmed L3 shell -- no analyst params."""
@@ -445,9 +446,11 @@ def test_exploit_stage_auto_defeats_canary_via_overread(store, case, pool, canar
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"over-read canary defeat produced no confirmed L3 (pocs={[(p.level, p.verified) for p in pocs]})"
-    # NOTE: the shipped reproducer does not yet replay THIS target -- a forking while(1) loop with
-    # two reads per iteration (leak fill, then overflow) that the generic canary script's single
-    # re-entry feed does not satisfy. Tracked in doc 51 item 2. The live confirm above is sound.
+    # The reproducer harvests the canary as a canary-SHAPED raw word (low byte 0, >=5 non-zero
+    # bytes) -- a naive every-8-bytes harvest picked a garbage word and tripped __stack_chk_fail.
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_classify_leak_auto_recovers_libc_and_canary():
