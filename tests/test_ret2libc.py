@@ -269,7 +269,7 @@ def test_analyst_ret2libc_pie_spawns_shell(pie_leak_bin):
     assert res2["ok"]
 
 
-def test_exploit_stage_files_l3_pie_ret2libc(store, case, pool, pie_leak_bin):
+def test_exploit_stage_files_l3_pie_ret2libc(store, case, pool, pie_leak_bin, tmp_path):
     """End-to-end through the ladder with strategy=ret2libc: a PIE binary under ASLR, given the
     analyst's leak symbol, is driven to a CONFIRMED L3 PIE ret2libc (shell spawned, marker echoed)."""
     from lykos.analyze.ingest import enqueue_triage, ingest
@@ -289,6 +289,10 @@ def test_exploit_stage_files_l3_pie_ret2libc(store, case, pool, pie_leak_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 PIE ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
+    # exploit.py re-leaks the base and pops a shell; it used to hang on an unbounded read.
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_find_canary_and_prefix():
@@ -548,7 +552,7 @@ def pie_fmtleak_bin(tmp_path_factory):
     return exe
 
 
-def test_strategy_auto_pie_ret2libc(store, case, pool, pie_fmtleak_bin):
+def test_strategy_auto_pie_ret2libc(store, case, pool, pie_fmtleak_bin, tmp_path):
     """End-to-end: strategy=auto on a PIE target with a reachable format-string libc leak reaches a
     CONFIRMED L3 with NO analyst leak config -- auto_provoke_leak + recover_libc_base do it."""
     from lykos.analyze.ingest import enqueue_triage, ingest
@@ -567,6 +571,10 @@ def test_strategy_auto_pie_ret2libc(store, case, pool, pie_fmtleak_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"strategy=auto did not auto-solve PIE ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
+    # auto mode baked LEAK_OFF=0; exploit.py now corroborates the base across leaked slots.
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_render_canary_script_reproduces_shell(canary_bin, tmp_path):
