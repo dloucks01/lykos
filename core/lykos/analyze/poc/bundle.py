@@ -1469,6 +1469,74 @@ def leak_replay(argv, stage1: bytes, leak: dict, stage2: dict, meta: dict,
             {"replay_leak.py": _LEAK_REPLAY, "leak.json": json.dumps(spec, indent=1).encode()})
 
 
+_MAGIC_REPLAY = b'''#!/usr/bin/env python3
+"""Replay a magic-value overwrite: the overflow writes a guard's magic constant into a local, so
+the target takes a protected branch that reads and prints a flag file. We plant a flag with a
+random marker the input never carried, run the target with the overflow on its channel, and check
+the marker came back -- a reflected input cannot forge it. Exit 0 = reproduced.
+RUN IN A SANDBOX/VM -- this executes an untrusted binary. Authorized use only."""
+import json
+import os
+import random
+import subprocess
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+spec = json.load(open(os.path.join(here, "magic.json")))
+exe = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+with open(os.path.join(here, "input.bin"), "rb") as f:
+    payload = f.read()
+token = "LYKOS_FLAG_%08x" % random.getrandbits(32)
+for name in spec["flag_names"]:                          # the target opens one of these by name
+    try:
+        with open(os.path.join(here, name), "w") as fh:
+            fh.write(token + "\\n")
+    except OSError:
+        pass
+argv = list(spec.get("argv") or [])
+stdin_bytes = b""
+if spec["mode"] == "file":
+    carrier = os.path.join(here, "input.bin")
+    argv = [carrier if a == "@@" else a for a in argv] if "@@" in argv else argv + [carrier]
+elif spec["mode"] == "arg":
+    s = payload.split(b"\\0", 1)[0].decode("latin-1")    # an argument ends at its first NUL
+    argv = [s if a == "@@" else a for a in argv] if "@@" in argv else argv + [s]
+else:
+    stdin_bytes = payload
+p = subprocess.Popen([exe] + argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, cwd=here)
+try:
+    out, _ = p.communicate(stdin_bytes, timeout=float(spec.get("timeout", 10)))
+except subprocess.TimeoutExpired:
+    p.kill()
+    out, _ = p.communicate()
+sys.stdout.write(out.decode("latin-1"))
+if token.encode() in out:
+    print("\\n[+] the magic gate opened and the planted flag was printed -- reproduced")
+    sys.exit(0)
+print("\\n[-] the flag marker did not appear")
+sys.exit(1)
+'''
+
+
+def magic_replay(mode: str, argv, flag_names, meta: dict,
+                 timeout: float = 10.0) -> tuple[str, dict]:
+    """(run_cmd, extra_files) for a magic-value overwrite; sets meta's verdict.
+
+    The overflow payload is static (no leak), so it ships as input.bin; the only thing the bundle
+    was missing is the flag file the target opens by name. The old bundle shipped neither a flag
+    nor a runner that plants one, so the target's fopen missed and nothing printed. Plants a random
+    marker so a reflected input cannot forge the proof."""
+    meta["verdict"] = {"exit": "zero", "script": "runner.sh",
+                       "note": "runner.sh plants a flag with a random marker and exits 0 only when "
+                               "the overwrite made the target print it; 1 otherwise"}
+    spec = {"mode": mode if mode in ("file", "arg") else "stdin",
+            "argv": [str(a) for a in argv or []],
+            "flag_names": list(flag_names), "timeout": timeout}
+    return ("python3 ./replay_magic.py ./target.bin",
+            {"replay_magic.py": _MAGIC_REPLAY, "magic.json": json.dumps(spec, indent=1).encode()})
+
+
 def build_secret(target_bytes: bytes, secrets: list, meta: dict) -> bytes:
     """Bundle a hard-coded-secret PoC: the binary, the extracted secret(s), and a pure-stdlib
     offline re-extractor that proves the credential is embedded (no target execution).

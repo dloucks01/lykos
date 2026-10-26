@@ -111,7 +111,7 @@ def test_no_gate_when_flag_is_unconditional(nogate_bin):
     assert find_magic_gates(nogate_bin.read_bytes()) == []
 
 
-def test_build_exploit_confirms_magic_overwrite(store, case, pool, magic_bin):
+def test_build_exploit_confirms_magic_overwrite(store, case, pool, magic_bin, tmp_path):
     t = ingest(store, case.id, magic_bin, filename="magic")
     q = JobQueue(store.conn)
     enqueue_triage(q, t, force=True); assert pool.wait_idle(30)
@@ -124,6 +124,11 @@ def test_build_exploit_confirms_magic_overwrite(store, case, pool, magic_bin):
     assert any("magic-value" in e.get("detail", "") for f in pb for e in f.evidence)
     l3 = next(pc for pc in pocs if pc.level == "L3")
     assert l3.finding_id
+    # The bundle used to ship no flag file, so runner.sh printed nothing. It now plants one with a
+    # random marker and proves the overwrite made the target disclose it.
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_explicit_magic_strategy(store, case, pool, magic_bin):
