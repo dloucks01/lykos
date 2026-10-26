@@ -407,3 +407,54 @@ def test_aarch64_array_index_single_function(store, case, pool, a64_gcc, tmp_pat
                 continue
             got.setdefault(names.get(d["function"]), set()).add(d["check"]["verdict"])
     assert got == {k: {v} for k, v in _A64_EXPECT.items()}, got
+
+
+# ------------------------------------------------------------------- arm32 (cross-compiled) ------
+@pytest.fixture
+def arm32_gcc():
+    cc = shutil.which("arm-linux-gnueabihf-gcc")
+    if not cc:
+        pytest.skip("no arm32 cross-compiler (arm-linux-gnueabihf-gcc)")
+    return cc
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_arm32_array_index_single_function(store, case, pool, arm32_gcc, tmp_path, monkeypatch, opt):
+    """CWE-129 on 32-bit ARM (single function). Same conservative shape as aarch64, but the global
+    base comes from a PC-relative literal pool and the frame base is fp/r11. arm32 needs P-Code
+    (the ghidra backend), so force it; a function using ARM conditional execution for the bound
+    (the -O2 `cmp;popls` idiom) is skipped -- SILENT, never a false finding. Every flagged function
+    must carry its correct verdict (no false positive); -O0 gets all four."""
+    monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
+    c = tmp_path / "a.c"; c.write_text(_A64_SRC)                # same fixture, cross-compiled to arm
+    out = tmp_path / "a"
+    if subprocess.run([arm32_gcc, opt, "-marm", "-fno-stack-protector", "-no-pie", "-w", str(c),
+                       "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile the arm32 fixture")
+    t = ingest(store, case.id, out, filename="a")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "arm" or store.targets.get(t.id).bits != 32:
+        pytest.skip("backend did not identify the target as arm32")
+    irs = {f.addr: f for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    from lykos.db.dao import FunctionDAO as _FD
+    one = _FD(store.conn).get(next(iter(irs.values())).id)
+    if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", []) for i in b.get("instructions", [])):
+        pytest.skip("this backend emits no P-Code for arm32 (the check analysis would be blind)")
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if d:
+                got.setdefault(names.get(d["function"]), set()).add(d["check"]["verdict"])
+    expected = {"unchk": "unchecked", "sgn": "signed", "bnd": "bound", "param_unchk": "unchecked"}
+    for fn, verdicts in got.items():                          # no false positive, no wrong verdict
+        assert fn in expected and verdicts == {expected[fn]}, (opt, fn, verdicts, got)
+    assert {"unchk", "param_unchk"} <= set(got), (opt, got)   # these reproduce whatever the opt
+    if opt == "-O0":
+        assert set(got) == set(expected), got                # -O0 (plain branches) gets all four

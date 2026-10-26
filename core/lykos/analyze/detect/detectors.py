@@ -1989,6 +1989,10 @@ _A64_NO_IDX_WRITE = {"cmp", "cmn", "tst", "str", "strb", "strh", "stp", "stur", 
                      "ret", "nop", "cbz", "cbnz", "tbz", "tbnz"}
 
 
+def _A64_COND_TERM(mnem):
+    return mnem.startswith("b.") or mnem in ("cbz", "cbnz", "tbz", "tbnz")
+
+
 def _a64_canon(reg):
     """The 64-bit name for an aarch64 register token (`w3`->`x3`, `wsp`/`sp`->`sp`), else the token."""
     r = (reg or "").lower()
@@ -2025,9 +2029,9 @@ def _a64_mem(op, names):
     if re.fullmatch(r"[wx]\d+", second.lower()):
         scale = 1
         if len(parts) >= 3:                                        # lsl #s / sxtw #s / uxtw #s
-            s = re.search(r"(?:lsl|sxtw|uxtw|sxtx)\s*#?(\d+)", parts[2].lower())
+            s = re.search(r"(?:lsl|sxtw|uxtw|sxtx)\s*#?(0x[0-9a-fA-F]+|\d+)", parts[2].lower())
             if s:
-                scale = 1 << int(s.group(1))
+                scale = 1 << int(s.group(1), 0)
             elif not re.search(r"(?:sxtw|uxtw|sxtx)\b", parts[2].lower()):
                 return None                                        # an extend with no shift is x1
         return ("indexed", base, _a64_canon(second), scale)
@@ -2106,11 +2110,21 @@ def _a64_index_slots(ctx, blocks, names, entry):
             if o not in taken and len(writes.get(o, [])) == 1}
 
 
-def _a64_slot_check(blocks, by_addr, site_block, slot_off, slot_name, dom):
-    """`_slot_check` for aarch64: the P-Code bounds analysis with (SP, X29) bases and an ("SP", off)
-    slot key -- an undecidable dominating branch that reads the slot -> None (no claim)."""
+def _arm_slot_check(blocks, by_addr, site_block, slot, dom, bases, cond_term, touch_pred):
+    """`_slot_check` for an ARM-family ISA: the P-Code bounds analysis with the ISA's frame bases
+    and a (base, off) slot key -- a dominating branch that READS the slot but the evaluator cannot
+    turn into a bound -> None (no claim). aarch64 uses ("SP", positive off); arm32 uses ("R11",
+    negative off). `cond_term(mnem)` recognises the ISA's conditional branch; `touch_pred(text)`
+    recognises an instruction that reads the slot."""
     from . import bounds
-    slot, bases = ("SP", slot_off), ("SP", "X29")
+    # guard_bound is authoritative: a bound it finds is real, so trust it before the fallback guard
+    # below (which only decides unchecked-vs-undecidable when no bound was found). Without this
+    # order a block that both DEFINES and checks the index -- `str r0,[k]; cmp r0,#0; blt` on arm32
+    # -O0, where the store makes branch_predicate over the whole block read nothing -- would be
+    # called undecidable even though guard_bound correctly saw the bound.
+    g = bounds.guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
+    if g is not None:
+        return ("bounded", g["bound"], bool(g["nonneg"]))
     for d in dom.get(site_block, ()):
         if d == site_block:
             continue
@@ -2118,30 +2132,30 @@ def _a64_slot_check(blocks, by_addr, site_block, slot_off, slot_name, dom):
         if not ins:
             continue
         last = _ops((ins[-1].get("text") or "").split(";")[0].strip())[0]
-        ends_cond = last.startswith("b.") or last in ("cbz", "cbnz", "tbz", "tbnz")
-        touches = any(("[" + slot_name) in (i.get("text") or "") for i in ins)
-        if ends_cond and touches and bounds.branch_predicate(ins, slot, bases) is None:
-            return None
-    g = bounds.guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
-    return ("unchecked",) if g is None else ("bounded", g["bound"], bool(g["nonneg"]))
+        if cond_term(last) and any(touch_pred(i.get("text") or "") for i in ins) \
+                and bounds.branch_predicate(ins, slot, bases) is None:
+            return None                                   # a dominating branch reads it, unreadably
+    return ("unchecked",)
 
 
-def _a64_reg_check(pred_block, after_idx, idx_reg, site_block, dom):
-    """`_reg_check` for aarch64: an index held in a REGISTER across the edge from the block that
-    defined it (`bl strtol; cmp w0,#9; b.gt` / an incoming parameter checked before the access).
-    `cmp;b.gt` is signed (a negative index still reaches), `cmp;b.hi` unsigned (proves non-negative)
-    -- branch_predicate encodes which, and _edge_pred_bound maps it onto the taken edge."""
+def _arm_reg_check(pred_block, after_idx, names, site_block, dom, bases, cond_term):
+    """`_reg_check` for an ARM-family ISA: an index held in a REGISTER across the edge from the
+    block that defined it (`bl strtol; cmp w0,#9; b.gt` / an incoming parameter checked before the
+    access). `cmp;b.gt` is signed (a negative index still reaches), `cmp;b.hi` unsigned (proves
+    non-negative) -- branch_predicate encodes which, and _edge_pred_bound maps it onto the taken
+    edge. `names` are the (reg) keys to try (x0 vs w0); `cond_term(mnem)` says the predecessor ends
+    in a conditional branch this ISA can read."""
     from . import bounds
     ins = pred_block.get("instructions") or []
     if not ins:
         return ("unchecked",)
     last = _ops((ins[-1].get("text") or "").split(";")[0].strip())[0]
-    if not (last.startswith("b.") or last in ("cbz", "cbnz", "tbz", "tbnz")):
+    if not cond_term(last):
         return ("unchecked",)
     reaching = dom.get(site_block, ())
     after = ins[after_idx + 1:]
-    for name in ("X" + idx_reg[1:], "W" + idx_reg[1:]):            # the compare may name x0 or w0
-        got = bounds.branch_predicate(after, ("reg", name), ("SP", "X29"))
+    for name in names:
+        got = bounds.branch_predicate(after, ("reg", name), bases)
         if got is None:
             continue
         e = bounds._edge_pred_bound(got, pred_block.get("succ") or [], reaching, site_block)
@@ -2158,9 +2172,19 @@ def _array_index_arm(ctx, out):
             _a64_scan_function(ctx, faddr, blocks, out)
 
 
+def _has_pcode(blocks) -> bool:
+    """Does this function carry P-Code? The dominating-check analysis is P-Code-based, so WITHOUT
+    it `guard_bound` sees no guard and every indexed access would read as `unchecked` -- a false
+    finding over a checked access. A backend that emits no P-Code for an ISA (measured: the native
+    backend gives none for 32-bit ARM) must therefore make the scan SILENT, not blind."""
+    return any((i.get("pcode") for b in blocks for i in (b.get("instructions") or [])))
+
+
 def _a64_scan_function(ctx, faddr, blocks, out):
     """The aarch64 CWE-129 scan over ONE function (its own scope, so `check_for` binds cleanly)."""
     from . import bounds
+    if not _has_pcode(blocks):                            # no P-Code -> the check is invisible -> silent
+        return
     frame = ctx.frames.get(faddr) or {}
     _vs, names = _frame_vars(frame)
     entry = next((b.get("addr") for b in blocks if _naddr(b.get("addr")) == _naddr(faddr)),
@@ -2185,14 +2209,17 @@ def _a64_scan_function(ctx, faddr, blocks, out):
 
     def check_for(src, ba, pred, idx_reg):
         if src.get("slot"):
-            return _a64_slot_check(blocks, by_addr, ba, src["slot"][1], src["slot_name"], dom)
+            nm = src["slot_name"]
+            return _arm_slot_check(blocks, by_addr, ba, ("SP", src["slot"][1]), dom, ("SP", "X29"),
+                                   _A64_COND_TERM, lambda t: ("[" + nm) in t)
         o = origin.get(id(src))
         if o is None:
             return None
         if o[0] == ba:
             return ("unchecked",)                     # same block: no branch between
         if pred is not None and o[0] == pred:
-            return _a64_reg_check(by_addr[pred], o[1], idx_reg, ba, dom)
+            return _arm_reg_check(by_addr[pred], o[1], ("X" + idx_reg[1:], "W" + idx_reg[1:]), ba,
+                                  dom, ("SP", "X29"), _A64_COND_TERM)
         return None                                   # carried further than one edge
 
     for b in blocks:
@@ -2267,6 +2294,305 @@ def _a64_scan_function(ctx, faddr, blocks, out):
         tail[ba] = {r: v for r, v in reg.items() if v and v[0] == "idx"}
 
 
+# ---- arm32 CWE-129 -----------------------------------------------------------------------------
+# Same conservative shape as the aarch64 scanner, for 32-bit ARM. Two differences carry the weight:
+# (1) the global base comes from a PC-relative LITERAL POOL (`ldr r3,[0xLIT]; add r3,pc,r3`), not an
+# adrp, so the literal word is read from the image and added to the instruction's PC; (2) the frame
+# base is fp/r11 with NEGATIVE slot offsets, so the check key is ("R11", off) with bases (SP, R11).
+# The P-Code dominating-check analysis is reused unchanged. SOUNDNESS GUARD: at -O2 the compiler
+# uses ARM conditional execution for the bound (`cmp r0,#9; popls`/`popgt` -- a predicated return,
+# not a branch the P-Code reader models), which would make a CHECKED access look unchecked. So a
+# function that uses any predicated (conditional-suffix) instruction is skipped entirely -- silent,
+# never a false finding. At -O0 the checks are plain `cmp;b.cond` branches and are read soundly.
+_ARM32_ARG = ("r0", "r1", "r2", "r3")
+_ARM32_NO_IDX_WRITE = {"cmp", "cmn", "tst", "teq", "str", "strb", "strh", "stm", "stmdb", "push",
+                       "b", "bl", "blx", "bx", "nop", "pop", "ret"}
+_ARM32_CONDS = ("eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt",
+                "gt", "le")
+_ARM32_PRED_RE = re.compile(
+    r"^(ldr|ldrb|ldrh|str|strb|strh|mov|movw|movt|mvn|add|adc|sub|sbc|rsb|rsc|and|orr|eor|bic|"
+    r"mul|lsl|lsr|asr|ror|pop|push|ldm|ldmia|stm|stmdb|bx|blx|cmp|cmn|tst|teq)("
+    + "|".join(_ARM32_CONDS) + r")$")
+_ARM32_BRANCH_RE = re.compile(r"^b(" + "|".join(_ARM32_CONDS) + r")$")
+
+
+def _ARM32_COND_TERM(mnem):
+    return bool(_ARM32_BRANCH_RE.fullmatch(mnem))
+
+
+def _arm32_canon(reg):
+    r = (reg or "").lower()
+    return "r11" if r in ("fp", "r11") else r
+
+
+def _arm32_isreg(tok):
+    return bool(re.fullmatch(r"r\d+|fp|sp|lr|pc", (tok or "").lower()))
+
+
+def _word_at(ctx, vaddr, n=4):
+    """The little-endian integer of `n` bytes at virtual address `vaddr` in an allocated, file-backed
+    section of the image (a literal-pool word), or None."""
+    v = _naddr(vaddr)
+    if v is None:
+        return None
+    secs, data = _image_sections(ctx)
+    if not data:
+        return None
+    for sec in secs:
+        if not (sec["flags"] & 2) or sec["type"] == 8 or not sec["addr"]:
+            continue
+        if sec["addr"] <= v < sec["addr"] + sec["size"]:
+            off = sec["offset"] + (v - sec["addr"])
+            return int.from_bytes(data[off:off + n], "little") if off + n <= len(data) else None
+    return None
+
+
+def _arm32_mem(op, names):
+    """Classify an arm32 memory operand: ('slot', off, name) for an fp/r11-relative local
+    `[fp, #-8]`; ('indexed', base, idx, scale) for `[rB, rI, lsl #s]` / `[rB, rI]`; ('base', reg,
+    disp) for `[rN]` / `[rN, #imm]`; or None. A literal-pool `ldr rN,[0xADDR]` is handled by the
+    scanner, not here."""
+    m = re.search(r"\[([^\]]*)\]", op or "")
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group(1).split(",") if p.strip()]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        tok = parts[0]
+        if names and tok in names:
+            return ("slot", int(names[tok]), tok)
+        if _arm32_isreg(tok):
+            return ("base", _arm32_canon(tok), 0)
+        return None
+    base = parts[0]
+    if not _arm32_isreg(base):
+        return None
+    base = _arm32_canon(base)
+    second = parts[1].lstrip("#")
+    if _NUM.match(second) or re.fullmatch(r"-(?:0x)?[0-9a-fA-F]+", second):
+        disp = int(second, 0)
+        return ("slot", disp, None) if base == "r11" else ("base", base, disp)
+    if _arm32_isreg(parts[1]):
+        scale = 1
+        if len(parts) >= 3:
+            s = re.search(r"lsl\s*#?(0x[0-9a-fA-F]+|\d+)", parts[2].lower())
+            if s:
+                scale = 1 << int(s.group(1), 0)
+            else:
+                return None
+        return ("indexed", base, _arm32_canon(parts[1]), scale)
+    return None
+
+
+def _arm32_touch(disp):
+    """An instruction that reads the fp/r11-relative slot at `disp` (for the unreadable-guard scan)."""
+    def pred(t):
+        for mm in re.finditer(r"\[(?:fp|r11)\s*,\s*#?(-?(?:0x)?[0-9a-fA-F]+)\]", t or ""):
+            try:
+                if int(mm.group(1), 0) == disp:
+                    return True
+            except ValueError:
+                pass
+        return False
+    return pred
+
+
+def _arm32_pcbase(instr):
+    """The PC value an `add rN, pc, rM` uses, from its P-Code `INT_ADD const:<pc> const:<k>`."""
+    for pc in instr.get("pcode", []) or []:
+        m = re.match(r"INT_ADD const:(0x[0-9a-fA-F]+|\d+):\d+ const:(0x[0-9a-fA-F]+|\d+):\d+", pc)
+        if m:
+            return int(m.group(1), 0) + int(m.group(2), 0)
+    return None
+
+
+def _arm32_index_slots(ctx, blocks, names, entry, call_names):
+    """Frame-slot offset -> source dict (a parser result or a parameter spilled to fp/r11-relative
+    memory, single writer, address never taken)."""
+    writes: dict = defaultdict(list)
+    taken = set()
+    for b in blocks:
+        for i in b.get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops:
+                continue
+            if mnem in ("str", "strb", "strh"):
+                mm = _arm32_mem(ops[-1], names)
+                if mm and mm[0] == "slot":
+                    writes[mm[1]].append(_naddr(i.get("addr")))
+            if mnem in ("add", "sub") and len(ops) == 3 and _arm32_canon(ops[1]) in ("r11", "sp") \
+                    and _NUM.match(ops[2].lstrip("#")):
+                imm = int(ops[2].lstrip("#"), 0)
+                taken.add(-imm if mnem == "sub" else imm)
+    out = {}
+    for b in blocks:
+        ins = b.get("instructions") or []
+        for j, i in enumerate(ins):
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if mnem not in ("bl", "blx") or not ops:
+                continue
+            name = call_names.get(_naddr(i.get("addr"))) \
+                or normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0]))
+            if name not in _INT_PARSERS:
+                continue
+            for i2 in ins[j + 1:j + 4]:
+                m2, o2 = _ops((i2.get("text") or "").split(";")[0].strip())
+                if m2 == "str" and o2 and _arm32_canon(o2[0]) == "r0":
+                    mm = _arm32_mem(o2[-1], names)
+                    if mm and mm[0] == "slot":
+                        out[mm[1]] = {"source": name, "source_site": i.get("addr"),
+                                      "slot": ("R11", mm[1]), "slot_name": mm[2], "kind": "parsed"}
+                    break
+                if m2 in ("bl", "blx"):
+                    break
+    e = next((b for b in blocks if b.get("addr") == entry), blocks[0])
+    clob = set()
+    for i in e.get("instructions") or []:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if mnem in ("bl", "blx"):
+            break
+        if mnem == "str" and len(ops) == 2 and _arm32_canon(ops[0]) in _ARM32_ARG \
+                and _arm32_canon(ops[0]) not in clob:
+            mm = _arm32_mem(ops[1], names)
+            if mm and mm[0] == "slot" and mm[1] not in out:
+                k = _ARM32_ARG.index(_arm32_canon(ops[0]))
+                out[mm[1]] = {"source": f"argument {k + 1}", "source_site": i.get("addr"),
+                              "slot": ("R11", mm[1]), "slot_name": mm[2], "kind": "param", "param": k}
+        if ops and _arm32_isreg(ops[0]) and mnem not in _ARM32_NO_IDX_WRITE:
+            clob.add(_arm32_canon(ops[0]))
+    return {o: s for o, s in out.items() if o not in taken and len(writes.get(o, [])) == 1}
+
+
+def _array_index_arm32(ctx, out):
+    """arm32 CWE-129 (single function). See the module note above."""
+    # The ghidra backend (which emits the P-Code this ISA needs) renders a `bl` target as a raw
+    # address, so the parser name is resolved through the call graph, not the disassembly text.
+    call_names = {_naddr(e.site_addr): normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "",
+                                                        e.dst_name))
+                  for e in (ctx.call_edges or []) if getattr(e, "dst_name", None)}
+    for faddr, ir in ctx.func_irs.items():
+        blocks = [b for b in ((ir or {}).get("blocks") or [])
+                  if isinstance(b, dict) and b.get("addr")]
+        if blocks and len(blocks) <= 2000:
+            _arm32_scan_function(ctx, faddr, blocks, out, call_names)
+
+
+def _arm32_scan_function(ctx, faddr, blocks, out, call_names):
+    from . import bounds
+    if not _has_pcode(blocks):                            # no P-Code -> the check is invisible
+        return
+    for b in blocks:                                      # conditional execution -> an unseen guard
+        for i in b.get("instructions") or []:
+            if _ARM32_PRED_RE.fullmatch(_ops((i.get("text") or "").split(";")[0].strip())[0]):
+                return
+    frame = ctx.frames.get(faddr) or {}
+    _vs, names = _frame_vars(frame)
+    entry = next((b.get("addr") for b in blocks if _naddr(b.get("addr")) == _naddr(faddr)),
+                 blocks[0].get("addr"))
+    slots = _arm32_index_slots(ctx, blocks, names, entry, call_names)
+    dom = bounds.dominators(blocks)
+    by_addr = {b.get("addr"): b for b in blocks}
+    preds: dict = defaultdict(list)
+    for b in blocks:
+        for sc in b.get("succ") or []:
+            preds[sc].append(b.get("addr"))
+    origin: dict = {}
+    params: dict = {}
+    for k, r in enumerate(_ARM32_ARG):
+        params[r] = {"source": f"argument {k + 1}", "source_site": faddr, "slot": None,
+                     "slot_name": None, "kind": "param", "param": k}
+        origin[id(params[r])] = (entry, -1)
+    tail: dict = {}
+
+    def check_for(src, ba, pred, idx_reg):
+        if src.get("slot"):
+            return _arm_slot_check(blocks, by_addr, ba, ("R11", src["slot"][1]), dom, ("SP", "R11"),
+                                   _ARM32_COND_TERM, _arm32_touch(src["slot"][1]))
+        o = origin.get(id(src))
+        if o is None:
+            return None
+        if o[0] == ba:
+            return ("unchecked",)
+        if pred is not None and o[0] == pred:
+            return _arm_reg_check(by_addr[pred], o[1], (idx_reg.upper(),), ba, dom, ("SP", "R11"),
+                                  _ARM32_COND_TERM)
+        return None
+
+    for b in blocks:
+        ba = b.get("addr")
+        ps = preds.get(ba, [])
+        reg: dict = {}
+        pred = None
+        if ba == entry:
+            reg = {r: ("idx", 1, 0, params[r]) for r in _ARM32_ARG}
+        elif len(ps) == 1 and ps[0] in tail and ps[0] != ba:
+            pred = ps[0]
+            reg = dict(tail[pred])
+        ins = b.get("instructions") or []
+        for j, i in enumerate(ins):
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops:
+                continue
+            dst = _arm32_canon(ops[0])
+            if mnem in ("bl", "blx"):
+                name = call_names.get(_naddr(i.get("addr"))) \
+                    or normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0]))
+                reg.clear()
+                if name in _INT_PARSERS:
+                    rsrc = {"source": name, "source_site": i.get("addr"), "slot": None,
+                            "slot_name": None, "kind": "register"}
+                    origin[id(rsrc)] = (ba, j)
+                    reg["r0"] = ("idx", 1, 0, rsrc)
+                continue
+            if mnem == "ldr" and len(ops) == 2 and re.fullmatch(r"\[(0x[0-9a-fA-F]+|\d+)\]",
+                                                                ops[1].strip()):
+                w = _word_at(ctx, int(ops[1].strip("[]"), 0))
+                reg[dst] = ("litoff", w) if w is not None else None
+                continue
+            if mnem == "add" and len(ops) == 3 and ops[1].lower() == "pc":
+                v = reg.get(_arm32_canon(ops[2]))
+                pcb = _arm32_pcbase(i)
+                if v and v[0] == "litoff" and pcb is not None:
+                    g = _global_base(ctx, addr=pcb + v[1])
+                    reg[dst] = ("ga", g[1], g[0], g[2]) if (g and g[1] is not None) else None
+                else:
+                    reg[dst] = None
+                continue
+            if mnem == "add" and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                v = reg.get(_arm32_canon(ops[1]))
+                imm = int(ops[2].lstrip("#"), 0)
+                reg[dst] = ("idx", v[1], v[2] + imm, v[3]) if (v and v[0] == "idx") else None
+                continue
+            mm = _arm32_mem(ops[-1], names)
+            if mm and mm[0] == "indexed":
+                base, idx = reg.get(mm[1]), reg.get(mm[2])
+                store = mnem in ("str", "strb", "strh")
+                if base and base[0] == "ga" and idx and idx[0] == "idx":
+                    scale, off = idx[1] * mm[3], idx[2] * mm[3]
+                    gbase = ("global", base[2], base[1], base[3])
+                    src = idx[3]
+                    chk = check_for(src, ba, pred, mm[2])
+                    v = _index_verdict(chk, gbase, scale, off) if chk else None
+                    if v is not None:
+                        verdict, oob = v
+                        out.append(_array_index_cand(faddr, i.get("addr"), gbase, scale, off, src,
+                                                     "write" if store else "read", chk, verdict, oob))
+                if not store:
+                    reg[dst] = None
+                continue
+            if mnem in ("ldr", "ldrb", "ldrh", "ldrsb", "ldrsh") and mm and mm[0] == "slot" \
+                    and mm[1] in slots:
+                reg[dst] = ("idx", 1, 0, slots[mm[1]])
+                continue
+            if mnem == "mov" and len(ops) == 2 and _arm32_isreg(ops[1]):
+                reg[dst] = reg.get(_arm32_canon(ops[1]))
+                continue
+            if mnem not in _ARM32_NO_IDX_WRITE and _arm32_isreg(ops[0]):
+                reg[dst] = None
+        tail[ba] = {r: v for r, v in reg.items() if v and v[0] == "idx"}
+
+
 @register_detector
 def array_index(ctx: DetectContext):
     """CWE-129, in two passes. Pass 1 walks every function and records (a) accesses indexed by an
@@ -2281,6 +2607,9 @@ def array_index(ctx: DetectContext):
     out: list = []
     if _is_aarch64(ctx.arch) and ctx.bits == 64:
         _array_index_arm(ctx, out)       # a separate, conservative aarch64 scanner
+        return out
+    if _is_arm32(ctx.arch) and ctx.bits == 32:
+        _array_index_arm32(ctx, out)     # the arm32 scanner (P-Code + no conditional exec)
         return out
     if not (_is_x86(ctx.arch) and ctx.bits == 64):
         return []
