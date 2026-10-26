@@ -617,3 +617,72 @@ def test_arm32_cross_function_join(store, case, pool, arm32_gcc, tmp_path, monke
     if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", []) for i in b.get("instructions", [])):
         pytest.skip("this backend emits no P-Code for arm32")
     assert _xfn_findings(store, t, pool, q) == {"leaf": {"unchecked"}}
+
+
+# ---------------------------------------------------- arm32 -O2 predicated-check recall (compiled) --
+_PRED_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+/* branch-checked -> SAFE (silent) */
+NX int chk(char*s){ int k=atoi(s); if(k>=0&&k<10) table[k]=1; return table[0]; }
+/* unchecked -> FLAG */
+NX int unchk(char*s){ int k=atoi(s); table[k]=1; return table[0]; }
+/* a predicated CLAMP of the INDEX itself -> SAFE, must stay silent (no false positive) */
+NX int clamp_idx(char*s){ int k=atoi(s); if(k>9)k=9; if(k<0)k=0; table[k]=2; return table[0]; }
+/* a predicated clamp on an UNRELATED value (the -O2 return-value idiom); table[k] is still
+   unchecked and straight-line -> FLAG. This is the recall the whole-function skip used to drop. */
+NX int clamp_ret(char*s){ int k=atoi(s); int r=k+1; if(r>100) r=100; table[k]=1; return r; }
+int main(int c,char**v){ return chk(v[1])+unchk(v[1])+clamp_idx(v[1])+clamp_ret(v[1]); }
+"""
+
+
+def test_arm32_O2_predicated_check_recall(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """At -O2 gcc uses ARM conditional execution (`movgt`/`movlt`) for clamps. The scanner used to
+    skip ANY function containing a predicated instruction -- sound, but it threw away a genuinely
+    unchecked access whenever the function also held an unrelated predicated op. Now only a
+    predicated RETURN/branch or multi-register transfer skips the function; a predicated single-dest
+    DATA op poisons just its destination. So `clamp_ret` (predicated clamp on the return value, index
+    untouched) is FLAGGED, while `clamp_idx` (predicated clamp of the index) and `chk` stay silent --
+    recall recovered with no false positive."""
+    monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
+    c = tmp_path / "pr.c"; c.write_text(_PRED_SRC)
+    out = tmp_path / "pr"
+    if subprocess.run([arm32_gcc, "-O2", "-marm", "-fno-stack-protector", "-no-pie", "-w", str(c),
+                       "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="pr")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "arm" or store.targets.get(t.id).bits != 32:
+        pytest.skip("backend did not identify arm32")
+    dao = FunctionDAO(store.conn)
+    funcs = {f.name: dao.get(f.id) for f in dao.list_by_target(t.id)}
+    cr = funcs.get("clamp_ret")
+    if not cr or not any(i.get("pcode") for b in (cr.ir or {}).get("blocks", [])
+                         for i in b.get("instructions", [])):
+        pytest.skip("this backend emits no P-Code for arm32")
+    # the test only guards the predication path when gcc actually emitted a predicated op here
+    from lykos.analyze.detect.detectors import _ARM32_PRED_RE
+    preds = [i.get("text") for b in (cr.ir or {}).get("blocks", [])
+             for i in b.get("instructions", [])
+             if _ARM32_PRED_RE.fullmatch((i.get("text") or "").split()[0].split(";")[0]
+                                         if i.get("text") else "")]
+    if not preds:
+        pytest.skip("gcc did not use ARM predication for clamp_ret on this toolchain")
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in dao.list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if d:
+                got.setdefault(names.get(d["function"]), set()).add(d["check"]["verdict"])
+    expected = {"unchk": "unchecked", "clamp_ret": "unchecked"}
+    for fn, verdicts in got.items():                           # no false positive, no wrong verdict
+        assert fn in expected and verdicts == {expected[fn]}, (fn, verdicts, got)
+    assert "clamp_ret" in got, got                             # the recall the skip used to drop
+    assert "clamp_idx" not in got and "chk" not in got, got    # predicated index clamp / branch-safe

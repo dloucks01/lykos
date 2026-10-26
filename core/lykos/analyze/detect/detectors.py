@@ -2387,11 +2387,14 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
 # (1) the global base comes from a PC-relative LITERAL POOL (`ldr r3,[0xLIT]; add r3,pc,r3`), not an
 # adrp, so the literal word is read from the image and added to the instruction's PC; (2) the frame
 # base is fp/r11 with NEGATIVE slot offsets, so the check key is ("R11", off) with bases (SP, R11).
-# The P-Code dominating-check analysis is reused unchanged. SOUNDNESS GUARD: at -O2 the compiler
-# uses ARM conditional execution for the bound (`cmp r0,#9; popls`/`popgt` -- a predicated return,
-# not a branch the P-Code reader models), which would make a CHECKED access look unchecked. So a
-# function that uses any predicated (conditional-suffix) instruction is skipped entirely -- silent,
-# never a false finding. At -O0 the checks are plain `cmp;b.cond` branches and are read soundly.
+# The P-Code dominating-check analysis is reused unchanged. SOUNDNESS GUARD for -O2 ARM conditional
+# execution (a bound enforced WITHOUT a branch edge the P-Code reader models): a predicated RETURN or
+# branch (`cmp r0,#9; popls`/`bxhi lr`) or a predicated multi-register transfer still skips the whole
+# function (`_arm32_pred_unsound`) -- silent, never a false finding. But a predicated single-dest DATA
+# op (`movhi r0,#0`, the common `-O2` return-value clamp, or a predicated index CLAMP) no longer
+# skips the function: its destination is poisoned (made undecidable) in-line, so a clamp of the index
+# suppresses only that access while a genuinely-unchecked access elsewhere is still flagged -- the
+# recall gcc's conditional execution used to cost. At -O0 the checks are plain `cmp;b.cond` branches.
 # Like aarch64, it feeds the shared CROSS-FUNCTION join: a parameter-indexed access is recorded (not
 # emitted) and a `bl`/`blx` forwarding an input/parameter argument is recorded, so input is followed
 # into a callee that indexes with the forwarded parameter; a bare parameter alone is not a finding.
@@ -2405,10 +2408,27 @@ _ARM32_PRED_RE = re.compile(
     r"mul|lsl|lsr|asr|ror|pop|push|ldm|ldmia|stm|stmdb|bx|blx|cmp|cmn|tst|teq)("
     + "|".join(_ARM32_CONDS) + r")$")
 _ARM32_BRANCH_RE = re.compile(r"^b(" + "|".join(_ARM32_CONDS) + r")$")
+# Predicated ops whose effect the edge-based bound analysis cannot model: a predicated RETURN/branch
+# (`bxhi lr`, `pophi {..,pc}`, `ldmiahi {..,pc}`) enforces a bound on the fall-through with NO block
+# edge, and a predicated multi-register load/store writes several registers at once. Their presence
+# forces the whole function to be skipped (silent, never wrong). A predicated single-dest DATA op
+# (`movhi r0,#0`) is handled in-line instead -- its destination is poisoned (made undecidable), so a
+# predicated clamp of the INDEX suppresses only that access while a predicated write to an unrelated
+# register leaves a genuinely-unchecked access flaggable.
+_ARM32_PRED_CF_BASE = {"bx", "blx", "pop", "push", "ldm", "ldmia", "stm", "stmdb"}
 
 
 def _ARM32_COND_TERM(mnem):
     return bool(_ARM32_BRANCH_RE.fullmatch(mnem))
+
+
+def _arm32_pred_unsound(mnem, ops):
+    """True for a predicated op that defeats the edge-based bound analysis (see _ARM32_PRED_CF_BASE):
+    a predicated branch/return, a predicated multi-register transfer, or a predicated write to pc."""
+    m = _ARM32_PRED_RE.fullmatch(mnem or "")
+    if not m:
+        return False
+    return m.group(1) in _ARM32_PRED_CF_BASE or any(_arm32_canon(o) == "pc" for o in (ops or ()))
 
 
 def _arm32_canon(reg):
@@ -2581,9 +2601,10 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     from . import bounds
     if not _has_pcode(blocks):                            # no P-Code -> the check is invisible
         return
-    for b in blocks:                                      # conditional execution -> an unseen guard
+    for b in blocks:                                      # unmodellable conditional execution
         for i in b.get("instructions") or []:
-            if _ARM32_PRED_RE.fullmatch(_ops((i.get("text") or "").split(";")[0].strip())[0]):
+            m0, o0 = _ops((i.get("text") or "").split(";")[0].strip())
+            if _arm32_pred_unsound(m0, o0):               # predicated return/branch / multi-reg -> skip
                 return
     frame = ctx.frames.get(faddr) or {}
     _vs, names = _frame_vars(frame)
@@ -2634,6 +2655,12 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
             if not ops:
                 continue
             dst = _arm32_canon(ops[0])
+            if _ARM32_PRED_RE.fullmatch(mnem):        # a predicated DATA op (control-flow already skipped)
+                # its result is conditional: poison the destination so a predicated CLAMP of the index
+                # makes that index undecidable (no false positive), and never read the op as an access
+                if _arm32_isreg(ops[0]):
+                    reg[dst] = None
+                continue
             if mnem == "b" and ops:                   # a tail call forwards a parameter (see aarch64)
                 callee = resolve_tail(ops[0])
                 if callee is not None and callee != _naddr(faddr):
