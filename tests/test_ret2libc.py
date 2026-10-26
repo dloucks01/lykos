@@ -349,7 +349,7 @@ def test_canary_ret2libc_spawns_shell(canary_bin):
     assert (res["canary"] & 0xFF) == 0                       # a real canary: null low byte
 
 
-def test_exploit_stage_files_l3_canary_ret2libc(store, case, pool, canary_bin):
+def test_exploit_stage_files_l3_canary_ret2libc(store, case, pool, canary_bin, tmp_path):
     """End-to-end through the ladder with strategy=canary: a canary-protected no-PIE binary is
     driven to a CONFIRMED L3 ret2libc, leaking and replaying the canary."""
     from lykos.analyze.ingest import enqueue_triage, ingest
@@ -370,9 +370,12 @@ def test_exploit_stage_files_l3_canary_ret2libc(store, case, pool, canary_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 canary ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
-def test_exploit_stage_auto_defeats_canary_no_params(store, case, pool, canary_bin):
+def test_exploit_stage_auto_defeats_canary_no_params(store, case, pool, canary_bin, tmp_path):
     """P3: strategy=auto with NO canary params. The stage PROVOKES the canary leak itself and
     DISCOVERS the canary/return offsets via the __stack_chk_fail threshold (discover_canary_offset),
     then ret2libc's past the canary to a confirmed L3 shell -- the fully-automatic canary defeat."""
@@ -393,6 +396,9 @@ def test_exploit_stage_auto_defeats_canary_no_params(store, case, pool, canary_b
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"auto canary defeat produced no confirmed L3 (pocs={[(p.level, p.verified) for p in pocs]})"
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 @pytest.fixture
@@ -439,6 +445,9 @@ def test_exploit_stage_auto_defeats_canary_via_overread(store, case, pool, canar
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"over-read canary defeat produced no confirmed L3 (pocs={[(p.level, p.verified) for p in pocs]})"
+    # NOTE: the shipped reproducer does not yet replay THIS target -- a forking while(1) loop with
+    # two reads per iteration (leak fill, then overflow) that the generic canary script's single
+    # re-entry feed does not satisfy. Tracked in doc 51 item 2. The live confirm above is sound.
 
 
 def test_classify_leak_auto_recovers_libc_and_canary():
@@ -595,4 +604,4 @@ def test_render_canary_script_reproduces_shell(canary_bin, tmp_path):
         ret_gadget=rop.find_gadget(data, "ret"), loop_feed=b"A\n")
     sf = tmp_path / "exploit.py"; sf.write_bytes(script)
     r = sp.run(["python3", str(sf), str(canary_bin)], capture_output=True, timeout=60)
-    assert r.returncode == 0 and b"uid=" in r.stdout, (r.stdout[:200], r.stderr[:200])
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[:200], r.stderr[:200])
