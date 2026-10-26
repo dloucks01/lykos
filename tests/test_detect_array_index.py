@@ -221,3 +221,75 @@ def test_division_replaces_the_index_value():
         ("0x1009", "cdq"), ("0x100a", "idiv ecx"), ("0x100c", "cdqe"),
         ("0x100e", "mov dword [rsp + rax*4 + 0x10], 5")])])
     assert array_index(ctx) == []
+
+
+# ------------------------------------------------------- an index handed to another function ----
+_PARAM_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define CALLEE __attribute__((noipa))
+CALLEE void set_unchecked(int i, int v) { table[i] = v; }
+CALLEE void set_checked(int i) { if (i < 0 || i >= 10) return; table[i] = 1; }
+CALLEE void set_raw(int i) { table[i] = 2; }
+CALLEE void put(int i) { table[i] = 3; }
+CALLEE void sgn(int i) { if (i < 10) table[i] = 4; }
+CALLEE void set_const(int i) { table[i] = 5; }
+CALLEE void clampi(int i) { if (i > 9) i = 9; if (i < 0) i = 0; table[i] = 6; }
+CALLEE void second(int v, int i) { table[i] = v; }
+CALLEE void inner(int i) { table[i] = 7; }
+CALLEE void outer(int i) { inner(i); }
+int main(int argc, char **argv) {
+    set_unchecked(atoi(argv[1]), 9);
+    set_checked(atoi(argv[1]));
+    int j = atoi(argv[2]);
+    if (j >= 0 && j < 10) set_raw(j);           /* the CALLER bounds it: in range */
+    int k = atoi(argv[3]);
+    if (k >= 0 && k <= 10) put(k);              /* the caller's bound admits 10 */
+    sgn(atoi(argv[1]));
+    set_const(3);
+    clampi(atoi(argv[1]));
+    second(1, atoi(argv[1]));
+    outer(atoi(argv[1]));                       /* two calls deep: not followed */
+    return 0;
+}
+"""
+# callee -> the verdict the detector must reach; every other function must stay silent
+_PARAM_EXPECT = {"set_unchecked": "unchecked", "put": "bound", "sgn": "signed",
+                 "second": "unchecked"}
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+@pytest.mark.parametrize("pie", [False, True])
+def test_an_input_index_passed_to_another_function(store, case, pool, gcc, tmp_path, opt, pie):
+    """`set(atoi(argv[1]), v)` with `set` writing `table[i]`: the index is parsed in one function
+    and used in another. The caller's check and the callee's check both count; anything the
+    detector cannot follow (a constant argument, a clamped parameter, a second call level) stays
+    silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "pi.c"
+    c.write_text(_PARAM_SRC)
+    out = tmp_path / "pi"
+    flags = [opt, "-fno-stack-protector"] + ([] if pie else ["-no-pie"])
+    if subprocess.run([gcc, *flags, str(c), "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="pi")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if not d:
+                continue
+            via = d["index"].get("via_call")
+            fn = names.get(d["function"])        # findings on one array merge: read each record
+            got.setdefault(fn, set()).add(d["check"]["verdict"])
+            if via:
+                assert names.get(via["caller"]) == "main" and "passed as argument" in e["detail"]
+    assert got == {k: {v} for k, v in _PARAM_EXPECT.items()}, got

@@ -1806,76 +1806,201 @@ _IDX_TITLES = {
 }
 
 
+_ARG_REGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")     # SysV integer argument order
+
+
+def _param_slot_sources(ir, slot_names, entry):
+    """Frame slots that hold an incoming integer ARGUMENT unmodified (the -O0 spill
+    `mov dword [rbp - 0x14], edi` in the entry block), keyed (BASE, disp) -> source dict. Dropped,
+    as for an input slot, when the slot is written anywhere else or its address is taken -- the
+    function could then change the value before it indexes with it."""
+    flat = _block_flat(ir)
+    leas: dict = defaultdict(list)
+    writes: dict = defaultdict(list)
+    for (_b, _j, addr, body) in flat:
+        mnem, ops = _ops(body)
+        if not ops:
+            continue
+        if mnem == "lea" and len(ops) == 2:
+            sl = _frame_slot(_mem_terms(ops[1], slot_names))
+            if sl:
+                leas[sl].append(_naddr(addr))
+        elif mnem not in _NO_WRITE:
+            sl = _frame_slot(_mem_terms(ops[0], slot_names))
+            if sl:
+                writes[sl].append(_naddr(addr))
+    out = {}
+    clobbered = set()                                     # arg registers already overwritten
+    for (blk, _j, addr, body) in flat:
+        if blk != entry:
+            break
+        mnem, ops = _ops(body)
+        if mnem == "call":
+            break
+        src = _X86_CANON.get(ops[1].lower()) if mnem == "mov" and len(ops) == 2 else None
+        sl = _frame_slot(_mem_terms(ops[0], slot_names)) if ops else None
+        if sl and src in _ARG_REGS and src not in clobbered and \
+                _mem_terms(ops[0], slot_names)[0] in ("dword", "qword", None):
+            if not leas.get(sl) and writes.get(sl) == [_naddr(addr)]:
+                k = _ARG_REGS.index(src)
+                out[sl] = {"source": f"argument {k + 1}", "source_site": addr, "slot": sl,
+                           "kind": "param", "param": k, "block": entry}
+            continue
+        if ops and _X86_CANON.get(ops[0].lower()) and mnem not in _NO_WRITE:
+            clobbered.add(_X86_CANON[ops[0].lower()])
+    return out
+
+
+def _combine_checks(caller, callee):
+    """Both checks hold at the access: the tighter upper bound, non-negative if either side
+    proves it. None (undecidable) on either side stays undecidable."""
+    if caller is None or callee is None:
+        return None
+    if caller[0] == "unchecked":
+        return callee
+    if callee[0] == "unchecked":
+        return caller
+    return ("bounded", min(caller[1], callee[1]), bool(caller[2] or callee[2]))
+
+
+def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out):
+    """Pass 1 of array_index over ONE function (see array_index)."""
+    from . import bounds
+    ir = {"blocks": blocks}
+    frame = ctx.frames.get(faddr) or {}
+    _vs, slot_names = _frame_vars(frame)
+    entry = next((b.get("addr") for b in blocks if _naddr(b.get("addr")) == _naddr(faddr)),
+                 blocks[0].get("addr"))
+    slots = _index_slot_sources(ctx, ir, slot_names)
+    for sl, src in _param_slot_sources(ir, slot_names, entry).items():
+        slots.setdefault(sl, src)
+    dom = bounds.dominators(blocks)
+    preds: dict = defaultdict(list)
+    for b in blocks:
+        for sc in b.get("succ") or []:
+            preds[sc].append(b.get("addr"))
+    by_addr = {b.get("addr"): b for b in blocks}
+    # A value held in a REGISTER is followed within its block and into a block whose SOLE
+    # predecessor computed it. origin: id(src) -> (block, index of the instruction after which
+    # it holds); a parameter arrives before the entry block's first instruction.
+    origin: dict = {}
+    params = {}
+    for k, r in enumerate(_ARG_REGS):
+        params[r] = {"source": f"argument {k + 1}", "source_site": faddr, "slot": None,
+                     "kind": "param", "param": k}
+        origin[id(params[r])] = (entry, -1)
+    tail: dict = {}
+
+    def check_for(src, ba, pred):
+        if src.get("slot"):
+            if src["block"] != ba and src["block"] not in dom.get(ba, ()):
+                return None                           # the value does not reach on every path
+            return _slot_check(blocks, ba, src["slot"], dom, slot_names)
+        o = origin.get(id(src))
+        if o is None:
+            return None
+        if o[0] == ba:
+            return ("unchecked",)                     # same block: no branch in between
+        if pred is not None and o[0] == pred:
+            regs = sorted((r for r, v in tail.get(pred, ({}, None))[0].items()
+                           if v[3] is src and v[1] == 1 and v[2] == 0),
+                          key=lambda r: r != "rax")
+            return _reg_check(by_addr[pred], o[1], regs, ba, dom) if regs else None
+        return None                                   # carried further than one edge
+
+    for b in blocks:
+        ba = b.get("addr")
+        ins = b.get("instructions") or []
+        seed, pred = {}, None
+        ps = preds.get(ba, [])
+        if ba == entry:
+            seed = {r: ("idx", 1, 0, params[r]) for r in _ARG_REGS}
+        elif len(ps) == 1 and ps[0] in tail and ps[0] != ba:
+            pred = ps[0]
+            seed = dict(tail[pred][0])
+        tr = _IdxTracker(ctx, slots, slot_names, seed)
+        for j, i in enumerate(ins):
+            body = (i.get("text") or "").split(";")[0].strip()
+            mnem, ops = _ops(body)
+            rsrc = None
+            if mnem == "call":
+                if _norm_call(body) in _INT_PARSERS:
+                    pre = [(x.get("text") or "") for x in ins[:j]]
+                    if _addr_for_reg(pre, "rdi") is None and not _str_flag_for_reg(pre, "rdi"):
+                        rsrc = {"source": _norm_call(body), "source_site": i.get("addr"),
+                                "slot": None, "kind": "register"}
+                        origin[id(rsrc)] = (ba, j)
+                callee = targets.get(_naddr(i.get("addr")))
+                if callee is not None:
+                    passed = {}
+                    for k, r in enumerate(_ARG_REGS):
+                        v = tr.st.get(r)
+                        if v and v[0] == "idx" and v[1] == 1 and v[2] == 0 and \
+                                v[3].get("kind") != "param":
+                            passed[k] = (v[3], check_for(v[3], ba, pred))
+                    if passed:
+                        calls.append((faddr, i.get("addr"), callee, passed))
+            hit = tr.step(mnem, ops, reg_source=rsrc)
+            if not hit:
+                continue
+            (_p, base, scale, off, src), access = hit
+            check = check_for(src, ba, pred)
+            if check is None:
+                continue
+            if src.get("kind") == "param":
+                summaries[_naddr(faddr)].append((faddr, i.get("addr"), base, scale, off,
+                                                 src["param"], access, check))
+                continue
+            v = _index_verdict(check, base, scale, off)
+            if v is None:
+                continue
+            verdict, oob = v
+            out.append(_array_index_cand(faddr, i.get("addr"), base, scale, off, src, access,
+                                         check, verdict, oob))
+        live = {r: v for r, v in tr.st.items() if v[0] == "idx"}
+        if live:
+            tail[ba] = (live, None)
+
+
 @register_detector
 def array_index(ctx: DetectContext):
+    """CWE-129, in two passes. Pass 1 walks every function and records (a) accesses indexed by an
+    input value it obtained itself, (b) accesses indexed by one of its own PARAMETERS, with the
+    check the function applies, and (c) every call that passes an input value as an argument,
+    with the check the caller applies on the way. Pass 2 joins (b) and (c): an index parsed in
+    `main` and handed to `set(i, v)`, which writes `table[i]`, is the commonest real shape and was
+    invisible while the index had to be parsed in the function that used it. One call level --
+    a parameter passed on again is not followed."""
     if not (_is_x86(ctx.arch) and ctx.bits == 64) or not ctx.func_irs:
         return []
-    from . import bounds
     out = []
+    summaries: dict = defaultdict(list)    # callee addr -> [(site, base, scale, off, k, access, check)]
+    calls: list = []                       # (caller, call site, callee addr, {k: (src, check)})
+    targets = {_naddr(e.site_addr): _naddr(e.dst_addr) for e in (ctx.call_edges or [])
+               if getattr(e, "dst_addr", None) and not getattr(e, "external", False)}
     for faddr, ir in ctx.func_irs.items():
         # the dominator / guard machinery keys every block by its address: a block without one
         # (a degenerate decompiler record) is dropped rather than allowed to sink the detector
         blocks = [b for b in ((ir or {}).get("blocks") or []) if isinstance(b, dict) and b.get("addr")]
         if not blocks or len(blocks) > 2000:
             continue
-        ir = {"blocks": blocks}
-        frame = ctx.frames.get(faddr) or {}
-        _vs, slot_names = _frame_vars(frame)
-        slots = _index_slot_sources(ctx, ir, slot_names)
-        dom = bounds.dominators(blocks)
-        preds: dict = defaultdict(list)
-        for b in blocks:
-            for sc in b.get("succ") or []:
-                preds[sc].append(b.get("addr"))
-        by_addr = {b.get("addr"): b for b in blocks}
-        # block -> (its end-of-block index registers, the input call in it if any). An index
-        # carried in a register flows only into a block whose SOLE predecessor computed it.
-        tail: dict = {}
-        for b in blocks:
-            ba = b.get("addr")
-            ins = b.get("instructions") or []
-            seed, pred = {}, None
-            ps = preds.get(ba, [])
-            if len(ps) == 1 and ps[0] in tail and ps[0] != ba:
-                pred = ps[0]
-                seed = dict(tail[pred][0])
-            tr = _IdxTracker(ctx, slots, slot_names, seed)
-            here = None                                    # (call index, source) in THIS block
-            for j, i in enumerate(ins):
-                body = (i.get("text") or "").split(";")[0].strip()
-                mnem, ops = _ops(body)
-                rsrc = None
-                if mnem == "call" and _norm_call(body) in _INT_PARSERS:
-                    pre = [(x.get("text") or "") for x in ins[:j]]
-                    if _addr_for_reg(pre, "rdi") is None and not _str_flag_for_reg(pre, "rdi"):
-                        rsrc = {"source": _norm_call(body), "source_site": i.get("addr"),
-                                "slot": None, "kind": "register"}
-                        here = (j, rsrc)
-                hit = tr.step(mnem, ops, reg_source=rsrc)
-                if not hit:
-                    continue
-                (_p, base, scale, off, src), access = hit
-                if src.get("slot"):
-                    if src["block"] != ba and src["block"] not in dom.get(ba, ()):
-                        continue                          # the input does not reach on every path
-                    check = _slot_check(blocks, ba, src["slot"], dom, slot_names)
-                elif here is not None and src is here[1]:
-                    check = ("unchecked",)                 # same block: no branch in between
-                elif pred is not None and tail[pred][1] is not None and src is tail[pred][1][1]:
-                    check = _reg_check(by_addr[pred], tail[pred][1][0], ["rax"], ba, dom)
-                else:
-                    check = None                           # carried further than one edge
-                if check is None:
-                    continue
-                v = _index_verdict(check, base, scale, off)
-                if v is None:
-                    continue
-                verdict, oob = v
-                out.append(_array_index_cand(faddr, i.get("addr"), base, scale, off, src, access,
-                                             check, verdict, oob))
-            live = {r: v for r, v in tr.st.items() if v[0] == "idx"}
-            if live:
-                tail[ba] = (live, here)
+        _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out)
+    # Pass 2: an input value handed to a function that indexes with that parameter.
+    for caller, call_site, callee, passed in calls:
+        for (cfaddr, site, base, scale, off, k, access, cchk) in summaries.get(callee, ()):
+            if k not in passed:
+                continue
+            src, caller_check = passed[k]
+            check = _combine_checks(caller_check, cchk)
+            if check is None:
+                continue
+            v = _index_verdict(check, base, scale, off)
+            if v is None:
+                continue
+            verdict, oob = v
+            via = dict(src, via={"caller": caller, "call_site": call_site, "argument": k + 1})
+            out.append(_array_index_cand(cfaddr, site, base, scale, off, via, access, check,
+                                         verdict, oob))
     return out
 
 
@@ -1899,6 +2024,10 @@ def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict
     sname = src["source"] if " " in src["source"] else src["source"] + "()"
     idx_from = (f"{sname} at {src['source_site']}"
                 + (f", held in {slot[0].lower()}{slot[1]:+#x}" if slot else ""))
+    via = src.get("via")
+    if via:
+        idx_from += (f", passed as argument {via['argument']} by the call at {via['call_site']} "
+                     f"in {via['caller']}")
     expr = f"index*{scale}" + (f"{off:+d}" if off else "")
     if verdict == "unchecked":
         why = "no dominating check bounds it from above on this path"
@@ -1914,7 +2043,9 @@ def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict
               f"(CWE-129). Static: the path to this access is not proven feasible.")
     data = {"array": arr, "index": {"source": src["source"], "source_site": src["source_site"],
                                     "slot": (f"{slot[0].lower()}{slot[1]:+#x}" if slot else None),
-                                    "expr": expr, "element_offset": off},
+                                    "expr": expr, "element_offset": off,
+                                    "via_call": via},
+            "function": faddr, "site": site,
             "access": access, "check": {"verdict": verdict,
                                         "bound": check[1] if check[0] == "bounded" else None,
                                         "nonneg": check[2] if check[0] == "bounded" else False},
