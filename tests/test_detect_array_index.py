@@ -812,3 +812,72 @@ def test_x86_unrelated_guard_index(store, case, pool, gcc, tmp_path):
     enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
     enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
     assert _merge_verdicts(store, t, pool, q) == {"unrel_guard": {"unchecked"}}   # var_guard silent
+
+
+# ------------------------------------------------- loop induction variable overrunning an array ---
+# A counted loop whose induction variable walks off a fixed array. The variable is recognised by its
+# constant init + single constant step; its reachable max comes from the loop's own exit bound, read
+# WITHOUT guard_bound's increment-store bail; and it is flagged only inside a SINGLE-EXIT loop (an
+# early break could stop short). -O0, where the induction variable is a stack slot.
+_IV_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void c_over(void){ for(int i=0;i<=10;i++) table[i]=i; }                 /* reaches 10 -> bound */
+NX void c_safe(void){ for(int i=0;i<10;i++) table[i]=i; }                  /* 0..9 -> silent */
+NX void c_break(void){ for(int i=0;i<=10;i++){ if(i==5)break; table[i]=i; } }  /* break -> silent */
+NX void c_inner(void){ for(int i=0;i<=20;i++){ if(i<10) table[i]=i; } }    /* inner guard -> silent */
+int main(int c,char**v){ c_over(); c_safe(); c_break(); c_inner(); return 0; }
+"""
+
+
+def test_x86_loop_induction_overrun(store, case, pool, gcc, tmp_path):
+    """A constant-trip-count loop that indexes past a fixed array is flagged `bound`; a safe loop, a
+    loop with an early break, and one with an inner bound all stay silent (no false positive). -O0,
+    induction variable in a stack slot."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "iv.c"; c.write_text(_IV_SRC)
+    out = tmp_path / "iv"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="iv")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"c_over": {"bound"}}
+
+
+# --------------------------------------------- loop length from unvalidated input (CWE-787) --------
+# `for(i=0;i<n;i++) table[i]=...` with n an unvalidated input value writes past a fixed array when n
+# exceeds it -- the classic input-controlled-length overflow. Flagged ONLY when the length has no
+# dominating bound: a re-assigned clamp (`if(n>10)n=10`) drops n as an input source, and a guard
+# around the loop (`if(n<=10)`) bounds it -- both stay silent (no false positive).
+_IVN_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void n_over(char*s){ int n=atoi(s); for(int i=0;i<n;i++) table[i]=i; }                 /* unchecked */
+NX void n_clamp(char*s){ int n=atoi(s); if(n>10)n=10; for(int i=0;i<n;i++) table[i]=i; }  /* clamp -> silent */
+NX void n_guard(char*s){ int n=atoi(s); if(n>=0&&n<=10) for(int i=0;i<n;i++) table[i]=i; } /* guard -> silent */
+int main(int c,char**v){ n_over(v[1]); n_clamp(v[1]); n_guard(v[1]); return 0; }
+"""
+
+
+def test_x86_loop_input_length_overflow(store, case, pool, gcc, tmp_path):
+    """A loop whose trip count is an UNVALIDATED input value overruns a fixed array -> `unchecked`;
+    a re-assigned clamp and a dominating guard on the length both stay silent (no false positive).
+    -O0, where the length is a stack slot."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "ivn.c"; c.write_text(_IVN_SRC)
+    out = tmp_path / "ivn"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="ivn")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"n_over": {"unchecked"}}

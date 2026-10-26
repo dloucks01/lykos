@@ -1705,6 +1705,158 @@ def _index_slot_sources(ctx, ir, slot_names):
     return out
 
 
+def _induction_slots(ir, slot_names):
+    """Frame slots that are LOOP INDUCTION VARIABLES: exactly one constant initialiser
+    (`mov $c, slot`) and exactly one constant-step update (`add $k, slot` / `inc slot`), with the
+    slot's address never taken and no other writer. Returned as index sources (kind 'induction') so
+    the dominating-guard analysis reads the loop's OWN exit bound and the induction verdict compares
+    the index the loop reaches to the array -- flagging a counted loop that walks off a fixed array
+    (`for(i=0;i<=10;i++) t[i]`). Forward (positive-step) counters only; anything else is dropped."""
+    flat = _block_flat(ir)
+    inits: dict = defaultdict(list)                        # slot -> [(addr, const, block)]
+    steps: dict = defaultdict(list)                        # slot -> [step]
+    other: dict = defaultdict(int)                         # slot -> count of writes we cannot model
+    leas: dict = defaultdict(int)
+    for (blk, _j, addr, body) in flat:
+        mnem, ops = _ops(body)
+        if not ops:
+            continue
+        if mnem == "lea" and len(ops) == 2:
+            s = _frame_slot(_mem_terms(ops[1], slot_names))
+            if s:
+                leas[s] += 1
+            continue
+        if mnem in _NO_WRITE:
+            continue
+        s = _frame_slot(_mem_terms(ops[0], slot_names))
+        if not s:
+            continue
+        if mnem == "mov" and len(ops) == 2 and _NUM.match(ops[1]):
+            inits[s].append((_naddr(addr), int(ops[1].lstrip("$"), 0), blk))
+        elif mnem in ("add", "sub") and len(ops) == 2 and _NUM.match(ops[1]):
+            steps[s].append(int(ops[1].lstrip("$"), 0) * (1 if mnem == "add" else -1))
+        elif mnem in ("inc", "dec"):
+            steps[s].append(1 if mnem == "inc" else -1)
+        else:
+            other[s] += 1
+    out = {}
+    for s in set(inits) & set(steps):
+        if leas.get(s) or other.get(s) or len(inits[s]) != 1 or len(steps[s]) != 1:
+            continue
+        init_addr, init_val, init_blk = inits[s][0]
+        if steps[s][0] <= 0 or init_val < 0:              # only a non-negative forward counter
+            continue
+        out[s] = {"source": "loop counter", "source_site": hex(init_addr), "slot": s,
+                  "kind": "induction", "block": init_blk, "init": init_val, "step": steps[s][0]}
+    return out
+
+
+def _access_loops_single_exit(blocks, preds, succ_map, access_block, dom):
+    """(ok, exit_src): ok iff `access_block` sits inside a loop AND every natural loop containing it
+    has exactly ONE exit edge; exit_src is the exit-edge source of the SMALLEST such loop (where the
+    loop's termination test lives). A second exit is an early `break`/`return` that can stop the loop
+    before the induction variable reaches the header's bound, so the claim is then withheld."""
+    found = False
+    best = None                                           # (loop size, exit source) of the innermost
+    for b in blocks:
+        bb = b.get("addr")
+        for h in succ_map.get(bb, ()):                    # a back edge bb -> h (h dominates bb)
+            if h == bb or h not in dom.get(bb, ()):
+                continue
+            loop = {h, bb}
+            stack = [bb]
+            while stack:                                  # natural loop: preds of the latch up to h
+                n = stack.pop()
+                for p in preds.get(n, ()):
+                    if p not in loop:
+                        loop.add(p)
+                        stack.append(p)
+            if access_block not in loop:
+                continue
+            found = True
+            exits = [(nn, s) for nn in loop for s in succ_map.get(nn, ()) if s not in loop]
+            if len(exits) != 1:
+                return (False, None)                      # a break/second exit -> not sound to claim
+            if best is None or len(loop) < best[0]:
+                best = (len(loop), exits[0][0])
+    return (found, best[1] if best else None)
+
+
+def _exit_input_slot(exit_blk, i_slot, input_slots, slot_names):
+    """The INPUT slot the loop's exit compares the induction slot against (`i < n`), or None. The
+    induction slot must also be read in the block (so this is the loop's own `i vs n` test).
+    `input_slots` (from `_index_slot_sources`) already drops an n that is clamped or re-written after
+    it arrives; the caller still checks n has no dominating bound (a guarded length is safe)."""
+    ins = (exit_blk or {}).get("instructions") or []
+    reads_i = False
+    nslot = None
+    for i in ins:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        for op in ops:
+            s = _frame_slot(_mem_terms(op, slot_names))
+            if s is not None and s == i_slot:
+                reads_i = True
+            if s is not None and s != i_slot and s in input_slots and mnem in ("cmp", "test", "sub"):
+                nslot = s
+    return nslot if reads_i else None
+
+
+def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, input_slots, slot_names):
+    """The bound on a LOOP INDUCTION index at the access, as a check tuple or None. Reads the loop's
+    own exit bound WITHOUT guard_bound's increment-store bail (the step runs AFTER the iteration's
+    access, and the slot has only its init + single increment, so the bound is not stale). The access
+    must sit in a SINGLE-EXIT loop -- an early break could stop before the bound, so otherwise the
+    claim is withheld. ('bounded', k, True) for a CONSTANT loop bound k; ('unchecked',) when the loop
+    length is an UNVALIDATED INPUT (`for(i=0;i<n;i++)`, n from input, unclamped); None otherwise."""
+    from . import bounds
+    succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
+    ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
+    if not ok:
+        return None
+    best = None
+    reaching = dom.get(access_block, ())
+    for d in reaching:
+        if d == access_block:
+            continue
+        blk = by_addr.get(d)
+        ins = (blk or {}).get("instructions") or []
+        if not ins or not _ends_in_cond_jump(ins):
+            continue
+        got = bounds.branch_predicate(ins, slot, bases)
+        if got is None:
+            continue
+        e = bounds._edge_pred_bound(got, blk.get("succ") or [], reaching, access_block)
+        if e is not None and (best is None or e[0] < best):
+            best = e[0]                                   # the tightest dominating bound (inner guards)
+    if best is not None:
+        return ("bounded", best, True)
+    if exit_src:
+        nslot = _exit_input_slot(by_addr.get(exit_src), slot, input_slots, slot_names)
+        # flag only when the input length has NO dominating bound of its own (`if(n<=10)` around the
+        # loop makes it safe; _index_slot_sources already excluded an n clamped by re-assignment)
+        if nslot is not None and bounds.guard_bound(blocks, exit_src, nslot, bases=bases,
+                                                    dom=dom) is None:
+            return ("unchecked",)                         # loop length is unvalidated input -> overrun
+    return None
+
+
+def _induction_verdict(check, base, scale, off, src):
+    """Verdict for a LOOP INDUCTION index (non-negative init, positive step): it cannot be negative,
+    so the only hazard is the loop's UPPER bound reaching past the array. 'bound' when a CONSTANT
+    bound overruns a known-size array; 'unchecked' when the loop length is unvalidated input (the loop
+    walks arbitrarily far). A variable non-input bound, or none, is undecidable (silent)."""
+    if check is None or base[0] != "global" or not base[3] or scale <= 0:
+        return None
+    cap = base[3]
+    if check[0] == "unchecked":
+        return "unchecked", [max(1, cap // scale), -1]    # loop walks past the array (input length)
+    if check[0] == "bounded":
+        bound = check[1]
+        if bound >= 0 and bound * scale + off + scale > cap:
+            return "bound", [bound]
+    return None
+
+
 def _rsp_slot_for_reg(texts, reg: str):
     """(`RSP`, disp) when `reg` holds `rsp + disp` (`lea rsi, [rsp + 0xc]`, the -O2 &local)."""
     for t in reversed(texts):
@@ -2045,7 +2197,10 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
     entry = next((b.get("addr") for b in blocks if _naddr(b.get("addr")) == _naddr(faddr)),
                  blocks[0].get("addr"))
     slots = _index_slot_sources(ctx, ir, slot_names)
+    input_slots = set(slots)                              # the unvalidated-input slots, for a loop bound
     for sl, src in _param_slot_sources(ir, slot_names, entry).items():
+        slots.setdefault(sl, src)
+    for sl, src in _induction_slots(ir, slot_names).items():
         slots.setdefault(sl, src)
     dom = bounds.dominators(blocks)
     preds: dict = defaultdict(list)
@@ -2072,6 +2227,9 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
         if src.get("slot"):
             if src["block"] != ba and src["block"] not in dom.get(ba, ()):
                 return None                           # the value does not reach on every path
+            if src.get("kind") == "induction":        # a loop counter: read the loop's own bound
+                return _induction_bound(blocks, by_addr, preds, ba, src["slot"], dom, ("RBP", "RSP"),
+                                        input_slots, slot_names)
             return _slot_check(blocks, ba, src["slot"], dom, slot_names)
         if id(src) not in origin:
             return None
@@ -2137,7 +2295,8 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                 summaries[_naddr(faddr)].append((faddr, i.get("addr"), base, scale, off,
                                                  src["param"], access, check))
                 continue
-            v = _index_verdict(check, base, scale, off)
+            v = (_induction_verdict(check, base, scale, off, src) if src.get("kind") == "induction"
+                 else _index_verdict(check, base, scale, off))
             if v is None:
                 continue
             verdict, oob = v
