@@ -1759,24 +1759,139 @@ def _slot_check(blocks, site_block, slot, dom, slot_names):
     return ("bounded", g["bound"], bool(g["nonneg"]))
 
 
-def _reg_check(pred_block, after_idx, regs, site_block, dom):
-    """The same question for an index held in a REGISTER across the edge from its source block
-    (`call strtol; cmp eax, 0xf; ja ...` -> the access in the successor)."""
+# ---- register-held index across a merge (all ISAs) ---------------------------------------------
+# An index kept in a register (never spilled) that reaches an access through a control-flow MERGE
+# (`int r=0; if(k<N) r=t[k]; t[k]=1;` at -O2 -- the second access sits at a 2-predecessor join).
+# The frame-slot path already handles merges, because its dominating-check analysis keys on a stable
+# memory location; a register does not, since the index can be in r0 at the guard and r2 at the use
+# and may be reassigned/poisoned in between. `_reg_bound` is a backward, edge-aware walk: the bound
+# proven for the raw input value `src` arriving at a block is the MEET over its predecessors of
+# (the bound carried into that predecessor, refined by the predecessor's terminating branch toward
+# this block). It reads each predecessor's branch with the register that actually held `src` THERE
+# (from the forward scan's origin/head maps, with COPY propagation covering intra-block copies), so
+# the register-identity gap cannot silently drop a real bound (which would be a false positive).
+_PRED_FLAG_WRITE = re.compile(r"->\s*reg:(CY|ZR|NG|OV):", re.I)
+
+
+def _reg_variants(rname):
+    """The register-name forms to seed the branch reader with. aarch64 compares the 32-bit `w` view
+    of a 64-bit `x` index (`cmp w0,#9`), and _REG_FAMILY does not relate them, so try both; every
+    other ISA's sub-register aliasing is already in _REG_FAMILY, so the canonical upper form suffices."""
+    m = re.fullmatch(r"[xw](\d+)", (rname or "").lower())
+    return (f"X{m.group(1)}", f"W{m.group(1)}") if m else ((rname or "").upper(),)
+
+
+def _same_idx(a, b):
+    """Two tracked register values are the SAME index: same scale, same offset, and the same input
+    source OBJECT (not merely equal fields) -- so a merge joins only genuinely identical values."""
+    return (isinstance(a, tuple) and isinstance(b, tuple) and len(a) >= 4 and len(b) >= 4
+            and a[0] == "idx" and b[0] == "idx" and a[1] == b[1] and a[2] == b[2] and a[3] is b[3])
+
+
+def _branch_pred_term(ins, slot, bases):
+    """branch_predicate reading the block's TERMINATING branch, not an ARM predicated op's internal
+    skip-CBRANCH (-O2 `movhi r0,#0` carries its own CBRANCH). A non-terminating instruction holding
+    a CBRANCH is a predicated op: drop its effect so the real branch is read -- unless it
+    conditionally writes a real condition flag, where dropping it could hide a bound, so bail."""
     from . import bounds
-    ins = pred_block.get("instructions") or []
-    if not _ends_in_cond_jump(ins):
+    if not ins:
+        return None
+    n = len(ins)
+    out = []
+    for j, i in enumerate(ins):
+        pcs = i.get("pcode") or []
+        if j != n - 1 and any((pc or "").startswith("CBRANCH") for pc in pcs):
+            if any(_PRED_FLAG_WRITE.search(pc or "") for pc in pcs):
+                return None
+            out.append({"addr": i.get("addr"), "text": i.get("text"), "pcode": []})
+        else:
+            out.append(i)
+    return bounds.branch_predicate(out, slot, bases)
+
+
+def _meet_checks(paths):
+    """The weakest guarantee over the paths reaching a merge, as a finding reads it: any path with
+    NO upper bound makes the index unchecked (an out-of-bounds value reaches the access on that
+    path); an undecidable path (None) blocks a claim unless another path is already unchecked; only
+    when every path is bounded is the merge bounded, at the loosest (largest) of the bounds."""
+    if not paths:
+        return None
+    if any(p == ("unchecked",) for p in paths):
         return ("unchecked",)
-    reaching = dom.get(site_block, ())
-    after = ins[after_idx + 1:]
-    for r in regs:
-        got = bounds.branch_predicate(after, ("reg", r.upper()), ("RBP", "RSP"))
-        if got is None:
+    if any(p is None for p in paths):
+        return None
+    return ("bounded", max(p[1] for p in paths), all(p[2] for p in paths))
+
+
+def _edge_bound(src, pred, block, cx):
+    """The upper bound `pred`'s terminating branch proves for `src` on the pred->block edge:
+    ("bounded", b, nn), ("unchecked",) when it adds none (branch not on src, or the taken edge is
+    the lower-bound side), or None when a branch on src cannot be read."""
+    from . import bounds
+    pblk = cx["by_addr"].get(pred)
+    if pblk is None:
+        return ("unchecked",)
+    pins = pblk.get("instructions") or []
+    last = _ops((pins[-1].get("text") or "").split(";")[0].strip())[0] if pins else ""
+    if not pins or not cx["cond_term"](last):
+        return ("unchecked",)                              # no terminating conditional branch
+    reaching = cx["dom"].get(block, ())
+    succ = pblk.get("succ") or []
+    cands = []                                             # (instruction slice, seed register)
+    o = cx["origin"].get(id(src))
+    if o is not None and o[0] == pred and len(o) >= 3 and o[2]:
+        cands.append((pins[o[1] + 1:], o[2]))              # src defined in pred: seed its def reg
+    for r, v in (cx["head"].get(pred) or {}).items():      # src flowed in: seed each head carrier
+        if isinstance(v, tuple) and v and v[0] == "idx" and v[3] is src:
+            cands.append((pins, r))
+    if not cands:
+        return None                                        # src live but no carrier found -> bail
+    for after, rname in cands:
+        for vr in _reg_variants(rname):
+            got = _branch_pred_term(after, ("reg", vr), cx["bases"])
+            if got is None:
+                continue
+            e = bounds._edge_pred_bound(got, succ, reaching, block)
+            return ("bounded", e[0], bool(e[1])) if e else ("unchecked",)
+    # the block ends in a conditional branch but none of src's carriers made it readable: it may be
+    # a VARIABLE bound (`if (i >= n)`) that genuinely constrains the index -- undecidable, not
+    # unchecked, so the claim is withheld (matching the frame-slot path, no false positive). The
+    # cost is a conservative miss when the branch is in fact on an unrelated value.
+    return None
+
+
+def _reg_bound(src, block, cx, seen=None):
+    """The upper bound proven for `src` where it is used as an index in `block`, held in a register.
+    A backward walk (see the section note). A loop back edge returns None (the result there would
+    depend on the walk's own chain, so it is not cached); a runaway walk is capped, also at None."""
+    if seen is None:
+        seen = frozenset()
+        cx["_calls"] = 0
+    if block in seen:
+        return None                                        # a loop back edge -> undecidable
+    cx["_calls"] += 1
+    if cx["_calls"] > 4000:
+        return None                                        # pathological CFG -> withhold the claim
+    o = cx["origin"].get(id(src))
+    if o is not None and o[0] == block:
+        return ("unchecked",)                              # defined here, no branch before the use
+    ps = cx["preds"].get(block, [])
+    if not ps:
+        return ("unchecked",)
+    seen2 = seen | {block}
+    paths = []
+    for p in ps:
+        tailp = cx["tail"].get(p)
+        if tailp is None:                                  # predecessor not yet processed (back edge)
+            paths.append(None)
             continue
-        e = bounds._edge_pred_bound(got, pred_block.get("succ") or [], reaching, site_block)
-        if e is None:
-            return ("unchecked",)
-        return ("bounded", e[0], bool(e[1]))
-    return None                                            # the branch is not readable on the index
+        if not any(isinstance(v, tuple) and v and v[0] == "idx" and v[3] is src
+                   and v[1] == 1 and v[2] == 0 for v in tailp.values()):
+            paths.append(None)                             # pred does not carry the raw src out
+            continue
+        paths.append(_combine_checks(_reg_bound(src, p, cx, seen2),
+                                     _edge_bound(src, p, block, cx)))
+    return _meet_checks(paths)
 
 
 def _index_verdict(check, base, scale, off):
@@ -1914,25 +2029,21 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
     for k, r in enumerate(_ARG_REGS):
         params[r] = {"source": f"argument {k + 1}", "source_site": faddr, "slot": None,
                      "kind": "param", "param": k}
-        origin[id(params[r])] = (entry, -1)
+        origin[id(params[r])] = (entry, -1, r)            # (block, instr index, defining register)
     tail: dict = {}
+    head: dict = {}
+    cx = {"origin": origin, "tail": tail, "head": head, "preds": preds, "dom": dom,
+          "by_addr": by_addr, "bases": ("RBP", "RSP"),
+          "cond_term": lambda m: m.startswith("j") and m != "jmp"}
 
     def check_for(src, ba, pred):
         if src.get("slot"):
             if src["block"] != ba and src["block"] not in dom.get(ba, ()):
                 return None                           # the value does not reach on every path
             return _slot_check(blocks, ba, src["slot"], dom, slot_names)
-        o = origin.get(id(src))
-        if o is None:
+        if id(src) not in origin:
             return None
-        if o[0] == ba:
-            return ("unchecked",)                     # same block: no branch in between
-        if pred is not None and o[0] == pred:
-            regs = sorted((r for r, v in tail.get(pred, ({}, None))[0].items()
-                           if v[3] is src and v[1] == 1 and v[2] == 0),
-                          key=lambda r: r != "rax")
-            return _reg_check(by_addr[pred], o[1], regs, ba, dom) if regs else None
-        return None                                   # carried further than one edge
+        return _reg_bound(src, ba, cx)                # backward edge-aware walk (handles merges)
 
     for b in blocks:
         ba = b.get("addr")
@@ -1943,7 +2054,14 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             seed = {r: ("idx", 1, 0, params[r]) for r in _ARG_REGS}
         elif len(ps) == 1 and ps[0] in tail and ps[0] != ba:
             pred = ps[0]
-            seed = dict(tail[pred][0])
+            seed = dict(tail[pred])
+        else:
+            proc = [p for p in ps if p in tail and p != ba]
+            if proc and len(proc) == len([p for p in ps if p != ba]):
+                for r, v in tail[proc[0]].items():        # a MERGE: carry a register common to all
+                    if v and v[0] == "idx" and all(_same_idx(tail[p].get(r), v) for p in proc[1:]):
+                        seed[r] = v
+        head[ba] = dict(seed)
         tr = _IdxTracker(ctx, slots, slot_names, seed)
         for j, i in enumerate(ins):
             body = (i.get("text") or "").split(";")[0].strip()
@@ -1955,7 +2073,7 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                     if _addr_for_reg(pre, "rdi") is None and not _str_flag_for_reg(pre, "rdi"):
                         rsrc = {"source": _norm_call(body), "source_site": i.get("addr"),
                                 "slot": None, "kind": "register"}
-                        origin[id(rsrc)] = (ba, j)
+                        origin[id(rsrc)] = (ba, j, "rax")     # the parser result lands in rax
             # A `call`, or a TAIL `jmp <func>` (how -O2 forwards a parameter: `outer: jmp inner`),
             # that passes an input index as an argument, unscaled. Two kinds, both recorded so pass
             # 2 can chain them: a value the caller PARSED itself (kind != param) is an entry into
@@ -1993,9 +2111,7 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             verdict, oob = v
             out.append(_array_index_cand(faddr, i.get("addr"), base, scale, off, src, access,
                                          check, verdict, oob))
-        live = {r: v for r, v in tr.st.items() if v[0] == "idx"}
-        if live:
-            tail[ba] = (live, None)
+        tail[ba] = {r: v for r, v in tr.st.items() if v[0] == "idx"}
 
 
 # ---- aarch64 CWE-129 ---------------------------------------------------------------------------
@@ -2167,31 +2283,6 @@ def _arm_slot_check(blocks, by_addr, site_block, slot, dom, bases, cond_term, to
     return ("unchecked",)
 
 
-def _arm_reg_check(pred_block, after_idx, names, site_block, dom, bases, cond_term):
-    """`_reg_check` for an ARM-family ISA: an index held in a REGISTER across the edge from the
-    block that defined it (`bl strtol; cmp w0,#9; b.gt` / an incoming parameter checked before the
-    access). `cmp;b.gt` is signed (a negative index still reaches), `cmp;b.hi` unsigned (proves
-    non-negative) -- branch_predicate encodes which, and _edge_pred_bound maps it onto the taken
-    edge. `names` are the (reg) keys to try (x0 vs w0); `cond_term(mnem)` says the predecessor ends
-    in a conditional branch this ISA can read."""
-    from . import bounds
-    ins = pred_block.get("instructions") or []
-    if not ins:
-        return ("unchecked",)
-    last = _ops((ins[-1].get("text") or "").split(";")[0].strip())[0]
-    if not cond_term(last):
-        return ("unchecked",)
-    reaching = dom.get(site_block, ())
-    after = ins[after_idx + 1:]
-    for name in names:
-        got = bounds.branch_predicate(after, ("reg", name), bases)
-        if got is None:
-            continue
-        e = bounds._edge_pred_bound(got, pred_block.get("succ") or [], reaching, site_block)
-        return ("unchecked",) if e is None else ("bounded", e[0], bool(e[1]))
-    return None                                                    # the branch is not on the index
-
-
 def _index_record(summaries, out, faddr, site, base, scale, off, src, access, chk):
     """Route one array-index hit (shared by the aarch64 and arm32 scanners). A PARAMETER-sourced
     index goes to `summaries` for the cross-function join -- it is a finding only once input is shown
@@ -2266,23 +2357,20 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
     for k, r in enumerate(_A64_ARG):
         params[r] = {"source": f"argument {k + 1}", "source_site": faddr, "slot": None,
                      "slot_name": None, "kind": "param", "param": k}
-        origin[id(params[r])] = (entry, -1)
+        origin[id(params[r])] = (entry, -1, r)            # (block, instr index, defining register)
     tail: dict = {}
+    head: dict = {}
+    cx = {"origin": origin, "tail": tail, "head": head, "preds": preds, "dom": dom,
+          "by_addr": by_addr, "bases": ("SP", "X29"), "cond_term": _A64_COND_TERM}
 
     def check_for(src, ba, pred, idx_reg):
         if src.get("slot"):
             nm = src["slot_name"]
             return _arm_slot_check(blocks, by_addr, ba, ("SP", src["slot"][1]), dom, ("SP", "X29"),
                                    _A64_COND_TERM, lambda t: ("[" + nm) in t)
-        o = origin.get(id(src))
-        if o is None:
+        if id(src) not in origin:
             return None
-        if o[0] == ba:
-            return ("unchecked",)                     # same block: no branch between
-        if pred is not None and o[0] == pred:
-            return _arm_reg_check(by_addr[pred], o[1], ("X" + idx_reg[1:], "W" + idx_reg[1:]), ba,
-                                  dom, ("SP", "X29"), _A64_COND_TERM)
-        return None                                   # carried further than one edge
+        return _reg_bound(src, ba, cx)                    # backward edge-aware walk (handles merges)
 
     for b in blocks:
         ba = b.get("addr")
@@ -2294,6 +2382,13 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
         elif len(ps) == 1 and ps[0] in tail and ps[0] != ba:
             pred = ps[0]
             reg = dict(tail[pred])
+        else:
+            proc = [p for p in ps if p in tail and p != ba]
+            if proc and len(proc) == len([p for p in ps if p != ba]):
+                for r, v in tail[proc[0]].items():        # a MERGE: carry a register common to all
+                    if v and v[0] == "idx" and all(_same_idx(tail[p].get(r), v) for p in proc[1:]):
+                        reg[r] = v
+        head[ba] = dict(reg)
         ins = b.get("instructions") or []
         for j, i in enumerate(ins):
             mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
@@ -2327,8 +2422,8 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                 if name in _INT_PARSERS:
                     rsrc = {"source": name, "source_site": i.get("addr"), "slot": None,
                             "slot_name": None, "kind": "register"}
-                    origin[id(rsrc)] = (ba, j)
-                    reg["x0"] = ("idx", 1, 0, rsrc)   # the parsed value, in w0/x0
+                    origin[id(rsrc)] = (ba, j, "x0")  # the parsed value lands in w0/x0
+                    reg["x0"] = ("idx", 1, 0, rsrc)
                 continue
             if mnem == "adrp":
                 c = _a64_adrp_const(i)
@@ -2622,22 +2717,19 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     for k, r in enumerate(_ARM32_ARG):
         params[r] = {"source": f"argument {k + 1}", "source_site": faddr, "slot": None,
                      "slot_name": None, "kind": "param", "param": k}
-        origin[id(params[r])] = (entry, -1)
+        origin[id(params[r])] = (entry, -1, r)            # (block, instr index, defining register)
     tail: dict = {}
+    head: dict = {}
+    cx = {"origin": origin, "tail": tail, "head": head, "preds": preds, "dom": dom,
+          "by_addr": by_addr, "bases": ("SP", "R11"), "cond_term": _ARM32_COND_TERM}
 
     def check_for(src, ba, pred, idx_reg):
         if src.get("slot"):
             return _arm_slot_check(blocks, by_addr, ba, ("R11", src["slot"][1]), dom, ("SP", "R11"),
                                    _ARM32_COND_TERM, _arm32_touch(src["slot"][1]))
-        o = origin.get(id(src))
-        if o is None:
+        if id(src) not in origin:
             return None
-        if o[0] == ba:
-            return ("unchecked",)
-        if pred is not None and o[0] == pred:
-            return _arm_reg_check(by_addr[pred], o[1], (idx_reg.upper(),), ba, dom, ("SP", "R11"),
-                                  _ARM32_COND_TERM)
-        return None
+        return _reg_bound(src, ba, cx)                    # backward edge-aware walk (handles merges)
 
     for b in blocks:
         ba = b.get("addr")
@@ -2649,6 +2741,15 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
         elif len(ps) == 1 and ps[0] in tail and ps[0] != ba:
             pred = ps[0]
             reg = dict(tail[pred])
+        else:
+            proc = [p for p in ps if p in tail and p != ba]
+            if proc and len(proc) == len([p for p in ps if p != ba]):
+                # a MERGE with every (non-self) predecessor processed: carry a register that holds
+                # the SAME index value out of all of them (the backward walk computes its bound)
+                for r, v in tail[proc[0]].items():
+                    if v and v[0] == "idx" and all(_same_idx(tail[p].get(r), v) for p in proc[1:]):
+                        reg[r] = v
+        head[ba] = dict(reg)
         ins = b.get("instructions") or []
         for j, i in enumerate(ins):
             mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
@@ -2681,7 +2782,7 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                 if name in _INT_PARSERS:
                     rsrc = {"source": name, "source_site": i.get("addr"), "slot": None,
                             "slot_name": None, "kind": "register"}
-                    origin[id(rsrc)] = (ba, j)
+                    origin[id(rsrc)] = (ba, j, "r0")      # the parser result lands in r0
                     reg["r0"] = ("idx", 1, 0, rsrc)
                 continue
             if mnem == "ldr" and len(ops) == 2 and re.fullmatch(r"\[(0x[0-9a-fA-F]+|\d+)\]",

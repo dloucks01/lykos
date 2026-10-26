@@ -686,3 +686,93 @@ def test_arm32_O2_predicated_check_recall(store, case, pool, arm32_gcc, tmp_path
         assert fn in expected and verdicts == {expected[fn]}, (fn, verdicts, got)
     assert "clamp_ret" in got, got                             # the recall the skip used to drop
     assert "clamp_idx" not in got and "chk" not in got, got    # predicated index clamp / branch-safe
+
+
+# ------------------------------------------- register-held index across a merge (all ISAs) -------
+# An index kept in a register (never spilled) that reaches an access through a control-flow MERGE.
+# `mixed`: a guarded read then an UNCHECKED write at a 2-pred join -> unchecked. `bothchk`: both arms
+# bound only from above -> signed (a negative index still reaches). `safe2`: both arms bound [0,10)
+# -> SILENT (the no-false-positive case). `varbnd`: a variable bound `i>=n` -> SILENT (undecidable).
+_MERGE_SRC = r"""
+#include <stdlib.h>
+int table[10];
+void sink(int);
+#define NX __attribute__((noipa))
+NX int mixed(char*s){ int k=atoi(s); int r=0; if(k>=0&&k<10) r=table[k]; table[k]=2; return r; }
+NX int bothchk(char*s,int c){ int k=atoi(s);
+  if(c){ if(k>=10)return 0; } else { if(k>=10)return 0; } table[k]=1; return 0; }
+NX int safe2(char*s,int c){ int k=atoi(s);
+  if(c){ if(k<0||k>=10)return 0; } else { if(k<0||k>=10)return 0; } table[k]=1; return 0; }
+NX int varbnd(char*s,int n){ int k=atoi(s); if(k<0||k>=n) return 0; table[k]=1; return 0; }
+int main(int c,char**v){ return mixed(v[1])+bothchk(v[1],c)+safe2(v[1],c)+varbnd(v[1],c); }
+"""
+_MERGE_EXPECT = {"mixed": "unchecked", "bothchk": "signed"}   # safe2 + varbnd must stay silent
+
+
+def _merge_verdicts(store, t, pool, q):
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if d:
+                got.setdefault(names.get(d["function"]), set()).add(d["check"]["verdict"])
+    return got
+
+
+@pytest.mark.parametrize("opt", ["-O2"])
+def test_x86_merge_register_index(store, case, pool, gcc, tmp_path, opt):
+    """x86-64: a register-held input index used past a control-flow merge is now analysed (it used to
+    be dropped at the join). mixed -> unchecked, bothchk -> signed; safe2 and the variable-bound
+    varbnd stay silent (no false positive)."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "mg.c"; c.write_text(_MERGE_SRC)
+    out = tmp_path / "mg"
+    if subprocess.run([gcc, opt, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="mg")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {k: {v} for k, v in _MERGE_EXPECT.items()}
+
+
+def test_aarch64_merge_register_index(store, case, pool, a64_gcc, tmp_path):
+    """Same register-held-index-across-a-merge recovery on aarch64 (native backend)."""
+    c = tmp_path / "mg.c"; c.write_text(_MERGE_SRC)
+    out = tmp_path / "mg"
+    if subprocess.run([a64_gcc, "-O2", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o",
+                       str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="mg")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "aarch64":
+        pytest.skip("backend did not identify aarch64")
+    assert _merge_verdicts(store, t, pool, q) == {k: {v} for k, v in _MERGE_EXPECT.items()}
+
+
+def test_arm32_merge_register_index(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """Same register-held-index-across-a-merge recovery on arm32 (ghidra backend for P-Code)."""
+    monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
+    c = tmp_path / "mg.c"; c.write_text(_MERGE_SRC)
+    out = tmp_path / "mg"
+    if subprocess.run([arm32_gcc, "-O2", "-marm", "-fno-stack-protector", "-no-pie", "-w", str(c),
+                       "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="mg")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "arm" or store.targets.get(t.id).bits != 32:
+        pytest.skip("backend did not identify arm32")
+    one = FunctionDAO(store.conn).get(next(iter(FunctionDAO(store.conn).list_by_target(t.id))).id)
+    if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", []) for i in b.get("instructions", [])):
+        pytest.skip("this backend emits no P-Code for arm32")
+    assert _merge_verdicts(store, t, pool, q) == {k: {v} for k, v in _MERGE_EXPECT.items()}
