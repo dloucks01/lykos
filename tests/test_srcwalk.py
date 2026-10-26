@@ -36,6 +36,6 @@ def test_same_named_files_stay_separate_and_unique_ones_keep_their_key(tmp_path)
                          (source_sinks.scan_source, "srcsink:"), (uaf.scan_source, "uaf:")):
         keys = _keys(scan(root), prefix)
         assert any("a/util.c" in k for k in keys) and any("b/util.c" in k for k in keys), keys
-        assert any(f"{prefix}main.c:" in k or f":main.c:" in k for k in keys), keys
+        assert any(f"{prefix}main.c:" in k or ":main.c:" in k for k in keys), keys
         assert not any("demo.c" in k for k in keys), keys       # examples/ is still skipped
         assert len(keys) == len(set(keys))

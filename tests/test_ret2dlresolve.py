@@ -120,7 +120,7 @@ def _stage(store):
         p.stop(grace=3.0)
 
 
-def _drive(store, pool, exe, *, offset=40):
+def _drive(store, pool, exe, *, offset=40, replay_in=None):
     from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc import enqueue_exploit
     from lykos.db.dao import PocDAO, TargetDAO
@@ -134,13 +134,19 @@ def _drive(store, pool, exe, *, offset=40):
                                         mitigations={"pie": "off"}, file_type="elf")
     run = enqueue_exploit(q, t, params={"strategy": "dlresolve", "offset": offset})
     assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
-    return [pc for pc in PocDAO(store.conn).list_by_target(t.id)
-            if pc.level == "L3" and pc.verified]
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    if l3 and replay_in is not None:
+        # The bundle used to carry the OFFSET as its input: runner.sh fed the target "40".
+        from factories import replay_l3_bundle
+        r = replay_l3_bundle(store, t.id, replay_in)
+        assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
+    return l3
 
 
-def test_exploit_stage_files_l3_ret2dlresolve(store, _stage, dl_bin):
-    """The stage selects and confirms ret2dlresolve, filing an L3 PoC -- no leak, no system@plt."""
-    assert _drive(store, _stage, dl_bin), "no confirmed L3 ret2dlresolve PoC"
+def test_exploit_stage_files_l3_ret2dlresolve(store, _stage, dl_bin, tmp_path):
+    """The stage selects and confirms ret2dlresolve, filing an L3 PoC -- no leak, no system@plt --
+    and the bundle's runner.sh reproduces the shell."""
+    assert _drive(store, _stage, dl_bin, replay_in=tmp_path), "no confirmed L3 ret2dlresolve PoC"
 
 
 def test_ret2dlresolve_declines_the_patched_target(store, _stage, dl_safe_bin):

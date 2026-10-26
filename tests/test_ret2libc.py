@@ -161,7 +161,7 @@ def pool(store):
         p.stop(grace=3.0)
 
 
-def test_exploit_stage_files_l3_ret2libc(store, case, pool, r2l_bin):
+def test_exploit_stage_files_l3_ret2libc(store, case, pool, r2l_bin, tmp_path):
     """End-to-end through the ladder: a no-PIE binary importing puts (not system) under ASLR is
     driven by the exploit stage to a CONFIRMED L3 ret2libc PoC (a shell spawns and echoes a marker),
     with no /bin/sh string or system@plt in the image."""
@@ -182,6 +182,11 @@ def test_exploit_stage_files_l3_ret2libc(store, case, pool, r2l_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 ret2libc PoC (pocs={[(p.level, p.verified) for p in pocs]})"
+    # The shipped reproducer leaks, rebuilds stage 2 from the leaked base, and gets the shell.
+    # It used to be the exploit SCRIPT shipped as input.bin, which runner.sh piped into the target.
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_exploit_stage_declines_the_patched_ret2libc(store, case, pool, r2l_safe_bin):

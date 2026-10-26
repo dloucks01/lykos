@@ -76,7 +76,7 @@ def test_seccomp_detected(seccomp_bin):
     assert info.mitigations.get("seccomp") == "on"      # prctl(PR_SET_SECCOMP) importer
 
 
-def test_orw_discloses_file_past_seccomp(store, case, seccomp_bin):
+def test_orw_discloses_file_past_seccomp(store, case, seccomp_bin, tmp_path):
     """End-to-end: a seccomp target that blocks execve is driven to a CONFIRMED L3 ORW exploit that
     opens+reads a file and writes it out. strategy=auto, no analyst params."""
     from lykos.analyze.ingest import enqueue_triage, ingest
@@ -102,5 +102,10 @@ def test_orw_discloses_file_past_seccomp(store, case, seccomp_bin):
         pocs = PocDAO(store.conn).list_by_target(t.id)
         assert any(pc.level == "L3" and pc.verified for pc in pocs), \
             f"no confirmed L3 ORW (pocs={[(p.level, p.verified) for p in pocs]})"
+        # The reproducer used to be `echo flag | ./target.bin`. It now replays the leak, rebuilds
+        # the ORW chain from the leaked base and discloses a file IT planted and never sent.
+        from factories import replay_l3_bundle
+        r = replay_l3_bundle(store, t.id, tmp_path)
+        assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
     finally:
         pool.stop(grace=3.0)

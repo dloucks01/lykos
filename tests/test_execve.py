@@ -77,7 +77,7 @@ def execve_safe_bin(tmp_path_factory):
     return _build_execve(tmp_path_factory, "execve_safe", "read(0,b,sizeof b)")  # bounds-fixed
 
 
-def test_exploit_stage_files_l3_execve_rop(store, case, pool, execve_bin):
+def test_exploit_stage_files_l3_execve_rop(store, case, pool, execve_bin, tmp_path):
     """End-to-end: a static no-PIE binary with pop gadgets + syscall + "/bin/sh" (no system) is
     driven to a CONFIRMED L3 execve syscall ROP -- a shell spawns and echoes our marker."""
     from lykos.analyze.ingest import enqueue_triage, ingest
@@ -96,6 +96,9 @@ def test_exploit_stage_files_l3_execve_rop(store, case, pool, execve_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 execve ROP (pocs={[(p.level, p.verified) for p in pocs]})"
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 def test_execve_rop_declines_the_patched_target(store, case, pool, execve_safe_bin):
