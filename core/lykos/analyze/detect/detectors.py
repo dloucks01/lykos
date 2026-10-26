@@ -1809,6 +1809,37 @@ def _branch_pred_term(ins, slot, bases):
     return bounds.branch_predicate(out, slot, bases)
 
 
+def _branch_on_index(ins, seed_regs):
+    """True if the block's TERMINATING branch condition depends (through P-Code dataflow) on a
+    register holding the index. It separates an unreadable branch ON the index (a VARIABLE bound
+    `if(i>=n)` -> undecidable, no claim) from a branch on an UNRELATED value (`if(n<=0)` guarding a
+    loop whose body indexes with an untouched input -> no constraint on the index). Over-approximate
+    (whole-taint, whole register family), the safe direction: a missed dependency could only turn an
+    undecidable verdict into a claim, so taint is seeded generously and propagated through every op."""
+    from .taint import _REG_FAMILY, _key, _parse
+    if not ins:
+        return False
+    taint = set()
+    for r in seed_regs:
+        for nm in _reg_variants(r):
+            taint.add(("reg", nm))
+            taint.update(("reg", f) for f in _REG_FAMILY.get(nm, ()))
+    n = len(ins)
+    for j, i in enumerate(ins):
+        for pc in i.get("pcode") or []:
+            mnem, insk, outk, toks = _parse(pc)
+            if mnem == "CBRANCH":
+                if j == n - 1 and len(toks) >= 3 and _key(toks[2]) in taint:
+                    return True                                # the terminating branch tests the index
+                continue                                       # a predicated op's CBRANCH is not it
+            if outk is not None:
+                if any(k in taint for k in insk):
+                    taint.add(outk)
+                else:
+                    taint.discard(outk)
+    return False
+
+
 def _meet_checks(paths):
     """The weakest guarantee over the paths reaching a merge, as a finding reads it: any path with
     NO upper bound makes the index unchecked (an out-of-bounds value reaches the access on that
@@ -1853,11 +1884,12 @@ def _edge_bound(src, pred, block, cx):
                 continue
             e = bounds._edge_pred_bound(got, succ, reaching, block)
             return ("bounded", e[0], bool(e[1])) if e else ("unchecked",)
-    # the block ends in a conditional branch but none of src's carriers made it readable: it may be
-    # a VARIABLE bound (`if (i >= n)`) that genuinely constrains the index -- undecidable, not
-    # unchecked, so the claim is withheld (matching the frame-slot path, no false positive). The
-    # cost is a conservative miss when the branch is in fact on an unrelated value.
-    return None
+    # the branch is not readable as a constant bound on the index. If it TESTS the index (a variable
+    # bound `if(i>=n)`) the claim is withheld (undecidable, no false positive); if it tests an
+    # UNRELATED value (`if(n<=0)` around a loop over an untouched input index) it adds no constraint.
+    if any(_branch_on_index(after, [rname]) for after, rname in cands):
+        return None
+    return ("unchecked",)
 
 
 def _reg_bound(src, block, cx, seen=None):

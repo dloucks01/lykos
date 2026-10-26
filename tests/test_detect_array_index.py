@@ -776,3 +776,39 @@ def test_arm32_merge_register_index(store, case, pool, arm32_gcc, tmp_path, monk
     if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", []) for i in b.get("instructions", [])):
         pytest.skip("this backend emits no P-Code for arm32")
     assert _merge_verdicts(store, t, pool, q) == {k: {v} for k, v in _MERGE_EXPECT.items()}
+
+
+# ---------------------------------------- input index guarded by an UNRELATED branch (all ISAs) ---
+# An input index reaching an access past a conditional branch that tests an UNRELATED value (a loop
+# trip count `if(n<=0)`, a flag) is unchecked -- the branch adds no bound on the index. It must be
+# told apart from a branch that tests the index itself with a VARIABLE bound (`if(i>=n)`), which is
+# undecidable (no claim), so neither becomes a false positive and the real one is still found.
+_UNREL_SRC = r"""
+#include <stdlib.h>
+int table[10];
+void sink(int);
+#define NX __attribute__((noipa))
+NX void unrel_guard(char*s,int n){ int i=atoi(s); if(n<=0) return; sink(table[i]); }
+NX void var_guard(char*s,int n){ int i=atoi(s); if(i<0||i>=n) return; table[i]=1; }
+void sink(int x){ volatile int y=x; (void)y; }
+int main(int c,char**v){ unrel_guard(v[1],c); var_guard(v[1],c); return 0; }
+"""
+
+
+def test_x86_unrelated_guard_index(store, case, pool, gcc, tmp_path):
+    """An input index (register-held at -O2) guarded by a branch on an UNRELATED value (`if(n<=0)`)
+    is unchecked; a branch that tests the index against a VARIABLE bound (`if(i>=n)`) stays silent
+    (undecidable, no FP). -O2, the register path (-O0 indices are slot-based, a separate path)."""
+    opt = "-O2"
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "ug.c"; c.write_text(_UNREL_SRC)
+    out = tmp_path / "ug"
+    if subprocess.run([gcc, opt, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="ug")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"unrel_guard": {"unchecked"}}   # var_guard silent
