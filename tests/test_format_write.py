@@ -80,7 +80,7 @@ def fmt_bin(gcc, tmp_path_factory, x86_64_only):
     return out
 
 
-def test_format_write_confirms_l3(store, case, pool, fmt_bin):
+def test_format_write_confirms_l3(store, case, pool, fmt_bin, tmp_path):
     t = ingest(store, case.id, fmt_bin, filename="fmtwin")
     q = JobQueue(store.conn)
     enqueue_triage(q, t, force=True); assert pool.wait_idle(40)
@@ -91,6 +91,9 @@ def test_format_write_confirms_l3(store, case, pool, fmt_bin):
     assert any(pc.level == "L3" and pc.verified for pc in PocDAO(store.conn).list_by_target(t.id))
     pb = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.state == "poc-backed"]
     assert any("format-string" in e.get("detail", "") for f in pb for e in f.evidence)
+    from factories import replay_l3_bundle
+    r = replay_l3_bundle(store, t.id, tmp_path)
+    assert r.returncode == 0 and b"[+]" in r.stdout, (r.stdout[-600:], r.stderr[-300:])
 
 
 @pytest.fixture

