@@ -1863,6 +1863,32 @@ def _combine_checks(caller, callee):
     return ("bounded", min(caller[1], callee[1]), bool(caller[2] or callee[2]))
 
 
+def _tail_resolver(ctx):
+    """A `resolve_tail(operand) -> callee entry addr or None` for the current target. A tail call
+    (x86 `jmp sym.inner`, ARM `b inner`) forwards a parameter at -O2 but the decompiler records NO
+    call edge for it, so it is invisible through `targets` alone. Match the branch operand against
+    the known function entries, by address or by name; a memory/computed/intra-function target is
+    not a tail call and returns None."""
+    func_entries = {_naddr(a) for a in ctx.func_irs}
+    fn_by_name: dict = {}
+    for f in (ctx.functions or []):
+        nm, ad = getattr(f, "name", None), getattr(f, "addr", None)
+        if nm and ad is not None:
+            fn_by_name[normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", nm))] = _naddr(ad)
+
+    def resolve_tail(operand):
+        tok = (operand or "").strip()
+        if not tok or re.search(r"[\[\]+*]", tok):            # a memory / computed jmp is not a tail call
+            return None
+        if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", tok):
+            a = _naddr(tok)
+            return a if a in func_entries else None
+        a = fn_by_name.get(normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", tok)))
+        return a if (a is not None and a in func_entries) else None
+
+    return resolve_tail
+
+
 def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail=None):
     """Pass 1 of array_index over ONE function (see array_index)."""
     from . import bounds
@@ -1981,9 +2007,12 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
 # block edge. The DOMINATING-CHECK analysis is reused unchanged -- bounds.guard_bound /
 # branch_predicate / _edge_pred_bound work on P-Code, which is architecture-neutral (measured: they
 # read `cmp wI,#9; b.gt` as signed and `b.hi` as unsigned correctly) -- with the aarch64 frame bases
-# (SP, X29) and a stack-slot key ("SP", frame_offset) or a ("reg", NAME) key. Single function (the
-# cross-function join is not yet wired), global arrays, index carried at most one edge; anything the
-# tracker cannot resolve is dropped, so a stack array, arm32, or a deeper carry is silent not wrong.
+# (SP, X29) and a stack-slot key ("SP", frame_offset) or a ("reg", NAME) key. The CROSS-FUNCTION
+# join is wired: a parameter-indexed access is recorded (not emitted) and a `bl`/`blr` (or a -O2
+# tail-call `b <func>`) that forwards an input/parameter argument is recorded, so the shared
+# `_array_index_join` follows input across call edges exactly as on x86 -- a bare parameter alone is
+# no longer a finding. The index is still carried at most one BLOCK edge WITHIN a function, so a
+# deeper intra-function carry is silent not wrong, and anything the tracker cannot resolve is dropped.
 _A64_ARG = ("x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7")
 _A64_NO_IDX_WRITE = {"cmp", "cmn", "tst", "str", "strb", "strh", "stp", "stur", "b", "bl", "blr",
                      "ret", "nop", "cbz", "cbnz", "tbz", "tbnz"}
@@ -2163,13 +2192,44 @@ def _arm_reg_check(pred_block, after_idx, names, site_block, dom, bases, cond_te
     return None                                                    # the branch is not on the index
 
 
-def _array_index_arm(ctx, out):
-    """aarch64 CWE-129 (single function). See the module note above."""
+def _index_record(summaries, out, faddr, site, base, scale, off, src, access, chk):
+    """Route one array-index hit (shared by the aarch64 and arm32 scanners). A PARAMETER-sourced
+    index goes to `summaries` for the cross-function join -- it is a finding only once input is shown
+    to reach that parameter, combining the check at each edge. Any other source (self-parsed input)
+    is a finding right here. An undecidable check (`chk` is None) is dropped, never guessed."""
+    if chk is None:
+        return
+    if src.get("kind") == "param":
+        summaries[_naddr(faddr)].append((faddr, site, base, scale, off, src["param"], access, chk))
+        return
+    v = _index_verdict(chk, base, scale, off)
+    if v is not None:
+        verdict, oob = v
+        out.append(_array_index_cand(faddr, site, base, scale, off, src, access, chk, verdict, oob))
+
+
+def _record_forward(calls, reg, arg_regs, faddr, site, callee, check_for, ba, pred):
+    """Record the input/parameter arguments a call or tail call forwards -- an UNSCALED index value
+    (`("idx", 1, 0, src)`) live in an argument register, with the check the caller applies on the
+    way -- as an edge for the cross-function join. Nothing live to forward records nothing."""
+    passed = {}
+    for k, r in enumerate(arg_regs):
+        v = reg.get(r)
+        if v and v[0] == "idx" and v[1] == 1 and v[2] == 0:
+            passed[k] = (v[3], check_for(v[3], ba, pred, r))
+    if passed:
+        calls.append((faddr, site, callee, passed))
+
+
+def _array_index_arm(ctx, summaries, calls, targets, resolve_tail, out):
+    """aarch64 CWE-129, pass 1. Per function: an access indexed by self-parsed input is emitted
+    directly; an access indexed by a PARAMETER is recorded in `summaries`, and a call (or tail call)
+    forwarding an input/parameter value in `calls`, for the shared cross-function join."""
     for faddr, ir in ctx.func_irs.items():
         blocks = [b for b in ((ir or {}).get("blocks") or [])
                   if isinstance(b, dict) and b.get("addr")]
         if blocks and len(blocks) <= 2000:
-            _a64_scan_function(ctx, faddr, blocks, out)
+            _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out)
 
 
 def _has_pcode(blocks) -> bool:
@@ -2180,8 +2240,10 @@ def _has_pcode(blocks) -> bool:
     return any((i.get("pcode") for b in blocks for i in (b.get("instructions") or [])))
 
 
-def _a64_scan_function(ctx, faddr, blocks, out):
-    """The aarch64 CWE-129 scan over ONE function (its own scope, so `check_for` binds cleanly)."""
+def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out):
+    """The aarch64 CWE-129 scan over ONE function (its own scope, so `check_for` binds cleanly).
+    A self-parsed input index is emitted here; a parameter index goes to `summaries` and a
+    forwarded argument to `calls`, both joined across call edges by `_array_index_join`."""
     from . import bounds
     if not _has_pcode(blocks):                            # no P-Code -> the check is invisible -> silent
         return
@@ -2238,7 +2300,26 @@ def _a64_scan_function(ctx, faddr, blocks, out):
             if not ops:
                 continue
             dst = _a64_canon(ops[0])
+            if mnem == "b" and ops:
+                # a tail call (`b inner` at -O2 forwards a parameter): the live argument registers
+                # carry the forwarded value and the function ends here. A plain `b` to a block
+                # within this function is NOT a tail call (resolve_tail returns None).
+                callee = resolve_tail(ops[0])
+                if callee is not None and callee != _naddr(faddr):
+                    _record_forward(calls, reg, _A64_ARG, faddr, i.get("addr"), callee,
+                                    check_for, ba, pred)
+                continue
             if mnem in ("bl", "blr"):
+                # record a forwarded index BEFORE the call clobbers the argument registers: an
+                # input/parameter value in x0-x7 (unscaled) passed to a known callee is an edge of
+                # the cross-function join (a parsed value seeds it; the function's own parameter
+                # carries it onward). Resolve the callee through the call graph, falling back to the
+                # direct branch target when the decompiler left the call edge out (measured: ghidra
+                # drops the edge for some direct `bl`s, which silently broke the seed).
+                callee = targets.get(_naddr(i.get("addr"))) or resolve_tail(ops[0] if ops else "")
+                if callee is not None:
+                    _record_forward(calls, reg, _A64_ARG, faddr, i.get("addr"), callee,
+                                    check_for, ba, pred)
                 name = normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "",
                                         ops[0])) if ops else ""
                 for r in list(reg):                   # a call clobbers the caller-saved regs
@@ -2284,14 +2365,8 @@ def _a64_scan_function(ctx, faddr, blocks, out):
                     scale, off = idx[1] * mm[3], idx[2] * mm[3]
                     abase = (("global", base[2], base[1], base[3]) if base[0] == "ga"
                              else ("stack", base[1], base[2]))
-                    src = idx[3]
-                    chk = check_for(src, ba, pred, mm[2])
-                    v = _index_verdict(chk, abase, scale, off) if chk else None
-                    if v is not None:
-                        verdict, oob = v
-                        out.append(_array_index_cand(faddr, i.get("addr"), abase, scale, off,
-                                                     src, "write" if store else "read", chk,
-                                                     verdict, oob))
+                    _index_record(summaries, out, faddr, i.get("addr"), abase, scale, off, idx[3],
+                                  "write" if store else "read", check_for(idx[3], ba, pred, mm[2]))
                 if not store:
                     reg[dst] = None                            # a load result is array data
                 continue
@@ -2317,6 +2392,9 @@ def _a64_scan_function(ctx, faddr, blocks, out):
 # not a branch the P-Code reader models), which would make a CHECKED access look unchecked. So a
 # function that uses any predicated (conditional-suffix) instruction is skipped entirely -- silent,
 # never a false finding. At -O0 the checks are plain `cmp;b.cond` branches and are read soundly.
+# Like aarch64, it feeds the shared CROSS-FUNCTION join: a parameter-indexed access is recorded (not
+# emitted) and a `bl`/`blx` forwarding an input/parameter argument is recorded, so input is followed
+# into a callee that indexes with the forwarded parameter; a bare parameter alone is not a finding.
 _ARM32_ARG = ("r0", "r1", "r2", "r3")
 _ARM32_NO_IDX_WRITE = {"cmp", "cmn", "tst", "teq", "str", "strb", "strh", "stm", "stmdb", "push",
                        "b", "bl", "blx", "bx", "nop", "pop", "ret"}
@@ -2435,7 +2513,11 @@ def _arm32_index_slots(ctx, blocks, names, entry, call_names):
                 if mm and mm[0] == "slot":
                     writes[mm[1]].append(_naddr(i.get("addr")))
             if mnem in ("add", "sub") and len(ops) == 3 and _arm32_canon(ops[1]) in ("r11", "sp") \
+                    and _arm32_canon(ops[0]) not in ("r11", "sp") \
                     and _NUM.match(ops[2].lstrip("#")):
+                # `add r3, fp, #-8` computes &local into a general register (address escapes); the
+                # frame setup `sub sp, sp, #N` / `add fp, sp, #4` has a frame-register DESTINATION and
+                # does NOT take a local's address -- excluding it kept the real param slot invisible.
                 imm = int(ops[2].lstrip("#"), 0)
                 taken.add(-imm if mnem == "sub" else imm)
     out = {}
@@ -2477,8 +2559,10 @@ def _arm32_index_slots(ctx, blocks, names, entry, call_names):
     return {o: s for o, s in out.items() if o not in taken and len(writes.get(o, [])) == 1}
 
 
-def _array_index_arm32(ctx, out):
-    """arm32 CWE-129 (single function). See the module note above."""
+def _array_index_arm32(ctx, summaries, calls, targets, resolve_tail, out):
+    """arm32 CWE-129, pass 1. As aarch64: a self-parsed input index is emitted directly; a parameter
+    index is recorded in `summaries` and a forwarded argument (call or tail call) in `calls`, for
+    the shared join."""
     # The ghidra backend (which emits the P-Code this ISA needs) renders a `bl` target as a raw
     # address, so the parser name is resolved through the call graph, not the disassembly text.
     call_names = {_naddr(e.site_addr): normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "",
@@ -2488,10 +2572,12 @@ def _array_index_arm32(ctx, out):
         blocks = [b for b in ((ir or {}).get("blocks") or [])
                   if isinstance(b, dict) and b.get("addr")]
         if blocks and len(blocks) <= 2000:
-            _arm32_scan_function(ctx, faddr, blocks, out, call_names)
+            _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out,
+                                 call_names)
 
 
-def _arm32_scan_function(ctx, faddr, blocks, out, call_names):
+def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out,
+                         call_names):
     from . import bounds
     if not _has_pcode(blocks):                            # no P-Code -> the check is invisible
         return
@@ -2548,7 +2634,20 @@ def _arm32_scan_function(ctx, faddr, blocks, out, call_names):
             if not ops:
                 continue
             dst = _arm32_canon(ops[0])
+            if mnem == "b" and ops:                   # a tail call forwards a parameter (see aarch64)
+                callee = resolve_tail(ops[0])
+                if callee is not None and callee != _naddr(faddr):
+                    _record_forward(calls, reg, _ARM32_ARG, faddr, i.get("addr"), callee,
+                                    check_for, ba, pred)
+                continue
             if mnem in ("bl", "blx"):
+                # record a forwarded index BEFORE the call clobbers r0-r3 (see the aarch64 scanner),
+                # resolving the callee through the call graph with the direct branch target as a
+                # fallback when the decompiler left the call edge out
+                callee = targets.get(_naddr(i.get("addr"))) or resolve_tail(ops[0] if ops else "")
+                if callee is not None:
+                    _record_forward(calls, reg, _ARM32_ARG, faddr, i.get("addr"), callee,
+                                    check_for, ba, pred)
                 name = call_names.get(_naddr(i.get("addr"))) \
                     or normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0]))
                 reg.clear()
@@ -2616,25 +2715,15 @@ def _arm32_scan_function(ctx, faddr, blocks, out, call_names):
                 if base and base[0] == "ga" and idx and idx[0] == "idx":
                     scale, off = idx[1] * mm[3], idx[2] * mm[3]
                     gbase = ("global", base[2], base[1], base[3])
-                    src = idx[3]
-                    chk = check_for(src, ba, pred, mm[2])
-                    v = _index_verdict(chk, gbase, scale, off) if chk else None
-                    if v is not None:
-                        verdict, oob = v
-                        out.append(_array_index_cand(faddr, i.get("addr"), gbase, scale, off, src,
-                                                     "write" if store else "read", chk, verdict, oob))
+                    _index_record(summaries, out, faddr, i.get("addr"), gbase, scale, off, idx[3],
+                                  "write" if store else "read", check_for(idx[3], ba, pred, mm[2]))
                 if not store:
                     reg[dst] = None
                 continue
             if mm and mm[0] == "base" and reg.get(mm[1]) and reg[mm[1]][0] == "ptr":
                 p = reg[mm[1]]                                 # a stack array element pointer + disp
-                src = p[4]
-                chk = check_for(src, ba, pred, mm[1])
-                v = _index_verdict(chk, p[1], p[2], p[3] + mm[2]) if chk else None
-                if v is not None:
-                    verdict, oob = v
-                    out.append(_array_index_cand(faddr, i.get("addr"), p[1], p[2], p[3] + mm[2], src,
-                                                 "write" if store else "read", chk, verdict, oob))
+                _index_record(summaries, out, faddr, i.get("addr"), p[1], p[2], p[3] + mm[2], p[4],
+                              "write" if store else "read", check_for(p[4], ba, pred, mm[1]))
                 if not store:
                     reg[dst] = None
                 continue
@@ -2662,38 +2751,25 @@ def array_index(ctx: DetectContext):
     if not ctx.func_irs:
         return []
     out: list = []
-    if _is_aarch64(ctx.arch) and ctx.bits == 64:
-        _array_index_arm(ctx, out)       # a separate, conservative aarch64 scanner
-        return out
-    if _is_arm32(ctx.arch) and ctx.bits == 32:
-        _array_index_arm32(ctx, out)     # the arm32 scanner (P-Code + no conditional exec)
-        return out
-    if not (_is_x86(ctx.arch) and ctx.bits == 64):
-        return []
-    summaries: dict = defaultdict(list)    # callee addr -> [(site, base, scale, off, k, access, check)]
+    summaries: dict = defaultdict(list)    # callee addr -> [(cfaddr, site, base, scale, off, k, access, check)]
     calls: list = []                       # (caller, call site, callee addr, {k: (src, check)})
     targets = {_naddr(e.site_addr): _naddr(e.dst_addr) for e in (ctx.call_edges or [])
                if getattr(e, "dst_addr", None) and not getattr(e, "external", False)}
-    # Resolve a tail `jmp` operand to a function entry: the decompiler does not record a call edge
-    # for a tail call, so a forwarded parameter at -O2 (`outer: jmp sym.inner`) is invisible through
-    # `targets` alone. Match the operand against the known function entries, by name or by address.
-    func_entries = {_naddr(a) for a in ctx.func_irs}
-    fn_by_name: dict = {}
-    for f in (ctx.functions or []):
-        nm, ad = getattr(f, "name", None), getattr(f, "addr", None)
-        if nm and ad is not None:
-            fn_by_name[normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", nm))] = _naddr(ad)
-
-    def resolve_tail(operand):
-        tok = (operand or "").strip()
-        if not tok or re.search(r"[\[\]+*]", tok):            # a memory / computed jmp is not a tail call
-            return None
-        if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", tok):
-            a = _naddr(tok)
-            return a if a in func_entries else None
-        a = fn_by_name.get(normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", tok)))
-        return a if (a is not None and a in func_entries) else None
-
+    resolve_tail = _tail_resolver(ctx)
+    # aarch64 and arm32 feed the SAME two-structure model (summaries + calls) through their own
+    # conservative pass-1 scanners, then share the ISA-neutral pass-2 join below. So a parameter
+    # index is flagged on ARM exactly as on x86 -- only when input is shown to reach it, combining
+    # the check at each call edge -- not merely because a bare parameter indexed an array.
+    if _is_aarch64(ctx.arch) and ctx.bits == 64:
+        _array_index_arm(ctx, summaries, calls, targets, resolve_tail, out)
+        _array_index_join(summaries, calls, out)
+        return out
+    if _is_arm32(ctx.arch) and ctx.bits == 32:
+        _array_index_arm32(ctx, summaries, calls, targets, resolve_tail, out)
+        _array_index_join(summaries, calls, out)
+        return out
+    if not (_is_x86(ctx.arch) and ctx.bits == 64):
+        return []
     for faddr, ir in ctx.func_irs.items():
         # the dominator / guard machinery keys every block by its address: a block without one
         # (a degenerate decompiler record) is dropped rather than allowed to sink the detector
@@ -2701,18 +2777,25 @@ def array_index(ctx: DetectContext):
         if not blocks or len(blocks) > 2000:
             continue
         _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail)
-    # Pass 2: an input value handed to a function that indexes with that parameter -- following a
-    # forwarded parameter across MORE THAN ONE call edge. Index the calls by callee and by the
-    # caller-PARAMETER each argument carries, then walk from every PARSED-input pass, combining the
-    # check at each edge, to the access that indexes the parameter at the end of the chain.
-    #
-    #   main: i=atoi(argv[1]); f(i)   -->   f(p): g(p)   -->   g(q): table[q]
-    #
-    # `forwards[(func, param)]` = the calls that pass func's parameter `param` onward (to callee
-    # arg k', with the check func applies first); `summaries[func]` = the accesses func indexes
-    # with a parameter. A visited set and a depth bound keep a recursive/mutually-recursive call
-    # graph finite; the join stays silent (never a false finding) when any edge's check is
-    # undecidable, since `_combine_checks(None, ...)` is None.
+    _array_index_join(summaries, calls, out)
+    return out
+
+
+def _array_index_join(summaries, calls, out):
+    """Pass 2 of array_index, SHARED by every ISA. An input value handed to a function that indexes
+    with that parameter -- following a forwarded parameter across MORE THAN ONE call edge. Index the
+    calls by callee and by the caller-PARAMETER each argument carries, then walk from every
+    PARSED-input pass, combining the check at each edge, to the access that indexes the parameter at
+    the end of the chain.
+
+      main: i=atoi(argv[1]); f(i)   -->   f(p): g(p)   -->   g(q): table[q]
+
+    `forwards[(func, param)]` = the calls that pass func's parameter `param` onward (to callee
+    arg k', with the check func applies first); `summaries[func]` = the accesses func indexes with a
+    parameter. A visited set and a depth bound keep a recursive/mutually-recursive call graph finite;
+    the join stays silent (never a false finding) when any edge's check is undecidable, since
+    `_combine_checks(None, ...)` is None. Reads only `summaries` and `calls` as pass 1 recorded them,
+    so it is architecture-neutral -- x86, aarch64 and arm32 all drive it."""
     forwards: dict = defaultdict(list)
     seeds = []                                            # (caller, call_site, callee, k, src, check)
     for caller, call_site, callee, passed in calls:
@@ -2751,7 +2834,6 @@ def array_index(ctx: DetectContext):
 
     for caller, call_site, callee, k, src, chk in seeds:
         _walk(callee, k, chk, src, [(caller, call_site, k)], set())
-    return out
 
 
 def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict, oob):

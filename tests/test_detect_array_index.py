@@ -532,3 +532,88 @@ def test_arm32_stack_array_index(store, case, pool, arm32_gcc, tmp_path, monkeyp
                 got.setdefault(names.get(d["function"]), set()).add((d["check"]["verdict"],
                                                                      d["array"]["kind"]))
     assert got == {"unchk_local": {("unchecked", "stack")}}, got
+
+
+# --------------------------------------------------------- ARM cross-function join (compiled) ----
+_XFN_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void leaf(int i){ table[i]=1; }                      /* indexes the forwarded param */
+NX void mid(int i){ leaf(i); }                          /* forwards it on (tail call at -O2) */
+NX void top(int i){ mid(i); }                           /* forwards it on (tail call at -O2) */
+NX void safe_leaf(int i){ table[i]=2; }
+NX void safe_top(int i){ if(i>=0&&i<10) safe_leaf(i); } /* CALLER bounds it before the forward */
+NX void uncalled(int i){ table[i]=9; }                  /* bare param fed only a constant */
+int main(int c,char**v){
+    top(atoi(v[1]));        /* main -> top -> mid -> leaf: three edges, unchecked */
+    safe_top(atoi(v[2]));   /* bounded before the forward -> must stay silent */
+    uncalled(3);            /* a constant, not input -> must stay silent */
+    return 0;
+}
+"""
+
+
+def _xfn_findings(store, t, pool, q):
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if not d:
+                continue
+            fn = names.get(d["function"])
+            got.setdefault(fn, set()).add(d["check"]["verdict"])
+            via = d["index"].get("via_call")
+            if fn == "leaf":                             # reached only across the forwarding chain
+                assert via and names.get(via["caller"]) == "main" and via.get("hops", 1) >= 2, via
+    return got
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_aarch64_cross_function_join(store, case, pool, a64_gcc, tmp_path, opt):
+    """CWE-129 across functions on aarch64: an index parsed in `main` is forwarded top -> mid ->
+    leaf (three edges; `bl` at -O0, tail-call `b` at -O2) before it indexes `table`. The shared join
+    follows it; `leaf` is flagged unchecked with the chain attributed to main. Precision: `safe_top`
+    bounds the index before forwarding (safe_leaf silent) and `uncalled` indexes a bare parameter
+    fed only a constant (silent) -- a bare parameter is no longer a finding on its own."""
+    c = tmp_path / "x.c"; c.write_text(_XFN_SRC)
+    out = tmp_path / "x"
+    if subprocess.run([a64_gcc, opt, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o",
+                       str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="x")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "aarch64":
+        pytest.skip("backend did not identify aarch64")
+    assert _xfn_findings(store, t, pool, q) == {"leaf": {"unchecked"}}
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_arm32_cross_function_join(store, case, pool, arm32_gcc, tmp_path, monkeypatch, opt):
+    """CWE-129 across functions on arm32 (ghidra backend for the P-Code the check analysis needs).
+    Same three-edge forward as aarch64; `leaf` is flagged unchecked via the chain, while the
+    caller-bounded forward and the constant-fed bare parameter stay silent. A function using ARM
+    predication for its bound is skipped (sound), so safe_leaf stays silent whichever way -O2 emits
+    safe_top's check."""
+    monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
+    c = tmp_path / "x.c"; c.write_text(_XFN_SRC)
+    out = tmp_path / "x"
+    if subprocess.run([arm32_gcc, opt, "-marm", "-fno-stack-protector", "-no-pie", "-w", str(c),
+                       "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="x")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "arm" or store.targets.get(t.id).bits != 32:
+        pytest.skip("backend did not identify arm32")
+    one = FunctionDAO(store.conn).get(next(iter(FunctionDAO(store.conn).list_by_target(t.id))).id)
+    if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", []) for i in b.get("instructions", [])):
+        pytest.skip("this backend emits no P-Code for arm32")
+    assert _xfn_findings(store, t, pool, q) == {"leaf": {"unchecked"}}
