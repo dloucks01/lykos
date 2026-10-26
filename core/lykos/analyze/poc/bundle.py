@@ -1267,6 +1267,87 @@ def _secret_readme(meta: dict, secrets: list) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
+_SHELL_REPLAY = b'''#!/usr/bin/env python3
+"""Replay an exploit whose proof is a SPAWNED SHELL, and say whether it reproduced.
+
+stages.json holds the exact stages the live confirmation sent: stage 1 is the overflow and goes
+on the channel it was measured on (stdin, ./input.bin as a file, or an argument); later stages
+are read by the chain itself from stdin. Then the shell gets an arithmetic challenge on stdin: a
+target that merely echoes its input prints the expression, only a shell prints the value.
+Exit 0 = a shell evaluated the challenge. RUN IN A SANDBOX/VM -- this executes an untrusted
+binary and spawns a shell from it. Authorized use only."""
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+spec = json.load(open(os.path.join(here, "stages.json")))
+exe = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+stages = [bytes.fromhex(h) for h in spec["stages"]]
+argv = [a.encode() for a in spec.get("argv") or []]
+first, on_stdin = stages[0], True
+if spec["mode"] in ("file", "arg"):
+    on_stdin = False
+    carrier = (os.path.join(here, "input.bin").encode() if spec["mode"] == "file"
+               else first.split(b"\\0", 1)[0])           # an argument ends at its first NUL
+    argv = [carrier if a == b"@@" else a for a in argv] if b"@@" in argv else argv + [carrier]
+p = subprocess.Popen([exe.encode()] + argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT)
+
+
+def send(b):
+    try:
+        p.stdin.write(b)
+        p.stdin.flush()
+    except OSError:                                      # the target died and closed the pipe
+        pass
+
+
+time.sleep(0.2)
+for s in ([first] if on_stdin else []) + stages[1:]:
+    send(s)
+    time.sleep(0.3)
+a, b = random.randint(1000, 9999), random.randint(1000, 9999)
+send(b"echo LYKOS_SHELL_$((%d*%d))\\n" % (a, b))
+try:
+    out, _ = p.communicate(timeout=float(spec.get("timeout", 5)))
+except subprocess.TimeoutExpired:
+    p.kill()
+    out, _ = p.communicate()
+sys.stdout.write(out.decode("latin-1"))
+if b"LYKOS_SHELL_%d" % (a * b) in out:
+    print("\\n[+] a shell spawned and evaluated the challenge -- reproduced")
+    sys.exit(0)
+print("\\n[-] no shell answered the challenge")
+sys.exit(1)
+'''
+
+
+SHELL_VERDICT = {"exit": "zero", "script": "runner.sh",
+                 "note": "runner.sh exits 0 and prints [+] when a shell the exploit spawned "
+                         "evaluated an arithmetic challenge; 1 when no shell answered"}
+
+
+def shell_replay(mode: str, argv, stages, meta: dict) -> tuple[str, dict]:
+    """(run_cmd, extra_files) for a bundle whose proof is a spawned shell; sets meta's verdict.
+
+    The runner used to feed ./input.bin to the target and report an exit status -- which says
+    nothing about a shell -- and the scripted exploits shipped their SCRIPT as input.bin, so
+    runner.sh piped Python source into the target. `stages` are the bytes the live confirmation
+    sent (stage 1 framed exactly as delivered); pass stage 1 as the bundle's input too, so
+    input.bin is what a file-channel replay opens."""
+    meta["verdict"] = dict(SHELL_VERDICT)
+    spec = {"mode": mode if mode in ("file", "arg") else "stdin",
+            "argv": [str(a) for a in argv or []],
+            "stages": [bytes(s).hex() for s in stages]}
+    return ("python3 ./replay_shell.py ./target.bin",
+            {"replay_shell.py": _SHELL_REPLAY,
+             "stages.json": json.dumps(spec, indent=1).encode()})
+
+
 def build_secret(target_bytes: bytes, secrets: list, meta: dict) -> bytes:
     """Bundle a hard-coded-secret PoC: the binary, the extracted secret(s), and a pure-stdlib
     offline re-extractor that proves the credential is embedded (no target execution).
