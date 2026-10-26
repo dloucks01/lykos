@@ -22,6 +22,7 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
+from .srcwalk import source_files
 
 _log = logging.getLogger(__name__)
 
@@ -29,11 +30,6 @@ UAF_STAGE = "uaf_scan"
 TOOL = "uaf"
 TOOL_VERSION = "uaf-1"
 
-_MAX_FILES = 6000
-_MAX_FILE = 4 << 20
-_SRC_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
-_SKIP_SEGMENTS = {"examples", "example", "demo", "demos", "test", "tests", "third_party",
-                  "3rdparty", "vendor", "node_modules"}
 
 _IDENT = r"[A-Za-z_]\w*"
 # the deallocators, across libc / kernel / FreeRTOS / glib / C++ (`delete p;`). The captured group
@@ -188,22 +184,8 @@ def scan_source(root: Path) -> list:
     """Every freed-then-used / freed-twice pointer across the source tree. Returns finding dicts
     (minus target/case ids), one per (free-site, use-site, pointer)."""
     findings: list = []
-    n = 0
-    for p in sorted(root.rglob("*")):
-        if n >= _MAX_FILES:
-            break
-        if not p.is_file() or p.suffix.lower() not in _SRC_SUFFIXES:
-            continue
-        if _SKIP_SEGMENTS & {seg.lower() for seg in p.parts}:
-            continue
-        try:
-            if p.stat().st_size > _MAX_FILE:
-                continue
-            lines = _strip_comments(p.read_text("utf-8", "replace")).splitlines()
-        except OSError:
-            continue
-        n += 1
-        findings.extend(_scan_text(p.name, lines))
+    for label, _p, text in source_files(root):
+        findings.extend(_scan_text(label, _strip_comments(text).splitlines()))
     return findings
 
 

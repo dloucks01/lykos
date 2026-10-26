@@ -185,23 +185,61 @@ def exploit_hint(cwe: str) -> "tuple[str, str | None] | None":
 
 
 # ------------------------------------------------------------------ version comparison
+# Pre-release tags, lowest first. A pre-release sorts BEFORE its release: `1.2.0-rc1` is the code
+# before the fix that ships in 1.2.0, so `lt 1.2.0` must include it.
+_PRE_RANK = {"dev": 0, "snapshot": 0, "alpha": 1, "a": 1, "beta": 2, "b": 2, "pre": 3,
+             "preview": 3, "rc": 4, "c": 4}
+_FINAL = (1,)
+
+
+def _pre_key(tag: str, num: str):
+    return (0, _PRE_RANK.get(tag.lower(), 0), int(num) if num else 0)
+
+
 def vkey(v: str):
-    """Sortable key for versions like 1.2.11 / 1.0.2k / 2018.76: each dotted part -> (int, str)
-    so numeric ordering dominates and a letter suffix (openssl) tie-breaks."""
+    """Sortable key for versions like 1.2.11 / 1.0.2k / 2018.76 / 1.2.0-rc1 / 3.0b2: (parts, pre).
+
+    Each dotted part -> (int, letters) so numeric ordering dominates and a bare letter suffix
+    (openssl's 1.0.2k, a POST-release) tie-breaks upward. A pre-release -- semver `-rc.1` /
+    `-beta`, Debian `~rc1`, an inline `rc1` / `b2` / `a1` (letters followed by a number) or a
+    named tag (alpha, beta, rc, pre, dev) -- sorts BELOW the same version without it. These were
+    dropped (`1.2.0-rc1` == 1.2.0) or ranked above it (`1.2.0rc1` > 1.2.0), so an advisory fixed
+    in 1.2.0 missed its own release candidates. Build metadata (`+build.5`) is ignored, as semver
+    says, and a numeric Debian revision (`1.2.0-1ubuntu2`) or a vendor tag (`1.0.2k-fips`) is the
+    same upstream release -- only a KNOWN pre-release tag lowers it."""
+    text = str(v).strip().split("+", 1)[0]
+    pre = _FINAL
+    m = re.match(r"^(.*?)[-~](.*)$", text)
+    if m:
+        text, tail = m.group(1), m.group(2)
+        sep = str(v).strip()[len(text)]
+        tm = re.match(r"([A-Za-z]+)[.\-_]?(\d*)", tail)
+        known = tm is not None and tm.group(1).lower() in _PRE_RANK and (
+            len(tm.group(1)) > 1 or bool(tm.group(2)))
+        if tm and (sep == "~" or known):
+            pre = _pre_key(tm.group(1), tm.group(2))
+        elif sep == "~":
+            pre = (0, 0, 0)
     out = []
-    for part in str(v).split("."):
-        m = re.match(r"(\d*)([a-zA-Z]*)", part)
-        num = int(m.group(1)) if m.group(1) else 0
-        out.append((num, m.group(2)))
-    return out
+    for part in text.split("."):
+        pm = re.match(r"(\d*)([a-zA-Z]*)(\d*)", part)
+        num = int(pm.group(1)) if pm.group(1) else 0
+        tag, tnum = pm.group(2), pm.group(3)
+        if tag and (tnum or (len(tag) > 1 and tag.lower() in _PRE_RANK)):
+            if pre == _FINAL:                            # inline pre-release: 1.2.0rc1, 3.0b2
+                pre = _pre_key(tag, tnum)
+            tag = ""
+        out.append((num, tag))
+    return out, pre
 
 
 def vcmp(a: str, b: str) -> int:
-    ka, kb = vkey(a), vkey(b)
+    (ka, pa), (kb, pb) = vkey(a), vkey(b)
     n = max(len(ka), len(kb))
     ka += [(0, "")] * (n - len(ka))
     kb += [(0, "")] * (n - len(kb))
-    return -1 if ka < kb else (1 if ka > kb else 0)
+    ka_full, kb_full = (ka, pa), (kb, pb)
+    return -1 if ka_full < kb_full else (1 if ka_full > kb_full else 0)
 
 
 def in_range(v: str, r: dict) -> bool:

@@ -39,6 +39,35 @@ def test_trailing_zero_parts_do_not_change_the_ordering():
     assert db.vcmp("1.0", "1.0.0.0") == 0
 
 
+@pytest.mark.parametrize("a,b", [
+    ("1.2.0-rc1", "1.2.0"),         # semver pre-release: before its release
+    ("1.2.0rc1", "1.2.0"),          # inline pre-release (python/pkg style)
+    ("1.2.0rc1", "1.2.0rc2"),
+    ("1.2.0-alpha.2", "1.2.0-beta.1"),
+    ("1.2.0-beta", "1.2.0-rc1"),
+    ("1.2.0~rc1", "1.2.0"),         # Debian `~` always sorts first
+    ("7.68.0-DEV", "7.68.0"),       # curl's development builds
+    ("3.0b2", "3.0"),
+    ("1.1.9", "1.2.0-rc1"),         # still after the previous release
+])
+def test_a_pre_release_orders_before_its_release(a, b):
+    """A release candidate of the fix version is code from BEFORE the fix: an advisory fixed in
+    1.2.0 (`lt 1.2.0`) must include 1.2.0-rc1. It used to read as 1.2.0 itself (the `-rc1` was
+    dropped) or, written inline, as newer than 1.2.0."""
+    assert db.vcmp(a, b) < 0, f"{a} should sort before {b}"
+    assert db.vcmp(b, a) > 0
+    assert db.in_range(a, {"lt": b})
+
+
+@pytest.mark.parametrize("a,b", [
+    ("1.0.2k-fips", "1.0.2k"),      # a vendor tag is not a pre-release (RHEL's OpenSSL banner)
+    ("1.2.0-1ubuntu2", "1.2.0"),    # a Debian revision is the same upstream release
+    ("1.2.0+build.5", "1.2.0"),     # semver build metadata is ignored
+])
+def test_a_vendor_suffix_is_the_same_release(a, b):
+    assert db.vcmp(a, b) == 0
+
+
 # ---- range boundaries --------------------------------------------------------------------
 
 def test_a_half_open_range_includes_its_lower_bound_and_excludes_its_upper():

@@ -24,6 +24,7 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
+from .srcwalk import source_files
 
 _log = logging.getLogger(__name__)
 
@@ -31,11 +32,6 @@ SOURCE_SINK_STAGE = "source_sink_scan"
 TOOL = "source-sinks"
 TOOL_VERSION = "source-sinks-1"
 
-_MAX_FILES = 6000
-_MAX_FILE = 4 << 20
-_SRC_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
-_SKIP_SEGMENTS = {"examples", "example", "demo", "demos", "test", "tests", "third_party",
-                  "3rdparty", "vendor", "node_modules"}
 
 _IDENT = r"[A-Za-z_]\w*"
 # command sinks -> the command argument position (0-based) whose non-literal value is CWE-78.
@@ -130,21 +126,7 @@ def _is_literal(arg: str) -> bool:
 
 def scan_source(root: Path) -> list:
     findings: list = []
-    n = 0
-    for p in sorted(root.rglob("*")):
-        if n >= _MAX_FILES:
-            break
-        if not p.is_file() or p.suffix.lower() not in _SRC_SUFFIXES:
-            continue
-        if _SKIP_SEGMENTS & {seg.lower() for seg in p.parts}:
-            continue
-        try:
-            if p.stat().st_size > _MAX_FILE:
-                continue
-            text = p.read_text("utf-8", "replace")
-        except OSError:
-            continue
-        n += 1
+    for label, _p, text in source_files(root):
         text = _strip_comments(text)                       # a sink named in a comment is not a call
         lines = text.splitlines()
         lit_vars = set(_LIT_ASSIGN.findall(text))          # locals assigned a string literal
@@ -172,11 +154,11 @@ def scan_source(root: Path) -> list:
                 if re.fullmatch(r"(?:NULL|0|nullptr)", arg):
                     continue
                 if fn in _CMDI:
-                    findings.append(_mk(p.name, i, fn, arg, "CWE-78",
+                    findings.append(_mk(label, i, fn, arg, "CWE-78",
                                         f"{fn}() runs a non-literal command ('{arg}')",
                                         "OS command injection"))
                 else:
-                    findings.append(_mk(p.name, i, fn, arg, "CWE-134",
+                    findings.append(_mk(label, i, fn, arg, "CWE-134",
                                         f"{fn}() uses a non-literal format string ('{arg}')",
                                         "format string"))
     return findings

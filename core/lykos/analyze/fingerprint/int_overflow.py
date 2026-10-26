@@ -21,6 +21,7 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
+from .srcwalk import source_files
 
 _log = logging.getLogger(__name__)
 
@@ -28,11 +29,6 @@ INT_OVERFLOW_STAGE = "int_overflow_scan"
 TOOL = "int-overflow"
 TOOL_VERSION = "int-overflow-1"
 
-_MAX_FILES = 6000
-_MAX_FILE = 4 << 20
-_SRC_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
-_SKIP_SEGMENTS = {"examples", "example", "demo", "demos", "test", "tests", "third_party",
-                  "3rdparty", "vendor", "node_modules"}
 
 # calloc/reallocarray are the SAFE allocators (they check the product internally) -> never flagged.
 _ALLOC = re.compile(r"\b(malloc|realloc|aligned_alloc|alloca|valloc|pvPortMalloc|vPortMalloc|"
@@ -99,21 +95,8 @@ def scan_source(root: Path) -> list:
     (minus target/case ids). Two shapes: arithmetic directly in the alloc arg, and an alloc of a
     size variable that was assigned such arithmetic earlier in the same window."""
     findings: list = []
-    n = 0
-    for p in sorted(root.rglob("*")):
-        if n >= _MAX_FILES:
-            break
-        if not p.is_file() or p.suffix.lower() not in _SRC_SUFFIXES:
-            continue
-        if _SKIP_SEGMENTS & {seg.lower() for seg in p.parts}:
-            continue
-        try:
-            if p.stat().st_size > _MAX_FILE:
-                continue
-            lines = _strip_comments(p.read_text("utf-8", "replace")).splitlines()
-        except OSError:
-            continue
-        n += 1
+    for label, _p, text in source_files(root):
+        lines = _strip_comments(text).splitlines()
         # size variables assigned from risky arithmetic: var -> line index
         size_vars: dict = {}
         for i, ln in enumerate(lines):
@@ -138,12 +121,12 @@ def scan_source(root: Path) -> list:
             if any(g in window for g in _GUARD):
                 continue            # an overflow guard is present -> not flagged (e.g. fixed code)
             alloc = m.group(1)
-            detail = (f"{p.name}:{i + 1}: {alloc}() size is overflow-prone arithmetic "
+            detail = (f"{label}:{i + 1}: {alloc}() size is overflow-prone arithmetic "
                       f"({frag}) with no nearby overflow check")
             findings.append({
                 "cwe": "CWE-190", "severity": "medium",
                 "title": f"Unchecked size arithmetic into {alloc}() (integer-overflow allocation)",
-                "dedup_key": f"intovf:{p.name}:{i + 1}:{alloc}",
+                "dedup_key": f"intovf:{label}:{i + 1}:{alloc}",
                 "evidence": [{"channel": "source", "detail": detail}],
                 "via": via})
     return findings

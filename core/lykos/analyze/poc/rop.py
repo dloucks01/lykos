@@ -853,16 +853,14 @@ def _s8(b):
     return b - 256 if b >= 128 else b
 
 
+_MOVABS = re.compile(rb"[\x48\x49][\xb8-\xbf]")
+
+
 def _find_movabs(seg, start):
     """Index of the next `movabs r64, imm64` (REX.W prefix 0x48/0x49, opcode 0xB8..0xBF) at or
     after `start`, or -1. This is the only x86-64 instruction carrying a full 64-bit immediate."""
-    x = max(0, start)
-    n = len(seg)
-    while x + 1 < n:
-        if seg[x] in (0x48, 0x49) and 0xB8 <= seg[x + 1] <= 0xBF:
-            return x
-        x += 1
-    return -1
+    m = _MOVABS.search(seg, max(0, start))             # C-speed scan: a byte loop took seconds
+    return m.start() if m else -1                      # on a large binary's code segment
 
 
 def _local_load_disp(seg, lo, hi):
@@ -1552,14 +1550,17 @@ def find_magic_gates(data: bytes):
             continue
         seg = data[off:off + sz]
         # (a) direct memory compare against an immediate.
-        i = 0
-        while True:
-            j = seg.find(b"\x81\x7d", i)                 # cmp dword [rbp+disp8], imm32
-            k = seg.find(b"\x81\x7c\x24", i)             # cmp dword [rsp+disp8], imm32
-            hit = min(x for x in (j, k) if x >= 0) if (j >= 0 or k >= 0) else -1
-            if hit < 0:
-                break
-            i = hit + 1
+        # Each pattern keeps its own next position and is re-searched only once consumed:
+        # re-finding BOTH from every hit rescanned the rest of the segment for the rarer one at
+        # every hit of the other -- quadratic on a large binary.
+        j = seg.find(b"\x81\x7d")                       # cmp dword [rbp+disp8], imm32
+        k = seg.find(b"\x81\x7c\x24")                   # cmp dword [rsp+disp8], imm32
+        while j >= 0 or k >= 0:
+            hit = min(x for x in (j, k) if x >= 0)
+            if hit == j:
+                j = seg.find(b"\x81\x7d", hit + 1)
+            if hit == k:
+                k = seg.find(b"\x81\x7c\x24", hit + 1)
             rbp = seg[hit:hit + 2] == b"\x81\x7d"
             base = hit + (3 if rbp else 4)
             if base + 4 > len(seg):

@@ -162,6 +162,27 @@ def test_history_detects_recall_and_fp_regressions(tmp_path):
     assert history.regressions(stable) == []
 
 
+def test_history_never_compares_runs_over_different_case_sets(tmp_path):
+    """A 2-case `--only` run after a full-corpus run is not a regression of it (or a recovery)."""
+    from types import SimpleNamespace
+
+    from lykos.eval import history
+    h = tmp_path / "hist.jsonl"
+    full = _report(1.0, 0.0)
+    full.outcomes = [SimpleNamespace(name=n) for n in ("a", "b", "c", "d")]
+    subset = _report(0.5, 0.0)
+    subset.outcomes = [SimpleNamespace(name=n) for n in ("c", "a")]
+    history.record(h, full, stage="static", min_state="candidate", ts=1)
+    history.record(h, subset, stage="static", min_state="candidate", ts=2)
+    assert history.regressions(history.load(h)) == []
+    again = _report(0.5, 0.0)
+    again.outcomes = [SimpleNamespace(name=n) for n in ("d", "c", "b", "a")]   # same set, any order
+    history.record(h, again, stage="static", min_state="candidate", ts=3)
+    regs = history.regressions(history.load(h))
+    assert len(regs) == 1 and regs[0]["recall_delta"] == -0.5
+    assert regs[0]["series"].startswith("static/candidate@")
+
+
 def _recj(recall, fp, stage, ts):
     return {"ts": ts, "stage": stage, "min_state": None, "git": "abc",
             "overall": {"recall": recall, "fp_rate": fp}}

@@ -1,12 +1,13 @@
 """Benchmark history + regression detection (doc 14's "metrics over time").
 
 Each scored `eval` run appends one JSON line to a history file (append-only, offline). The
-history is grouped into **series** by (stage, min_state) -- comparing like with like -- and a
+history is grouped into **series** by (stage, min_state, corpus) -- comparing like with like -- and a
 run is a **regression** when its overall recall drops or its false-positive rate rises versus
 the previous run in the same series. The dashboard renders these; the CLI can fail on one.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import subprocess
@@ -30,6 +31,16 @@ def _git_rev():
         return None
 
 
+def corpus_id(report) -> str | None:
+    """A short fingerprint of WHICH cases were scored. Recall over a 10-case `--only` subset and
+    over the full corpus are different quantities; without this the next full run after a
+    subset run was reported as a regression (or masked one)."""
+    names = sorted(str(getattr(o, "name", "")) for o in (getattr(report, "outcomes", None) or []))
+    if not names:
+        return None
+    return hashlib.sha256("\n".join(names).encode()).hexdigest()[:8]
+
+
 def record(path, report, *, stage: str, min_state=None, label=None, ts=None) -> dict:
     """Append one run's scored metrics to the history file; returns the stored record."""
     # Both static backends: a run on the no-JVM native backend (rizin+pypcode) was recorded as
@@ -41,6 +52,7 @@ def record(path, report, *, stage: str, min_state=None, label=None, ts=None) -> 
         "ts": int(ts if ts is not None else time.time()),
         "git": _git_rev(), "stage": stage, "min_state": min_state, "label": label,
         "backend": backend, "n_cases": report.metrics.get("n_cases", 0),
+        "corpus": corpus_id(report),
         "overall": report.metrics.get("overall", {}),
         "per_cwe": report.metrics.get("per_cwe", {}),
     }
@@ -72,7 +84,10 @@ def load(path) -> list:
 
 def series_key(rec) -> str:
     s = rec.get("stage", "?")
-    return f"{s}/{rec['min_state']}" if rec.get("min_state") else s
+    key = f"{s}/{rec['min_state']}" if rec.get("min_state") else s
+    # Runs recorded before the corpus fingerprint existed keep their old series: their case set
+    # is unknown, so they are never compared with a fingerprinted run.
+    return f"{key}@{rec['corpus']}" if rec.get("corpus") else key
 
 
 def series(history) -> dict:
