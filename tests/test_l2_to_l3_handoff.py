@@ -217,15 +217,15 @@ def test_a_nul_in_the_slot_is_only_blamed_on_truncation_where_truncation_happens
     emitted on a run delivering through a FILE, where a zero byte travels intact, so it named a
     cause that was not there and sent the reader after the wrong thing. Only argv and env are
     NUL-terminated."""
-    import inspect
-
     from lykos.analyze.poc import exploit_stage
-    src = inspect.getsource(exploit_stage.build_exploit_stage)
-    window = src[src.index("_nul_cuts_the_slot("):][:1600]
-    assert 'mode in ("arg", "env")' in window, \
-        "the truncation claim must be conditional on a NUL-terminated channel"
-    assert "landing beside the slot" in window, \
-        "on a byte-safe channel the note must say what IS happening, not what is not"
+    plan = {"exploit": "ret2win", "label": "win", "bp": 0x401136,
+            "payload": b"A" * 40 + (0x401136).to_bytes(8, "little") + b"C" * 16}
+    for mode in ("arg", "env"):
+        note = exploit_stage._unreached_note(plan, {}, 40, mode, 8)
+        assert "copy is truncated" in note, (mode, note)
+    for mode in ("file", "stdin"):
+        note = exploit_stage._unreached_note(plan, {}, 40, mode, 8)
+        assert "copy is truncated" not in note and "landing beside the slot" in note, (mode, note)
 
 
 def test_poc_primitive_records_the_channel_it_resolved():
