@@ -8,6 +8,7 @@ the claim false -- a validator call, a variable bound, a clamp that rewrites the
 &index, a constant atoi("3") -- is a skip, never a guess."""
 from __future__ import annotations
 
+import shutil
 import subprocess
 
 import pytest
@@ -132,9 +133,12 @@ def test_degenerate_ir_never_raises(irs):
     assert array_index(ctx) == []
 
 
-def test_non_x86_64_is_silent():
-    ctx = _ctx([_blk("0x1000", [("0x1000", "bl atoi")])])
-    ctx.arch = "aarch64"
+def test_unsupported_isa_is_silent():
+    # aarch64 is now handled (below); an ISA with no tracker (mips) returns nothing, never guesses.
+    ctx = _ctx([_blk("0x1000", [("0x1000", "lw $a0, 0($sp)")])])
+    ctx.arch = "mips"
+    assert array_index(ctx) == []
+    ctx.arch = "aarch64"                                   # no resolvable access here -> still silent
     assert array_index(ctx) == []
 
 
@@ -345,3 +349,60 @@ def test_an_input_index_forwarded_across_several_calls(store, case, pool, gcc, t
             if fn == "leaf":
                 assert via and names.get(via["caller"]) == "main" and via.get("hops", 1) >= 2, via
     assert got == {"leaf": {"unchecked"}}, got
+
+
+# ------------------------------------------------------------------- aarch64 (cross-compiled) ----
+_A64_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NI __attribute__((noinline))
+NI void unchk(char*s){ int k=atoi(s); table[k]=1; }                         /* unchecked */
+NI void sgn(char*s){ int k=atoi(s); if(k<10) table[k]=2; }                  /* signed only */
+NI void bnd(char*s){ int k=atoi(s); if(k>=0&&k<=10) table[k]=3; }           /* bound admits 10 */
+NI void okc(char*s){ int k=atoi(s); if(k>=0&&k<10) table[k]=4; }            /* in bounds -> silent */
+NI void clmp(char*s){ int k=atoi(s); if(k>9)k=9; if(k<0)k=0; table[k]=5; }  /* clamped -> silent */
+NI void param_unchk(int i){ table[i]=6; }                                   /* param, unchecked */
+NI void param_chk(int i){ if(i<0||i>=10)return; table[i]=7; }               /* param, checked -> silent */
+int main(int c,char**v){ unchk(v[1]); sgn(v[1]); bnd(v[1]); okc(v[1]); clmp(v[1]);
+                         param_unchk(atoi(v[1])); param_chk(atoi(v[1])); return 0; }
+"""
+_A64_EXPECT = {"unchk": "unchecked", "sgn": "signed", "bnd": "bound", "param_unchk": "unchecked"}
+
+
+@pytest.fixture
+def a64_gcc():
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if not cc:
+        pytest.skip("no aarch64 cross-compiler (aarch64-linux-gnu-gcc)")
+    return cc
+
+
+def test_aarch64_array_index_single_function(store, case, pool, a64_gcc, tmp_path):
+    """CWE-129 on aarch64 (single function): an input/parameter index into a GLOBAL array via
+    `str/ldr wN,[xB,xI,lsl #s]`. The P-Code dominating-check analysis (reused unchanged) reads the
+    aarch64 `cmp;b.cond` guards, so a checked/clamped/in-bounds access stays silent while unchecked,
+    signed-only and past-the-end ones are flagged. Built at -O0 (the index is spilled to a slot;
+    an -O2 register-only index is not yet followed -- silent, not wrong)."""
+    c = tmp_path / "a.c"; c.write_text(_A64_SRC)
+    out = tmp_path / "a"
+    if subprocess.run([a64_gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o",
+                       str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile the aarch64 fixture")
+    t = ingest(store, case.id, out, filename="a")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    if store.targets.get(t.id).arch != "aarch64":
+        pytest.skip("backend did not identify the target as aarch64")
+    enqueue_detect(q, t, force=True); assert pool.wait_idle(120)
+    names = {f.addr: f.name for f in FunctionDAO(store.conn).list_by_target(t.id)}
+    got = {}
+    for f in FindingDAO(store.conn).list_by_target(t.id):
+        if f.detector != "array_index":
+            continue
+        for e in f.evidence:
+            d = e.get("array_index")
+            if not d:
+                continue
+            got.setdefault(names.get(d["function"]), set()).add(d["check"]["verdict"])
+    assert got == {k: {v} for k, v in _A64_EXPECT.items()}, got

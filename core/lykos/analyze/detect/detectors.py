@@ -1972,6 +1972,226 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             tail[ba] = (live, None)
 
 
+# ---- aarch64 CWE-129 ---------------------------------------------------------------------------
+# The x86 _IdxTracker (operand syntax, SysV registers, [base+idx*scale+disp]) does not fit aarch64,
+# so this is a separate, conservative scanner for the commonest shape: an input/parameter integer,
+# sign-extended, indexing a GLOBAL array with `str/ldr wN, [xBase, xIdx, lsl #s]`. The DOMINATING-
+# CHECK analysis is reused unchanged -- bounds.guard_bound / branch_predicate work on P-Code, which
+# is architecture-neutral (measured: on this ISA they read `cmp wI,#9; b.gt` correctly) -- with the
+# aarch64 frame bases (SP, X29) and a stack-slot key ("SP", frame_offset). Single function only in
+# this first cut; the cross-function join and an index kept in a register across blocks are not yet
+# followed, so such a case is silent, never wrong. Anything the tracker cannot resolve is dropped.
+_A64_ARG = ("x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7")
+_A64_NO_IDX_WRITE = {"cmp", "cmn", "tst", "str", "strb", "strh", "stp", "stur", "b", "bl", "blr",
+                     "ret", "nop", "cbz", "cbnz", "tbz", "tbnz"}
+
+
+def _a64_canon(reg):
+    """The 64-bit name for an aarch64 register token (`w3`->`x3`, `wsp`/`sp`->`sp`), else the token."""
+    r = (reg or "").lower()
+    if r in ("sp", "wsp"):
+        return "sp"
+    m = re.fullmatch(r"[wx](\d+|zr)", r)
+    return ("x" + m.group(1)) if m else r
+
+
+def _a64_mem(op, names):
+    """Classify an aarch64 memory operand: ('slot', offset, name) for a named frame local
+    `[var_2ch]`; ('indexed', base, idx, scale) for an `[xB, xI, lsl #s]` / `[xB, wI, sxtw #s]` /
+    `[xB, xI]` array access; ('base', reg, disp) for `[xN]` / `[xN, #imm]`; or None."""
+    m = re.search(r"\[([^\]]*)\]", op or "")
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group(1).split(",") if p.strip()]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        tok = parts[0]
+        if names and tok in names:
+            return ("slot", int(names[tok]), tok)
+        if re.fullmatch(r"[wx]\d+|sp|wsp", tok.lower()):
+            return ("base", _a64_canon(tok), 0)
+        return None
+    base = parts[0]
+    if not re.fullmatch(r"[wx]\d+|sp|wsp", base.lower()):
+        return None
+    base = _a64_canon(base)
+    second = parts[1]
+    if second.startswith("#") or _NUM.match(second.lstrip("#")):
+        return ("base", base, int(second.lstrip("#"), 0))          # [xN, #imm]
+    if re.fullmatch(r"[wx]\d+", second.lower()):
+        scale = 1
+        if len(parts) >= 3:                                        # lsl #s / sxtw #s / uxtw #s
+            s = re.search(r"(?:lsl|sxtw|uxtw|sxtx)\s*#?(\d+)", parts[2].lower())
+            if s:
+                scale = 1 << int(s.group(1))
+            elif not re.search(r"(?:sxtw|uxtw|sxtx)\b", parts[2].lower()):
+                return None                                        # an extend with no shift is x1
+        return ("indexed", base, _a64_canon(second), scale)
+    return None
+
+
+def _a64_adrp_const(instr):
+    """The page address an `adrp xN, _` materialises, read from its P-Code (`COPY const:C -> reg:xN`);
+    the disassembly text's symbol is often a nearby reloc, so the P-Code constant is the truth."""
+    for pc in instr.get("pcode", []) or []:
+        m = re.match(r"COPY const:(0x[0-9a-fA-F]+|\d+):\d+ -> reg:(\w+)", pc)
+        if m:
+            return int(m.group(1), 0)
+    return None
+
+
+def _a64_index_slots(ctx, blocks, names, entry):
+    """Frame-slot offset -> source dict, for a slot that holds a parsed input integer or an incoming
+    PARAMETER, written exactly once and whose address is never taken (`add xN, sp/x29, #off`) -- so
+    nothing can re-bound it unseen. Conservative: on any doubt the slot is dropped."""
+    writes: dict = defaultdict(list)                               # offset -> [instr addr]
+    taken = set()                                                  # offsets whose &addr escaped
+    for b in blocks:
+        for i in b.get("instructions") or []:
+            body = (i.get("text") or "").split(";")[0].strip()
+            mnem, ops = _ops(body)
+            if not ops:
+                continue
+            if mnem.startswith("st"):                              # str/strb/strh/stp/stur
+                mm = _a64_mem(ops[-1], names)
+                if mm and mm[0] == "slot":
+                    writes[mm[1]].append(_naddr(i.get("addr")))
+            if mnem == "add" and len(ops) == 3 and ops[1].lower() in ("sp", "x29") \
+                    and _NUM.match(ops[2].lstrip("#")):
+                taken.add(int(ops[2].lstrip("#"), 0))              # add xN, sp, #off  == &slot
+    out = {}
+    # a parser result spilled: `bl <parser>` then `str w0, [slot]` within a few instructions
+    for b in blocks:
+        ins = b.get("instructions") or []
+        for j, i in enumerate(ins):
+            body = (i.get("text") or "").split(";")[0].strip()
+            mnem, ops = _ops(body)
+            if mnem not in ("bl", "blr") or not ops:
+                continue
+            name = normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0]))
+            if name not in _INT_PARSERS:
+                continue
+            for i2 in ins[j + 1:j + 4]:
+                m2, o2 = _ops((i2.get("text") or "").split(";")[0].strip())
+                if m2 == "str" and o2 and o2[0].lower() in ("w0", "x0"):
+                    mm = _a64_mem(o2[-1], names)
+                    if mm and mm[0] == "slot":
+                        out[mm[1]] = {"source": name, "source_site": i.get("addr"),
+                                      "slot": ("SP", mm[1]), "slot_name": mm[2], "kind": "parsed"}
+                    break
+                if m2 in ("bl", "blr"):
+                    break
+    # an incoming parameter spilled in the entry block: `str wK, [slot]`, arg reg not yet clobbered
+    e = next((b for b in blocks if b.get("addr") == entry), blocks[0])
+    clob = set()
+    for i in e.get("instructions") or []:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if mnem in ("bl", "blr"):
+            break
+        if mnem == "str" and len(ops) == 2 and _a64_canon(ops[0]) in _A64_ARG \
+                and _a64_canon(ops[0]) not in clob:
+            mm = _a64_mem(ops[1], names)
+            if mm and mm[0] == "slot" and mm[1] not in out:
+                k = _A64_ARG.index(_a64_canon(ops[0]))
+                out[mm[1]] = {"source": f"argument {k + 1}", "source_site": i.get("addr"),
+                              "slot": ("SP", mm[1]), "slot_name": mm[2], "kind": "param", "param": k}
+        if ops and re.fullmatch(r"[wx]\d+", ops[0].lower()) and mnem not in _A64_NO_IDX_WRITE:
+            clob.add(_a64_canon(ops[0]))
+    # keep only single-writer, address-never-taken slots
+    return {o: s for o, s in out.items()
+            if o not in taken and len(writes.get(o, [])) == 1}
+
+
+def _a64_slot_check(blocks, by_addr, site_block, slot_off, slot_name, dom):
+    """`_slot_check` for aarch64: the P-Code bounds analysis with (SP, X29) bases and an ("SP", off)
+    slot key -- an undecidable dominating branch that reads the slot -> None (no claim)."""
+    from . import bounds
+    slot, bases = ("SP", slot_off), ("SP", "X29")
+    for d in dom.get(site_block, ()):
+        if d == site_block:
+            continue
+        ins = (by_addr.get(d) or {}).get("instructions") or []
+        if not ins:
+            continue
+        last = _ops((ins[-1].get("text") or "").split(";")[0].strip())[0]
+        ends_cond = last.startswith("b.") or last in ("cbz", "cbnz", "tbz", "tbnz")
+        touches = any(("[" + slot_name) in (i.get("text") or "") for i in ins)
+        if ends_cond and touches and bounds.branch_predicate(ins, slot, bases) is None:
+            return None
+    g = bounds.guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
+    return ("unchecked",) if g is None else ("bounded", g["bound"], bool(g["nonneg"]))
+
+
+def _array_index_arm(ctx, out):
+    """aarch64 CWE-129 (single function). See the module note above."""
+    from . import bounds
+    for faddr, ir in ctx.func_irs.items():
+        blocks = [b for b in ((ir or {}).get("blocks") or [])
+                  if isinstance(b, dict) and b.get("addr")]
+        if not blocks or len(blocks) > 2000:
+            continue
+        frame = ctx.frames.get(faddr) or {}
+        _vs, names = _frame_vars(frame)
+        entry = next((b.get("addr") for b in blocks if _naddr(b.get("addr")) == _naddr(faddr)),
+                     blocks[0].get("addr"))
+        slots = _a64_index_slots(ctx, blocks, names, entry)
+        if not slots:
+            continue
+        dom = bounds.dominators(blocks)
+        by_addr = {b.get("addr"): b for b in blocks}
+        for b in blocks:
+            reg: dict = {}                                         # xN -> value, within this block
+            for i in b.get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                if not ops:
+                    continue
+                dst = _a64_canon(ops[0])
+                if mnem == "adrp":
+                    c = _a64_adrp_const(i)
+                    reg[dst] = ("gapage", c) if c is not None else None
+                    continue
+                if mnem == "add" and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                    v = reg.get(_a64_canon(ops[1]))
+                    imm = int(ops[2].lstrip("#"), 0)
+                    if v and v[0] == "gapage":
+                        g = _global_base(ctx, addr=v[1] + imm)
+                        reg[dst] = ("ga", g[1], g[0], g[2]) if (g and g[1] is not None) else None
+                    elif v and v[0] == "idx":
+                        reg[dst] = ("idx", v[1], v[2] + imm, v[3])
+                    else:
+                        reg[dst] = None
+                    continue
+                mm = _a64_mem(ops[-1], names)
+                if mm and mm[0] == "indexed":                      # an array access
+                    base, idx = reg.get(mm[1]), reg.get(mm[2])
+                    store = mnem.startswith("st")
+                    if base and base[0] == "ga" and idx and idx[0] == "idx":
+                        scale, off = idx[1] * mm[3], idx[2] * mm[3]
+                        gbase = ("global", base[2], base[1], base[3])
+                        src = idx[3]
+                        chk = _a64_slot_check(blocks, by_addr, b.get("addr"),
+                                              src["slot"][1], src["slot_name"], dom)
+                        v = _index_verdict(chk, gbase, scale, off) if chk else None
+                        if v is not None:
+                            verdict, oob = v
+                            out.append(_array_index_cand(faddr, i.get("addr"), gbase, scale, off,
+                                                         src, "write" if store else "read", chk,
+                                                         verdict, oob))
+                    if not store:
+                        reg[dst] = None                            # a load result is array data
+                    continue
+                if mnem in ("ldr", "ldrsw", "ldrsb", "ldrsh", "ldrb", "ldrh") and mm \
+                        and mm[0] == "slot" and mm[1] in slots:
+                    reg[dst] = ("idx", 1, 0, slots[mm[1]])          # the index value, from its slot
+                    continue
+                if mnem == "mov" and len(ops) == 2 and re.fullmatch(r"[wx]\d+", ops[1].lower()):
+                    reg[dst] = reg.get(_a64_canon(ops[1]))
+                    continue
+                if mnem not in _A64_NO_IDX_WRITE and re.fullmatch(r"[wx]\d+", ops[0].lower()):
+                    reg[dst] = None                                # any other write clobbers it
+
+
 @register_detector
 def array_index(ctx: DetectContext):
     """CWE-129, in two passes. Pass 1 walks every function and records (a) accesses indexed by an
@@ -1981,9 +2201,14 @@ def array_index(ctx: DetectContext):
     `main` and handed to `set(i, v)`, which writes `table[i]`, is the commonest real shape and was
     invisible while the index had to be parsed in the function that used it. One call level --
     a parameter passed on again is not followed."""
-    if not (_is_x86(ctx.arch) and ctx.bits == 64) or not ctx.func_irs:
+    if not ctx.func_irs:
         return []
-    out = []
+    out: list = []
+    if _is_aarch64(ctx.arch) and ctx.bits == 64:
+        _array_index_arm(ctx, out)       # a separate, conservative aarch64 scanner
+        return out
+    if not (_is_x86(ctx.arch) and ctx.bits == 64):
+        return []
     summaries: dict = defaultdict(list)    # callee addr -> [(site, base, scale, off, k, access, check)]
     calls: list = []                       # (caller, call site, callee addr, {k: (src, check)})
     targets = {_naddr(e.site_addr): _naddr(e.dst_addr) for e in (ctx.call_edges or [])
