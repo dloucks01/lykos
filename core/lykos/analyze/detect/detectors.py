@@ -1744,26 +1744,32 @@ def _x86_lea_incr_steps(ir, slot_names):
     return out
 
 
-def _induction_slots(ir, slot_names):
-    """Frame slots that are LOOP INDUCTION VARIABLES: exactly one constant initialiser
-    (`mov $c, slot`) and exactly one constant-step update (`add $k, slot` / `inc slot`, or the
-    register-mediated `arr[i++]` form via `_x86_lea_incr_steps`), with the slot's address never taken
-    and no other writer. Returned as index sources (kind 'induction') so the dominating-guard analysis
-    reads the loop's OWN exit bound and the induction verdict compares the index the loop reaches to
-    the array -- flagging a counted loop that walks off a fixed array (`for(i=0;i<=10;i++) t[i]`).
-    Forward (positive-step) counters only; anything else is dropped."""
+def _induction_slots(ir, slot_names, input_slots=None):
+    """Frame slots that are LOOP INDUCTION VARIABLES: exactly one initialiser (a constant `mov $c,slot`,
+    or a copy of an unvalidated-INPUT slot `mov slot,r` after `mov r,[n]`) and exactly one constant-step
+    update (`add $k, slot` / `inc slot`, or the register-mediated `arr[i++]` form via
+    `_x86_lea_incr_steps`), with the slot's address never taken and no other writer. Returned as index
+    sources (kind 'induction') so the dominating-guard analysis reads the loop's OWN bound and the
+    induction verdict compares the index the loop reaches to the array -- flagging a counted loop that
+    walks off a fixed array (`for(i=0;i<=10;i++) t[i]`, the descending `for(i=C;i>=0;i--) t[i]`, or the
+    input-start `for(i=n;i>=0;i--) t[i]`). `input_slots` names the attacker-controlled slots."""
     flat = _block_flat(ir)
     incr = _x86_lea_incr_steps(ir, slot_names)             # register-mediated `slot += k` stores
     incr_addrs = {_naddr(a) for lst in incr.values() for (_k, a) in lst}
     blk_of = {_naddr(addr): blk for (blk, _j, addr, _b) in flat}
     inits: dict = defaultdict(list)                        # slot -> [(addr, const, block)]
+    init_input: dict = {}                                  # slot -> the input slot it was copied from
     steps: dict = defaultdict(list)                        # slot -> [(step, step_block)]
     other: dict = defaultdict(int)                         # slot -> count of writes we cannot model
     leas: dict = defaultdict(int)
     for s, lst in incr.items():
         for (k, a) in lst:
             steps[s].append((k, blk_of.get(_naddr(a))))
+    cur_blk = None
+    reg_slot: dict = {}                                    # reg -> input slot it was just loaded from
     for (blk, _j, addr, body) in flat:
+        if blk != cur_blk:
+            cur_blk, reg_slot = blk, {}                    # the init copy is block-local, so is tracking
         mnem, ops = _ops(body)
         if not ops:
             continue
@@ -1772,6 +1778,9 @@ def _induction_slots(ir, slot_names):
             if s:
                 leas[s] += 1
             continue
+        if mnem == "mov" and len(ops) == 2 and _X86_CANON.get(ops[0].lower()):   # reg <- [input slot]
+            ld = _frame_slot(_mem_terms(ops[1], slot_names))
+            reg_slot[_X86_CANON[ops[0].lower()]] = ld if (input_slots and ld in input_slots) else None
         if mnem in _NO_WRITE:
             continue
         s = _frame_slot(_mem_terms(ops[0], slot_names))
@@ -1779,6 +1788,9 @@ def _induction_slots(ir, slot_names):
             continue
         if mnem == "mov" and len(ops) == 2 and _NUM.match(ops[1]):
             inits[s].append((_naddr(addr), int(ops[1].lstrip("$"), 0), blk))
+        elif mnem == "mov" and len(ops) == 2 and reg_slot.get(_X86_CANON.get(ops[1].lower())):
+            inits[s].append((_naddr(addr), None, blk))     # i = n, a copy of an unvalidated-input slot
+            init_input[s] = reg_slot[_X86_CANON[ops[1].lower()]]
         elif mnem in ("add", "sub") and len(ops) == 2 and _NUM.match(ops[1]):
             steps[s].append((int(ops[1].lstrip("$"), 0) * (1 if mnem == "add" else -1), blk))
         elif mnem in ("inc", "dec"):
@@ -1793,8 +1805,17 @@ def _induction_slots(ir, slot_names):
             continue
         init_addr, init_val, init_blk = inits[s][0]
         step_val, step_blk = steps[s][0]
-        if init_val < 0 or step_val == 0:                 # init must be non-negative; a zero step is
-            continue                                      # not a counter
+        if step_val == 0:
+            continue
+        if s in init_input:                               # input-start counter: only the DESCENDING form
+            if step_val >= 0:                             # (an ascending input-start is a separate shape)
+                continue
+            out[s] = {"source": "loop counter", "source_site": hex(init_addr), "slot": s,
+                      "kind": "induction", "block": init_blk, "init": None, "step": step_val,
+                      "step_block": step_blk, "init_input": init_input[s], "descending": True}
+            continue
+        if init_val < 0:                                  # a constant init must be non-negative
+            continue
         out[s] = {"source": "loop counter", "source_site": hex(init_addr), "slot": s,
                   "kind": "induction", "block": init_blk, "init": init_val, "step": step_val,
                   "step_block": step_blk}
@@ -2389,29 +2410,46 @@ _DESC_TAKEN = {
 }
 
 
+_DESC_INPUT_PROBE = 1 << 30                                    # a large OOB index for the input-start case
+
+
 def _descending_bound(blocks, by_addr, preds, access_block, dom, src, canon,
-                      cmp_mnems, neg_cmp_mnems, load_mnems, store_mnems, counter_of):
-    """('bounded', init, True) for a DESCENDING constant-init counter (`for(i=C;i>=0;i--) table[i]`,
-    step<0) whose body provably runs at i=init, so the FIRST iteration stores table[init] -- and when
-    the constant init is itself out of range that first store overruns (the classic descending
-    off-by-one). None otherwise. The counter only decreases, so the greatest index it reaches is the
-    init constant; the exit test is used ONLY to confirm the body executes at least once at i=init:
+                      cmp_mnems, neg_cmp_mnems, load_mnems, store_mnems, counter_of, bases=None):
+    """The verdict for a DESCENDING counter (`for(i=START;i>=0;i--) table[i]`, step<0) whose body
+    provably runs at i=START, so the FIRST iteration stores table[START]. Two kinds of START:
+      * a CONSTANT init -> ('bounded', init, True): the counter only decreases, so the greatest index
+        it reaches is the init constant, and _induction_verdict flags it when that is out of range (the
+        classic descending off-by-one);
+      * an UNVALIDATED-INPUT init (`src['init_input']` = the input slot `n`) -> ('unchecked',): the
+        first store is table[n] and n is attacker-controlled, so an unbounded n overruns -- the
+        descending twin of the ascending `for(i=0;i<n;i++)` input-length overrun. Only when n has NO
+        dominating bound (a `if(n<=K)` guard makes it safe -> silent, as in the ascending case; the
+        input-slot detectors already dropped a re-clamped n), hence `bases` is required.
+    None otherwise. The exit test is used ONLY to confirm the body runs at the START value:
       * a single-block self-loop (the `-O1` shape `table[i]=i; sub i,1; cmp i,-1; jne .`) is straight
-        line -- the store runs each iteration before the terminal branch, so it runs at init;
+        line -- the store runs each iteration before the terminal branch, so it runs at START;
       * otherwise the exit test must DOMINATE the access (a top/pre-access test), so on the first
-        iteration its compared value is init (the step runs only later, inside the body), and the body
-        runs at init iff that test's in-loop edge is taken for i=init.
+        iteration its compared value is START, and the body runs iff the in-loop edge is taken for it.
+    The input case probes a large index (an unbounded n reaches it), so only a down-counting loop whose
+    continuation admits a large value (`i>=0`/`i>C`/`i!=C`), not an `i<C` upper test, is flagged.
     `counter_of(op)` is truthy when `op` directly names the counter (its slot memory operand, or its
     register); the slot form also follows the counter through a register loaded from the slot."""
-    init = src.get("init")
-    if init is None or init < 0 or src.get("step", 0) >= 0:
+    from . import bounds
+    init, nslot = src.get("init"), src.get("init_input")
+    if src.get("step", 0) >= 0 or (nslot is None and (init is None or init < 0)):
         return None
     succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
     ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
     if not ok or exit_src is None:
         return None
+    if nslot is not None:                                      # input-start: n must be unbounded
+        if bases is None or bounds.guard_bound(blocks, exit_src, nslot, bases=bases, dom=dom) is not None:
+            return None
+        probe, result = _DESC_INPUT_PROBE, ("unchecked",)
+    else:
+        probe, result = init, ("bounded", init, True)
     if access_block in (succ_map.get(access_block) or ()):     # single-block self-loop (bottom test)
-        return ("bounded", init, True)
+        return result
     if exit_src == access_block or exit_src not in dom.get(access_block, ()):
         return None                                            # not a pre-access test -> not sound
     ins = (by_addr.get(exit_src) or {}).get("instructions") or []
@@ -2444,7 +2482,7 @@ def _descending_bound(blocks, by_addr, preds, access_block, dom, src, canon,
             counter_regs.discard(canon(o2[0].lower()))         # overwritten: no longer the counter
     if T is None:
         return None
-    return ("bounded", init, True) if pred(init, T) else None
+    return result if pred(probe, T) else None
 
 
 def _rsp_slot_for_reg(texts, reg: str):
@@ -2946,7 +2984,7 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
     input_slots = set(slots)                              # the unvalidated-input slots, for a loop bound
     for sl, src in _param_slot_sources(ir, slot_names, entry).items():
         slots.setdefault(sl, src)
-    for sl, src in _induction_slots(ir, slot_names).items():
+    for sl, src in _induction_slots(ir, slot_names, input_slots).items():
         slots.setdefault(sl, src)
     dom = bounds.dominators(blocks)
     preds: dict = defaultdict(list)
@@ -3017,7 +3055,8 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             if src.get("descending"):
                 return _descending_bound(blocks, by_addr, preds, ba, dom, src, _X86_CANON.get,
                                          ("cmp",), (), (), (),
-                                         lambda op: _X86_CANON.get(op.lower()) == src["reg"])
+                                         lambda op: _X86_CANON.get(op.lower()) == src["reg"],
+                                         ("RBP", "RSP"))
             c = _induction_bound(
                 blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("RBP", "RSP"),
                 lambda m: m.startswith("j") and m != "jmp",
@@ -3035,7 +3074,8 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                     return _descending_bound(
                         blocks, by_addr, preds, ba, dom, src, _X86_CANON.get, ("cmp",), (),
                         ("mov", "movsxd", "movsx", "movzx"), (),
-                        lambda op: _frame_slot(_mem_terms(op, slot_names)) == src["slot"])
+                        lambda op: _frame_slot(_mem_terms(op, slot_names)) == src["slot"],
+                        ("RBP", "RSP"))
                 b = _induction_bound(
                     blocks, by_addr, preds, ba, src["slot"], dom, ("RBP", "RSP"),
                     lambda m: m.startswith("j") and m != "jmp",
@@ -3265,10 +3305,11 @@ def _a64_index_slots(ctx, blocks, names, entry):
             if o not in taken and len(writes.get(o, [])) == 1}
 
 
-def _a64_classify_store(ins, j, src_reg, off, names):
+def _a64_classify_store(ins, j, src_reg, off, names, input_slots=None):
     """Classify a `str <src_reg>, [slot@off]` at index j: ('init', c) for a constant initialiser
     (`str wzr` or a preceding `mov src,#c`), ('step', k) for a `ldr t,[slot]; add src,t,#k; str src`
-    increment of the SAME slot, or ('other',) for anything else."""
+    increment of the SAME slot, ('input', n_off) when src was just loaded from an unvalidated-INPUT
+    slot (`ldr src,[n]; str src,[i]` -- the descending input-start counter `i=n`), or ('other',)."""
     src = _a64_canon(src_reg)
     if src == "xzr" or (src_reg or "").lower() in ("wzr", "xzr"):
         return ("init", 0)
@@ -3288,6 +3329,10 @@ def _a64_classify_store(ins, j, src_reg, off, names):
                         k0 = int(o[2].lstrip("#"), 0)
                         return ("step", k0 if m == "add" else -k0)   # `sub` -> DESCENDING counter
             return ("other",)
+        if input_slots is not None and m in ("ldr", "ldrsw") and len(o) >= 2:
+            mm = _a64_mem(o[-1], names)
+            if mm and mm[0] == "slot" and mm[1] in input_slots:
+                return ("input", mm[1])                  # i = n, a copy of an unvalidated-input slot
         return ("other",)
     return ("other",)
 
@@ -3354,10 +3399,11 @@ def _a64_induction_regs(blocks, preds, succ_map, dom, by_addr):
     return out
 
 
-def _a64_induction_slots(blocks, names):
-    """Frame slots that are LOOP INDUCTION VARIABLES on aarch64: one constant initialiser (`str wzr`
-    / `mov w,#c; str w`) and one load-add-store step (`ldr w,[s]; add w,w,#k; str w,[s]`), &addr never
-    taken, no other writer. Returned as index sources (kind 'induction'), same as the x86 detector."""
+def _a64_induction_slots(blocks, names, input_slots=None):
+    """Frame slots that are LOOP INDUCTION VARIABLES on aarch64: one initialiser (constant `str wzr` /
+    `mov w,#c; str w`, or a copy of an unvalidated-INPUT slot `ldr w,[n]; str w`) and one load-add-store
+    step (`ldr w,[s]; add w,w,#k; str w,[s]`), &addr never taken, no other writer. Returned as index
+    sources (kind 'induction'), same as the x86 detector. `input_slots` names the input slot offsets."""
     taken = set()
     stores: dict = defaultdict(list)                      # offset -> [(addr, slot_name, class, block)]
     for b in blocks:
@@ -3373,15 +3419,21 @@ def _a64_induction_slots(blocks, names):
                 mm = _a64_mem(ops[-1], names)
                 if mm and mm[0] == "slot":
                     stores[mm[1]].append((i.get("addr"), mm[2],
-                                          _a64_classify_store(ins, j, ops[0], mm[1], names),
+                                          _a64_classify_store(ins, j, ops[0], mm[1], names, input_slots),
                                           b.get("addr")))
     out = {}
     for off, lst in stores.items():
         if off in taken:
             continue
         inits = [s for s in lst if s[2][0] == "init"]
+        inputs = [s for s in lst if s[2][0] == "input"]
         steps = [s for s in lst if s[2][0] == "step"]
-        if len(lst) == 2 and len(inits) == 1 and len(steps) == 1 \
+        if len(lst) == 2 and len(inputs) == 1 and len(steps) == 1 and steps[0][2][1] < 0:
+            out[off] = {"source": "loop counter", "source_site": inputs[0][0], "slot": ("SP", off),
+                        "slot_name": inputs[0][1], "kind": "induction", "init": None,
+                        "step": steps[0][2][1], "step_block": steps[0][3],
+                        "init_input": ("SP", inputs[0][2][1]), "descending": True}
+        elif len(lst) == 2 and len(inits) == 1 and len(steps) == 1 \
                 and inits[0][2][1] >= 0 and steps[0][2][1] != 0:
             out[off] = {"source": "loop counter", "source_site": inits[0][0], "slot": ("SP", off),
                         "slot_name": inits[0][1], "kind": "induction",
@@ -3667,7 +3719,7 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                  blocks[0].get("addr"))
     slots = _a64_index_slots(ctx, blocks, names, entry)
     a64_input_slots = {off for off, s in slots.items() if s.get("kind") in ("parsed", "pointer")}
-    for off, src in _a64_induction_slots(blocks, names).items():
+    for off, src in _a64_induction_slots(blocks, names, a64_input_slots).items():
         slots.setdefault(off, src)
     dom = bounds.dominators(blocks)
     by_addr = {b.get("addr"): b for b in blocks}
@@ -3730,7 +3782,8 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                         blocks, by_addr, preds, ba, dom, src, _a64_canon, ("cmp", "subs"), ("cmn",),
                         ("ldr", "ldrsw", "ldrb", "ldrh", "ldrsb", "ldrsh"), ("str", "strb", "strh"),
                         lambda op: (lambda mm: bool(mm) and mm[0] == "slot"
-                                    and ("SP", mm[1]) == src["slot"])(_a64_mem(op, names)))
+                                    and ("SP", mm[1]) == src["slot"])(_a64_mem(op, names)),
+                        ("SP", "X29"))
                 b = _induction_bound(blocks, by_addr, preds, ba, ("SP", src["slot"][1]), dom,
                                      ("SP", "X29"), _A64_COND_TERM,
                                      exit_input=lambda eb: _a64_exit_input_slot(
@@ -4084,10 +4137,11 @@ def _arm32_index_slots(ctx, blocks, names, entry, call_names):
     return {o: s for o, s in out.items() if o not in taken and len(writes.get(o, [])) == 1}
 
 
-def _arm32_classify_store(ins, j, src_reg, off, names):
+def _arm32_classify_store(ins, j, src_reg, off, names, input_slots=None):
     """Classify a `str <src_reg>, [slot@off]` at index j on arm32: ('init', c) for a `mov src,#c`
     initialiser, ('step', k) for a `ldr t,[slot]; add src,t,#k; str src` increment of the SAME slot,
-    or ('other',)."""
+    ('input', n_off) when src was just loaded from an unvalidated-INPUT slot (`ldr src,[n]; str src,[i]`
+    -- the descending input-start counter `i=n`), or ('other',)."""
     src = _arm32_canon(src_reg)
     for k in range(j - 1, max(-1, j - 6), -1):
         m, o = _ops((ins[k].get("text") or "").split(";")[0].strip())
@@ -4105,14 +4159,19 @@ def _arm32_classify_store(ins, j, src_reg, off, names):
                         k0 = int(o[2].lstrip("#"), 0)
                         return ("step", k0 if m == "add" else -k0)   # `sub` -> DESCENDING counter
             return ("other",)
+        if input_slots is not None and m in ("ldr", "ldrsb", "ldrsh") and len(o) >= 2:
+            mm = _arm32_mem(o[-1], names)
+            if mm and mm[0] == "slot" and mm[1] in input_slots:
+                return ("input", mm[1])                  # i = n, a copy of an unvalidated-input slot
         return ("other",)
     return ("other",)
 
 
-def _arm32_induction_slots(blocks, names):
-    """arm32 LOOP INDUCTION VARIABLE slots: one `mov r,#c; str r,[s]` initialiser and one
-    `ldr r,[s]; add r,r,#k; str r,[s]` step, &addr never taken, no other writer. Index sources
-    (kind 'induction'), as the x86/aarch64 detectors."""
+def _arm32_induction_slots(blocks, names, input_slots=None):
+    """arm32 LOOP INDUCTION VARIABLE slots: one initialiser (`mov r,#c; str r,[s]`, or a copy of an
+    unvalidated-INPUT slot `ldr r,[n]; str r,[s]`) and one `ldr r,[s]; add r,r,#k; str r,[s]` step,
+    &addr never taken, no other writer. Index sources (kind 'induction'), as the x86/aarch64 detectors.
+    `input_slots` names the input slot offsets."""
     taken = set()
     stores: dict = defaultdict(list)
     for b in blocks:
@@ -4129,15 +4188,21 @@ def _arm32_induction_slots(blocks, names):
                 mm = _arm32_mem(ops[-1], names)
                 if mm and mm[0] == "slot":
                     stores[mm[1]].append((i.get("addr"), mm[2],
-                                          _arm32_classify_store(ins, j, ops[0], mm[1], names),
+                                          _arm32_classify_store(ins, j, ops[0], mm[1], names, input_slots),
                                           b.get("addr")))
     out = {}
     for off, lst in stores.items():
         if off in taken:
             continue
         inits = [s for s in lst if s[2][0] == "init"]
+        inputs = [s for s in lst if s[2][0] == "input"]
         steps = [s for s in lst if s[2][0] == "step"]
-        if len(lst) == 2 and len(inits) == 1 and len(steps) == 1 \
+        if len(lst) == 2 and len(inputs) == 1 and len(steps) == 1 and steps[0][2][1] < 0:
+            out[off] = {"source": "loop counter", "source_site": inputs[0][0], "slot": ("R11", off),
+                        "slot_name": inputs[0][1], "kind": "induction", "init": None,
+                        "step": steps[0][2][1], "step_block": steps[0][3],
+                        "init_input": ("R11", inputs[0][2][1]), "descending": True}
+        elif len(lst) == 2 and len(inits) == 1 and len(steps) == 1 \
                 and inits[0][2][1] >= 0 and steps[0][2][1] != 0:
             out[off] = {"source": "loop counter", "source_site": inits[0][0], "slot": ("R11", off),
                         "slot_name": inits[0][1], "kind": "induction",
@@ -4381,7 +4446,7 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                  blocks[0].get("addr"))
     slots = _arm32_index_slots(ctx, blocks, names, entry, call_names)
     arm32_input_slots = {off for off, s in slots.items() if s.get("kind") == "parsed"}
-    for off, src in _arm32_induction_slots(blocks, names).items():
+    for off, src in _arm32_induction_slots(blocks, names, arm32_input_slots).items():
         slots.setdefault(off, src)
     dom = bounds.dominators(blocks)
     by_addr = {b.get("addr"): b for b in blocks}
@@ -4441,7 +4506,8 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                         blocks, by_addr, preds, ba, dom, src, _arm32_canon, ("cmp", "subs"), ("cmn",),
                         ("ldr", "ldrb", "ldrh", "ldrsb", "ldrsh"), ("str", "strb", "strh"),
                         lambda op: (lambda mm: bool(mm) and mm[0] == "slot"
-                                    and ("R11", mm[1]) == src["slot"])(_arm32_mem(op, names)))
+                                    and ("R11", mm[1]) == src["slot"])(_arm32_mem(op, names)),
+                        ("SP", "R11"))
                 b = _induction_bound(blocks, by_addr, preds, ba, ("R11", src["slot"][1]), dom,
                                      ("SP", "R11"), _ARM32_COND_TERM,
                                      exit_input=lambda eb: _arm32_exit_input_slot(

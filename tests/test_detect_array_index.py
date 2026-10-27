@@ -1411,3 +1411,42 @@ def test_x86_const_oob_store(store, case, pool, gcc, tmp_path, opt):
     if sandbox.host_arch() != "x86-64":
         pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
     assert _run_host(store, case, pool, gcc, tmp_path, _COB_SRC, [opt], "cob") == {"simd_over": {"bound"}}
+
+
+# ------------------------------------ input-start descending counter (CWE-129) -------------------
+# `int n=atoi(s); for(i=n;i>=0;i--) table[i]` walks the array DOWN from an attacker-controlled start:
+# the first iteration stores table[n], so an unbounded n overruns -- the descending twin of the
+# ascending `for(i=0;i<n;i++)` input-length overrun. The induction slot's init is a COPY of the input
+# slot (`i = n`), which the slot detectors now record as init_input; _descending_bound returns
+# ('unchecked',) when that input has NO dominating bound. n_clamp (re-clamped n -> dropped from the
+# input slots) and n_guard (`if(n<=9)` dominating bound) stay silent -- no false positive.
+_DNI_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void n_over(char*s){ int n=atoi(s); for(int i=n;i>=0;i--) table[i]=i; }                 /* unchecked */
+NX void n_clamp(char*s){ int n=atoi(s); if(n>10)n=10; for(int i=n;i>=0;i--) table[i]=i; }  /* clamp -> silent */
+NX void n_guard(char*s){ int n=atoi(s); if(n>=0&&n<=9) for(int i=n;i>=0;i--) table[i]=i; } /* guard -> silent */
+int main(int c,char**v){ n_over(v[1]); n_clamp(v[1]); n_guard(v[1]); return 0; }
+"""
+_DNI_EXPECT = {"n_over": {"unchecked"}}
+
+
+def test_x86_input_start_descending_O0(store, case, pool, gcc, tmp_path):
+    """x86-64 -O0: a descending loop from an unvalidated input start n -> table[n] overrun -> unchecked;
+    the re-clamped (n_clamp) and dominating-bound-guarded (n_guard) companions stay silent (no FP)."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _DNI_SRC, ["-O0"], "dni") == _DNI_EXPECT
+
+
+def test_aarch64_input_start_descending_O0(store, case, pool, a64_gcc, tmp_path):
+    """Same input-start descending overrun on aarch64 -O0 (init copy `ldr w,[n]; str w,[i]`)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _DNI_SRC, ["-O0"], False, None,
+                   "aarch64") == _DNI_EXPECT
+
+
+def test_arm32_input_start_descending_O0(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """Same input-start descending overrun on arm32 -O0 (ghidra backend for P-Code)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DNI_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == _DNI_EXPECT
