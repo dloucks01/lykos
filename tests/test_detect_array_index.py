@@ -1164,3 +1164,56 @@ def test_aarch64_vectorized_simd_overrun(store, case, pool, a64_gcc, tmp_path):
     v_safe stays silent."""
     assert _run_iv(store, case, pool, a64_gcc, tmp_path, _VEC_SRC, ["-O2"], False, None,
                    "aarch64") == {"v_over": {"bound"}}
+
+
+# ------------------------------------ loop-invariant array base held in a register (CWE-129) -------
+# At -O2 gcc HOISTS the array base out of the loop into a register (`lea rbx,[table]` / `adrp/add
+# x20,table`), computed once. The loop header is a control-flow merge whose carry keeps only idx
+# values, so the base register is otherwise dropped and a per-iteration access `base[i]` cannot
+# resolve its array. The base is now carried into every loop block (loop-invariant, not written in
+# the loop, surviving calls as a callee-saved register). h_over indexes with an unvalidated atoi value
+# -> unchecked; h_safe guards it with the (unsigned)i<10 idiom (`cmp;jbe` INTO the access) -> silent,
+# which also exercises the guard-on-the-taken-edge-in-a-loop fix (the latch must not negate the guard).
+_HDR_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void h_over(void){ char buf[16]; while(fgets(buf,16,stdin)){ int i=atoi(buf); table[i]=0; } }
+NX void h_safe(void){ char buf[16]; while(fgets(buf,16,stdin)){ int i=atoi(buf); if(i>=0&&i<10) table[i]=0; } }
+int main(void){ h_over(); h_safe(); return 0; }
+"""
+
+
+def test_x86_loop_invariant_base(store, case, pool, gcc, tmp_path):
+    """x86-64 -O2: the base &table is hoisted to a callee-saved register across the loop; the per-
+    iteration `table[atoi(buf)]` access resolves it via the base carry -> unchecked. The guarded
+    companion h_safe stays silent (the `cmp i,9; jbe access` guard is honoured even though the loop
+    latch also reaches the access via the back edge)."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "hdr.c"; c.write_text(_HDR_SRC)
+    out = tmp_path / "hdr"
+    if subprocess.run([gcc, "-O2", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="hdr")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"h_over": {"unchecked"}}
+
+
+def test_aarch64_loop_invariant_base(store, case, pool, a64_gcc, tmp_path, monkeypatch):
+    """aarch64 -O2: base hoisted to x20 (callee-saved, survives the fgets/atoi calls) -> the base
+    carry resolves `table[atoi]` -> unchecked; h_safe guarded -> silent. Uses the ghidra backend
+    (native rizin is slow on the fgets/stdin binary)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _HDR_SRC, ["-O2"], True, monkeypatch,
+                   "aarch64") == {"h_over": {"unchecked"}}
+
+
+def test_arm32_loop_invariant_base(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """arm32 -O2: base hoisted to a callee-saved r4-r11 register -> base carry resolves the access ->
+    unchecked; h_safe guarded -> silent (ghidra backend)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _HDR_SRC, ["-O2", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"h_over": {"unchecked"}}

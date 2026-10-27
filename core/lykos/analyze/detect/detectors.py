@@ -2448,6 +2448,23 @@ def _meet_checks(paths):
     return ("bounded", max(p[1] for p in paths), all(p[2] for p in paths))
 
 
+def _reaches_without(by_addr, start, target, avoid):
+    """Can control reach `target` from `start` WITHOUT passing through `avoid`? A forward CFG walk."""
+    if start == target:
+        return True
+    seen = {avoid}
+    stack = [start]
+    while stack:
+        n = stack.pop()
+        if n == target:
+            return True
+        if n in seen:
+            continue
+        seen.add(n)
+        stack.extend((by_addr.get(n) or {}).get("succ") or [])
+    return False
+
+
 def _edge_bound(src, pred, block, cx):
     """The upper bound `pred`'s terminating branch proves for `src` on the pred->block edge:
     ("bounded", b, nn), ("unchecked",) when it adds none (branch not on src, or the taken edge is
@@ -2461,7 +2478,12 @@ def _edge_bound(src, pred, block, cx):
     if not pins or not cx["cond_term"](last):
         return ("unchecked",)                              # no terminating conditional branch
     reaching = cx["dom"].get(block, ())
-    succ = pblk.get("succ") or []
+    # Keep only successors that reach the site on a FORWARD path (not by looping back through `pred`).
+    # In a loop `cmp i,9; jbe site; .. <latch> -> pred`, the latch dominates the site via the back
+    # edge, so `_edge_pred_bound` would otherwise read BOTH edges as reaching the site and discard the
+    # guard -- a false "unchecked" on a guarded access. The latch reaches the site only through `pred`,
+    # so it is dropped here and the `jbe site` bound is honoured.
+    succ = [s for s in (pblk.get("succ") or []) if _reaches_without(cx["by_addr"], s, block, pred)]
     cands = []                                             # (instruction slice, seed register)
     o = cx["origin"].get(id(src))
     if o is not None and o[0] == pred and len(o) >= 3 and o[2]:
@@ -2743,16 +2765,23 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
     # a stack slot). Seeded at each loop header below so the array accesses it indexes resolve; its
     # bound comes from the loop's own exit test (_induction_bound with exit_const/exit_input).
     reg_inductions = _induction_regs(blocks, preds, succ_map, dom, by_addr)
-    ind_writes: dict = {}                                 # header -> regs written anywhere in its loop
-    for h, regs in reg_inductions.items():
-        body = next(iter(regs.values()))["loop"] if regs else frozenset()
+    # Every natural loop, so a loop-invariant array base held in a register (`lea rbx,[table]` hoisted
+    # out of the loop) is carried into the loop blocks below: `tail` carries only idx values, so
+    # without this the in-loop access `base[i]` cannot resolve its array (the loop-header-merge gap).
+    all_loops = _reg_natural_loops(blocks, preds, succ_map, dom)
+    loop_writes: dict = {}                                # header -> regs written anywhere in its loop
+    block_in_loops: dict = defaultdict(list)              # block -> [loop header it belongs to]
+    for h, body in all_loops.items():
         w = set()
         for la in body:
+            block_in_loops[la].append(h)
             for i in (by_addr.get(la) or {}).get("instructions") or []:
                 m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
-                if o2 and _X86_CANON.get(o2[0].lower()):
+                if m2 == "call":
+                    w.update(_CALLER_SAVED)               # a call clobbers the caller-saved regs
+                elif o2 and _X86_CANON.get(o2[0].lower()) and m2 not in _NO_WRITE:
                     w.add(_X86_CANON[o2[0].lower()])
-        ind_writes[h] = w
+        loop_writes[h] = w
     # A value held in a REGISTER is followed within its block and into a block whose SOLE
     # predecessor computed it. origin: id(src) -> (block, index of the instruction after which
     # it holds); a parameter arrives before the entry block's first instruction.
@@ -2770,24 +2799,21 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
           "cond_term": lambda m: m.startswith("j") and m != "jmp"}
 
     def seed_induction(ba, seed):
-        """Seed a loop header with its register counter(s) at their header value, plus the
-        loop-invariant base registers the preheader left live (`lea rcx,[table]`), which `tail`
-        (idx-only) does not carry -- without the base the in-loop access cannot resolve its array."""
-        regs = reg_inductions.get(ba)
-        if not regs:
-            return
-        body = next(iter(regs.values()))["loop"]
-        written = ind_writes.get(ba, set())
-        # loop-invariant array bases the preheader(s) left live: `tail` carries only idx values, so a
-        # base register (`lea rcx,[table]`) is lost without this. Take each from the NEAREST dominating
-        # block that defines it (most dominators = closest); a base reaches on every path, so it is safe
-        # to seed. gcc's remainder peeling gives the header several dominators, hence not just one.
-        for d in sorted((d for d in dom.get(ba, ()) if d != ba and d not in body and d in tail_all),
-                        key=lambda x: -len(dom.get(x, ()))):
-            for r, v in tail_all[d].items():
-                if v and v[0] in ("ga", "fa", "sa", "ptr") and r not in written and r not in seed:
-                    seed[r] = v
-        for r, src in regs.items():
+        """Carry each loop-invariant array base into every block of a loop containing `ba` (`tail` is
+        idx-only, so a base register `lea rcx,[table]` hoisted out of the loop is otherwise lost and
+        the in-loop access cannot resolve its array), and seed a loop header's register counter(s) at
+        their header value. A base is taken from the NEAREST dominating block that defines it (most
+        dominators = closest); it reaches on every path and is not written in the loop, so it is safe
+        to seed in any loop block regardless of block-processing order."""
+        for h in block_in_loops.get(ba, ()):
+            body = all_loops[h]
+            written = loop_writes.get(h, set())
+            for d in sorted((d for d in dom.get(h, ()) if d != h and d not in body and d in tail_all),
+                            key=lambda x: -len(dom.get(x, ()))):
+                for r, v in tail_all[d].items():
+                    if v and v[0] in ("ga", "fa", "sa", "ptr") and r not in written and r not in seed:
+                        seed[r] = v
+        for r, src in (reg_inductions.get(ba) or {}).items():
             seed[r] = ("idx", 1, 0, src)                  # the counter at its header value (R0)
 
     def check_for(src, ba, pred):
@@ -3410,16 +3436,22 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
         for sc in b.get("succ") or []:
             preds[sc].append(b.get("addr"))
     reg_inductions = _a64_induction_regs(blocks, preds, succ_map, dom, by_addr)   # -O2 register counters
-    ind_writes: dict = {}
-    for h, regs in reg_inductions.items():
-        body = next(iter(regs.values()))["loop"] if regs else frozenset()
+    # every natural loop, so a hoisted loop-invariant array base (`adrp/add x1,table`) is carried into
+    # its blocks below -- `tail` is idx-only, so otherwise the in-loop access cannot resolve its array
+    all_loops = _reg_natural_loops(blocks, preds, succ_map, dom)
+    loop_writes: dict = {}
+    block_in_loops: dict = defaultdict(list)
+    for h, body in all_loops.items():
         w = set()
         for la in body:
+            block_in_loops[la].append(h)
             for i in (by_addr.get(la) or {}).get("instructions") or []:
                 m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
-                if o2 and re.fullmatch(r"[wx]\d+", o2[0].lower()):
+                if m2 in ("bl", "blr"):
+                    w.update(f"x{n}" for n in range(0, 18))   # a call clobbers x0-x17
+                elif o2 and re.fullmatch(r"[wx]\d+", o2[0].lower()) and m2 not in _A64_NO_IDX_WRITE:
                     w.add(_a64_canon(o2[0]))
-        ind_writes[h] = w
+        loop_writes[h] = w
     # A register-held index is followed within its block and into a block whose SOLE predecessor
     # defined it. origin: id(src) -> (block, instr index after which it holds); a parameter
     # arrives before the entry block. tail: block -> {reg: idx-value} live at the block end.
@@ -3462,20 +3494,18 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
         return _reg_bound(src, ba, cx)                    # backward edge-aware walk (handles merges)
 
     def seed_induction(ba, reg):
-        """Seed a loop header with its register counter(s) and the loop-invariant array base the
-        preheader left live (`adrp/add x2,table` -- a ('ga',...) value `tail` does not carry); see the
-        x86 twin in `_index_scan_function`."""
-        regs = reg_inductions.get(ba)
-        if not regs:
-            return
-        body = next(iter(regs.values()))["loop"]
-        written = ind_writes.get(ba, set())
-        for d in sorted((d for d in dom.get(ba, ()) if d != ba and d not in body and d in tail_all),
-                        key=lambda x: -len(dom.get(x, ()))):
-            for r, v in tail_all[d].items():
-                if v and v[0] in ("ga", "sa") and r not in written and r not in reg:
-                    reg[r] = v
-        for r, src in regs.items():
+        """Carry each loop-invariant array base (`adrp/add x2,table` hoisted out of the loop -- a
+        ('ga',...) value `tail` does not carry) into every block of a loop containing `ba`, and seed a
+        header's register counter(s). See the x86 twin in `_index_scan_function`."""
+        for h in block_in_loops.get(ba, ()):
+            body = all_loops[h]
+            written = loop_writes.get(h, set())
+            for d in sorted((d for d in dom.get(h, ()) if d != h and d not in body and d in tail_all),
+                            key=lambda x: -len(dom.get(x, ()))):
+                for r, v in tail_all[d].items():
+                    if v and v[0] in ("ga", "sa") and r not in written and r not in reg:
+                        reg[r] = v
+        for r, src in (reg_inductions.get(ba) or {}).items():
             reg[r] = ("idx", 1, 0, src)
 
     for b in blocks:
@@ -3522,10 +3552,12 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                 if callee is not None:
                     _record_forward(calls, reg, _A64_ARG, faddr, i.get("addr"), callee,
                                     check_for, ba, pred)
-                name = normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "",
-                                        ops[0])) if ops else ""
-                for r in list(reg):                   # a call clobbers the caller-saved regs
-                    reg.pop(r, None)
+                name = (call_names or {}).get(_naddr(i.get("addr"))) \
+                    or (normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0])) if ops else "")
+                for r in list(reg):                   # a call clobbers x0-x18/x30; x19-x28 are preserved
+                    m = re.fullmatch(r"x(\d+)", _a64_canon(r))
+                    if not (m and 19 <= int(m.group(1)) <= 29):
+                        reg.pop(r, None)
                 if name in _INT_PARSERS:
                     rsrc = {"source": name, "source_site": i.get("addr"), "slot": None,
                             "slot_name": None, "kind": "register"}
@@ -4091,9 +4123,28 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     dom = bounds.dominators(blocks)
     by_addr = {b.get("addr"): b for b in blocks}
     preds: dict = defaultdict(list)
+    succ_map: dict = {}
     for b in blocks:
+        succ_map[b.get("addr")] = tuple(b.get("succ") or ())
         for sc in b.get("succ") or []:
             preds[sc].append(b.get("addr"))
+    # every natural loop, so a hoisted loop-invariant array base (`ldr/add r,pc,..` literal pool) is
+    # carried into its blocks -- `tail` is idx-only, otherwise the in-loop access cannot resolve it
+    all_loops = _reg_natural_loops(blocks, preds, succ_map, dom)
+    loop_writes: dict = {}
+    block_in_loops: dict = defaultdict(list)
+    for h, body in all_loops.items():
+        w = set()
+        for la in body:
+            block_in_loops[la].append(h)
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
+                if m2 in ("bl", "blx"):
+                    w.update(_ARM32_ARG)                  # a call clobbers r0-r3 (and ip); be safe
+                    w.add("r12")
+                elif o2 and _arm32_isreg(o2[0]) and m2 not in _ARM32_NO_IDX_WRITE:
+                    w.add(_arm32_canon(o2[0]))
+        loop_writes[h] = w
     origin: dict = {}
     params: dict = {}
     for k, r in enumerate(_ARM32_ARG):
@@ -4101,9 +4152,22 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                      "slot_name": None, "kind": "param", "param": k}
         origin[id(params[r])] = (entry, -1, r)            # (block, instr index, defining register)
     tail: dict = {}
+    tail_all: dict = {}
     head: dict = {}
     cx = {"origin": origin, "tail": tail, "head": head, "preds": preds, "dom": dom,
           "by_addr": by_addr, "bases": ("SP", "R11"), "cond_term": _ARM32_COND_TERM}
+
+    def seed_bases(ba, reg):
+        """Carry each loop-invariant array base (`ldr r,[pc,..]; add r,pc,r` literal-pool &table,
+        hoisted out of the loop) into every block of a loop containing `ba` -- `tail` is idx-only."""
+        for h in block_in_loops.get(ba, ()):
+            body = all_loops[h]
+            written = loop_writes.get(h, set())
+            for d in sorted((d for d in dom.get(h, ()) if d != h and d not in body and d in tail_all),
+                            key=lambda x: -len(dom.get(x, ()))):
+                for r, v in tail_all[d].items():
+                    if v and v[0] in ("ga", "sa") and r not in written and r not in reg:
+                        reg[r] = v
 
     def check_for(src, ba, pred, idx_reg):
         if src.get("slot"):
@@ -4140,6 +4204,7 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                 for r, v in tail[proc[0]].items():
                     if v and v[0] == "idx" and all(_same_idx(tail[p].get(r), v) for p in proc[1:]):
                         reg[r] = v
+        seed_bases(ba, reg)                               # loop-invariant array base carry
         head[ba] = dict(reg)
         ins = b.get("instructions") or []
         for j, i in enumerate(ins):
@@ -4169,7 +4234,10 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                                     check_for, ba, pred)
                 name = call_names.get(_naddr(i.get("addr"))) \
                     or normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0]))
-                reg.clear()
+                for r in list(reg):                   # a call clobbers r0-r3/r12/lr; r4-r11 are preserved
+                    m = re.fullmatch(r"r(\d+)", _arm32_canon(r))
+                    if not (m and 4 <= int(m.group(1)) <= 11):
+                        reg.pop(r, None)
                 if name in _INT_PARSERS:
                     rsrc = {"source": name, "source_site": i.get("addr"), "slot": None,
                             "slot_name": None, "kind": "register"}
@@ -4256,6 +4324,7 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
             if mnem not in _ARM32_NO_IDX_WRITE and _arm32_isreg(ops[0]):
                 reg[dst] = None
         tail[ba] = {r: v for r, v in reg.items() if v and v[0] == "idx"}
+        tail_all[ba] = dict(reg)
     # -O2 walking-pointer loops (a pointer walks the array, a counter gives the trip count). Reached
     # only when the function passed the `_arm32_pred_unsound` gate above, so the input-length form
     # (which carries a predicated return) is already skipped -- the constant trip count is handled.
