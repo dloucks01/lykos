@@ -1793,11 +1793,13 @@ def _induction_slots(ir, slot_names):
             continue
         init_addr, init_val, init_blk = inits[s][0]
         step_val, step_blk = steps[s][0]
-        if step_val <= 0 or init_val < 0:                 # only a non-negative forward counter
-            continue
+        if init_val < 0 or step_val == 0:                 # init must be non-negative; a zero step is
+            continue                                      # not a counter
         out[s] = {"source": "loop counter", "source_site": hex(init_addr), "slot": s,
                   "kind": "induction", "block": init_blk, "init": init_val, "step": step_val,
                   "step_block": step_blk}
+        if step_val < 0:                                  # a DESCENDING counter: max index is the init
+            out[s]["descending"] = True
     return out
 
 
@@ -1875,9 +1877,16 @@ def _induction_regs(blocks, preds, succ_map, dom, by_addr):
                 else:
                     other[dreg] += 1
         for reg, st in steps.items():
-            if other.get(reg) or len(st) != 1 or st[0][0] <= 0:
-                continue                                  # not a lone, positive, otherwise-stable step
+            if other.get(reg) or len(st) != 1 or st[0][0] == 0:
+                continue                                  # not a lone, non-zero, otherwise-stable step
             init = _reg_const_init(by_addr, dom, header, body, reg)
+            if st[0][0] < 0:                              # a DESCENDING counter: the bound is the init
+                if init is None or init < 0:              # (max index); needs a known non-negative start
+                    continue
+                out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
+                                    "kind": "induction", "reg": reg, "step": st[0][0], "init": init,
+                                    "header": header, "loop": frozenset(body), "descending": True}
+                continue
             out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
                                 "kind": "induction", "reg": reg, "step": st[0][0],
                                 "init": init if (init is not None and init >= 0) else 0,
@@ -2332,10 +2341,13 @@ def _co_induction_bound(i_src, slots, access_block, blocks, by_addr, preds, dom,
 
 
 def _induction_verdict(check, base, scale, off, src):
-    """Verdict for a LOOP INDUCTION index (non-negative init, positive step): it cannot be negative,
-    so the only hazard is the loop's UPPER bound reaching past the array. 'bound' when a CONSTANT
-    bound overruns a known-size array; 'unchecked' when the loop length is unvalidated input (the loop
-    walks arbitrarily far). A variable non-input bound, or none, is undecidable (silent)."""
+    """Verdict for a LOOP INDUCTION index: the greatest index value the loop reaches (for a forward
+    counter the loop's UPPER bound; for a DESCENDING counter the constant init, the first iteration's
+    value -- `_descending_bound` supplies it as a ('bounded', init, True) check). 'bound' when that
+    CONSTANT greatest value overruns a known-size array; 'unchecked' when the loop length is
+    unvalidated input (the loop walks arbitrarily far). A variable non-input bound, or none, is
+    undecidable (silent). A forward counter's index cannot be negative; a descending counter is only
+    emitted with a non-negative init, so neither underflows."""
     if check is None or base[0] != "global" or not base[3] or scale <= 0:
         return None
     cap = base[3]
@@ -2346,6 +2358,93 @@ def _induction_verdict(check, base, scale, off, src):
         if bound >= 0 and bound * scale + off + scale > cap:
             return "bound", [bound]
     return None
+
+
+def _signed_imm(v):
+    """A compare immediate read as a SIGNED counter bound: `int` indices are 32-bit, but a counter
+    promoted to a 64-bit register is compared at pointer width, so both `cmp dword,0xffffffff` and
+    `cmp rax,0xffffffffffffffff` mean -1. Values below the sign bit are returned unchanged."""
+    if v >= 2 ** 63:
+        return v - 2 ** 64
+    if 2 ** 31 <= v < 2 ** 32:
+        return v - 2 ** 32
+    return v
+
+
+# p(i, T): the branch is TAKEN when the signed counter i relates to the compare constant T this way.
+# jns/js (and b.pl/b.mi, bpl/bmi) are sign tests whose T is the compare's constant (0 at -O0). Any
+# mnemonic absent here leaves the exit relation unknown, so the descending counter is left unflagged.
+_DESC_TAKEN = {
+    "jge": lambda i, T: i >= T, "jnl": lambda i, T: i >= T, "jg": lambda i, T: i > T,
+    "jnle": lambda i, T: i > T, "jle": lambda i, T: i <= T, "jng": lambda i, T: i <= T,
+    "jl": lambda i, T: i < T, "jnge": lambda i, T: i < T, "jne": lambda i, T: i != T,
+    "jnz": lambda i, T: i != T, "je": lambda i, T: i == T, "jz": lambda i, T: i == T,
+    "jns": lambda i, T: i >= 0, "js": lambda i, T: i < 0,
+    "b.ge": lambda i, T: i >= T, "b.gt": lambda i, T: i > T, "b.le": lambda i, T: i <= T,
+    "b.lt": lambda i, T: i < T, "b.ne": lambda i, T: i != T, "b.eq": lambda i, T: i == T,
+    "b.pl": lambda i, T: i >= 0, "b.mi": lambda i, T: i < 0,
+    "bge": lambda i, T: i >= T, "bgt": lambda i, T: i > T, "ble": lambda i, T: i <= T,
+    "blt": lambda i, T: i < T, "bne": lambda i, T: i != T, "beq": lambda i, T: i == T,
+    "bpl": lambda i, T: i >= 0, "bmi": lambda i, T: i < 0,
+}
+
+
+def _descending_bound(blocks, by_addr, preds, access_block, dom, src, canon,
+                      cmp_mnems, neg_cmp_mnems, load_mnems, store_mnems, counter_of):
+    """('bounded', init, True) for a DESCENDING constant-init counter (`for(i=C;i>=0;i--) table[i]`,
+    step<0) whose body provably runs at i=init, so the FIRST iteration stores table[init] -- and when
+    the constant init is itself out of range that first store overruns (the classic descending
+    off-by-one). None otherwise. The counter only decreases, so the greatest index it reaches is the
+    init constant; the exit test is used ONLY to confirm the body executes at least once at i=init:
+      * a single-block self-loop (the `-O1` shape `table[i]=i; sub i,1; cmp i,-1; jne .`) is straight
+        line -- the store runs each iteration before the terminal branch, so it runs at init;
+      * otherwise the exit test must DOMINATE the access (a top/pre-access test), so on the first
+        iteration its compared value is init (the step runs only later, inside the body), and the body
+        runs at init iff that test's in-loop edge is taken for i=init.
+    `counter_of(op)` is truthy when `op` directly names the counter (its slot memory operand, or its
+    register); the slot form also follows the counter through a register loaded from the slot."""
+    init = src.get("init")
+    if init is None or init < 0 or src.get("step", 0) >= 0:
+        return None
+    succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
+    ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
+    if not ok or exit_src is None:
+        return None
+    if access_block in (succ_map.get(access_block) or ()):     # single-block self-loop (bottom test)
+        return ("bounded", init, True)
+    if exit_src == access_block or exit_src not in dom.get(access_block, ()):
+        return None                                            # not a pre-access test -> not sound
+    ins = (by_addr.get(exit_src) or {}).get("instructions") or []
+    if not ins:
+        return None
+    mnem, ops = _ops((ins[-1].get("text") or "").split(";")[0].strip())
+    pred = _DESC_TAKEN.get(mnem)
+    if pred is None or not ops:
+        return None
+    if _naddr(ops[0]) not in {_naddr(a) for a in src.get("loop", ())}:
+        return None                                            # taken edge must continue the loop
+    counter_regs: set = set()
+    T = None
+    for i in ins[:-1]:
+        m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
+        if not o2:
+            continue
+        if (m2 in load_mnems or m2 in store_mnems) and len(o2) >= 2 and counter_of(o2[-1]):
+            counter_regs.add(canon(o2[0].lower()))             # reg <-/-> slot: now holds the counter
+            continue
+        is_ctr = len(o2) >= 2 and _NUM.match(o2[1].lstrip("#")) \
+            and (counter_of(o2[0]) or canon(o2[0].lower()) in counter_regs)
+        if m2 in cmp_mnems and is_ctr:
+            T = _signed_imm(int(o2[1].lstrip("#"), 0))
+            continue
+        if m2 in neg_cmp_mnems and is_ctr:                     # `cmn r,#k` compares r against -k
+            T = -int(o2[1].lstrip("#"), 0)
+            continue
+        if canon(o2[0].lower()) in counter_regs:
+            counter_regs.discard(canon(o2[0].lower()))         # overwritten: no longer the counter
+    if T is None:
+        return None
+    return ("bounded", init, True) if pred(init, T) else None
 
 
 def _rsp_slot_for_reg(texts, reg: str):
@@ -2868,6 +2967,10 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
 
     def check_for(src, ba, pred):
         if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
+            if src.get("descending"):
+                return _descending_bound(blocks, by_addr, preds, ba, dom, src, _X86_CANON.get,
+                                         ("cmp",), (), (), (),
+                                         lambda op: _X86_CANON.get(op.lower()) == src["reg"])
             c = _induction_bound(
                 blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("RBP", "RSP"),
                 lambda m: m.startswith("j") and m != "jmp",
@@ -2881,6 +2984,11 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             if src["block"] != ba and src["block"] not in dom.get(ba, ()):
                 return None                           # the value does not reach on every path
             if src.get("kind") == "induction":        # a loop counter: read the loop's own bound
+                if src.get("descending"):
+                    return _descending_bound(
+                        blocks, by_addr, preds, ba, dom, src, _X86_CANON.get, ("cmp",), (),
+                        ("mov", "movsxd", "movsx", "movzx"), (),
+                        lambda op: _frame_slot(_mem_terms(op, slot_names)) == src["slot"])
                 b = _induction_bound(
                     blocks, by_addr, preds, ba, src["slot"], dom, ("RBP", "RSP"),
                     lambda m: m.startswith("j") and m != "jmp",
@@ -3123,17 +3231,40 @@ def _a64_classify_store(ins, j, src_reg, off, names):
             continue
         if m == "mov" and len(o) == 2 and _NUM.match(o[1].lstrip("#")):
             return ("init", int(o[1].lstrip("#"), 0))
-        if m == "add" and len(o) == 3 and _NUM.match(o[2].lstrip("#")):
+        if m in ("add", "sub") and len(o) == 3 and _NUM.match(o[2].lstrip("#")):
             tmp = _a64_canon(o[1])
             for k2 in range(k - 1, max(-1, k - 4), -1):   # tmp = load of the same slot
                 m2, o2 = _ops((ins[k2].get("text") or "").split(";")[0].strip())
                 if o2 and _a64_canon(o2[0]) == tmp and m2 in ("ldr", "ldrsw"):
                     mm = _a64_mem(o2[-1], names)
                     if mm and mm[0] == "slot" and mm[1] == off:
-                        return ("step", int(o[2].lstrip("#"), 0))
+                        k0 = int(o[2].lstrip("#"), 0)
+                        return ("step", k0 if m == "add" else -k0)   # `sub` -> DESCENDING counter
             return ("other",)
         return ("other",)
     return ("other",)
+
+
+def _a64_reg_const_init(by_addr, dom, header, body, reg):
+    """The non-negative constant `reg` holds on entry to an aarch64 loop, read from its single
+    dominating preheader (`mov xD,#c` / `mov xD,wzr` as that block's last write to reg), or None.
+    The aarch64 twin of `_reg_const_init`, used only for a DESCENDING counter whose bound is the
+    init (an ascending reg counter takes its bound from the exit test and needs no init)."""
+    pre = [d for d in dom.get(header, ()) if d != header and d not in body]
+    if len(pre) != 1:
+        return None
+    init = None
+    for i in (by_addr.get(pre[0]) or {}).get("instructions") or []:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if not ops or _a64_canon(ops[0]) != reg:
+            continue
+        if mnem == "mov" and len(ops) == 2 and _NUM.match(ops[1].lstrip("#")):
+            init = int(ops[1].lstrip("#"), 0)
+        elif mnem == "mov" and len(ops) == 2 and ops[1].lower() in ("wzr", "xzr"):
+            init = 0
+        else:
+            init = None                                   # an opaque write: value unknown from here
+    return init
 
 
 def _a64_induction_regs(blocks, preds, succ_map, dom, by_addr):
@@ -3159,7 +3290,16 @@ def _a64_induction_regs(blocks, preds, succ_map, dom, by_addr):
                 elif mnem not in _A64_NO_IDX_WRITE:
                     other[dst] += 1
         for reg, st in steps.items():
-            if other.get(reg) or len(st) != 1 or st[0][0] <= 0:
+            if other.get(reg) or len(st) != 1 or st[0][0] == 0:
+                continue
+            if st[0][0] < 0:                              # a DESCENDING counter: the bound is the init
+                init = _a64_reg_const_init(by_addr, dom, header, body, reg)
+                if init is None or init < 0:              # (max index); needs a known non-negative start
+                    continue
+                out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
+                                    "slot_name": None, "kind": "induction", "reg": reg,
+                                    "step": st[0][0], "init": init, "header": header,
+                                    "loop": frozenset(body), "descending": True}
                 continue
             out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
                                 "slot_name": None, "kind": "induction", "reg": reg, "step": st[0][0],
@@ -3195,10 +3335,12 @@ def _a64_induction_slots(blocks, names):
         inits = [s for s in lst if s[2][0] == "init"]
         steps = [s for s in lst if s[2][0] == "step"]
         if len(lst) == 2 and len(inits) == 1 and len(steps) == 1 \
-                and inits[0][2][1] >= 0 and steps[0][2][1] > 0:
+                and inits[0][2][1] >= 0 and steps[0][2][1] != 0:
             out[off] = {"source": "loop counter", "source_site": inits[0][0], "slot": ("SP", off),
                         "slot_name": inits[0][1], "kind": "induction",
                         "init": inits[0][2][1], "step": steps[0][2][1], "step_block": steps[0][3]}
+            if steps[0][2][1] < 0:                         # a DESCENDING counter: max index is the init
+                out[off]["descending"] = True
     return out
 
 
@@ -3523,6 +3665,10 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
 
     def check_for(src, ba, pred, idx_reg):
         if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
+            if src.get("descending"):
+                return _descending_bound(blocks, by_addr, preds, ba, dom, src, _a64_canon,
+                                         ("cmp", "subs"), ("cmn",), (), (),
+                                         lambda op: _a64_canon(op) == src["reg"])
             c = _induction_bound(blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("SP", "X29"),
                                  _A64_COND_TERM, loop_body=src["loop"],
                                  exit_const=lambda eb: _loop_exit_const(eb, src, _a64_canon, ("b.ne",)))
@@ -3532,6 +3678,12 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                                          _a64_canon, {"cmp", "cmn", "subs"})
         if src.get("slot"):
             if src.get("kind") == "induction":            # a loop counter: read the loop's own bound
+                if src.get("descending"):
+                    return _descending_bound(
+                        blocks, by_addr, preds, ba, dom, src, _a64_canon, ("cmp", "subs"), ("cmn",),
+                        ("ldr", "ldrsw", "ldrb", "ldrh", "ldrsb", "ldrsh"), ("str", "strb", "strh"),
+                        lambda op: (lambda mm: bool(mm) and mm[0] == "slot"
+                                    and ("SP", mm[1]) == src["slot"])(_a64_mem(op, names)))
                 b = _induction_bound(blocks, by_addr, preds, ba, ("SP", src["slot"][1]), dom,
                                      ("SP", "X29"), _A64_COND_TERM,
                                      exit_input=lambda eb: _a64_exit_input_slot(
@@ -3896,14 +4048,15 @@ def _arm32_classify_store(ins, j, src_reg, off, names):
             continue
         if m in ("mov", "movw") and len(o) == 2 and _NUM.match(o[1].lstrip("#")):
             return ("init", int(o[1].lstrip("#"), 0))
-        if m == "add" and len(o) == 3 and _NUM.match(o[2].lstrip("#")):
+        if m in ("add", "sub") and len(o) == 3 and _NUM.match(o[2].lstrip("#")):
             tmp = _arm32_canon(o[1])
             for k2 in range(k - 1, max(-1, k - 4), -1):
                 m2, o2 = _ops((ins[k2].get("text") or "").split(";")[0].strip())
                 if o2 and _arm32_canon(o2[0]) == tmp and m2 in ("ldr", "ldrsb", "ldrsh"):
                     mm = _arm32_mem(o2[-1], names)
                     if mm and mm[0] == "slot" and mm[1] == off:
-                        return ("step", int(o[2].lstrip("#"), 0))
+                        k0 = int(o[2].lstrip("#"), 0)
+                        return ("step", k0 if m == "add" else -k0)   # `sub` -> DESCENDING counter
             return ("other",)
         return ("other",)
     return ("other",)
@@ -3938,10 +4091,12 @@ def _arm32_induction_slots(blocks, names):
         inits = [s for s in lst if s[2][0] == "init"]
         steps = [s for s in lst if s[2][0] == "step"]
         if len(lst) == 2 and len(inits) == 1 and len(steps) == 1 \
-                and inits[0][2][1] >= 0 and steps[0][2][1] > 0:
+                and inits[0][2][1] >= 0 and steps[0][2][1] != 0:
             out[off] = {"source": "loop counter", "source_site": inits[0][0], "slot": ("R11", off),
                         "slot_name": inits[0][1], "kind": "induction",
                         "init": inits[0][2][1], "step": steps[0][2][1], "step_block": steps[0][3]}
+            if steps[0][2][1] < 0:                         # a DESCENDING counter: max index is the init
+                out[off]["descending"] = True
     return out
 
 
@@ -4234,6 +4389,12 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     def check_for(src, ba, pred, idx_reg):
         if src.get("slot"):
             if src.get("kind") == "induction":            # a loop counter: read the loop's own bound
+                if src.get("descending"):
+                    return _descending_bound(
+                        blocks, by_addr, preds, ba, dom, src, _arm32_canon, ("cmp", "subs"), ("cmn",),
+                        ("ldr", "ldrb", "ldrh", "ldrsb", "ldrsh"), ("str", "strb", "strh"),
+                        lambda op: (lambda mm: bool(mm) and mm[0] == "slot"
+                                    and ("R11", mm[1]) == src["slot"])(_arm32_mem(op, names)))
                 b = _induction_bound(blocks, by_addr, preds, ba, ("R11", src["slot"][1]), dom,
                                      ("SP", "R11"), _ARM32_COND_TERM,
                                      exit_input=lambda eb: _arm32_exit_input_slot(

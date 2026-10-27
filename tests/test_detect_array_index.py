@@ -1280,3 +1280,103 @@ def test_arm32_slot_equality_exit_O0(store, case, pool, arm32_gcc, tmp_path, mon
     """Same on arm32 -O0 (`cmp r,#0xb; bne` read via _slot_exit_const; ghidra backend for P-Code)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _EQ_SRC, ["-O0", "-marm"], True,
                    monkeypatch, "arm", 32) == _EQ_EXPECT
+
+
+# ----------------------------------------- DESCENDING counter (CWE-129) --------------------------
+# `for(i=C;i>=0;i--) table[i]` walks the array from the top DOWN; when the constant start C is itself
+# out of range, the FIRST iteration's store overruns (the classic descending off-by-one). The counter
+# only decreases, so the greatest index it reaches is the init constant -- unlike an ascending loop,
+# whose bound comes from the exit test. Covered on the -O0 SLOT path (all three ISAs) and the register
+# path gcc keeps at -O1 (x86-64 + aarch64; arm32 -O1/-O2 lowers a countdown to a walking pointer, a
+# separate shape). `_descending_bound` flags only when the body provably runs at i=init.
+_DEC_SRC = r"""
+int table[10];
+#define NX __attribute__((noipa))
+NX void ge_over(void){ for(int i=10;i>=0;i--) table[i]=i; }   /* i 10..0  -> table[10] OOB */
+NX void gt_over(void){ for(int i=10;i>0;i--) table[i]=i; }    /* i 10..1  -> table[10] OOB */
+NX void ne_over(void){ for(int i=10;i!=-1;i--) table[i]=i; }  /* i 10..0  -> table[10] OOB */
+NX void dec_safe(void){ for(int i=9;i>=0;i--) table[i]=i; }   /* i 9..0   -> in bounds, silent */
+int main(void){ ge_over(); gt_over(); ne_over(); dec_safe(); return 0; }
+"""
+_DEC_EXPECT = {"ge_over": {"bound"}, "gt_over": {"bound"}, "ne_over": {"bound"}}
+
+# `i != -1` reliably keeps a register loop at -O1 on both x86-64 and aarch64 (a narrow range fully
+# unrolls to constant stores -- a separate shape); dn_safe (start 9) stays in bounds -> silent.
+_DECR_SRC = r"""
+int table[10];
+#define NX __attribute__((noipa))
+NX void dn_over(void){ for(int i=10;i!=-1;i--) table[i]=i; }  /* table[10] OOB */
+NX void dn_safe(void){ for(int i=9;i!=-1;i--) table[i]=i; }   /* in bounds -> silent */
+int main(void){ dn_over(); dn_safe(); return 0; }
+"""
+
+# No-false-positive companions: a safe in-bounds countdown; a DEAD loop whose start is below the exit
+# floor (the body never runs, so the out-of-range start is never stored -- `_descending_bound`'s gate
+# must suppress it); and an input-driven start (unknown init -> not a constant bound, a sound miss).
+_NOFP_SRC = r"""
+int table[10];
+int small[3];
+#define NX __attribute__((noipa))
+NX void safe9(void){ for(int i=9;i>=0;i--) table[i]=i; }
+NX void dead_loop(void){ for(int i=5;i>=8;i--) small[i]=i; }
+NX void input_dn(int n){ for(int i=n;i>=0;i--) table[i]=i; }
+int main(int c,char**v){ safe9(); dead_loop(); input_dn(c); return 0; }
+"""
+
+
+def _run_host(store, case, pool, cc, tmp_path, src, flags, name):
+    """Build `src` with the host gcc and return the verdict map (for the x86-64 host-arch e2e cases)."""
+    c = tmp_path / (name + ".c"); c.write_text(src)
+    out = tmp_path / name
+    if subprocess.run([cc, *flags, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename=name)
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    return _merge_verdicts(store, t, pool, q)
+
+
+def test_x86_descending_slot_O0(store, case, pool, gcc, tmp_path):
+    """x86-64 -O0 (slot): `for(i=C;i>=0/>0/!=-1;i--) table[i]` with C out of range -> table[C] OOB on
+    the first iteration -> bound; dec_safe (start 9) stays in bounds -> silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _DEC_SRC, ["-O0"], "dec") == _DEC_EXPECT
+
+
+def test_x86_descending_register_O1(store, case, pool, gcc, tmp_path):
+    """x86-64 -O1: the counter is promoted to a register (`table[i]=i; sub rax,1; cmp rax,-1; jne`,
+    a single-block self-loop). The same descending overruns are flagged from the register path."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _DEC_SRC, ["-O1"], "dec") == _DEC_EXPECT
+
+
+def test_x86_descending_no_false_positive(store, case, pool, gcc, tmp_path):
+    """No descending false positives: a safe in-bounds countdown, a DEAD loop whose start is below the
+    exit floor (body never runs), and an input-driven start (unknown init) are all silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _NOFP_SRC, ["-O0"], "nofp") == {}
+
+
+def test_aarch64_descending_slot_O0(store, case, pool, a64_gcc, tmp_path):
+    """Same descending off-by-one on aarch64 -O0 (slot path: `sub w,w,#1` step read by
+    _a64_classify_store; exit `cmp w,#0; b.ge` / `cmn w,#1; b.ne`)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _DEC_SRC, ["-O0"], False, None,
+                   "aarch64") == _DEC_EXPECT
+
+
+def test_aarch64_descending_register_O1(store, case, pool, a64_gcc, tmp_path):
+    """aarch64 -O1: the counter is register-held (`str w0,[x1,x0,lsl#2]; sub x0,x0,#1; cmn x0,#1;
+    b.ne`, a self-loop); the descending overrun is flagged, init read from the preheader `mov x0,#C`."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _DECR_SRC, ["-O1"], False, None,
+                   "aarch64") == {"dn_over": {"bound"}}
+
+
+def test_arm32_descending_slot_O0(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """Same descending off-by-one on arm32 -O0 (slot path; `sub r,r,#1` step; ghidra backend)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DEC_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == _DEC_EXPECT
