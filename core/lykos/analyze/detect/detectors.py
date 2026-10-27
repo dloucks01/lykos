@@ -1901,12 +1901,14 @@ def _induction_regs(blocks, preds, succ_map, dom, by_addr):
             if other.get(reg) or len(st) != 1 or st[0][0] == 0:
                 continue                                  # not a lone, non-zero, otherwise-stable step
             init = _reg_const_init(by_addr, dom, header, body, reg)
-            if st[0][0] < 0:                              # a DESCENDING counter: the bound is the init
-                if init is None or init < 0:              # (max index); needs a known non-negative start
-                    continue
-                out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
-                                    "kind": "induction", "reg": reg, "step": st[0][0], "init": init,
-                                    "header": header, "loop": frozenset(body), "descending": True}
+            if st[0][0] < 0:                              # a DESCENDING counter: the greatest index is
+                base = {"source": "loop counter", "source_site": st[0][1], "slot": None,  # the init,
+                        "kind": "induction", "reg": reg, "step": st[0][0],                # a constant or
+                        "header": header, "loop": frozenset(body), "descending": True}    # an input start
+                if init is not None and init >= 0:
+                    out[header][reg] = {**base, "init": init}
+                else:                                     # init not a known constant: an input start is
+                    out[header][reg] = {**base, "init": None, "init_input_reg": True}     # resolved later
                 continue
             out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
                                 "kind": "induction", "reg": reg, "step": st[0][0],
@@ -2143,6 +2145,31 @@ def _reg_loop_input_bound(src, access_block, head, cx, by_addr, dom, preds, bloc
     if chk[0] == "bounded":
         return ("bounded", max(0, chk[1] - src["step"]), bool(chk[2]))
     return None
+
+
+def _reg_input_start_bound(src, access_block, head, cx, by_addr, dom, preds, blocks, canon):
+    """('unchecked',) for a DESCENDING REGISTER counter whose INIT is an unvalidated input
+    (`int n=atoi(s); for(i=n;i>=0;i--) table[i]` at -O1/-O2, where gcc promotes the counter to a
+    register), or None. The first iteration stores table[n], so an unbounded n overruns -- the
+    register twin of the -O0 slot input-start case. The counter's init is its value in the loop's
+    single preheader; resolved to an input source through the tracker (`cx['tail']`), it takes the
+    same dominating-bound check as the ascending input-length path (`_length_bound` over the dominators
+    of the header): no bound -> unchecked, a `if(n<=k)` guard/clamp -> silent (no false positive).
+    The verdict rests on the init, not the exit relation, so the sign-test exit needs no reading."""
+    header, body = src.get("header"), src.get("loop") or frozenset()
+    if header is None:
+        return None
+    pre = [p for p in preds.get(header, ()) if p not in body]
+    if len(pre) != 1:
+        return None                                        # no single, unambiguous preheader
+    v = (cx["tail"].get(pre[0]) or {}).get(src["reg"])
+    if not (v and v[0] == "idx" and v[1] == 1 and v[2] == 0):
+        return None                                        # the init is not a raw tracked value
+    isrc = v[3]
+    if isrc.get("kind") not in _IND_INPUT_KINDS or id(isrc) not in cx["origin"]:
+        return None                                        # the init did not come from unvalidated input
+    chk = _length_bound(by_addr, header, isrc, cx)         # a dominating bound on n makes it safe
+    return ("unchecked",) if (chk and chk[0] == "unchecked") else None
 
 
 def _access_loops_single_exit(blocks, preds, succ_map, access_block, dom):
@@ -3053,6 +3080,9 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
     def check_for(src, ba, pred):
         if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
             if src.get("descending"):
+                if src.get("init_input_reg"):
+                    return _reg_input_start_bound(src, ba, head, cx, by_addr, dom, preds, blocks,
+                                                  _X86_CANON.get)
                 return _descending_bound(blocks, by_addr, preds, ba, dom, src, _X86_CANON.get,
                                          ("cmp",), (), (), (),
                                          lambda op: _X86_CANON.get(op.lower()) == src["reg"],
@@ -3384,14 +3414,15 @@ def _a64_induction_regs(blocks, preds, succ_map, dom, by_addr):
         for reg, st in steps.items():
             if other.get(reg) or len(st) != 1 or st[0][0] == 0:
                 continue
-            if st[0][0] < 0:                              # a DESCENDING counter: the bound is the init
-                init = _a64_reg_const_init(by_addr, dom, header, body, reg)
-                if init is None or init < 0:              # (max index); needs a known non-negative start
-                    continue
-                out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
-                                    "slot_name": None, "kind": "induction", "reg": reg,
-                                    "step": st[0][0], "init": init, "header": header,
-                                    "loop": frozenset(body), "descending": True}
+            if st[0][0] < 0:                              # a DESCENDING counter: greatest index is the
+                init = _a64_reg_const_init(by_addr, dom, header, body, reg)       # init (const or input)
+                base = {"source": "loop counter", "source_site": st[0][1], "slot": None,
+                        "slot_name": None, "kind": "induction", "reg": reg, "step": st[0][0],
+                        "header": header, "loop": frozenset(body), "descending": True}
+                if init is not None and init >= 0:
+                    out[header][reg] = {**base, "init": init}
+                else:                                     # init not a known constant: an input start is
+                    out[header][reg] = {**base, "init": None, "init_input_reg": True}     # resolved later
                 continue
             out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
                                 "slot_name": None, "kind": "induction", "reg": reg, "step": st[0][0],
@@ -3765,9 +3796,12 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
     def check_for(src, ba, pred, idx_reg):
         if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
             if src.get("descending"):
+                if src.get("init_input_reg"):
+                    return _reg_input_start_bound(src, ba, head, cx, by_addr, dom, preds, blocks,
+                                                  _a64_canon)
                 return _descending_bound(blocks, by_addr, preds, ba, dom, src, _a64_canon,
                                          ("cmp", "subs"), ("cmn",), (), (),
-                                         lambda op: _a64_canon(op) == src["reg"])
+                                         lambda op: _a64_canon(op) == src["reg"], ("SP", "X29"))
             c = _induction_bound(blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("SP", "X29"),
                                  _A64_COND_TERM, loop_body=src["loop"],
                                  exit_const=lambda eb: _loop_exit_const(eb, src, _a64_canon, ("b.ne",)))

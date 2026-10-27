@@ -1450,3 +1450,30 @@ def test_arm32_input_start_descending_O0(store, case, pool, arm32_gcc, tmp_path,
     """Same input-start descending overrun on arm32 -O0 (ghidra backend for P-Code)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DNI_SRC, ["-O0", "-marm"], True,
                    monkeypatch, "arm", 32) == _DNI_EXPECT
+
+
+# ---------------------------- register input-start descending counter (CWE-129) ------------------
+# At -O1/-O2 gcc promotes the input-start descending counter to a REGISTER: `int n=atoi(s);
+# for(i=n;i>=0;i--) table[i]` becomes `call strtol; ...; .loop: table[i]=i; sub i,1; <sign test>`,
+# the counter i register initialised from the parser result. The register induction detector emits it
+# with init_input_reg; _reg_input_start_bound resolves the counter's init (its value in the loop
+# preheader) to the input source through the tracker and takes the same dominating-bound check as the
+# ascending input-length path -- ('unchecked',) when n has no bound, silent under a clamp/guard. The
+# verdict rests on the init being unbounded input, so the sign-test exit (`jns`/`tbz w,#31`) is not
+# read. Reuses _DNI_SRC (n_over unchecked; n_clamp re-clamped -> opaque; n_guard dominating bound).
+
+
+def test_x86_register_input_start_descending_O1(store, case, pool, gcc, tmp_path):
+    """x86-64 -O1: the input-start descending counter lives in a register (`sub rax,1; test eax,eax;
+    jns`), its init the strtol result -> table[n] overrun -> unchecked; n_clamp and n_guard silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _DNI_SRC, ["-O1"], "dni") == _DNI_EXPECT
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_aarch64_register_input_start_descending(store, case, pool, a64_gcc, tmp_path, opt):
+    """aarch64 -O1/-O2: the counter is register-held (`sub x0,x0,#1; tbz w0,#31`), its init the strtol
+    result sign-extended into the register -> table[n] overrun -> unchecked; companions silent."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _DNI_SRC, [opt], False, None,
+                   "aarch64") == _DNI_EXPECT
