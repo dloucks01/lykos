@@ -16,6 +16,9 @@ from ...db.dao import FindingDAO, FunctionDAO, PocDAO, TargetDAO
 # Reaching a saved return address or an arbitrary address IS an out-of-bounds write, and a
 # controlled read of memory the program did not intend to expose IS an out-of-bounds read.
 _PRIM_CWE = {"instruction-pointer-control": "CWE-787",
+             # A Windows stack smash that confirms control of the saved frame pointer / SEH
+             # registration frame: the write itself is a stack-based buffer overflow.
+             "seh-frame-control": "CWE-121",
              "write-what-where": "CWE-787",
              "arbitrary-write": "CWE-787",
              "arbitrary-read": "CWE-125",
@@ -79,6 +82,7 @@ from .capture import (
     how_to_feed,
     make_capture,
     make_qemu_capture,
+    make_wine_capture,
     materialize_helper,
     plain_build_bytes,
     replay_exe_for,
@@ -979,6 +983,15 @@ def primitive_stage(ctx) -> dict:
     ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
 
+    # A Windows PE runs under Wine, not ptrace: the whole machinery below (replay harnesses,
+    # sanitizer twins, ptrace/qemu captures, siginfo-based address verdicts, Ghidra stack-frame
+    # seeding) assumes an ELF the host can trace, and none of it can follow Win64 state through
+    # wineserver -- so for every PE this stage ran to the end and produced nothing. The PE L2 path
+    # is self-contained: it drives Wine with WINEDEBUG=+seh and recovers the control offset from
+    # the guest register dump + walked SEH frames. See `_pe_ip_primitive`.
+    if (target.file_type or "").lower() == "pe":
+        return _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, timeout)
+
     # Detonate the binary that ACTUALLY crashed. `build_poc` already replays a libFuzzer crash
     # against the harness it was found in; this stage did not, so it detonated a tool that never
     # calls the vulnerable path, the cyclic pattern did not fault, and the stage reported "no L2
@@ -1589,6 +1602,112 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
     return verdict, demo, demo_cap, base_mode
 
 
+def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, timeout):
+    """L2 for a Windows PE, via Wine's `+seh` crash dump (the one window into Win64 guest state the
+    host ptrace tracer cannot reach). Detonate a cyclic pattern, then recover the control offset
+    from the guest register dump + walked SEH frames, distinguishing -- honestly -- two outcomes:
+
+      * the faulting RIP itself holds the cyclic bytes -> a true instruction-pointer hijack
+        (`instruction-pointer-control`), the strong L2, confirmed by the canonical marker landing
+        in the PC on a re-detonation;
+      * only the saved frame pointer (rbp) and/or the Wine SEH registration frame hold them ->
+        `seh-frame-control`, confirmed by a NUL-free sentinel landing in that slot. This is a
+        Windows SEH-overwrite / stack-pivot LEAD, not an automatic instruction-pointer hijack:
+        x64 SEH is table-based (.pdata/.xdata), so the overwritten on-stack frame pointer is not
+        dispatched through, and a frame-pointer-based (`leave`) epilogue faults reading the
+        corrupt frame before any `ret` reaches a controlled address. The verdict says exactly
+        that and files the control-flow consequence as POTENTIAL, never demonstrated.
+
+    Self-contained on purpose: the ELF path's replay harnesses, sanitizer twins, ptrace/qemu
+    captures, siginfo address verdicts and Ghidra frame seeding all assume a host-traceable ELF."""
+    word = 8 if (target.bits or 64) >= 64 else 4
+    arch = target.arch or "x86-64"
+    # Pass 1 scopes to 64-bit PE: `make_wine_capture` parses the x64 `+seh` dump (rip/rsp/rbp); a
+    # 32-bit (WoW64) guest reports eip/esp/ebp through a different dump -- a real but separate lane.
+    if word != 8:
+        ctx.emit("primitive.done", payload={"primitive": None, "supported": False,
+                 "note": "L2 for a 32-bit PE: the Wine crash dump is 32-bit (eip/esp/ebp) and the "
+                         "WoW64 capture lane is not built yet; the PE is still analysed statically "
+                         "and reproduced to L1 under Wine"})
+        ctx.progress(pct=100, msg="L2 not yet supported for a 32-bit PE")
+        return {}
+    endian = "little"
+    length = min(max(len(orig) * 2, 256), 4096)
+    pattern = primitive.cyclic(length)
+
+    # Feed the cyclic down the recorded channel first, then the others -- a crashing input fed the
+    # wrong way does not fault, and reporting that as "no L2" turns a wrong setup into a negative.
+    cap0, used_mode, tried = {}, mode, []
+    for m in sweep_modes(mode, pattern):
+        tried.append(m)
+        cap0 = make_wine_capture(exe, m, base_argv, timeout, arch=arch, bits=word * 8)(pattern)
+        if cap0.get("ok") and cap0.get("signal_name"):
+            used_mode = m
+            break
+    if not (cap0.get("ok") and cap0.get("signal_name")):
+        ctx.emit("primitive.done", payload={
+            "primitive": None, "supported": True, "input_modes_tried": tried,
+            "note": "cyclic pattern did not fault under Wine via " + ", ".join(tried)
+                    + ": " + str(cap0.get("reason", ""))})
+        ctx.progress(pct=100, msg="no Wine fault under cyclic pattern (tried %s)"
+                     % ", ".join(tried))
+        return {}
+    capture = make_wine_capture(exe, used_mode, base_argv, timeout, arch=arch, bits=word * 8)
+
+    # 1) a true instruction-pointer hijack: the faulting PC holds the cyclic bytes. Confirm with
+    #    the canonical marker (a `ret` lands on it, PC==MARKER), exactly as the native path does.
+    pc = cap0.get("pc")
+    pc_off = (primitive.cyclic_find(primitive._reg_window(pc, word, endian, 4), length, 4)
+              if pc else -1)
+    regs = primitive.controlled_registers(cap0, length, endian=endian, word=word)
+    if pc_off != -1:
+        ctx.progress(msg=f"confirming instruction-pointer control at offset {pc_off} (pc)")
+        control = primitive.control_input(pc_off, length, word, endian)
+        confirmed = primitive.marker_confirmed(capture(control), word, endian)
+        prim = {"type": "instruction-pointer-control", "offset": pc_off, "source": "pc",
+                "marker": primitive._ip_marker(word), "observed_pc": pc, "confirmed": confirmed,
+                "registers": regs, "substrate": "wine"}
+        extra = (f"instruction-pointer control at offset {pc_off} (pc), "
+                 + ("confirmed" if confirmed else "unconfirmed") + " under Wine +seh")
+        return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
+                         prim, confirmed, extra)
+
+    # 2) controlled saved frame pointer / SEH registration frame -- the honest SEH-overwrite lead.
+    seh = cap0.get("seh_frame")
+    seh_off = (primitive.cyclic_find(primitive._reg_window(seh, word, endian, 4), length, 4)
+               if seh else -1)
+    fp_off = regs.get("rbp", -1)
+    off = fp_off if fp_off != -1 else seh_off
+    if off != -1:
+        ctx.progress(msg=f"confirming saved-frame-pointer / SEH-frame control at offset {off}")
+        control = primitive.pe_frame_control_input(off, length, word)
+        where = primitive.pe_frame_confirmed(capture(control), word)
+        confirmed = bool(where)
+        prim = {"type": "seh-frame-control", "offset": off,
+                "source": "rbp" if fp_off != -1 else "seh_frame",
+                "marker": primitive.pe_frame_sentinel(word), "observed_pc": pc,
+                "confirmed": confirmed, "registers": regs, "seh_frame": seh,
+                "substrate": "wine"}
+        _slot = {"rbp": "the saved frame pointer (rbp)", "seh_frame": "the SEH registration frame",
+                 "": "the saved frame pointer / SEH frame"}[where]
+        extra = (f"controlled saved frame pointer / SEH registration frame at offset {off}, "
+                 + (f"confirmed under Wine +seh (sentinel in {_slot})" if confirmed
+                    else "unconfirmed under Wine +seh")
+                 + " -- a Windows SEH-overwrite / stack-pivot lead; x64 SEH is table-based, so "
+                 "this is not an automatic instruction-pointer hijack")
+        return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
+                         prim, confirmed, extra)
+
+    # 3) the crash reproduces under Wine but no register/frame carries attacker bytes.
+    ctx.emit("primitive.done", payload={
+        "primitive": None, "supported": True, "input_modes_tried": tried,
+        "note": "the cyclic pattern faults the PE under Wine (" + str(cap0.get("nt_status"))
+                + ") but no saved register or SEH frame holds the pattern -- reproduced at L1, "
+                "no controllable L2 primitive recovered"})
+    ctx.progress(pct=100, msg="Wine crash reproduced; no controllable primitive in the dump")
+    return {}
+
+
 def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, confirmed,
               extra, *, frame=(b"", b""), relength: bool = False):
     """Bundle the demonstrating input, record an L2 (or L1) PoC, promote the crash finding on
@@ -1620,6 +1739,12 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         # "RCE demonstrated" is an over-claim, so IP-control headlines a demonstrated hijack and
         # carries RCE only as POTENTIAL. Write/read primitives ARE their effect, so stay demonstrated.
         _EFF = {"instruction-pointer-control": ("control-flow-hijack", "Control-flow hijack"),
+                # A Windows stack smash with CONFIRMED control of the saved frame pointer / SEH
+                # registration frame. What is demonstrated is the memory corruption (the overwrite
+                # of a saved pointer at a known offset); the control-flow-hijack consequence is a
+                # LEAD and is filed separately as POTENTIAL below.
+                "seh-frame-control": ("memory-corruption",
+                                      "Stack buffer overflow (saved frame pointer / SEH control)"),
                 "write-what-where": ("memory-corruption", "Memory corruption (arbitrary write)"),
                 "arbitrary-write": ("memory-corruption", "Memory corruption (arbitrary write)"),
                 "arbitrary-read": ("info-disclosure", "Information disclosure (memory leak)"),
@@ -1691,8 +1816,11 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         # ...and the DISCRIMINATOR, or a sanitizer abort keys to the signal alone and merges
         # every such defect into one finding. See `crash_key_parts`.
         _fpc, _disc, _hj = crash_key_parts(ctx.conn, target.id, _orig)
+        # The capture substrate, for provenance: a PE's registers come from Wine's +seh dump, not
+        # ptrace -- labelling a PE finding "ptrace" would name a tracer that never touched it.
+        _substrate = prim.get("substrate") or "ptrace"
         cand = crash_finding_candidate(
-            cap0.get("signal_name"), control_sha, "ptrace", "primitive",
+            cap0.get("signal_name"), control_sha, _substrate, "primitive",
             f"({level} primitive: {extra})", state="poc-backed", confidence=0.98,
             bundle_sha=bundle_sha, fault_pc=_fpc, discriminator=_disc, hijack=_hj)
         if _kind_title:
@@ -1732,6 +1860,10 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                 cand["title_only"] = False
                 if prim.get("type") == "instruction-pointer-control":
                     cand["severity"] = "critical"       # RIP control, confirmed under ptrace
+                elif prim.get("type") == "seh-frame-control":
+                    # A confirmed stack smash controlling the saved frame pointer / SEH frame --
+                    # high, not critical: the control-flow hijack is a lead, not demonstrated RIP.
+                    cand["severity"] = "high"
                 elif prim.get("uninit"):
                     # From the VERDICT, not from the signal. MemorySanitizer halts the process,
                     # so `_SIG_CWE["SIGABRT"]` rates every uninitialised read `high` -- including
@@ -1759,6 +1891,19 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                                  "status": "potential",
                                  "detail": "control-flow hijack achieved at L2; code execution not "
                                            "demonstrated at this level (see L3 exploit)"})
+            elif prim.get("type") == "seh-frame-control":
+                # The memory corruption above is DEMONSTRATED; the control-flow hijack it leads to
+                # is only POTENTIAL. x64 SEH is table-based, so the overwritten on-stack frame
+                # pointer is not dispatched through automatically -- reaching the instruction
+                # pointer needs a stack pivot / SEH-overwrite chain the Windows weaponizer does not
+                # yet build. Saying "demonstrated" here would be the overclaim this whole stage
+                # resists.
+                _effects.append({"kind": "control-flow-hijack",
+                                 "title": "Control-flow hijack (SEH overwrite / stack pivot)",
+                                 "status": "potential",
+                                 "detail": "saved frame pointer / SEH registration frame controlled "
+                                           "at a known offset; x64 SEH is table-based, so this is a "
+                                           "lead rather than an automatic instruction-pointer hijack"})
             cand.setdefault("evidence", []).append(
                 {"channel": "effects", "detail": json.dumps(_effects)})
         fd.upsert(target.id, target.case_id, cand)

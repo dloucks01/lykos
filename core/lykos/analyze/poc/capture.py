@@ -24,6 +24,90 @@ def _sub_out(argv, work):
         return argv
     return ["lykos.out" if a == OUTPUT_PLACEHOLDER else a for a in argv]
 
+
+import re as _re  # noqa: E402
+
+# Wine's `+seh` channel prints the guest register state and the walked exception frames on an
+# unhandled guest fault -- the only window into a PE's crash state here, since the host ptrace
+# tracer cannot follow Win64 state through wineserver. These are the lines that carry attacker bytes.
+_WINE_DISPATCH_RE = _re.compile(
+    rb"dispatch_exception rip=([0-9a-fA-F]+) rsp=([0-9a-fA-F]+) rbp=([0-9a-fA-F]+)")
+_WINE_FRAME_RE = _re.compile(rb"invalid frame ([0-9a-fA-F]+)")
+_WINE_AV_ADDR_RE = _re.compile(rb"EXCEPTION_ACCESS_VIOLATION\)[^\n]*?addr=([0-9a-fA-F]+)")
+
+
+def make_wine_capture(exe, mode, base_argv, timeout, *, arch="x86-64", bits=64):
+    """capture(data)->dict for a PE under Wine, the control-capture analogue of `make_capture`
+    (host ptrace) and `make_qemu_capture` (qemu gdbstub). A PE runs under Wine, whose state the
+    host ptrace tracer cannot read, so this drives the target with WINEDEBUG=+seh and parses the
+    guest register dump + walked exception frames out of Wine's stderr.
+
+    Returns the same contract the L2 stage consumes -- {ok, signal_name, arch, pc, sp, regs} -- plus
+    `control_candidates`: every (source, value) the crash exposed that an overflow could have
+    placed attacker bytes in (the faulting `rip`, the saved frame pointer `rbp`, the walked SEH
+    exception-frame pointer, the access-violation address). The caller (`_pe_ip_primitive`) searches
+    these for the cyclic pattern to recover the control offset, and labels the primitive by WHICH one
+    was controlled -- a controlled `rip`/fault address is RIP control; a controlled `rbp`/SEH frame is
+    the weaker, honestly-named frame-pointer / SEH-overwrite lead (x64 SEH is table-based, not an
+    automatic RIP)."""
+    def capture(data: bytes, breakpoints=None) -> dict:
+        # `-all,+seh`: ONLY the seh channel (the guest register dump + walked frames). The default
+        # channels flood stderr (wineusb/hid fixmes) and, since the capture buffer keeps the HEAD,
+        # push the crash lines past the cap -- so the controlled register was lost in the noise.
+        # It goes through sandbox.run's `winedebug=` (the trusted, pinned override), NOT
+        # env_overrides: _run_windows pins WINEDEBUG so a TARGET-supplied env var cannot silence
+        # the crash marker, and that same pin would otherwise drop an override smuggled via env.
+        argv, stdin_bytes, env = list(base_argv), None, {}
+        winedebug = "-all,+seh"
+        if mode == "stdin":
+            stdin_bytes = data
+        elif mode == "arg":
+            try:
+                argv = place(argv, sandbox.argv_arg(data, truncate=True))
+            except sandbox.ArgvNulError as e:
+                return {"ok": False, "reason": str(e)}
+        elif mode == "file":
+            work = Path(tempfile.mkdtemp(prefix="lykos-wine-"))
+            (work / "input.bin").write_bytes(data)
+            argv = place(argv, str(work / "input.bin"))
+        elif mode == "env":
+            var, argv = env_var_from_argv(argv)
+            if not var:
+                return {"ok": False, "reason": "env mode but no NAME=@@ prefix recorded"}
+            env[var] = data.decode("latin-1")
+        else:
+            return {"ok": False, "reason": f"wine capture cannot deliver via {mode!r}"}
+        try:
+            res = sandbox.run(exe, argv=argv, stdin=stdin_bytes or b"", timeout=timeout,
+                              arch=arch, bits=bits, env_overrides=env or None,
+                              winedebug=winedebug)
+        except Exception as e:                           # noqa: BLE001 -- advisory capture
+            return {"ok": False, "reason": f"wine run failed: {e!r}"}
+        err = res.stderr or b""
+        status, name, _detail = sandbox.wine_exception(err)
+        if status is None:
+            return {"ok": False, "reason": "no Wine guest exception in stderr"}
+        cands, dispatches = [], _WINE_DISPATCH_RE.findall(err)
+        pc = sp = None
+        regs: dict = {}
+        for rip_h, rsp_h, rbp_h in dispatches:
+            rip, rsp, rbp = int(rip_h, 16), int(rsp_h, 16), int(rbp_h, 16)
+            cands.append(("rip", rip)); cands.append(("rbp", rbp))
+            pc, sp, regs = rip, rsp, {"rip": rip, "rsp": rsp, "rbp": rbp}   # keep the LAST dump
+        for fr_h in _WINE_FRAME_RE.findall(err):
+            cands.append(("seh_frame", int(fr_h, 16)))
+        for av_h in _WINE_AV_ADDR_RE.findall(err):
+            cands.append(("fault_addr", int(av_h, 16)))
+        return {"ok": True, "signal_name": "SIGSEGV", "arch": arch, "nt_status": status,
+                "pc": pc, "sp": sp, "regs": regs,
+                "fault_addr": int(_WINE_AV_ADDR_RE.findall(err)[-1], 16)
+                if _WINE_AV_ADDR_RE.search(err) else None,
+                "seh_frame": int(_WINE_FRAME_RE.findall(err)[-1], 16)
+                if _WINE_FRAME_RE.search(err) else None,
+                "control_candidates": cands}
+
+    return capture
+
 _HELPER = "ptrace_capture.py"
 
 

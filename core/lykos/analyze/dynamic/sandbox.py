@@ -2339,7 +2339,7 @@ def _ensure_wineprefix(wine: str, prefix: str) -> None:
 
 
 def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix,
-                 env_overrides=None) -> RunResult:
+                 env_overrides=None, winedebug=None) -> RunResult:
     wine = _wine()
     if not wine:
         return RunResult(isolation="unsupported-windows",
@@ -2350,9 +2350,14 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix,
     # WINEDEBUG=fixme-all drops the noisy fixme channel but keeps err:/warn: (the unhandled-
     # exception marker we classify on). DISPLAY="" avoids GUI popups on headless hosts.
     # WINEPREFIX/WINEDEBUG/DISPLAY are PINNED past the env channel: they decide whether wine
-    # launches and whether the unhandled-exception marker we classify on survives.
+    # launches and whether the unhandled-exception marker we classify on survives -- which is
+    # exactly why a target-supplied `env_overrides["WINEDEBUG"]` must NOT be able to silence it.
+    # `winedebug` is the ONE trusted, in-process override (the L2 capture asking for `+seh`, the
+    # guest register dump); it still pins, so it cannot be clobbered either, and it only ever
+    # ADDS the seh trace channel to the err markers wine_exception() keys on -- never removes one.
     env = _env_for_runtime(env_overrides, pinned={"WINEPREFIX": prefix,
-                                                  "WINEDEBUG": "fixme-all", "DISPLAY": ""})
+                                                  "WINEDEBUG": winedebug or "fixme-all",
+                                                  "DISPLAY": ""})
     cmd = [wine, str(exe)] + [str(a) for a in argv]
     eff_timeout = max(timeout, 10.0)                   # wine bootstraps a wineserver -> headroom
     # wine + wineserver need many fds/threads and a large AS; use the GENEROUS emu/wine cap (not
@@ -2395,7 +2400,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),
         env_overrides: Optional[dict] = None, aslr: bool = False,
-        guard_page: bool = False, ro_binds=()) -> RunResult:
+        guard_page: bool = False, ro_binds=(), winedebug: Optional[str] = None) -> RunResult:
     """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
     ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
     was running blind on output shape alone -- eleven of the twelve architectures the platform
@@ -2423,7 +2428,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     if _is_pe(exe):                                     # Windows PE -> Wine substrate
         return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
                             capture=capture, wineprefix=wineprefix,
-                            env_overrides=env_overrides)
+                            env_overrides=env_overrides, winedebug=winedebug)
     if _is_jvm(exe):                                    # jar / .class -> the JVM
         return _run_java(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
                          capture=capture, env_overrides=env_overrides)

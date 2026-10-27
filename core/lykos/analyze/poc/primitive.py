@@ -25,6 +25,18 @@ MARKER = 0x1337C0DE1337
 # 32-bit targets truncate a 48-bit PC, so IP control on i386/arm/mips uses a 4-byte sentinel
 # (an unmapped user address, so the fetch faults at it). Reads as "1337c0de".
 MARKER32 = 0x1337C0DE
+# A NUL-FREE sentinel for confirming a Windows frame-pointer / SEH-registration-frame primitive.
+# MARKER has 0x00 high bytes, which is exactly right for a RETURN ADDRESS -- a `ret` lands on the
+# canonical address equal to MARKER, so PC==MARKER proves control -- but wrong for the SAVED FRAME
+# POINTER: that slot is confirmed by the REGISTER still holding our bytes at the fault, and an
+# arg/`strcpy` sink truncates the payload at MARKER's first NUL (byte 6), so too few bytes reach
+# the slot to smash past it and fault at all (measured: a 38-byte truncated arg leaves povf's
+# return address intact and it returns cleanly). A NUL-free sentinel delivers in full through every
+# channel. It also must not occur in `cyclic()` (lowercase a-z) -- these are uppercase (0x48-0x4F)
+# -- so a coincidental cyclic byte run can never be mistaken for a confirmed sentinel. Reads as
+# "ONMLKJIH" little-endian.
+PE_FRAME_SENTINEL = 0x48494A4B4C4D4E4F
+PE_FRAME_SENTINEL32 = 0x484A4C4E
 # Return-address registers across link-register ABIs, checked as IP-control sources.
 # Fallback list, used when the capture does not say which ISA it came from.
 _RA_REGS = ("lr", "x30", "r31", "ra")
@@ -369,6 +381,41 @@ def marker_confirmed(cap: dict, word: int = 8, endian: str = "little") -> bool:
         if w and w[:len(want)] == want:
             return True
     return False
+
+
+def pe_frame_sentinel(word: int) -> int:
+    """The NUL-free sentinel to confirm a Windows saved-frame-pointer / SEH-frame primitive."""
+    return PE_FRAME_SENTINEL if word >= 8 else PE_FRAME_SENTINEL32
+
+
+def pe_frame_control_input(offset: int, length: int, word: int = 8) -> bytes:
+    """cyclic filler up to `offset`, the NUL-free frame sentinel at the control slot, then `C`
+    padding to `length`. Unlike `control_input` the sentinel has no NUL, so the full payload
+    survives an argv/`strcpy` channel and smashes PAST the saved frame pointer -- which is what
+    makes the function actually fault (a sentinel that stopped AT the slot would leave the return
+    address intact and the call would return cleanly). The padding also overwrites the return
+    slot, so the fault is reached whether the epilogue trips on the frame pointer or the return."""
+    body = bytearray(cyclic(offset))
+    body += pe_frame_sentinel(word).to_bytes(word, "little")
+    if len(body) < length:
+        body += b"C" * (length - len(body))
+    return bytes(body)
+
+
+def pe_frame_confirmed(cap: dict, word: int = 8) -> str:
+    """Which controlled slot holds the frame sentinel at the fault: "rbp", "seh_frame", or "".
+
+    A confirmed Windows frame primitive requires the slot the cyclic pass flagged to hold OUR
+    sentinel exactly on a re-detonation -- the same marker discipline the native path uses, so a
+    coincidental cyclic window or an off-by-a-word recovery cannot pass. x86 PE is little-endian,
+    and the capture already parsed the register/frame into an integer, so the comparison is a
+    plain equality against the sentinel value."""
+    sent = pe_frame_sentinel(word)
+    if (cap.get("regs") or {}).get("rbp") == sent:
+        return "rbp"
+    if cap.get("seh_frame") == sent:
+        return "seh_frame"
+    return ""
 
 
 # --------------------------------------------------------------------- L2 memory primitives
