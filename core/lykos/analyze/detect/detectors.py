@@ -1921,6 +1921,55 @@ def _x86_exit_const(exit_blk, src):
     return _loop_exit_const(exit_blk, src, _X86_CANON.get, ("jne", "jnz"))
 
 
+def _attach_slot_loops(slots, all_loops, block_in_loops):
+    """Give each SLOT induction source its loop body (the union of loops whose block holds the step),
+    so `_slot_exit_const` can confirm the equality exit's not-equal edge continues the loop. Register
+    inductions already carry `loop`; slot detectors do not compute the CFG, so it is attached here."""
+    for src in slots.values():
+        if src.get("kind") == "induction" and src.get("slot") and src.get("step_block") is not None \
+                and "loop" not in src:
+            body: set = set()
+            for h in block_in_loops.get(src["step_block"], ()):
+                body |= all_loops.get(h, set())
+            if body:
+                src["loop"] = frozenset(body)
+
+
+def _slot_exit_const(exit_blk, src, slot_of, canon, ne_branches, load_mnems, store_mnems, cmp_mnems):
+    """R0_max for a SLOT induction whose loop exit is the equality form `cmp i, C; <ne-branch>
+    <in-loop>` with i a stack slot -- compared directly (`cmp [i], C`, x86) or after moving i into a
+    register (`ldr r,[i]; cmp r,C` / `str r,[i]; cmp r,C`, aarch64/arm32). Termination needs i to hit
+    C, so the header value reaches C - step. None otherwise. The slot-path twin of `_x86_exit_const`:
+    branch_predicate turns `< C` / `<= C` into an upper bound but not `!= C`, so the `for(i=0;i!=C;i++)`
+    equality exit needs this. `slot_of(op)` gives the slot key a memory operand reads (else None)."""
+    ins = (exit_blk or {}).get("instructions") or []
+    if not ins:
+        return None
+    mnem, ops = _ops((ins[-1].get("text") or "").split(";")[0].strip())
+    if mnem not in ne_branches or not ops:
+        return None
+    if _naddr(ops[0]) not in {_naddr(a) for a in src.get("loop", ())}:
+        return None                                       # the not-equal edge must continue the loop
+    slot = src["slot"]
+    slot_regs: set = set()                                # registers currently holding the slot value
+    bound = None
+    for i in ins[:-1]:
+        m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
+        if not o2:
+            continue
+        if (m2 in load_mnems or m2 in store_mnems) and len(o2) >= 2 and slot_of(o2[-1]) == slot:
+            slot_regs.add(canon(o2[0].lower()))           # reg <-/-> slot: now holds the slot value
+            continue
+        if m2 in cmp_mnems and len(o2) >= 2:
+            for x, y in ((o2[0], o2[1]), (o2[1], o2[0])):
+                if _NUM.match(y.lstrip("#")) and (slot_of(x) == slot or canon(x.lower()) in slot_regs):
+                    bound = int(y.lstrip("#"), 0)
+            continue
+        if o2 and canon(o2[0].lower()) in slot_regs:
+            slot_regs.discard(canon(o2[0].lower()))       # overwritten: no longer the raw slot value
+    return bound - src["step"] if bound is not None else None
+
+
 _IND_INPUT_KINDS = ("register", "parsed", "pointer")
 
 
@@ -2782,6 +2831,7 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                 elif o2 and _X86_CANON.get(o2[0].lower()) and m2 not in _NO_WRITE:
                     w.add(_X86_CANON[o2[0].lower()])
         loop_writes[h] = w
+    _attach_slot_loops(slots, all_loops, block_in_loops)  # slot inductions get their loop body
     # A value held in a REGISTER is followed within its block and into a block whose SOLE
     # predecessor computed it. origin: id(src) -> (block, index of the instruction after which
     # it holds); a parameter arrives before the entry block's first instruction.
@@ -2835,7 +2885,10 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                     blocks, by_addr, preds, ba, src["slot"], dom, ("RBP", "RSP"),
                     lambda m: m.startswith("j") and m != "jmp",
                     exit_input=lambda eb: _exit_input_slot(eb, src["slot"], input_slots, slot_names),
-                    exit_unbounded=lambda eb: _exit_driven_by_input_call(eb, ("rax",), _X86_CANON.get))
+                    exit_unbounded=lambda eb: _exit_driven_by_input_call(eb, ("rax",), _X86_CANON.get),
+                    exit_const=lambda eb: _slot_exit_const(
+                        eb, src, lambda op: _frame_slot(_mem_terms(op, slot_names)), _X86_CANON.get,
+                        ("jne", "jnz"), ("mov", "movsxd", "movsx", "movzx"), (), ("cmp",)))
                 return b if b is not None else _co_induction_bound(
                     src, slots, ba, blocks, by_addr, preds, dom, ("RBP", "RSP"),
                     lambda m: m.startswith("j") and m != "jmp")
@@ -3452,6 +3505,7 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                 elif o2 and re.fullmatch(r"[wx]\d+", o2[0].lower()) and m2 not in _A64_NO_IDX_WRITE:
                     w.add(_a64_canon(o2[0]))
         loop_writes[h] = w
+    _attach_slot_loops(slots, all_loops, block_in_loops)  # slot inductions get their loop body
     # A register-held index is followed within its block and into a block whose SOLE predecessor
     # defined it. origin: id(src) -> (block, instr index after which it holds); a parameter
     # arrives before the entry block. tail: block -> {reg: idx-value} live at the block end.
@@ -3483,7 +3537,14 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                                      exit_input=lambda eb: _a64_exit_input_slot(
                                          eb, src["slot"][1], a64_input_slots, names),
                                      exit_unbounded=lambda eb: _exit_driven_by_input_call(
-                                         eb, ("x0", "w0"), _a64_canon, call_names))
+                                         eb, ("x0", "w0"), _a64_canon, call_names),
+                                     exit_const=lambda eb: _slot_exit_const(
+                                         eb, src, lambda op: (lambda mm: ("SP", mm[1]) if mm
+                                                              and mm[0] == "slot" else None)(
+                                             _a64_mem(op, names)),
+                                         _a64_canon, ("b.ne",),
+                                         ("ldr", "ldrsw", "ldrb", "ldrh", "ldrsb", "ldrsh"),
+                                         ("str", "strb", "strh"), ("cmp", "subs")))
                 return b if b is not None else _co_induction_bound(
                     src, slots, ba, blocks, by_addr, preds, dom, ("SP", "X29"), _A64_COND_TERM)
             nm = src["slot_name"]
@@ -4145,6 +4206,7 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                 elif o2 and _arm32_isreg(o2[0]) and m2 not in _ARM32_NO_IDX_WRITE:
                     w.add(_arm32_canon(o2[0]))
         loop_writes[h] = w
+    _attach_slot_loops(slots, all_loops, block_in_loops)  # slot inductions get their loop body
     origin: dict = {}
     params: dict = {}
     for k, r in enumerate(_ARM32_ARG):
@@ -4177,7 +4239,14 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                                      exit_input=lambda eb: _arm32_exit_input_slot(
                                          eb, src["slot"][1], arm32_input_slots, names),
                                      exit_unbounded=lambda eb: _exit_driven_by_input_call(
-                                         eb, ("r0",), _arm32_canon, call_names))
+                                         eb, ("r0",), _arm32_canon, call_names),
+                                     exit_const=lambda eb: _slot_exit_const(
+                                         eb, src, lambda op: (lambda mm: ("R11", mm[1]) if mm
+                                                              and mm[0] == "slot" else None)(
+                                             _arm32_mem(op, names)),
+                                         _arm32_canon, ("bne",),
+                                         ("ldr", "ldrb", "ldrh", "ldrsb", "ldrsh"),
+                                         ("str", "strb", "strh"), ("cmp", "subs")))
                 return b if b is not None else _co_induction_bound(
                     src, slots, ba, blocks, by_addr, preds, dom, ("SP", "R11"), _ARM32_COND_TERM)
             return _arm_slot_check(blocks, by_addr, ba, ("R11", src["slot"][1]), dom, ("SP", "R11"),

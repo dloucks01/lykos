@@ -1217,3 +1217,66 @@ def test_arm32_loop_invariant_base(store, case, pool, arm32_gcc, tmp_path, monke
     unchecked; h_safe guarded -> silent (ghidra backend)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _HDR_SRC, ["-O2", "-marm"], True,
                    monkeypatch, "arm", 32) == {"h_over": {"unchecked"}}
+
+
+# ----------------------------------------- -O0 slot equality-exit (CWE-129) ----------------------
+# A `for(i=0; i!=C; i++) table[i]=i;` loop terminates on an EQUALITY test (`cmp i,C; jne body`),
+# not an ordered `<`/`<=` compare. branch_predicate derives an upper bound from lt/le but not from a
+# bare `!=`, so at -O0 (slot induction) the exit value was invisible and the overrun was missed,
+# while the -O2 register path already read it via _loop_exit_const. _slot_exit_const closes the gap:
+# termination proves i reaches C-step exactly, so table[C-1] is provably accessed. eq_over (i!=11)
+# touches table[10] -> bound; eq_safe (i!=10) tops out at table[9] -> in bounds -> silent (no FP).
+_EQ_SRC = r"""
+int table[10];
+#define NX __attribute__((noipa))
+NX void eq_over(void){ for(int i=0;i!=11;i++) table[i]=i; }  /* i 0..10 -> table[10] overrun */
+NX void eq_safe(void){ for(int i=0;i!=10;i++) table[i]=i; }  /* i 0..9  -> in bounds, silent */
+int main(void){ eq_over(); eq_safe(); return 0; }
+"""
+_EQ_EXPECT = {"eq_over": {"bound"}}
+
+
+def test_x86_slot_equality_exit_O0(store, case, pool, gcc, tmp_path):
+    """x86-64 -O0: equality-exit slot loop `for(i=0;i!=11;i++) table[i]`. The `cmp [i],0xb; jne` exit
+    bounds i at 10 via _slot_exit_const -> table[10] overrun -> bound. eq_safe (i!=10) stays silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "eq.c"; c.write_text(_EQ_SRC)
+    out = tmp_path / "eq"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="eq")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == _EQ_EXPECT
+
+
+def test_x86_slot_equality_exit_O2_parity(store, case, pool, gcc, tmp_path):
+    """The -O2 register path already read the equality exit; assert it still matches the -O0 verdict
+    so the two paths stay in parity on this shape."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "eq.c"; c.write_text(_EQ_SRC)
+    out = tmp_path / "eq"
+    if subprocess.run([gcc, "-O2", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="eq")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == _EQ_EXPECT
+
+
+def test_aarch64_slot_equality_exit_O0(store, case, pool, a64_gcc, tmp_path):
+    """Same equality-exit co-bound on aarch64 -O0 (`cmp w,#0xb; b.ne` read via _slot_exit_const)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _EQ_SRC, ["-O0"], False, None,
+                   "aarch64") == _EQ_EXPECT
+
+
+def test_arm32_slot_equality_exit_O0(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """Same on arm32 -O0 (`cmp r,#0xb; bne` read via _slot_exit_const; ghidra backend for P-Code)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _EQ_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == _EQ_EXPECT
