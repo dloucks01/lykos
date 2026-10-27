@@ -1477,3 +1477,15 @@ def test_aarch64_register_input_start_descending(store, case, pool, a64_gcc, tmp
     result sign-extended into the register -> table[n] overrun -> unchecked; companions silent."""
     assert _run_iv(store, case, pool, a64_gcc, tmp_path, _DNI_SRC, [opt], False, None,
                    "aarch64") == _DNI_EXPECT
+
+
+def test_x86_peeled_input_start_descending_O2(store, case, pool, gcc, tmp_path):
+    """x86-64 -O2: gcc 2x-unrolls the input-start descending loop with remainder peeling, so the
+    counter gains multiple steps (not a clean induction) and the overrun surfaces as the PEELED first
+    iteration -- a direct `table[n]` store with n the strtol result. The index resolves to the input
+    source, but _reg_bound withholds inside the surrounding loop; the register-index path falls back
+    to the dominator-only _length_bound, now with robust variable-guard detection (_length_unreadable_cmp
+    ignores 1-bit flag operands), so n_over -> unchecked while n_clamp/n_guard stay silent -- no FP."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _DNI_SRC, ["-O2"], "dni") == _DNI_EXPECT

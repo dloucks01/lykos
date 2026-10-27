@@ -2058,6 +2058,14 @@ def _length_unreadable_cmp(ins, length_regs):
     magnitude, so the length stays unchecked. Over-approximates toward True (withhold)."""
     from .bounds import _const_tok
     from .taint import _REG_FAMILY, _key, _parse
+
+    def _width(tok):                                      # the varnode's byte size (3rd `:`-field)
+        parts = (tok or "").split(":")
+        try:
+            return int(parts[2], 0) if len(parts) >= 3 else 0
+        except ValueError:
+            return 0
+
     if not ins:
         return False
     taint = set()
@@ -2082,10 +2090,16 @@ def _length_unreadable_cmp(ins, length_regs):
             opnds = toks[1:]
             tainted = [(_key(t) in taint) for t in opnds]
             if mnem in _CMP_PCODE and any(tainted):
-                if any((not tainted[x]) and _const_tok(opnds[x]) is None
+                # a REAL variable bound compares the length to a full-width value (a GP register or
+                # memory); the other operand being a 1-bit FLAG (`INT_NOTEQUAL OF, SF`, part of the
+                # branch's own SF/OF/ZF combination) is not a bound and must not seed -- otherwise every
+                # signed compare's flag math would read as "compared to a variable" and over-withhold.
+                if any((not tainted[x]) and _const_tok(opnds[x]) is None and _width(opnds[x]) > 1
                        for x in range(len(opnds))):
                     boundt.add(outk)                      # length compared to a variable other operand
-            if any(tainted):
+            if any(_key(t) in boundt for t in opnds):
+                boundt.add(outk)                          # carry the variable-bound flag to the branch
+            if any(tainted):                              # condition through the derived SF/OF/ZF flags
                 taint.add(outk)
     return False
 
@@ -3120,7 +3134,17 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             return _slot_check(blocks, ba, src["slot"], dom, slot_names)
         if id(src) not in origin:
             return None
-        return _reg_bound(src, ba, cx)                # backward edge-aware walk (handles merges)
+        c = _reg_bound(src, ba, cx)                   # backward edge-aware walk (handles merges)
+        if c is None and src.get("kind") in _IND_INPUT_KINDS:
+            # The index here IS a raw unvalidated input (the tracker resolved it to idx*1+0), but the
+            # backward walk was withheld -- typically because the register is also decremented in a
+            # SURROUNDING loop (the x86 -O2 input-start descending loop gcc 2x-unrolls, whose PEELED
+            # first iteration `table[n]=..` is a direct input index). Fall back to the dominator-only
+            # length bound: no dominating guard -> unchecked, a `if(n<=k)` constant guard -> its bound
+            # (silent in range), a VARIABLE guard (`if(i>=n)`) -> withheld (None -> silent). Dominator-
+            # only, so it never reads a non-dominating branch; never a false positive.
+            return _length_bound(by_addr, ba, src, cx)
+        return c
 
     for b in blocks:
         ba = b.get("addr")
