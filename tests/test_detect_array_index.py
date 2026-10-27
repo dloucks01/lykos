@@ -954,11 +954,12 @@ def test_x86_loop_induction_overrun_O2(store, case, pool, gcc, tmp_path):
     assert _merge_verdicts(store, t, pool, q) == {"c_over": {"bound"}}
 
 
-def test_x86_loop_input_length_O2_no_false_positive(store, case, pool, gcc, tmp_path):
-    """x86-64 -O2: gcc peels the loop remainder, branching on the loop-length value's parity, which
-    the length analysis cannot see through -- so an input-length overrun is a sound MISS here. The
-    point under test is that it produces NO false positive: n_clamp and n_guard (both safe) and even
-    n_over all stay silent rather than being wrongly flagged by the register-counter machinery."""
+def test_x86_loop_input_length_O2(store, case, pool, gcc, tmp_path):
+    """x86-64 -O2: an input-length loop overruns a fixed array -> unchecked, even though gcc peels the
+    remainder (a parity split `and edx,1; jne` and a peeled `if(1==n)` check). The DOMINATOR-only
+    length scan skips those peel branches (neither dominates the loop) while still honouring a real
+    dominating guard: n_clamp (a cmov clamp that rewrites n into an opaque register) and n_guard (a
+    dominating `cmp eax,0xa; ja`) both stay silent -- no false positive."""
     if sandbox.host_arch() != "x86-64":
         pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
     c = tmp_path / "ivn.c"; c.write_text(_IVN_SRC)
@@ -970,7 +971,7 @@ def test_x86_loop_input_length_O2_no_false_positive(store, case, pool, gcc, tmp_
     q = JobQueue(store.conn)
     enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
     enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
-    assert _merge_verdicts(store, t, pool, q) == {}
+    assert _merge_verdicts(store, t, pool, q) == {"n_over": {"unchecked"}}
 
 
 def test_aarch64_const_oob_store_O2(store, case, pool, a64_gcc, tmp_path):

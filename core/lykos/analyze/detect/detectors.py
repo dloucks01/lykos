@@ -1899,15 +1899,102 @@ def _loop_exit_other_reg(exit_blk, counter_reg, canon, cmp_mnems):
     return None
 
 
+# P-Code comparison opcodes: a length-tainted operand reaching one of these against a NON-CONSTANT
+# other operand is a variable bound the predicate reader cannot evaluate (so the claim is withheld);
+# the length reaching a branch only through a bit mask (INT_AND/OR/XOR) is a parity/remainder split
+# that cannot bound the magnitude, so it is ignored.
+_CMP_PCODE = {"INT_LESS", "INT_SLESS", "INT_LESSEQUAL", "INT_SLESSEQUAL", "INT_EQUAL",
+              "INT_NOTEQUAL", "INT_SUB", "INT_SBORROW", "INT_CARRY", "INT_SCARRY"}
+
+
+def _length_regs_at(d, length_src, cx):
+    """The registers holding `length_src` (raw, idx 1/0) at dominator block `d`: its definition
+    register there, plus every head carrier -- the seeds for reading `d`'s branch over the value."""
+    regs = set()
+    o = cx["origin"].get(id(length_src))
+    if o is not None and o[0] == d and len(o) >= 3 and o[2]:
+        regs.add(o[2])
+    for r, v in (cx["head"].get(d) or {}).items():
+        if isinstance(v, tuple) and v and v[0] == "idx" and v[3] is length_src \
+                and v[1] == 1 and v[2] == 0:
+            regs.add(r)
+    return regs
+
+
+def _length_unreadable_cmp(ins, length_regs):
+    """True iff the block's TERMINATING branch depends on the length value through a COMPARISON
+    against a NON-CONSTANT -- a variable bound the predicate reader could not evaluate, so the claim
+    must be withheld (the safe, no-false-positive direction). A bit test (`and n,1`, the -O2
+    remainder parity split) or a comparison against a CONSTANT does not count: neither bounds the
+    magnitude, so the length stays unchecked. Over-approximates toward True (withhold)."""
+    from .bounds import _const_tok
+    from .taint import _REG_FAMILY, _key, _parse
+    if not ins:
+        return False
+    taint = set()
+    boundt = set()                                        # varnodes = length compared to a non-constant
+    for r in length_regs:
+        for nm in _reg_variants(r):
+            taint.add(("reg", nm))
+            taint.update(("reg", f) for f in _REG_FAMILY.get(nm, ()))
+    n = len(ins)
+    for j, i in enumerate(ins):
+        for pc in i.get("pcode") or []:
+            try:
+                mnem, _insk, outk, toks = _parse(pc)
+            except Exception:
+                continue
+            if mnem == "CBRANCH":
+                if j == n - 1 and len(toks) >= 3 and _key(toks[2]) in boundt:
+                    return True
+                continue
+            if outk is None:
+                continue
+            opnds = toks[1:]
+            tainted = [(_key(t) in taint) for t in opnds]
+            if mnem in _CMP_PCODE and any(tainted):
+                if any((not tainted[x]) and _const_tok(opnds[x]) is None
+                       for x in range(len(opnds))):
+                    boundt.add(outk)                      # length compared to a variable other operand
+            if any(tainted):
+                taint.add(outk)
+    return False
+
+
+def _length_bound(by_addr, exit_src, length_src, cx):
+    """The loop-LENGTH value's dominating-check bound: ('bounded', k, nn) | ('unchecked',) | None.
+    DOMINATOR-ONLY (a guard must dominate the loop to bound the length on every path), so the `-O2`
+    remainder-peeling branches -- a parity split and a counter-vs-length compare, NEITHER dominating
+    the loop -- cannot defeat it the way the full backward `_reg_bound` walk does (that walk reaches
+    the peel branches through non-dominating predecessors and reads them as undecidable, which is why
+    an x86 `-O2` input-length loop was silent). A dominating branch the predicate reader cannot
+    evaluate withholds the claim ONLY when it compares the length to a non-constant (a real variable
+    bound); a parity/bit split is non-bounding and ignored."""
+    best = None
+    for d in cx["dom"].get(exit_src, ()):
+        if d == exit_src:
+            continue
+        ins = (by_addr.get(d) or {}).get("instructions") or []
+        if not ins or not cx["cond_term"](_ops((ins[-1].get("text") or "").split(";")[0].strip())[0]):
+            continue
+        e = _edge_bound(length_src, d, exit_src, cx)
+        if e is None:
+            if _length_unreadable_cmp(ins, _length_regs_at(d, length_src, cx)):
+                return None                               # a variable bound we cannot read -> withhold
+            continue                                      # a parity / bit test -> non-bounding, ignore
+        if e[0] == "bounded" and (best is None or e[1] < best):
+            best = e[1]
+    return ("bounded", best, True) if best is not None else ("unchecked",)
+
+
 def _reg_loop_input_bound(src, access_block, head, cx, by_addr, dom, preds, blocks, canon, cmp_mnems):
     """Bound for a register counter whose loop LENGTH is held in another register (`for(i=0;i<n;i++)`
-    at -O2, n in a register). The length value's OWN dominating-check bound -- via `_reg_bound`, which
-    follows the value across register-identity changes, so a guard tested on a different register that
-    held the same value (`cmp eax,#10` before `mov esi,eax`) is still seen -- decides: UNVALIDATED
-    input gives ('unchecked',); a guard/clamp `n<=k` means the counter reaches at most `k - step`, so
-    ('bounded', k-step, nn) (an inner guard on the index clamps tighter through `_induction_bound`,
-    which runs first). None when the exit is not a counter-vs-input-register test, or the length is not
-    a raw tracked input value -- a clamp that rewrites n into an opaque register drops it here, silent."""
+    at -O2, n in a register). The length value's own DOMINATING-check bound (`_length_bound`) decides:
+    UNVALIDATED input gives ('unchecked',); a guard/clamp `n<=k` means the counter reaches at most
+    `k - step`, so ('bounded', k-step, nn) (an inner guard on the index clamps tighter through
+    `_induction_bound`, which runs first). None when the exit is not a counter-vs-input-register test,
+    or the length is not a raw tracked input value -- a clamp that rewrites n into an opaque register
+    drops it here, silent."""
     succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
     ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
     if not ok or exit_src is None:
@@ -1921,7 +2008,7 @@ def _reg_loop_input_bound(src, access_block, head, cx, by_addr, dom, preds, bloc
     rbsrc = v[3]
     if rbsrc.get("kind") not in _IND_INPUT_KINDS or id(rbsrc) not in cx["origin"]:
         return None                                       # not unvalidated input -> no claim
-    chk = _reg_bound(rbsrc, exit_src, cx)
+    chk = _length_bound(by_addr, exit_src, rbsrc, cx)
     if chk is None:
         return None
     if chk[0] == "unchecked":
