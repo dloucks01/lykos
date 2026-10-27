@@ -4589,6 +4589,80 @@ def _arm32_descending_walk(ctx, faddr, blocks, preds, succ_map, dom, by_addr, ou
             return                                           # one walking-pointer finding per function
 
 
+def _arm32_predicated_descending_walk(ctx, faddr, blocks, out):
+    """arm32 `-O2` descending walking-pointer overrun whose loop exits via a PREDICATED RETURN
+    (`str r3,[r2,#-4]!; subs r3,r3,#1; bxcc lr; b .loop`). The decompiler drops the conditional-return
+    edge, so the loop looks exitless and the function is skipped by the `_arm32_pred_unsound` gate --
+    but the overrun is the FIRST (pre-decrement) store, which runs on iteration 1 regardless of the
+    (invisible) exit. This pass runs BEFORE that gate, for this one shape only, and so must be
+    self-contained and tightly gated: it bails unless the ONLY predicated op in the function is a
+    `bx<cc>`/`blx<cc>` return (a predicated DATA op could feed the walk and is left to the gate). The
+    array is resolved by TRIP COUNT absolutely (shared with `_arm32_descending_walk`), so the broken
+    CFG and the shared anchor symbol never mislead it; nothing predicated feeds the walk, so the
+    first-store overrun is sound. No single-exit / single-block requirement (the exit is invisible)."""
+    saw_pret = False
+    for b in blocks:
+        for i in b.get("instructions") or []:
+            m0 = _ops((i.get("text") or "").split(";")[0].strip())[0]
+            mm = _ARM32_PRED_RE.fullmatch(m0 or "")
+            if not mm:
+                continue
+            if mm.group(1) in ("bx", "blx"):
+                saw_pret = True                           # a conditional return: the dropped-edge exit
+            else:
+                return                                    # any other predicated op -> too risky, bail
+    if not saw_pret:
+        return                                            # no predicated return -> the gated passes run
+    from . import bounds
+    preds: dict = defaultdict(list)
+    succ_map: dict = {}
+    by_addr = {b.get("addr"): b for b in blocks}
+    for b in blocks:
+        succ_map[b.get("addr")] = tuple(b.get("succ") or ())
+        for sc in b.get("succ") or []:
+            preds[sc].append(b.get("addr"))
+    dom = bounds.dominators(blocks)
+    seen = set()
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                w = _arm32_walk_store(mnem, ops)
+                if w is None:
+                    continue
+                p, stride, pre = w
+                width = {"strb": 1, "strh": 2}.get(mnem, 4)
+                if not pre or stride >= 0 or -stride != width or p in seen:   # PRE-decrement, |stride|=w
+                    continue
+                seen.add(p)
+                if _arm32_reg_written_in(body, by_addr, p):
+                    continue
+                ct = _arm32_desc_walk_trips(by_addr, dom, header, body, p)
+                gb = _arm32_walk_base(ctx, by_addr, dom, header, body, p)
+                if ct is None or gb is None:
+                    continue
+                _rc, trips = ct
+                gbase, base_off = gb
+                base_abs = gbase[2] + base_off
+                arr_base = base_abs + trips * stride            # the lowest store == the array's base
+                obj = _global_base(ctx, addr=arr_base)          # resolve the TRUE array absolutely
+                if not (obj and obj[1] is not None and obj[2]):
+                    continue
+                top = (base_abs + stride) - obj[1]              # the highest (first) store's offset
+                if top < 0:
+                    continue
+                base = ("global", obj[0], obj[1], obj[2])
+                verdict = _index_verdict(("bounded", top // width, True), base, width, top % width)
+                if verdict is None:
+                    continue
+                vd, oob = verdict
+                isrc = {"source": "a descending walk", "source_site": i.get("addr"), "slot": None,
+                        "slot_name": None, "kind": "constant"}
+                out.append(_array_index_cand(faddr, i.get("addr"), base, width, top % width, isrc,
+                                             "write", ("bounded", top // width, True), vd, oob))
+                return                                           # one walking-pointer finding per function
+
+
 def _array_index_arm32(ctx, summaries, calls, targets, resolve_tail, out):
     """arm32 CWE-129, pass 1. As aarch64: a self-parsed input index is emitted directly; a parameter
     index is recorded in `summaries` and a forwarded argument (call or tail call) in `calls`, for
@@ -4611,6 +4685,10 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     from . import bounds
     if not _has_pcode(blocks):                            # no P-Code -> the check is invisible
         return
+    # A descending pre-decrement walking pointer whose loop exits via a predicated return (`bxcc lr`)
+    # -- the decompiler drops that edge, so the gate below skips the function; this handles its
+    # first-store overrun first, from the walk alone (no reliance on the broken CFG).
+    _arm32_predicated_descending_walk(ctx, faddr, blocks, out)
     for b in blocks:                                      # unmodellable conditional execution
         for i in b.get("instructions") or []:
             m0, o0 = _ops((i.get("text") or "").split(";")[0].strip())

@@ -1545,3 +1545,13 @@ def test_x86_one_past_const_store(store, case, pool, gcc, tmp_path, opt):
     if sandbox.host_arch() != "x86-64":
         pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
     assert _run_host(store, case, pool, gcc, tmp_path, _OPS_SRC, [opt], "ops") == {"op_over": {"bound"}}
+
+
+def test_arm32_predicated_return_descending_walk_O2(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """arm32 -O2: the descending walking pointer exits via a PREDICATED RETURN (`subs r3,r3,#1;
+    bxcc lr; b .loop`). The decompiler drops that edge, so the loop looks exitless and the normal
+    scan skips the function via _arm32_pred_unsound; _arm32_predicated_descending_walk runs before
+    that gate and flags the first-store overrun from the walk alone (trip-count absolute array
+    resolution). w_over overruns table[10]; w_safe and w_big stay silent -- no false positive."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DW_SRC, ["-O2", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"w_over": {"bound"}}
