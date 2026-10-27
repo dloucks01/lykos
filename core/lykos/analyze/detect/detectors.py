@@ -1755,13 +1755,14 @@ def _induction_slots(ir, slot_names):
     flat = _block_flat(ir)
     incr = _x86_lea_incr_steps(ir, slot_names)             # register-mediated `slot += k` stores
     incr_addrs = {_naddr(a) for lst in incr.values() for (_k, a) in lst}
+    blk_of = {_naddr(addr): blk for (blk, _j, addr, _b) in flat}
     inits: dict = defaultdict(list)                        # slot -> [(addr, const, block)]
-    steps: dict = defaultdict(list)                        # slot -> [step]
+    steps: dict = defaultdict(list)                        # slot -> [(step, step_block)]
     other: dict = defaultdict(int)                         # slot -> count of writes we cannot model
     leas: dict = defaultdict(int)
     for s, lst in incr.items():
-        for (k, _a) in lst:
-            steps[s].append(k)
+        for (k, a) in lst:
+            steps[s].append((k, blk_of.get(_naddr(a))))
     for (blk, _j, addr, body) in flat:
         mnem, ops = _ops(body)
         if not ops:
@@ -1779,9 +1780,9 @@ def _induction_slots(ir, slot_names):
         if mnem == "mov" and len(ops) == 2 and _NUM.match(ops[1]):
             inits[s].append((_naddr(addr), int(ops[1].lstrip("$"), 0), blk))
         elif mnem in ("add", "sub") and len(ops) == 2 and _NUM.match(ops[1]):
-            steps[s].append(int(ops[1].lstrip("$"), 0) * (1 if mnem == "add" else -1))
+            steps[s].append((int(ops[1].lstrip("$"), 0) * (1 if mnem == "add" else -1), blk))
         elif mnem in ("inc", "dec"):
-            steps[s].append(1 if mnem == "inc" else -1)
+            steps[s].append((1 if mnem == "inc" else -1, blk))
         elif _naddr(addr) in incr_addrs:
             continue                                       # the `arr[i++]` store-back, counted above
         else:
@@ -1791,10 +1792,12 @@ def _induction_slots(ir, slot_names):
         if leas.get(s) or other.get(s) or len(inits[s]) != 1 or len(steps[s]) != 1:
             continue
         init_addr, init_val, init_blk = inits[s][0]
-        if steps[s][0] <= 0 or init_val < 0:              # only a non-negative forward counter
+        step_val, step_blk = steps[s][0]
+        if step_val <= 0 or init_val < 0:                 # only a non-negative forward counter
             continue
         out[s] = {"source": "loop counter", "source_site": hex(init_addr), "slot": s,
-                  "kind": "induction", "block": init_blk, "init": init_val, "step": steps[s][0]}
+                  "kind": "induction", "block": init_blk, "init": init_val, "step": step_val,
+                  "step_block": step_blk}
     return out
 
 
@@ -2247,6 +2250,36 @@ def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, con
     if exit_unbounded is not None and exit_src is not None and exit_unbounded(by_addr.get(exit_src)):
         return ("unchecked",)                             # trip count is input-call-driven -> unbounded
     return None
+
+
+def _co_induction_bound(i_src, slots, access_block, blocks, by_addr, preds, dom, bases, cond_term):
+    """When induction index i has NO bound of its own, a co-induction j in the same loop can still
+    bound it: `for(j=0;j<100;j++){ table[i]=..; i++; }` -- the exit bounds j, not i, but i advances in
+    LOCKSTEP with j (its step in the SAME block, so both step once per iteration), so i provably
+    reaches init_i + step_i*(T-1) where T is j's constant trip count. Returns ('bounded', i_max, True)
+    for the tightest such co-bound, or None. Sound: same-block steps guarantee equal advance counts,
+    and `_induction_bound`'s single-exit gate excludes an early break that would stop short. Only j's
+    CONSTANT bound (from a dominating `cmp j,const`) is used -- an input-bounded j is left to i's own
+    input/unbounded paths."""
+    sb = i_src.get("step_block")
+    if sb is None or i_src.get("step", 0) <= 0:
+        return None
+    best = None
+    for j_src in slots.values():
+        if j_src is i_src or j_src.get("kind") != "induction" or not j_src.get("slot") \
+                or j_src.get("step_block") != sb or j_src.get("step", 0) <= 0:
+            continue                                      # not a lockstep co-counter
+        chk = _induction_bound(blocks, by_addr, preds, access_block, j_src["slot"], dom, bases,
+                               cond_term)
+        if not (chk and chk[0] == "bounded"):
+            continue
+        m = (chk[1] - j_src["init"]) // j_src["step"]     # iterations the loop provably runs
+        if m < 0:
+            continue
+        i_max = i_src["init"] + i_src["step"] * m
+        if best is None or i_max < best:
+            best = i_max
+    return ("bounded", best, True) if best is not None else None
 
 
 def _induction_verdict(check, base, scale, off, src):
@@ -2772,11 +2805,14 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             if src["block"] != ba and src["block"] not in dom.get(ba, ()):
                 return None                           # the value does not reach on every path
             if src.get("kind") == "induction":        # a loop counter: read the loop's own bound
-                return _induction_bound(
+                b = _induction_bound(
                     blocks, by_addr, preds, ba, src["slot"], dom, ("RBP", "RSP"),
                     lambda m: m.startswith("j") and m != "jmp",
                     exit_input=lambda eb: _exit_input_slot(eb, src["slot"], input_slots, slot_names),
                     exit_unbounded=lambda eb: _exit_driven_by_input_call(eb, ("rax",), _X86_CANON.get))
+                return b if b is not None else _co_induction_bound(
+                    src, slots, ba, blocks, by_addr, preds, dom, ("RBP", "RSP"),
+                    lambda m: m.startswith("j") and m != "jmp")
             return _slot_check(blocks, ba, src["slot"], dom, slot_names)
         if id(src) not in origin:
             return None
@@ -3057,7 +3093,7 @@ def _a64_induction_slots(blocks, names):
     / `mov w,#c; str w`) and one load-add-store step (`ldr w,[s]; add w,w,#k; str w,[s]`), &addr never
     taken, no other writer. Returned as index sources (kind 'induction'), same as the x86 detector."""
     taken = set()
-    stores: dict = defaultdict(list)                      # offset -> [(addr, slot_name, class)]
+    stores: dict = defaultdict(list)                      # offset -> [(addr, slot_name, class, block)]
     for b in blocks:
         ins = b.get("instructions") or []
         for j, i in enumerate(ins):
@@ -3071,7 +3107,8 @@ def _a64_induction_slots(blocks, names):
                 mm = _a64_mem(ops[-1], names)
                 if mm and mm[0] == "slot":
                     stores[mm[1]].append((i.get("addr"), mm[2],
-                                          _a64_classify_store(ins, j, ops[0], mm[1], names)))
+                                          _a64_classify_store(ins, j, ops[0], mm[1], names),
+                                          b.get("addr")))
     out = {}
     for off, lst in stores.items():
         if off in taken:
@@ -3082,7 +3119,7 @@ def _a64_induction_slots(blocks, names):
                 and inits[0][2][1] >= 0 and steps[0][2][1] > 0:
             out[off] = {"source": "loop counter", "source_site": inits[0][0], "slot": ("SP", off),
                         "slot_name": inits[0][1], "kind": "induction",
-                        "init": inits[0][2][1], "step": steps[0][2][1]}
+                        "init": inits[0][2][1], "step": steps[0][2][1], "step_block": steps[0][3]}
     return out
 
 
@@ -3408,12 +3445,14 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                                          _a64_canon, {"cmp", "cmn", "subs"})
         if src.get("slot"):
             if src.get("kind") == "induction":            # a loop counter: read the loop's own bound
-                return _induction_bound(blocks, by_addr, preds, ba, ("SP", src["slot"][1]), dom,
-                                        ("SP", "X29"), _A64_COND_TERM,
-                                        exit_input=lambda eb: _a64_exit_input_slot(
-                                            eb, src["slot"][1], a64_input_slots, names),
-                                        exit_unbounded=lambda eb: _exit_driven_by_input_call(
-                                            eb, ("x0", "w0"), _a64_canon, call_names))
+                b = _induction_bound(blocks, by_addr, preds, ba, ("SP", src["slot"][1]), dom,
+                                     ("SP", "X29"), _A64_COND_TERM,
+                                     exit_input=lambda eb: _a64_exit_input_slot(
+                                         eb, src["slot"][1], a64_input_slots, names),
+                                     exit_unbounded=lambda eb: _exit_driven_by_input_call(
+                                         eb, ("x0", "w0"), _a64_canon, call_names))
+                return b if b is not None else _co_induction_bound(
+                    src, slots, ba, blocks, by_addr, preds, dom, ("SP", "X29"), _A64_COND_TERM)
             nm = src["slot_name"]
             return _arm_slot_check(blocks, by_addr, ba, ("SP", src["slot"][1]), dom, ("SP", "X29"),
                                    _A64_COND_TERM, lambda t: ("[" + nm) in t)
@@ -3789,7 +3828,8 @@ def _arm32_induction_slots(blocks, names):
                 mm = _arm32_mem(ops[-1], names)
                 if mm and mm[0] == "slot":
                     stores[mm[1]].append((i.get("addr"), mm[2],
-                                          _arm32_classify_store(ins, j, ops[0], mm[1], names)))
+                                          _arm32_classify_store(ins, j, ops[0], mm[1], names),
+                                          b.get("addr")))
     out = {}
     for off, lst in stores.items():
         if off in taken:
@@ -3800,7 +3840,7 @@ def _arm32_induction_slots(blocks, names):
                 and inits[0][2][1] >= 0 and steps[0][2][1] > 0:
             out[off] = {"source": "loop counter", "source_site": inits[0][0], "slot": ("R11", off),
                         "slot_name": inits[0][1], "kind": "induction",
-                        "init": inits[0][2][1], "step": steps[0][2][1]}
+                        "init": inits[0][2][1], "step": steps[0][2][1], "step_block": steps[0][3]}
     return out
 
 
@@ -4060,12 +4100,14 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     def check_for(src, ba, pred, idx_reg):
         if src.get("slot"):
             if src.get("kind") == "induction":            # a loop counter: read the loop's own bound
-                return _induction_bound(blocks, by_addr, preds, ba, ("R11", src["slot"][1]), dom,
-                                        ("SP", "R11"), _ARM32_COND_TERM,
-                                        exit_input=lambda eb: _arm32_exit_input_slot(
-                                            eb, src["slot"][1], arm32_input_slots, names),
-                                        exit_unbounded=lambda eb: _exit_driven_by_input_call(
-                                            eb, ("r0",), _arm32_canon, call_names))
+                b = _induction_bound(blocks, by_addr, preds, ba, ("R11", src["slot"][1]), dom,
+                                     ("SP", "R11"), _ARM32_COND_TERM,
+                                     exit_input=lambda eb: _arm32_exit_input_slot(
+                                         eb, src["slot"][1], arm32_input_slots, names),
+                                     exit_unbounded=lambda eb: _exit_driven_by_input_call(
+                                         eb, ("r0",), _arm32_canon, call_names))
+                return b if b is not None else _co_induction_bound(
+                    src, slots, ba, blocks, by_addr, preds, dom, ("SP", "R11"), _ARM32_COND_TERM)
             return _arm_slot_check(blocks, by_addr, ba, ("R11", src["slot"][1]), dom, ("SP", "R11"),
                                    _ARM32_COND_TERM, _arm32_touch(src["slot"][1]))
         if id(src) not in origin:

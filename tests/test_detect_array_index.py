@@ -1073,3 +1073,52 @@ def test_arm32_unbounded_input_copy_O2_silent(store, case, pool, arm32_gcc, tmp_
     `_arm32_pred_unsound` gate skips the function -- a sound MISS, never a false positive (silent)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _UNB_SRC, ["-O2", "-marm"], True,
                    monkeypatch, "arm", 32) == {}
+
+
+# ------------------------------------ PARALLEL bounded counter: for(j=0;j<N) table[i++] (CWE-129) --
+# A counted loop whose exit bounds a counter j to a CONSTANT, while a SEPARATE index i walks a fixed
+# array in lockstep (both step once per iteration, in the same block). The loop runs a known number of
+# times, so i provably reaches init_i + step_i*(T-1) and overruns -> bound. The co-bound fires only
+# when i has no bound of its own and a lockstep co-counter j is constant-bounded. p_cond's i advances
+# CONDITIONALLY (its step is in a guarded block, not lockstep with j), so it stays silent -- no FP.
+# This is a -O0 shape: at -O2 gcc fuses i/j and vectorises (a separate, still-open SIMD shape).
+_PAR_SRC = r"""
+int table[10];
+#define NX __attribute__((noipa))
+NX void p_eq(void){ int i=0; for(int j=0;j<100;j++){ table[i]=j; i++; } }          /* i hits 99 */
+NX void p_off(void){ int i=5; for(int j=0;j<100;j++){ table[i]=j; i++; } }         /* i hits 104 */
+NX void p_2x(void){ int i=0; for(int j=0;j<100;j++){ table[i]=j; i+=2; } }         /* i hits 198 */
+NX void p_cond(char*s){ int i=0; for(int j=0;j<100;j++){ table[i]=j; if(s[j]) i++; } } /* cond -> silent */
+int main(int c,char**v){ p_eq(); p_off(); p_2x(); p_cond(v[1]); return 0; }
+"""
+_PAR_EXPECT = {"p_eq": {"bound"}, "p_off": {"bound"}, "p_2x": {"bound"}}
+
+
+def test_x86_parallel_bounded_counter(store, case, pool, gcc, tmp_path):
+    """x86-64 -O0: `for(j=0;j<100;j++){ table[i]=j; i++; }` -- the exit bounds j, but i walks the array
+    in lockstep (both increments in the body block), so i provably reaches init_i + step_i*99 and
+    overruns -> bound. p_eq->99, p_off->104, p_2x->198; p_cond (conditional i++) stays silent (no FP)."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "par.c"; c.write_text(_PAR_SRC)
+    out = tmp_path / "par"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="par")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == _PAR_EXPECT
+
+
+def test_aarch64_parallel_bounded_counter(store, case, pool, a64_gcc, tmp_path):
+    """Same parallel-bounded-counter co-bound on aarch64 -O0 (native backend)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _PAR_SRC, ["-O0"], False, None,
+                   "aarch64") == _PAR_EXPECT
+
+
+def test_arm32_parallel_bounded_counter(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """Same on arm32 -O0 (ghidra backend for P-Code)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _PAR_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == _PAR_EXPECT
