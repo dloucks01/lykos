@@ -266,5 +266,10 @@ def test_pe_l3_rop_winexec_runs_an_attacker_command(store, case, pool, tmp_path)
     l3 = [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L3"]
     assert l3, "no verified L3 ROP PoC filed"
     fs = FindingDAO(store.conn).list_by_target(t.id)
-    assert any("remote code execution" in (f.title or "").lower() and f.severity == "critical"
-               for f in fs), [(f.title, f.severity) for f in fs]
+    rce = [f for f in fs if "remote code execution" in (f.title or "").lower()
+           and f.severity == "critical"]
+    assert rce, [(f.title, f.severity) for f in fs]
+    # honesty: the RCE is confirmed under Wine's FIXED layout, and the finding must say so -- Wine
+    # does not randomize, so the exploit's fixed addresses are not an ASLR defeat. No over-claim.
+    ev = " ".join(e.get("detail", "") for f in rce for e in (f.evidence or []))
+    assert "ASLR" in ev and "Wine" in ev and "leak" in ev.lower(), ev[:300]

@@ -94,11 +94,22 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   Both try the direct redirect and a one-`ret`-gadget **+8 alignment** (a Win64 callee or a CRT
   routine it calls can fault on a misaligned stack), and deliver over a **NUL-tolerant** channel
   (file/stdin; a Win64 address has NUL bytes an argv/`strcpy` sink truncates — arg-channel L3 is
-  declined). **Still missing:** a **leak-based ROP** (ASLR defeat — the current chain relies on
-  Wine’s fixed image/stack addresses), SEH-overwrite chains, and ROP arg setup beyond rcx (rdx/r8/r9
-  for multi-arg sinks). Also pending: the 32-bit (WoW64) capture lane (the `+seh` dump is
-  eip/esp/ebp), and structure-preserving framing for a structured PE input. A PE with no exec sink /
-  gadget and no reachable win, or one needing a leak, is declined honestly and the confirmed L2 stands.
+  declined). Each L3 finding carries an **honest ASLR note** (`_pe_aslr_note`): the exploit uses
+  fixed image/stack addresses confirmed only under Wine’s fixed layout, and states whether those
+  hold on the real target (PE header ASLR off) or would need a runtime leak (ASLR on).
+- **The ASLR-defeat ceiling (2026-10-27, measured):** a **leak-based ROP / ASLR defeat is not
+  verifiable here, so it is not built.** Wine loads the guest at **fixed** image, stack and DLL
+  addresses — identical across runs with host ASLR on or off (measured) — so there is nothing to
+  leak against. lykos’s own standard is that *a randomized child is the only honest test* of a
+  leak-based claim (`poc/leak.py` confirms ELF PIE with `aslr=True`); with no randomizing Windows
+  runtime available offline (Wine doesn’t randomize; no real-Windows / full-system VM), a Windows
+  ASLR defeat would be an **unverifiable** claim, which the “never ship unverified exploit code” rule
+  forbids. This is a documented environment ceiling (like mips L3 with no cross-compiler), not a
+  code gap: the fixed-address ROP/ret2win is confirmed and honestly qualified; the defeat waits on a
+  randomizing runtime. **Also still missing:** SEH-overwrite chains, ROP arg setup beyond rcx
+  (rdx/r8/r9 for multi-arg sinks), the 32-bit (WoW64) capture lane (the `+seh` dump is eip/esp/ebp),
+  and structure-preserving framing for a structured PE input. A PE with no exec sink / gadget and no
+  reachable win is declined honestly and the confirmed L2 stands.
   *(2026-10-27 static: **Win32 dangerous-API detection** — `detect/detectors.py
   windows_dangerous_imports` reads the PE import table and flags the high-signal sinks (WinExec /
   ShellExecute / CreateProcess / wsprintf / lstrcpy / URLDownloadToFile / msvcrt copies), the static
