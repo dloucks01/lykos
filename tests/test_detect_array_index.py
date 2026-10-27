@@ -881,3 +881,49 @@ def test_x86_loop_input_length_overflow(store, case, pool, gcc, tmp_path):
     enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
     enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
     assert _merge_verdicts(store, t, pool, q) == {"n_over": {"unchecked"}}
+
+
+# ------------------------------------------- loop induction variable on ARM (-O0, cross-compiled) --
+def _run_iv(store, case, pool, cc, tmp_path, src, flags, ghidra, monkeypatch, want_arch, want_bits=None):
+    if monkeypatch is not None and ghidra:
+        monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
+    c = tmp_path / "iv.c"; c.write_text(src)
+    out = tmp_path / "iv"
+    if subprocess.run([cc, *flags, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot cross-compile")
+    t = ingest(store, case.id, out, filename="iv")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(240)
+    tgt = store.targets.get(t.id)
+    if tgt.arch != want_arch or (want_bits and tgt.bits != want_bits):
+        pytest.skip(f"backend did not identify {want_arch}")
+    if ghidra:
+        one = FunctionDAO(store.conn).get(next(iter(FunctionDAO(store.conn).list_by_target(t.id))).id)
+        if not any(i.get("pcode") for b in (one.ir or {}).get("blocks", [])
+                   for i in b.get("instructions", [])):
+            pytest.skip("this backend emits no P-Code")
+    return _merge_verdicts(store, t, pool, q)
+
+
+def test_aarch64_loop_induction(store, case, pool, a64_gcc, tmp_path):
+    """Loop induction overrun + input-length overflow on aarch64 -O0 (native backend)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _IV_SRC, ["-O0"], False, None,
+                   "aarch64") == {"c_over": {"bound"}}
+
+
+def test_aarch64_loop_input_length(store, case, pool, a64_gcc, tmp_path):
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _IVN_SRC, ["-O0"], False, None,
+                   "aarch64") == {"n_over": {"unchecked"}}
+
+
+def test_arm32_loop_induction(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """Loop induction overrun + input-length overflow on arm32 -O0 (ghidra backend for P-Code)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _IV_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"c_over": {"bound"}}
+
+
+def test_arm32_loop_input_length(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _IVN_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"n_over": {"unchecked"}}
