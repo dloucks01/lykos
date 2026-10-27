@@ -1837,18 +1837,19 @@ def _induction_regs(blocks, preds, succ_map, dom, by_addr):
     return out
 
 
-def _x86_exit_const(exit_blk, src):
+def _loop_exit_const(exit_blk, src, canon, ne_branches):
     """R0_max (the greatest value the counter holds at the loop header) for a register-counter loop
-    whose own exit test is the `-O2` equality form `cmp reg, C; jne <in-loop>`: termination requires
-    the counter to hit C exactly, so the last header value is C - step (a value provably reached).
-    None when the exit is not this counter-vs-constant equality shape (an inequality or a register
-    bound is read elsewhere). Using the full step as the header-to-test distance never over-states
-    R0_max, so a flagged overrun is always one the loop actually reaches."""
+    whose own exit test is the `-O2` equality form `cmp reg, C; <ne-branch> <in-loop>` (x86 `jne`,
+    ARM `bne`): termination requires the counter to hit C exactly, so the last header value is
+    C - step (a value provably reached). None when the exit is not this counter-vs-constant equality
+    shape (an inequality or a register bound is read elsewhere). Using the full step as the
+    header-to-test distance never over-states R0_max, so a flagged overrun is always reached.
+    `canon(tok)` gives a register's canonical name (None for a non-register)."""
     ins = (exit_blk or {}).get("instructions") or []
     if not ins:
         return None
     mnem, ops = _ops((ins[-1].get("text") or "").split(";")[0].strip())
-    if mnem not in ("jne", "jnz") or not ops:
+    if mnem not in ne_branches or not ops:
         return None
     loop_n = {_naddr(a) for a in src["loop"]}
     if _naddr(ops[0]) not in loop_n:                      # the not-equal edge must continue the loop
@@ -1859,13 +1860,17 @@ def _x86_exit_const(exit_blk, src):
         if m2 not in ("cmp", "test"):
             continue
         if m2 == "cmp" and len(o2) == 2:
-            a, b = o2[0].lower(), o2[1].lower()
-            if _X86_CANON.get(a) == reg and _NUM.match(b):
+            a, b = o2[0].lower().lstrip("#"), o2[1].lower().lstrip("#")
+            if canon(o2[0].lower()) == reg and _NUM.match(b):
                 return int(b, 0) - src["step"]
-            if _X86_CANON.get(b) == reg and _NUM.match(a):
+            if canon(o2[1].lower()) == reg and _NUM.match(a):
                 return int(a, 0) - src["step"]
         return None                                       # the flag-setter is not counter-vs-constant
     return None
+
+
+def _x86_exit_const(exit_blk, src):
+    return _loop_exit_const(exit_blk, src, _X86_CANON.get, ("jne", "jnz"))
 
 
 _IND_INPUT_KINDS = ("register", "parsed", "pointer")
@@ -3415,6 +3420,183 @@ def _arm32_exit_input_slot(exit_blk, i_off, input_slots, names):
     return nslot if (reads_i and has_cmp) else None
 
 
+def _arm32_induction_regs(blocks, preds, succ_map, dom, by_addr):
+    """Register loop counters on arm32 (the `-O2` shape): a register with EXACTLY ONE constant
+    positive self-increment (`add rD,rD,#k`) in the loop and no other in-loop writer. Returns
+    {header -> {reg: src}} (src carries reg/step/loop). See `_a64_induction_regs` (the aarch64 twin).
+    The entry value is not required -- the bound comes from the loop's exit test, not the init."""
+    out: dict = defaultdict(dict)
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        steps: dict = defaultdict(list)
+        other: dict = defaultdict(int)
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                if not ops or not _arm32_isreg(ops[0]):
+                    continue
+                dst = _arm32_canon(ops[0])
+                if mnem in ("add", "sub") and len(ops) == 3 and _arm32_canon(ops[1]) == dst \
+                        and _NUM.match(ops[2].lstrip("#")):
+                    steps[dst].append((int(ops[2].lstrip("#"), 0) * (1 if mnem == "add" else -1),
+                                       i.get("addr")))
+                elif mnem not in _ARM32_NO_IDX_WRITE:
+                    other[dst] += 1
+        for reg, st in steps.items():
+            if other.get(reg) or len(st) != 1 or st[0][0] <= 0:
+                continue
+            out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
+                                "slot_name": None, "kind": "induction", "reg": reg, "step": st[0][0],
+                                "init": 0, "header": header, "loop": frozenset(body)}
+    return out
+
+
+def _arm32_walk_store(mnem, ops):
+    """(ptr_reg, stride, pre_index) for an arm32 WRITEBACK store that walks a pointer -- pre-index
+    `str rX,[p,#k]!` or post-index `str rX,[p],#k` -- else None. These walk `p` by `k` bytes each
+    iteration (the `-O2` form of `for(..) *q++ = ..`), so the array index is implicit in the walk."""
+    if mnem not in ("str", "strb", "strh"):
+        return None
+    if len(ops) == 2 and ops[1].rstrip().endswith("]!"):
+        m = re.match(r"\[\s*(r\d+|fp|sp|lr)\s*,\s*#?(-?(?:0x)?[0-9a-fA-F]+)\s*\]!$", ops[1].strip())
+        if m:
+            return (_arm32_canon(m.group(1)), int(m.group(2), 0), True)
+    if len(ops) == 3 and re.fullmatch(r"\[\s*(r\d+|fp|sp|lr)\s*\]", ops[1].strip()) \
+            and _NUM.match(ops[2].lstrip("#")):
+        m = re.match(r"\[\s*(r\d+|fp|sp|lr)\s*\]", ops[1].strip())
+        return (_arm32_canon(m.group(1)), int(ops[2].lstrip("#"), 0), False)
+    return None
+
+
+def _arm32_walk_base(ctx, by_addr, dom, header, body, p):
+    """Resolve a walking pointer's INITIAL value to a global object: ('global', name, addr, sz) and
+    the signed byte offset into it, or None. Re-simulates the literal-pool base build in the blocks
+    that dominate the loop (`ldr p,[0xLIT]; add p,pc,p; sub p,p,#4` -> &table - 4), which the main
+    scanner drops once it subtracts from a `ga`. A known symbol size is required (else None)."""
+    val: dict = {}
+    for d in sorted((x for x in dom.get(header, ()) if x != header and x not in body),
+                    key=lambda x: len(dom.get(x, ()))):              # farthest dominator first (exec order)
+        for i in (by_addr.get(d) or {}).get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops or not _arm32_isreg(ops[0]):
+                continue
+            dst = _arm32_canon(ops[0])
+            if mnem == "ldr" and len(ops) == 2 and re.fullmatch(r"\[(0x[0-9a-fA-F]+|\d+)\]",
+                                                                ops[1].strip()):
+                w = _word_at(ctx, int(ops[1].strip("[]"), 0))
+                val[dst] = ("litoff", w) if w is not None else None
+            elif mnem == "add" and len(ops) == 3 and ops[1].lower() == "pc":
+                v = val.get(_arm32_canon(ops[2]))
+                pcb = _arm32_pcbase(i)
+                if v and v[0] == "litoff" and pcb is not None:
+                    g = _global_base(ctx, addr=pcb + v[1])
+                    val[dst] = ("ga", g[0], g[1], g[2], 0) if (g and g[1] is not None) else None
+                else:
+                    val[dst] = None
+            elif mnem in ("add", "sub") and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                v = val.get(_arm32_canon(ops[1]))
+                k = int(ops[2].lstrip("#"), 0) * (1 if mnem == "add" else -1)
+                val[dst] = ("ga", v[1], v[2], v[3], v[4] + k) if (v and v[0] == "ga") else None
+            else:
+                val[dst] = None                                      # any other write clobbers it
+    g = val.get(p)
+    if g and g[0] == "ga" and g[2] is not None and g[3]:
+        return ("global", g[1], g[2], g[3]), g[4]
+    return None
+
+
+def _arm32_const_init(by_addr, dom, header, body, reg):
+    """The non-negative constant `reg` holds on entry to the loop, from its single dominating
+    preheader (`mov reg, #c`), or None. arm32-specific (`_reg_const_init` reads x86 operands)."""
+    pre = [d for d in dom.get(header, ()) if d != header and d not in body]
+    if len(pre) != 1:
+        return None
+    init = None
+    for i in (by_addr.get(pre[0]) or {}).get("instructions") or []:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if not ops or _arm32_canon(ops[0]) != reg:
+            continue
+        init = int(ops[1].lstrip("#"), 0) if (mnem in ("mov", "movs") and len(ops) == 2
+                                              and _NUM.match(ops[1].lstrip("#"))) else None
+    return init
+
+
+def _arm32_reg_written_in(body, by_addr, reg):
+    """True if `reg` is the explicit destination of any instruction in the loop body. The walking
+    pointer's own writeback is implicit (the store's dest operand is the stored VALUE, not the
+    pointer), so a match here means some OTHER write reloads/recomputes the pointer -- not a clean
+    walk, so the overrun is withheld."""
+    for la in body:
+        for i in (by_addr.get(la) or {}).get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if ops and _arm32_isreg(ops[0]) and _arm32_canon(ops[0]) == reg \
+                    and mnem not in _ARM32_NO_IDX_WRITE:
+                return True
+    return False
+
+
+def _arm32_walking_pointer_loops(ctx, faddr, blocks, preds, succ_map, dom, by_addr, out):
+    """arm32 `-O2` WALKING-POINTER loop overrun: gcc compiles `for(i=0;i<=10;i++) t[i]=i` into a
+    pointer that walks the array (`str r3,[r2,#4]!`, r2 = &t - 4) with a separate counter giving the
+    trip count (`cmp r3,#11; bne`). No index register appears in the store, so the induction path
+    cannot see it; this pass links the pointer's stride and start to the counter's CONSTANT trip
+    count and flags the overrun. The input-length form carries a predicated return (`pople`) and is
+    already skipped by the caller's `_arm32_pred_unsound` gate -- so only the constant case is handled
+    here (sound: an unprovable trip count yields no claim). step=1, stride=width, known init only."""
+    for header, counters in _arm32_induction_regs(blocks, preds, succ_map, dom, by_addr).items():
+        body = next(iter(counters.values()))["loop"]
+        ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, header, dom)
+        if not ok or exit_src is None:
+            continue
+        # the counter whose constant equality exit governs the loop
+        rc, src, r0max = None, None, None
+        for reg, s in counters.items():
+            v = _loop_exit_const(by_addr.get(exit_src), s, _arm32_canon, ("bne",))
+            if v is not None:
+                rc, src, r0max = reg, s, v
+                break
+        if src is None or src["step"] != 1:                 # step 1 keeps the walk in lockstep
+            continue
+        init = _arm32_const_init(by_addr, dom, header, body, rc)
+        if init is None:
+            continue
+        trips = (r0max - init) // src["step"] + 1           # iterations the loop runs
+        if trips <= 0:
+            continue
+        seen = set()
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                w = _arm32_walk_store(mnem, ops)
+                if w is None:
+                    continue
+                p, stride, pre = w
+                width = {"strb": 1, "strh": 2}.get(mnem, 4)
+                if stride != width or stride <= 0 or p in seen:
+                    continue
+                seen.add(p)
+                if _arm32_reg_written_in(body, by_addr, p):  # p must be walked ONLY by the writeback
+                    continue
+                gb = _arm32_walk_base(ctx, by_addr, dom, header, body, p)
+                if gb is None:
+                    continue
+                gbase, base_off = gb
+                # the max byte offset the walk writes: pre-index advances before each store
+                max_off = base_off + (trips if pre else trips - 1) * stride
+                if max_off < 0:
+                    continue
+                verdict = _index_verdict(("bounded", max_off // stride, True), gbase, stride,
+                                         max_off % stride)
+                if verdict is None:
+                    continue
+                vd, oob = verdict
+                isrc = {"source": "loop counter", "source_site": i.get("addr"), "slot": None,
+                        "slot_name": None, "kind": "induction", "reg": rc}
+                out.append(_array_index_cand(faddr, i.get("addr"), gbase, stride, max_off % stride,
+                                             isrc, "write", ("bounded", max_off // stride, True),
+                                             vd, oob))
+                return                                       # one walking-pointer finding per function
+
+
 def _array_index_arm32(ctx, summaries, calls, targets, resolve_tail, out):
     """arm32 CWE-129, pass 1. As aarch64: a self-parsed input index is emitted directly; a parameter
     index is recorded in `summaries` and a forwarded argument (call or tail call) in `calls`, for
@@ -3614,6 +3796,11 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
             if mnem not in _ARM32_NO_IDX_WRITE and _arm32_isreg(ops[0]):
                 reg[dst] = None
         tail[ba] = {r: v for r, v in reg.items() if v and v[0] == "idx"}
+    # -O2 walking-pointer loops (a pointer walks the array, a counter gives the trip count). Reached
+    # only when the function passed the `_arm32_pred_unsound` gate above, so the input-length form
+    # (which carries a predicated return) is already skipped -- the constant trip count is handled.
+    succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
+    _arm32_walking_pointer_loops(ctx, faddr, blocks, preds, succ_map, dom, by_addr, out)
 
 
 @register_detector

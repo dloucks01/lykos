@@ -987,3 +987,21 @@ def test_aarch64_loop_input_length_O2(store, case, pool, a64_gcc, tmp_path):
     the strtol result with no dominating bound -> unchecked; n_clamp/n_guard stay silent."""
     assert _run_iv(store, case, pool, a64_gcc, tmp_path, _IVN_SRC, ["-O2"], False, None,
                    "aarch64") == {"n_over": {"unchecked"}}
+
+
+def test_arm32_walking_pointer_overrun_O2(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """arm32 -O2: the counted overrun compiles to a WALKING-POINTER loop (`str r3,[r2,#4]!` with
+    r2 = &table - 4) plus a separate trip-count counter (`cmp r3,#11; bne`); no index register
+    appears in the store. The pointer's stride x constant trip count reaches table[10] past the
+    10-int array -> bound. c_safe/c_break/c_inner stay silent (no false positive)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _IV_SRC, ["-O2", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"c_over": {"bound"}}
+
+
+def test_arm32_walking_pointer_input_length_O2_silent(store, case, pool, arm32_gcc, tmp_path,
+                                                      monkeypatch):
+    """arm32 -O2 input-length loops carry a predicated return (`if(n<=0)return` -> `pople {..,pc}`),
+    which the conservative `_arm32_pred_unsound` gate cannot model and so skips the whole function.
+    The result is a sound MISS, never a false positive -- n_over/n_clamp/n_guard all stay silent."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _IVN_SRC, ["-O2", "-marm"], True,
+                   monkeypatch, "arm", 32) == {}
