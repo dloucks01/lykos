@@ -32,8 +32,43 @@ import re as _re  # noqa: E402
 # tracer cannot follow Win64 state through wineserver. These are the lines that carry attacker bytes.
 _WINE_DISPATCH_RE = _re.compile(
     rb"dispatch_exception rip=([0-9a-fA-F]+) rsp=([0-9a-fA-F]+) rbp=([0-9a-fA-F]+)")
+# The `code=` line that PRECEDES each register dump, with the NT status of THAT exception. It
+# matters because a guest raises benign exceptions during start-up (Wine's own RPC probe reports
+# RPC_S_SERVER_UNAVAILABLE=0x6ba, handled and continued), and a smashed stack makes the SEH
+# dispatcher RECURSE -- re-raising the same fault dozens of times at a Wine-internal address, which
+# floods stderr and, because the capture keeps the HEAD, pushes the final "Unhandled" marker past
+# the cap. Keying the crash on the FIRST dispatch whose code is a FATAL NT status (not on a marker
+# that may be flooded out, and not on the LAST dump which in that flood is the recursion) recovers
+# the real fault -- the faulting instruction, or the hijacked target when a `ret` reached a
+# canonical-but-unmapped address (then rip == that address, which is how clean RIP control shows).
+_WINE_DISPATCH_CODE_RE = _re.compile(rb"dispatch_exception code=([0-9a-fA-F]{8})\b")
+#: NT statuses that mean the guest actually faulted (vs. a benign, handled start-up exception such
+#: as RPC_S_SERVER_UNAVAILABLE=0x6ba). ACCESS_VIOLATION, STACK_OVERFLOW, ILLEGAL_INSTRUCTION,
+#: INT_DIVIDE_BY_ZERO, STACK_BUFFER_OVERRUN, HEAP_CORRUPTION, NONCONTINUABLE, FAIL_FAST, PRIV_INSTR,
+#: and the float faults -- the same family `sandbox._WINE_EXC` names.
+_WINE_FATAL_CODES = frozenset({
+    "c0000005", "c00000fd", "c000001d", "c0000094", "c0000409", "c0000374",
+    "c0000025", "c0000602", "c0000096", "c000008c", "c000008d", "c000008e",
+})
 _WINE_FRAME_RE = _re.compile(rb"invalid frame ([0-9a-fA-F]+)")
 _WINE_AV_ADDR_RE = _re.compile(rb"EXCEPTION_ACCESS_VIOLATION\)[^\n]*?addr=([0-9a-fA-F]+)")
+
+
+def _wine_first_fatal(err: bytes):
+    """(rip, rsp, rbp, code) of the FIRST fatal-NT-status guest exception in Wine's +seh output,
+    or (None, None, None, None). This is the real crash: a benign start-up exception has a
+    non-fatal code, and the SEH-recursion flood that follows a stack smash repeats AFTER it."""
+    lines = err.split(b"\n")
+    for i, ln in enumerate(lines):
+        mc = _WINE_DISPATCH_CODE_RE.search(ln)
+        if not mc or mc.group(1).decode().lower() not in _WINE_FATAL_CODES:
+            continue
+        for ln2 in lines[i + 1:i + 5]:                 # the register dump follows within a few lines
+            mr = _WINE_DISPATCH_RE.search(ln2)
+            if mr:
+                return (int(mr.group(1), 16), int(mr.group(2), 16),
+                        int(mr.group(3), 16), mc.group(1).decode().lower())
+    return (None, None, None, None)
 
 
 def make_wine_capture(exe, mode, base_argv, timeout, *, arch="x86-64", bits=64):
@@ -85,24 +120,35 @@ def make_wine_capture(exe, mode, base_argv, timeout, *, arch="x86-64", bits=64):
             return {"ok": False, "reason": f"wine run failed: {e!r}"}
         err = res.stderr or b""
         status, name, _detail = sandbox.wine_exception(err)
-        if status is None:
+        # The crash state comes from the FIRST fatal guest exception's register dump -- robust to the
+        # SEH-recursion flood that buries the "Unhandled" marker wine_exception keys on (see
+        # _wine_first_fatal). pc here is the faulting instruction, or -- when a `ret` reached a
+        # canonical-but-unmapped address -- that address itself (rip == target), which is exactly
+        # how a clean instruction-pointer hijack presents on Win64.
+        f_rip, f_rsp, f_rbp, f_code = _wine_first_fatal(err)
+        if status is None and f_rip is None:
             return {"ok": False, "reason": "no Wine guest exception in stderr"}
-        cands, dispatches = [], _WINE_DISPATCH_RE.findall(err)
-        pc = sp = None
-        regs: dict = {}
-        for rip_h, rsp_h, rbp_h in dispatches:
-            rip, rsp, rbp = int(rip_h, 16), int(rsp_h, 16), int(rbp_h, 16)
-            cands.append(("rip", rip)); cands.append(("rbp", rbp))
-            pc, sp, regs = rip, rsp, {"rip": rip, "rsp": rsp, "rbp": rbp}   # keep the LAST dump
+        # A fatal dispatch with no wine_exception marker is only a crash if the process did NOT
+        # exit cleanly -- a guest can raise and HANDLE an access violation and still exit 0, and
+        # calling that a crash would be a false positive. wine_exception's own markers (an
+        # "Unhandled"/invalid-frame line) are definitive on their own.
+        if status is None and res.exit_code in (0, None):
+            return {"ok": False, "reason": "guest exception was handled (clean exit); not a crash"}
+        nt = status or f_code
+        cands: list = []
+        for rip_h, rsp_h, rbp_h in _WINE_DISPATCH_RE.findall(err):
+            cands.append(("rip", int(rip_h, 16))); cands.append(("rbp", int(rbp_h, 16)))
         for fr_h in _WINE_FRAME_RE.findall(err):
             cands.append(("seh_frame", int(fr_h, 16)))
         for av_h in _WINE_AV_ADDR_RE.findall(err):
             cands.append(("fault_addr", int(av_h, 16)))
-        return {"ok": True, "signal_name": "SIGSEGV", "arch": arch, "nt_status": status,
+        pc, sp = f_rip, f_rsp
+        regs = {"rip": f_rip, "rsp": f_rsp, "rbp": f_rbp} if f_rip is not None else {}
+        return {"ok": True, "signal_name": "SIGSEGV", "arch": arch, "nt_status": nt,
                 "pc": pc, "sp": sp, "regs": regs,
-                "fault_addr": int(_WINE_AV_ADDR_RE.findall(err)[-1], 16)
+                "fault_addr": int(_WINE_AV_ADDR_RE.findall(err)[0], 16)
                 if _WINE_AV_ADDR_RE.search(err) else None,
-                "seh_frame": int(_WINE_FRAME_RE.findall(err)[-1], 16)
+                "seh_frame": int(_WINE_FRAME_RE.findall(err)[0], 16)
                 if _WINE_FRAME_RE.search(err) else None,
                 "control_candidates": cands}
 

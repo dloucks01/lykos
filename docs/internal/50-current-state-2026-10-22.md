@@ -64,22 +64,33 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   register dump (`trace:seh:dispatch_exception rip/rsp/rbp`) + the walked SEH frames
   (`err:seh:call_seh_handlers invalid frame <hex>`). `primitive_stage.py` `_pe_ip_primitive` (reached
   by a `file_type == "pe"` branch, self-contained — none of the ELF replay/sanitizer/ptrace/qemu/
-  Ghidra machinery applies) detonates a cyclic pattern and recovers the control offset, distinguishing
-  **honestly**: a controlled faulting **RIP** → `instruction-pointer-control` (confirmed by the
-  canonical marker in the PC); only a controlled **saved frame pointer (rbp) / SEH registration frame**
-  → `seh-frame-control` (confirmed by a NUL-free sentinel in that slot). The second is the common x64
-  shape — a `leave` epilogue faults on the corrupt frame before any `ret`, and x64 SEH is table-based —
-  so it is filed as a **confirmed memory-corruption (CWE-121)** with the control-flow hijack as a
-  **POTENTIAL** effect, never a demonstrated RIP/RCE. (Measured on a mingw `char buf[32]; strcpy`
-  smash: rbp + SEH frame controlled at offset 32, confirmed; PC *not* controlled.)
-- **The wall is now L3 only:** `build_exploit` explicitly declines a PE
-  (`exploit_stage.py`, right after the `supports_ip_control` guard) with an honest reason — every
-  synthesis strategy is SysV/ELF (ELF symbol/GOT/PLT tables, System V AMD64 ABI, Linux shellcode),
-  so running them against a PE can only fail to confirm after wasted work. **Missing: the Win64
-  weaponizer** — Win64 ABI (rcx/rdx/r8/r9 + 32-byte shadow space), SEH-overwrite / stack-pivot
-  chains, WinExec/VirtualProtect/LoadLibrary gadget synthesis, and PE import/IAT resolution for
-  gadget/symbol lookup. Also still pending: the 32-bit (WoW64) capture lane (the `+seh` dump is
-  eip/esp/ebp), and structure-preserving framing / minimization for a structured PE input.
+  Ghidra machinery applies) detonates a cyclic pattern and recovers the control offset. The capture
+  keys the crash on the **first fatal-NT-status dispatch** (`_wine_first_fatal`), robust to the
+  SEH-recursion flood a stack smash provokes (it buries the `Unhandled` marker past the HEAD-capped
+  buffer), and surfaces a clean hijack directly: when a `ret` reaches a canonical-but-unmapped
+  address, `pc == that address`. The stage distinguishes **honestly**: a **return-address overwrite**
+  (the common x64 shape — the cyclic value is non-canonical so the CPU faults *at* the `ret`; the
+  stage PROBES candidate offsets with the canonical marker, `pc == MARKER` confirms) →
+  `instruction-pointer-control`, the strong primitive; only a controlled **saved frame pointer /
+  SEH registration frame** with no reachable return (a `leave`-style epilogue faulting first) →
+  `seh-frame-control` (NUL-free sentinel), filed as **confirmed memory-corruption (CWE-121)** with
+  the hijack only **POTENTIAL**. (Measured on a mingw `char buf[32]` smash: clean RIP confirmed at
+  offset 40.)
+- **L3 now reached (2026-10-27): Win64 ret2win.** `build_exploit`’s `_pe_ret2win_exploit`
+  (`exploit_stage.py`) redirects the confirmed clean RIP to an attacker-chosen win function
+  (`exploit.find_win` over the PE’s recovered functions + call graph) and proves it **ran under
+  Wine** — the win’s stdout appears where a **neutralised-slot negative control** produces none, so
+  our overwrite caused the execution. It tries both the direct redirect and a one-`ret`-gadget **+8
+  alignment** (`_pe_ret_gadget`), because a Win64 callee or a CRT routine it calls can fault on a
+  misaligned stack, and it delivers over a **NUL-tolerant** channel (file/stdin; a Win64 address has
+  NUL bytes that an argv/`strcpy` sink truncates). Filed as a demonstrated control-flow hijack to a
+  chosen function (CWE-121, critical), with RCE only POTENTIAL (turning it into an arbitrary command
+  needs ROP argument setup). **Still missing: the Win64 ROP weaponizer** — WinExec/system via the
+  Win64 ABI (rcx/rdx/r8/r9 + 32-byte shadow space) and a stack pivot or info leak (ASLR defeat),
+  SEH-overwrite chains, PE import/IAT resolution for gadget/symbol lookup. Also pending: the 32-bit
+  (WoW64) capture lane (the `+seh` dump is eip/esp/ebp), and structure-preserving framing /
+  minimization for a structured PE input. A PE with no reachable win function, or one needing a
+  leak, is declined honestly and the confirmed L2 stands.
   *(2026-10-27 static: **Win32 dangerous-API detection** — `detect/detectors.py
   windows_dangerous_imports` reads the PE import table and flags the high-signal sinks (WinExec /
   ShellExecute / CreateProcess / wsprintf / lstrcpy / URLDownloadToFile / msvcrt copies), the static
@@ -89,9 +100,10 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   and Wine runs **~1 exec/s** (`substrate.py:83/372`); depth collapses to static + concolic.
 
 **Current max for a PE, one line:** parsed statically (incl. Windows mitigations) + disassembled +
-Wine-executed to a verified **L1** crash **and a confirmed L2 primitive** (clean RIP, or — the common
-x64 shape — a controlled saved-frame-pointer / SEH frame, honestly labelled as a hijack *lead*);
-**no L3** (the Win64 weaponizer is not built).
+Wine-executed to a verified **L1** crash, a **confirmed L2** primitive (clean RIP at the return
+offset, or a controlled saved-frame-pointer / SEH frame), and a **confirmed L3 Win64 ret2win** when a
+win function is reachable (redirect proved to run under Wine against a negative control); L3 beyond
+ret2win (an arbitrary-command ROP call / ASLR defeat) waits on the Win64 ROP weaponizer.
 
 ## Large binaries (100 MB+)
 

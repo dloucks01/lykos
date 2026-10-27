@@ -1602,6 +1602,36 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
     return verdict, demo, demo_cap, base_mode
 
 
+#: Bound the clean-RIP offset probe (each candidate is a Wine detonation, ~1-2s). The return
+#: address of a stack buffer sits at an offset >= the buffer size and <= the crashing input length;
+#: a word-aligned sweep within that range, capped, covers it without an unbounded search.
+_PE_RIP_PROBE_STEP = 8
+_PE_RIP_PROBE_MAX = 400
+_PE_RIP_PROBE_CAP = 48
+
+
+def _pe_rip_offset_candidates(ctx, target, regs, word, orig):
+    """Return-address offsets to probe for clean RIP control, best-first: the saved-frame-pointer
+    slot plus a word (a frame-pointer epilogue's return address sits one word above saved rbp),
+    then any static stack-frame predictions, then a bounded word-aligned sweep."""
+    cands = []
+    if "rbp" in regs:
+        cands.append(regs["rbp"] + word)
+    try:
+        for c in primitive.frame_offset_candidates(_hydrate_frames(ctx, target.id, target), word):
+            cands.append(c["offset"])
+    except Exception:                                    # noqa: BLE001 -- static seed is advisory
+        pass
+    hi = min(max(len(orig) + 2 * word, 64), _PE_RIP_PROBE_MAX)
+    cands.extend(range(word, hi + 1, _PE_RIP_PROBE_STEP))
+    seen, out = set(), []
+    for c in cands:
+        if isinstance(c, int) and c > 0 and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:_PE_RIP_PROBE_CAP]
+
+
 def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, timeout):
     """L2 for a Windows PE, via Wine's `+seh` crash dump (the one window into Win64 guest state the
     host ptrace tracer cannot reach). Detonate a cyclic pattern, then recover the control offset
@@ -1671,6 +1701,30 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
                  + ("confirmed" if confirmed else "unconfirmed") + " under Wine +seh")
         return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
                          prim, confirmed, extra)
+
+    # 1b) a return-address overwrite that faults AT the `ret`. On Win64 a stack overflow usually
+    #     overwrites the return address, but the CYCLIC value there is non-canonical, so the CPU
+    #     faults at the `ret` itself (pc = the ret instruction) with the pattern nowhere in a
+    #     register -- the pattern is on the stack, which the Wine dump does not carry. So PROBE:
+    #     place the CANONICAL marker at each candidate return offset using a SHORT payload
+    #     (filler + marker, no trailing pad) so the overwrite stops at the slot and the smashed
+    #     caller frame does not make the SEH dispatcher recurse; the `ret` then lands on the marker
+    #     and pc == MARKER proves control. This is the common real x64 shape -- MSVC/optimised code
+    #     omits the frame pointer, so there is no saved rbp to leak the offset -- and it also wins
+    #     for the frame-pointer case, where the return address (one word above saved rbp) is the
+    #     stronger primitive than the rbp control the SEH-frame fallback below would report.
+    m = primitive._ip_marker(word)
+    for off in _pe_rip_offset_candidates(ctx, target, regs, word, orig):
+        ctx.progress(msg=f"probing instruction-pointer control at return offset {off}")
+        control = primitive.control_input(off, off + word, word, endian)    # short: filler+marker
+        if capture(control).get("pc") == m:
+            prim = {"type": "instruction-pointer-control", "offset": off, "source": "ret",
+                    "marker": m, "observed_pc": pc, "confirmed": True,
+                    "registers": regs, "substrate": "wine"}
+            extra = (f"instruction-pointer control at offset {off} (return address), confirmed "
+                     f"under Wine +seh: the `ret` transfers to the planted address (pc == marker)")
+            return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
+                             prim, True, extra)
 
     # 2) controlled saved frame pointer / SEH registration frame -- the honest SEH-overwrite lead.
     seh = cap0.get("seh_frame")

