@@ -1122,3 +1122,45 @@ def test_arm32_parallel_bounded_counter(store, case, pool, arm32_gcc, tmp_path, 
     """Same on arm32 -O0 (ghidra backend for P-Code)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _PAR_SRC, ["-O0", "-marm"], True,
                    monkeypatch, "arm", 32) == _PAR_EXPECT
+
+
+# --------------------------------------------- -O2 VECTORISED SIMD walk (CWE-129) ------------------
+# At -O2 gcc vectorises a counted array walk into SIMD stores driven by a BYTE-OFFSET counter
+# (`movaps %xmm0,(%rdx,%rax,1); add $0x10,%rax; cmp $0x190,%rax; jne` on x86; `str q,[x0,x1]; add
+# x0,x0,#0x10; cmp x0,#0x190; b.ne` on aarch64, where x1 is the base and x0 the offset). The
+# register-induction path reads it: the counter's constant equality bound gives the greatest byte
+# offset reached, and the SIMD store (any mnemonic, resolved by its memory operand) at that offset
+# overruns a smaller array. A vectorised loop that fits (big[1024]) stays silent -- no false positive.
+_VEC_SRC = r"""
+int table[10];
+int big[1024];
+#define NX __attribute__((noipa))
+NX void v_over(void){ int i=0; for(int j=0;j<100;j++){ table[i]=j; i++; } }  /* vectorised overrun */
+NX void v_safe(void){ for(int j=0;j<1024;j++) big[j]=j; }                    /* vectorised, in-bounds */
+int main(int c,char**v){ v_over(); v_safe(); return 0; }
+"""
+
+
+def test_x86_vectorized_simd_overrun(store, case, pool, gcc, tmp_path):
+    """x86-64 -O2: a vectorised array walk whose SIMD stores run past a fixed array -> bound; a
+    vectorised loop that fits the array (v_safe over big[1024]) stays silent (no false positive)."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "vec.c"; c.write_text(_VEC_SRC)
+    out = tmp_path / "vec"
+    if subprocess.run([gcc, "-O2", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="vec")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"v_over": {"bound"}}
+
+
+def test_aarch64_vectorized_simd_overrun(store, case, pool, a64_gcc, tmp_path):
+    """aarch64 -O2: the vectorised walk is `str q,[x0,x1]` (x1 the base, x0 the byte-offset counter);
+    the base/index operands are tried both ways and the counter's constant bound flags the overrun.
+    v_safe stays silent."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _VEC_SRC, ["-O2"], False, None,
+                   "aarch64") == {"v_over": {"bound"}}

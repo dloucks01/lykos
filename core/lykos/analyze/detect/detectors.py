@@ -3438,7 +3438,8 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
     def check_for(src, ba, pred, idx_reg):
         if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
             c = _induction_bound(blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("SP", "X29"),
-                                 _A64_COND_TERM, loop_body=src["loop"])
+                                 _A64_COND_TERM, loop_body=src["loop"],
+                                 exit_const=lambda eb: _loop_exit_const(eb, src, _a64_canon, ("b.ne",)))
             if c is not None:
                 return c
             return _reg_loop_input_bound(src, ba, head, cx, by_addr, dom, preds, blocks,
@@ -3559,15 +3560,22 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                 continue
             mm = _a64_mem(ops[-1], names)
             if mm and mm[0] == "indexed":                      # an array access
-                base = reg.get(mm[1]) if mm[1] not in ("sp", "x29") else ("sa", "SP", 0)
-                idx = reg.get(mm[2])
                 store = mnem.startswith("st")
-                if base and base[0] in ("ga", "sa") and idx and idx[0] == "idx":
-                    scale, off = idx[1] * mm[3], idx[2] * mm[3]
-                    abase = (("global", base[2], base[1], base[3]) if base[0] == "ga"
-                             else ("stack", base[1], base[2]))
-                    _index_record(summaries, out, faddr, i.get("addr"), abase, scale, off, idx[3],
-                                  "write" if store else "read", check_for(idx[3], ba, pred, mm[2]))
+                # the base is whichever operand holds the array address; the other is the index. When
+                # neither operand is shifted (`[x0, x1]`, the vectorised `str q,[off,base]` walk), EITHER
+                # may be the base, so try both orderings -- the lsl form `[xB, xI, lsl #s]` pins the
+                # index to the second operand, so only that ordering is tried.
+                orders = [(mm[1], mm[2])] + ([(mm[2], mm[1])] if mm[3] == 1 else [])
+                for bkey, ikey in orders:
+                    base = ("sa", "SP", 0) if bkey in ("sp", "x29") else reg.get(bkey)
+                    idx = reg.get(ikey)
+                    if base and base[0] in ("ga", "sa") and idx and idx[0] == "idx":
+                        scale, off = idx[1] * mm[3], idx[2] * mm[3]
+                        abase = (("global", base[2], base[1], base[3]) if base[0] == "ga"
+                                 else ("stack", base[1], base[2]))
+                        _index_record(summaries, out, faddr, i.get("addr"), abase, scale, off, idx[3],
+                                      "write" if store else "read", check_for(idx[3], ba, pred, ikey))
+                        break
                 if not store:
                     reg[dst] = None                            # a load result is array data
                 continue
