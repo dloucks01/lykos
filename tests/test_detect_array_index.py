@@ -1489,3 +1489,31 @@ def test_x86_peeled_input_start_descending_O2(store, case, pool, gcc, tmp_path):
     if sandbox.host_arch() != "x86-64":
         pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
     assert _run_host(store, case, pool, gcc, tmp_path, _DNI_SRC, ["-O2"], "dni") == _DNI_EXPECT
+
+
+# ---------------------------- arm32 descending walking-pointer overrun (CWE-129) -----------------
+# At -O1/-O2 gcc lowers `for(i=C;i>=0;i--) t[i]=i` on arm32 into a pointer walking the array DOWN with
+# PRE-decrement writeback (`str r3,[r2,#-4]!`, r2 = &t + (C+1)*4) and a value counter for the trip
+# count -- no index register, so the induction path cannot see it. _arm32_descending_walk resolves the
+# array by its TRIP COUNT (lowest store = base + trips*stride) ABSOLUTELY, not via the literal's anchor
+# symbol: gcc may encode `&big` as `&table + 0x128`, so trusting the anchor would wrongly blame table.
+# w_over overruns table[10]; w_safe (exactly table[0..9]) and w_big (fills big[64], whose walk gcc
+# anchors on table's symbol) stay silent -- the no-false-positive guard for the adjacent-array case.
+_DW_SRC = r"""
+int table[10];
+int big[64];
+#define NX __attribute__((noipa))
+NX void w_over(void){ for(int i=10;i>=0;i--) table[i]=i; }   /* table[10] OOB via pre-dec walk */
+NX void w_safe(void){ for(int i=9;i>=0;i--) table[i]=i; }    /* exactly table[0..9] -> silent */
+NX void w_big(void){ for(int i=63;i>=0;i--) big[i]=i; }      /* fills big[64], anchored on &table -> silent */
+int main(void){ w_over(); w_safe(); w_big(); return 0; }
+"""
+
+
+def test_arm32_descending_walking_pointer_O1(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """arm32 -O1: a descending countdown lowered to a PRE-decrement walking pointer overruns table[10]
+    on its first store; w_safe (in bounds) and w_big (a larger array whose walk gcc anchors on table's
+    symbol + a large offset) stay silent -- the trip-count absolute array resolution prevents the
+    adjacent-array false positive. ghidra backend (arm32 P-Code)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DW_SRC, ["-O1", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"w_over": {"bound"}}

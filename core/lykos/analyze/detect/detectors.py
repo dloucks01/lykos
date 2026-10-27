@@ -4471,6 +4471,102 @@ def _arm32_walking_pointer_loops(ctx, faddr, blocks, preds, succ_map, dom, by_ad
                 return                                       # one walking-pointer finding per function
 
 
+def _arm32_desc_walk_trips(by_addr, dom, header, body, p):
+    """(counter_reg, trips) for a single-block descending walk's VALUE counter -- the lone register
+    with a `sub/subs rC,rC,#s` step (not the walking pointer p), a constant init in the dominating
+    preheader, and a terminating `bne` whose exit value is read from a `cmn rC,#k` (-> -k), `cmp rC,#k`
+    (-> k), or the flag-setting `subs` itself (-> 0). trips = (init - exit) // s. None when the counter,
+    its init, or the trip count cannot be pinned (so an unprovable walk yields no claim)."""
+    ins = (by_addr.get(header) or {}).get("instructions") or []
+    steps: dict = defaultdict(list)
+    for i in ins:
+        m, o = _ops((i.get("text") or "").split(";")[0].strip())
+        if m in ("sub", "subs") and len(o) == 3 and _arm32_isreg(o[0]) and _arm32_canon(o[0]) == p:
+            return None                                     # p is stepped by a plain sub, not writeback
+        if m in ("sub", "subs") and len(o) == 3 and _arm32_canon(o[0]) == _arm32_canon(o[1]) \
+                and _NUM.match(o[2].lstrip("#")):
+            steps[_arm32_canon(o[0])].append(int(o[2].lstrip("#"), 0))
+    cands = [(r, s) for r, s in steps.items() if len(s) == 1 and s[0] > 0 and r != p]
+    if len(cands) != 1:
+        return None
+    rc, s = cands[0][0], cands[0][1][0]
+    init = _arm32_const_init(by_addr, dom, header, body, rc)
+    if init is None or init < 0:
+        return None
+    exitv, step_sets_flags = None, False
+    for i in ins:
+        m, o = _ops((i.get("text") or "").split(";")[0].strip())
+        if m == "cmn" and len(o) == 2 and _arm32_canon(o[0]) == rc and _NUM.match(o[1].lstrip("#")):
+            exitv = -int(o[1].lstrip("#"), 0)
+        elif m == "cmp" and len(o) == 2 and _arm32_canon(o[0]) == rc and _NUM.match(o[1].lstrip("#")):
+            exitv = int(o[1].lstrip("#"), 0)
+        elif m == "subs" and len(o) == 3 and _arm32_canon(o[0]) == rc:
+            step_sets_flags = True
+    if exitv is None and step_sets_flags:
+        exitv = 0                                           # `subs rC,rC,#s; bne` exits when rC hits 0
+    if exitv is None:
+        return None
+    trips = (init - exitv) // s
+    return (rc, trips) if trips >= 1 else None
+
+
+def _arm32_descending_walk(ctx, faddr, blocks, preds, succ_map, dom, by_addr, out):
+    """arm32 `-O1`/`-O2` DESCENDING walking-pointer overrun: gcc compiles `for(i=C;i>=0;i--) t[i]=i`
+    into a pointer that walks the array DOWN with PRE-decrement writeback (`str r3,[r2,#-4]!`, r2 =
+    &t + (C+1)*stride), plus a value counter giving the trip count. The store carries no index
+    register, so the induction path cannot see it. The walk writes `trips` elements ending at
+    base_abs + trips*stride (the lowest), so THAT is the array's base -- resolved ABSOLUTELY (not via
+    the literal's anchor symbol, which gcc may share with a neighbour: `&big` can be encoded `&table +
+    0x128`, and trusting the anchor would wrongly blame `table`). The highest (first) store is
+    base_abs + stride; when its offset in the resolved array plus the width exceeds the array's
+    st_size the first iteration overruns. Flagged only for a single-block SELF-LOOP (the store runs
+    before the loop's branch, so it always executes) whose pointer is walked ONLY by the writeback
+    and whose start + trip count are both constant -- never a false positive."""
+    seen_fn = set()
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        if len(body) != 1 or header not in body:            # single-block self-loop: the store, then
+            continue                                        # the counter step + branch -- store runs 1st
+        ok, _exit = _access_loops_single_exit(blocks, preds, succ_map, header, dom)
+        if not ok:
+            continue
+        for i in (by_addr.get(header) or {}).get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            w = _arm32_walk_store(mnem, ops)
+            if w is None:
+                continue
+            p, stride, pre = w
+            width = {"strb": 1, "strh": 2}.get(mnem, 4)
+            if not pre or stride >= 0 or -stride != width or p in seen_fn:   # PRE-decrement, |stride|=w
+                continue
+            seen_fn.add(p)
+            if _arm32_reg_written_in(body, by_addr, p):     # p recomputed elsewhere -> not a clean walk
+                continue
+            ct = _arm32_desc_walk_trips(by_addr, dom, header, body, p)
+            gb = _arm32_walk_base(ctx, by_addr, dom, header, body, p)
+            if ct is None or gb is None:
+                continue
+            _rc, trips = ct
+            gbase, base_off = gb
+            base_abs = gbase[2] + base_off                  # the pointer's value on loop entry
+            arr_base = base_abs + trips * stride            # the LOWEST store == the array's own base
+            obj = _global_base(ctx, addr=arr_base)          # resolve the TRUE array absolutely
+            if not (obj and obj[1] is not None and obj[2]):
+                continue
+            top = (base_abs + stride) - obj[1]              # the highest (first) store's offset in it
+            if top < 0:
+                continue
+            base = ("global", obj[0], obj[1], obj[2])
+            verdict = _index_verdict(("bounded", top // width, True), base, width, top % width)
+            if verdict is None:
+                continue
+            vd, oob = verdict
+            isrc = {"source": "a descending walk", "source_site": i.get("addr"), "slot": None,
+                    "slot_name": None, "kind": "constant"}
+            out.append(_array_index_cand(faddr, i.get("addr"), base, width, top % width, isrc,
+                                         "write", ("bounded", top // width, True), vd, oob))
+            return                                           # one walking-pointer finding per function
+
+
 def _array_index_arm32(ctx, summaries, calls, targets, resolve_tail, out):
     """arm32 CWE-129, pass 1. As aarch64: a self-parsed input index is emitted directly; a parameter
     index is recorded in `summaries` and a forwarded argument (call or tail call) in `calls`, for
@@ -4731,6 +4827,7 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
     # (which carries a predicated return) is already skipped -- the constant trip count is handled.
     succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
     _arm32_walking_pointer_loops(ctx, faddr, blocks, preds, succ_map, dom, by_addr, out)
+    _arm32_descending_walk(ctx, faddr, blocks, preds, succ_map, dom, by_addr, out)
 
 
 @register_detector
