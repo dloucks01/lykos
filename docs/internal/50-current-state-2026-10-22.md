@@ -62,8 +62,12 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   produces nothing: (1) **L2** RIP-confirmation is host-native ptrace (`poc/ptrace_capture.py`) and
   cannot follow Win64 state through wineserver; (2) **L3** `build_exploit` is entirely ELF symbol
   tables + System V AMD64 ABI + Linux shellcode — **no Win64 ABI (rcx/rdx/r8/r9 + shadow space), no
-  SEH-overwrite, no WinExec/VirtualProtect/LoadLibrary gadget synthesis.** Static detectors are
-  generic libc-name matches (catch msvcrt `strcpy`/`sprintf`; miss `wsprintf`/Win32).
+  SEH-overwrite, no WinExec/VirtualProtect/LoadLibrary gadget synthesis.** *(2026-10-27: static
+  **Win32 dangerous-API detection now exists** — `detect/detectors.py windows_dangerous_imports`
+  reads the PE import table and flags the high-signal sinks (WinExec / ShellExecute / CreateProcess /
+  wsprintf / lstrcpy / URLDownloadToFile / msvcrt copies), the static twin of the dynamic winmonitor
+  set, because rizin leaves a PE's IAT thunks unnamed so the call-graph `dangerous_api` missed them.
+  The L2/L3 weaponizer wall above is unchanged.)*
 - **Large PE:** additionally loses the coverage/directed-fuzz depth lane — AFL can't instrument a PE
   and Wine runs **~1 exec/s** (`substrate.py:83/372`); depth collapses to static + concolic.
 

@@ -131,6 +131,54 @@ def dangerous_api(ctx: DetectContext):
     return out
 
 
+# High-signal dangerous sinks whose mere IMPORT by a PE is worth reporting: command/process
+# execution, unbounded string copies, and file download. Low-signal I/O (memcpy/malloc/open/printf)
+# is NOT flagged on import -- it needs a call site + taint to be a defect, and every PE imports it,
+# so flagging the import would be noise. These are the defect-by-presence sinks.
+_PE_IMPORT_SINKS = frozenset({
+    "system", "popen", "execve", "execl", "execlp", "execvp",
+    "WinExec", "_wsystem", "CreateProcessA", "CreateProcessW", "CreateProcessAsUserW",
+    "ShellExecuteA", "ShellExecuteW", "ShellExecuteExW",
+    "gets", "strcpy", "strcat", "sprintf", "vsprintf",
+    "wsprintfA", "wsprintfW", "lstrcpyA", "lstrcpyW", "lstrcatA", "lstrcatW",
+    "StrCpyA", "StrCpyW", "StrCatW", "wcscpy", "wcscat",
+    "URLDownloadToFileA", "URLDownloadToFileW",
+})
+
+
+@register_detector
+def windows_dangerous_imports(ctx: DetectContext):
+    """A PE's dangerous Win32/CRT imports (`dangerous_api`'s static twin for Windows). rizin does not
+    resolve a PE's IAT thunks into named call edges, so `dangerous_api` -- which keys on the call
+    graph -- misses `WinExec`/`wsprintf`/`ShellExecute`/... on a PE even though the import plainly
+    says the program CAN call them. This reads the import table straight from the image (via `pe.parse`)
+    and files each high-signal sink import as an honest CANDIDATE (same posture + dedup key as
+    `dangerous_api`, so an API that IS resolved to a call edge collapses to one finding). ELF/other
+    formats return nothing (the call-graph path already covers them)."""
+    data = ctx.image() if callable(getattr(ctx, "image", None)) else None
+    if not data or data[:2] != b"MZ":                     # PE only; ELF is covered by dangerous_api
+        return []
+    try:
+        from ..pe import parse as _pe_parse
+        syms = (_pe_parse(data).imports or {}).get("symbols") or []
+    except Exception:                                     # noqa: BLE001 -- a malformed PE: no imports
+        return []
+    out, seen = [], set()
+    for sym in syms:
+        n = normalize(sym)
+        if n not in _PE_IMPORT_SINKS or n in seen:
+            continue
+        seen.add(n)
+        cwe, sev, desc = DANGEROUS[n]
+        cand = _cand(
+            cwe, desc, sev, "windows_dangerous_imports",
+            [{"channel": "pattern", "detail": f"PE imports {n}() (dangerous Win32/CRT sink)"}],
+            dedup_key=f"{cwe}:dangerous_api:{n}", confidence=0.4)
+        cand["api"] = n
+        out.append(cand)
+    return out
+
+
 # -------------------------------------------------- Go / Rust language-aware sinks (call-graph)
 # Go and Rust are memory-safe, so their bugs are not overflows but INJECTION / TRAVERSAL / SSRF
 # through the standard library: a runtime command, path, SQL query or URL built from untrusted

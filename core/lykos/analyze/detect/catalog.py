@@ -33,6 +33,7 @@ CWE = {
     "CWE-367": ("Time-of-check Time-of-use (TOCTOU) Race Condition", "medium"),
     "CWE-457": ("Use of Uninitialized Variable", "medium"),
     "CWE-822": ("Untrusted Pointer Dereference", "medium"),
+    "CWE-494": ("Download of Code Without Integrity Check", "high"),
 }
 
 
@@ -169,6 +170,36 @@ DANGEROUS = {
                                                  "length, not the requested one"),
     "sprint_symbol":    ("CWE-200",  "low",    "sprint_symbol -- resolves a kernel address to a "
                                                "name, defeating KASLR if it reaches userspace"),
+    # --- WIN32 sinks (a PE import / call). The static twin of the dynamic winmonitor set: a PE's
+    # dangerous Win32 APIs were invisible to the call-graph detector (which only knew libc names), so
+    # a Windows command-exec / unbounded-copy / format / download sink went unflagged on a PE until
+    # it ran under Wine. Same posture as the libc entries: the SINK is certain, the defect is
+    # corroborated by taint (LoadLibrary is deliberately omitted -- every PE loads many DLLs).
+    "WinExec":            ("CWE-78",  "high",   "Command/process execution via WinExec()"),
+    "_wsystem":           ("CWE-78",  "high",   "Command execution via _wsystem()"),
+    "CreateProcessA":     ("CWE-78",  "high",   "Process execution via CreateProcessA()"),
+    "CreateProcessW":     ("CWE-78",  "high",   "Process execution via CreateProcessW()"),
+    "CreateProcessAsUserW": ("CWE-78", "high",  "Process execution via CreateProcessAsUserW()"),
+    "ShellExecuteA":      ("CWE-78",  "high",   "Command execution via ShellExecuteA()"),
+    "ShellExecuteW":      ("CWE-78",  "high",   "Command execution via ShellExecuteW()"),
+    "ShellExecuteExW":    ("CWE-78",  "high",   "Command execution via ShellExecuteExW()"),
+    "wsprintfA":          ("CWE-120", "high",   "Unbounded wsprintfA into a buffer (no length)"),
+    "wsprintfW":          ("CWE-120", "high",   "Unbounded wsprintfW into a buffer (no length)"),
+    "lstrcpyA":           ("CWE-120", "high",   "Unbounded lstrcpyA into a buffer"),
+    "lstrcpyW":           ("CWE-120", "high",   "Unbounded lstrcpyW into a buffer"),
+    "lstrcatA":           ("CWE-120", "high",   "Unbounded lstrcatA into a buffer"),
+    "lstrcatW":           ("CWE-120", "high",   "Unbounded lstrcatW into a buffer"),
+    "StrCpyA":            ("CWE-120", "high",   "Unbounded StrCpyA into a buffer"),
+    "StrCpyW":            ("CWE-120", "high",   "Unbounded StrCpyW into a buffer"),
+    "StrCatW":            ("CWE-120", "high",   "Unbounded StrCatW into a buffer"),
+    "wcscpy":             ("CWE-120", "high",   "Unbounded wcscpy into a buffer"),
+    "wcscat":             ("CWE-120", "high",   "Unbounded wcscat into a buffer"),
+    "swprintf":           ("CWE-134", "low",    "swprintf -- check the format string is not tainted"),
+    "_snwprintf":         ("CWE-134", "low",    "_snwprintf -- check the format string is not tainted"),
+    "URLDownloadToFileA": ("CWE-494", "high",   "URLDownloadToFileA -- fetches a file from a runtime "
+                                                "URL (download-and-execute if the URL is controlled)"),
+    "URLDownloadToFileW": ("CWE-494", "high",   "URLDownloadToFileW -- fetches a file from a runtime "
+                                                "URL (download-and-execute if the URL is controlled)"),
 }
 
 # APIs whose presence is worth REPORTING but is not by itself a defect claim. `memcpy` is a
@@ -187,7 +218,11 @@ ADVISORY = {"strncpy", "memcpy", "memmove", "printf", "fprintf", "snprintf", "sy
             "malloc", "calloc", "realloc", "reallocarray",
             # a query call is a CWE-89 defect only when the query STRING is tainted.
             "sqlite3_exec", "sqlite3_prepare", "sqlite3_prepare_v2", "mysql_query",
-            "mysql_real_query", "PQexec", "PQexecParams"}
+            "mysql_real_query", "PQexec", "PQexecParams",
+            # Win32: a wide-format sink is a defect only when its FORMAT is tainted (like printf), and
+            # a URL download only when its URL is tainted (like a path op). The unbounded wsprintf/
+            # lstrcpy/WinExec/ShellExecute sinks are NOT advisory -- the sink itself is the bug.
+            "swprintf", "_snwprintf", "URLDownloadToFileA", "URLDownloadToFileW"}
 
 # untrusted-input source functions (normalized) for reachability correlation
 SOURCES = {
