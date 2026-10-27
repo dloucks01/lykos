@@ -209,3 +209,62 @@ def test_pe_l3_ret2win_confirmed_under_wine(store, case, pool, tmp_path):
     fs = FindingDAO(store.conn).list_by_target(t.id)
     assert any("ret2win" in (f.title or "").lower() and f.severity == "critical" for f in fs), \
         [(f.title, f.severity) for f in fs]
+
+
+_ROP_WINEXEC_C = (
+    "#include <windows.h>\n#include <stdio.h>\n"
+    "void vuln(FILE *f){ char buf[32]; fread(buf, 1, 400, f); }\n"
+    "int main(int argc, char **argv){ if(argc<2) return 2;\n"
+    "  if(argc>9999) WinExec(argv[0], 0);\n"            # import WinExec (branch never taken)
+    "  FILE*f=fopen(argv[1],\"rb\"); if(!f) return 3; vuln(f); return 0; }\n")
+
+
+def _mingw_rop_winexec(tmp_path):
+    cc = shutil.which("x86_64-w64-mingw32-gcc")
+    if not cc:
+        pytest.skip("no mingw cross compiler")
+    if not sandbox._wine():
+        pytest.skip("no wine to execute the PE")
+    c = tmp_path / "we.c"
+    c.write_text(_ROP_WINEXEC_C)
+    exe = tmp_path / "we.exe"
+    r = subprocess.run([cc, "-O1", "-fno-stack-protector", "-w", str(c), "-o", str(exe),
+                        "-lkernel32"], capture_output=True, timeout=180)
+    if r.returncode != 0:
+        pytest.skip("mingw cannot link here: " + r.stderr.decode(errors="replace")[:200])
+    return exe
+
+
+def test_pe_l3_rop_winexec_runs_an_attacker_command(store, case, pool, tmp_path):
+    """End to end: a PE that imports WinExec and has a stack overflow reaches a CONFIRMED L3 Win64
+    ROP -> WinExec that runs an ATTACKER-CHOSEN command under Wine. The chain is `pop rcx; ret` ->
+    &command (at a stable Wine stack address) -> the WinExec import thunk; confirmation is a unique
+    token appearing in a marker file that a neutralised-sink negative control does not create."""
+    exe = _mingw_rop_winexec(tmp_path)
+    q = JobQueue(store.conn)
+    t = ingest(store, case.id, exe, filename="we.exe")
+    for enq in (enqueue_triage, enqueue_disassemble):
+        enq(q, t, force=True)
+        assert pool.wait_idle(180)
+    t = store.targets.get(t.id)
+    assert t.file_type == "pe"
+
+    crash = store.put_artifact(case.id, "crash", data=b"A" * 200).sha256
+    pr = enqueue_primitive(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 20})
+    assert pool.wait_idle(300) and q.runs.get(pr.id).status == "done"
+    l2 = next(e.payload for e in q.events.list(run_id=pr.id, limit=80)
+              if e.type == "primitive.done")
+    assert l2["primitive"] == "instruction-pointer-control" and l2["confirmed"], l2
+
+    xr = enqueue_exploit(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 20})
+    assert pool.wait_idle(240) and q.runs.get(xr.id).status == "done"
+    xp = next(e.payload for e in q.events.list(run_id=xr.id, limit=80)
+              if e.type == "exploit.done")
+    assert xp.get("confirmed") and xp.get("exploit") == "rop-winexec", xp
+    assert xp.get("sink") == "winexec"
+
+    l3 = [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L3"]
+    assert l3, "no verified L3 ROP PoC filed"
+    fs = FindingDAO(store.conn).list_by_target(t.id)
+    assert any("remote code execution" in (f.title or "").lower() and f.severity == "critical"
+               for f in fs), [(f.title, f.severity) for f in fs]

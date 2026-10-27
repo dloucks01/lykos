@@ -76,21 +76,29 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   `seh-frame-control` (NUL-free sentinel), filed as **confirmed memory-corruption (CWE-121)** with
   the hijack only **POTENTIAL**. (Measured on a mingw `char buf[32]` smash: clean RIP confirmed at
   offset 40.)
-- **L3 now reached (2026-10-27): Win64 ret2win.** `build_exploit`’s `_pe_ret2win_exploit`
-  (`exploit_stage.py`) redirects the confirmed clean RIP to an attacker-chosen win function
-  (`exploit.find_win` over the PE’s recovered functions + call graph) and proves it **ran under
-  Wine** — the win’s stdout appears where a **neutralised-slot negative control** produces none, so
-  our overwrite caused the execution. It tries both the direct redirect and a one-`ret`-gadget **+8
-  alignment** (`_pe_ret_gadget`), because a Win64 callee or a CRT routine it calls can fault on a
-  misaligned stack, and it delivers over a **NUL-tolerant** channel (file/stdin; a Win64 address has
-  NUL bytes that an argv/`strcpy` sink truncates). Filed as a demonstrated control-flow hijack to a
-  chosen function (CWE-121, critical), with RCE only POTENTIAL (turning it into an arbitrary command
-  needs ROP argument setup). **Still missing: the Win64 ROP weaponizer** — WinExec/system via the
-  Win64 ABI (rcx/rdx/r8/r9 + 32-byte shadow space) and a stack pivot or info leak (ASLR defeat),
-  SEH-overwrite chains, PE import/IAT resolution for gadget/symbol lookup. Also pending: the 32-bit
-  (WoW64) capture lane (the `+seh` dump is eip/esp/ebp), and structure-preserving framing /
-  minimization for a structured PE input. A PE with no reachable win function, or one needing a
-  leak, is declined honestly and the confirmed L2 stands.
+- **L3 now reached (2026-10-27): Win64 ROP → WinExec/system, and ret2win.** `build_exploit` tries,
+  strongest first (`exploit_stage.py`):
+  - **`_pe_rop_exploit`** — a single-call Win64 ROP that runs an **attacker-chosen command** through
+    an imported exec sink (**WinExec / system / _wsystem** — the sinks the Win32 import detector
+    flags): `pop rcx; ret` loads the Win64 first-argument register with the command pointer, then the
+    `jmp/call [__imp_<sink>]` thunk runs it. The command string lives in the payload at a **stable
+    Wine stack address** (Wine does not randomise the stack — measured: rsp identical across runs), so
+    no leak is needed. Confirmation is a **unique token** in a marker file the command writes, which a
+    **neutralised-sink negative control** does not create — demonstrated **RCE**. Self-contained PE
+    import/IAT resolution (`_pe_import_iat`/`_pe_call_target`) matches the `FF25/FF15` thunk to the
+    sink; `_pe_gadget` finds `pop rcx; ret`. Verified: a mingw PE importing WinExec runs
+    `cmd /c echo <token>` under Wine.
+  - **`_pe_ret2win_exploit`** — redirect the clean RIP to an attacker-chosen win function
+    (`exploit.find_win`) and prove it **ran** (its stdout vs. a neutralised-slot negative control).
+    A demonstrated control-flow hijack to a chosen function (RCE only POTENTIAL).
+  Both try the direct redirect and a one-`ret`-gadget **+8 alignment** (a Win64 callee or a CRT
+  routine it calls can fault on a misaligned stack), and deliver over a **NUL-tolerant** channel
+  (file/stdin; a Win64 address has NUL bytes an argv/`strcpy` sink truncates — arg-channel L3 is
+  declined). **Still missing:** a **leak-based ROP** (ASLR defeat — the current chain relies on
+  Wine’s fixed image/stack addresses), SEH-overwrite chains, and ROP arg setup beyond rcx (rdx/r8/r9
+  for multi-arg sinks). Also pending: the 32-bit (WoW64) capture lane (the `+seh` dump is
+  eip/esp/ebp), and structure-preserving framing for a structured PE input. A PE with no exec sink /
+  gadget and no reachable win, or one needing a leak, is declined honestly and the confirmed L2 stands.
   *(2026-10-27 static: **Win32 dangerous-API detection** — `detect/detectors.py
   windows_dangerous_imports` reads the PE import table and flags the high-signal sinks (WinExec /
   ShellExecute / CreateProcess / wsprintf / lstrcpy / URLDownloadToFile / msvcrt copies), the static
@@ -101,9 +109,10 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
 
 **Current max for a PE, one line:** parsed statically (incl. Windows mitigations) + disassembled +
 Wine-executed to a verified **L1** crash, a **confirmed L2** primitive (clean RIP at the return
-offset, or a controlled saved-frame-pointer / SEH frame), and a **confirmed L3 Win64 ret2win** when a
-win function is reachable (redirect proved to run under Wine against a negative control); L3 beyond
-ret2win (an arbitrary-command ROP call / ASLR defeat) waits on the Win64 ROP weaponizer.
+offset, or a controlled saved-frame-pointer / SEH frame), and **confirmed L3** — a Win64 single-call
+ROP that runs an attacker-chosen command through an imported WinExec/system (demonstrated RCE), or a
+ret2win to an in-image win function — all proved under Wine against a negative control; L3 beyond this
+(a leak-based ROP / ASLR defeat, SEH-overwrite chains, WoW64 32-bit) is the remaining Windows work.
 
 ## Large binaries (100 MB+)
 
