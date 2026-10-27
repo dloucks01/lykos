@@ -2887,6 +2887,53 @@ def _x86_unbounded_walk(ctx, faddr, blocks, preds, succ_map, dom, by_addr, slot_
             return                                                   # one walking-pointer finding/function
 
 
+_RAM_STORE_RE = re.compile(r"->\s*ram:(0x[0-9a-fA-F]+|\d+):(\d+)\b")
+
+
+def _x86_const_oob_stores(ctx, faddr, blocks, out):
+    """A CONSTANT-ADDRESS store that writes past a known-size global array -- the x86 `-O1`/`-O2`
+    fully-unrolled / vectorised overrun (`for(i=0;i<N;i++) t[i]=v` compiled to straight-line
+    `movups xmmword [table+off],xmm` / `mov dword [table+off],c`), which carries no loop or index
+    register for the induction path to read. A direct store to an absolute address shows in p-code as
+    `<op> ... -> ram:A:W`; when A lands INSIDE a known-size object and the W-byte write crosses the
+    object's st_size, it is a CWE-129 overrun -- a wide SIMD store straddling the array's end. A store
+    whose START address is AT or PAST the object end is NOT attributed to it: the linked binary has
+    lost the symbol+addend origin, so that address could belong to an adjacent global -- a bare
+    one-past scalar store is left silent, never a false positive. A known symbol size is required (an
+    opaque .data/.bss address or a size-0 flexible array stays silent). The aarch64 twin
+    `_a64_const_oob_stores` reads the same overrun off an `adrp+add` base pointer instead, since
+    aarch64 cannot express an absolute-address store in one instruction."""
+    for b in blocks:
+        for i in b.get("instructions") or []:
+            seen = set()
+            for pc in i.get("pcode") or []:
+                if not isinstance(pc, str):
+                    continue
+                m = _RAM_STORE_RE.search(pc)
+                if not m:
+                    continue
+                addr, width = int(m.group(1), 0), int(m.group(2), 0)
+                if width <= 0 or (addr, width) in seen:
+                    continue
+                seen.add((addr, width))
+                g = _global_base(ctx, addr=addr)
+                if not (g and g[1] is not None and g[2]):      # resolved to a known-size object
+                    continue
+                eff = g[3]                                      # byte offset of the store START in it
+                if eff < 0 or eff + width <= g[2]:              # start inside and no crossing -> in bounds
+                    continue
+                base = ("global", g[0], g[1], g[2])
+                chk = ("bounded", eff // width, True)
+                v = _index_verdict(chk, base, width, eff % width)
+                if v is None:
+                    continue
+                verdict, oob = v
+                src = {"source": "a constant offset", "source_site": i.get("addr"),
+                       "slot": None, "kind": "constant"}
+                out.append(_array_index_cand(faddr, i.get("addr"), base, width, eff % width,
+                                             src, "write", chk, verdict, oob))
+
+
 def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail=None):
     """Pass 1 of array_index over ONE function (see array_index)."""
     from . import bounds
@@ -4601,6 +4648,7 @@ def array_index(ctx: DetectContext):
         if not blocks or len(blocks) > 2000:
             continue
         _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail)
+        _x86_const_oob_stores(ctx, faddr, blocks, out)
         preds: dict = defaultdict(list)
         succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
         for b in blocks:

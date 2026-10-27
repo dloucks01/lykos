@@ -1380,3 +1380,34 @@ def test_arm32_descending_slot_O0(store, case, pool, arm32_gcc, tmp_path, monkey
     """Same descending off-by-one on arm32 -O0 (slot path; `sub r,r,#1` step; ghidra backend)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DEC_SRC, ["-O0", "-marm"], True,
                    monkeypatch, "arm", 32) == _DEC_EXPECT
+
+
+# ------------------------------------ const-OOB store (unrolled / vectorised, CWE-129) -----------
+# At -O1/-O2/-O3 gcc fully unrolls or VECTORISES a counted write into straight-line constant-address
+# stores with no loop or index register (`movaps xmmword [a10+32],xmm`), which the induction path
+# cannot see. _x86_const_oob_stores reads the absolute store address + width from the p-code
+# (`-> ram:A:W`): when the store STARTS inside a known-size array and its width crosses the end (a wide
+# SIMD store straddling the boundary) it is a CWE-129 overrun. simd_over writes a10[0..11] as three
+# 16-byte stores; the third (a10+32, bytes 32..47) crosses a10's 40-byte end -> bound. In-bounds
+# vectorised writes (simd_safe exactly a10[0..9]; a16_ok fills a16[16]) never straddle -> silent. A
+# bare one-past SCALAR store (`mov [a10+40],c`) is a sound MISS: the linked binary has lost the
+# symbol+addend origin, so its address is not soundly attributable to a10 (never a false positive).
+_COB_SRC = r"""
+int a10[10];
+int a16[16];
+#define NX __attribute__((noipa))
+NX void simd_over(void){ for(int i=0;i<12;i++) a10[i]=i; }  /* a10[10],a10[11] OOB -> straddle */
+NX void simd_safe(void){ for(int i=0;i<10;i++) a10[i]=i; }  /* exactly a10[0..9] -> in bounds */
+NX void a16_ok(void){ for(int i=0;i<16;i++) a16[i]=i; }     /* in bounds for a16[16] */
+int main(void){ simd_over(); simd_safe(); a16_ok(); return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2", "-O3"])
+def test_x86_const_oob_store(store, case, pool, gcc, tmp_path, opt):
+    """x86-64 -O1/-O2/-O3: a vectorised counted write unrolls to constant-address SIMD stores; the one
+    that straddles a10's end is flagged (bound) from the p-code absolute store, while the in-bounds
+    vectorised writes (simd_safe, a16_ok) stay silent -- no false positive."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _COB_SRC, [opt], "cob") == {"simd_over": {"bound"}}
