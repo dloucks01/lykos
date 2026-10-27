@@ -273,3 +273,62 @@ def test_pe_l3_rop_winexec_runs_an_attacker_command(store, case, pool, tmp_path)
     # does not randomize, so the exploit's fixed addresses are not an ASLR defeat. No over-claim.
     ev = " ".join(e.get("detail", "") for f in rce for e in (f.evidence or []))
     assert "ASLR" in ev and "Wine" in ev and "leak" in ev.lower(), ev[:300]
+
+
+_W32_RET2WIN_C = (
+    "#include <windows.h>\n#include <stdio.h>\n"
+    "void win(void){ DWORD w; WriteFile(GetStdHandle((DWORD)-11), \"PWNED32_ok\\n\", 11, &w, 0);"
+    " ExitProcess(0x55); }\n"
+    "void vuln(FILE *f){ char buf[32]; fread(buf, 1, 200, f); }\n"
+    "int main(int argc, char **argv){ if(argc<2) return 2; FILE*f=fopen(argv[1],\"rb\");"
+    " if(!f) return 3; vuln(f); return 0; }\n")
+
+
+def _mingw32_ret2win(tmp_path):
+    cc = shutil.which("i686-w64-mingw32-gcc")
+    if not cc:
+        pytest.skip("no i686 mingw cross compiler")
+    if not sandbox._wine():
+        pytest.skip("no wine to execute the PE")
+    c = tmp_path / "rw32.c"
+    c.write_text(_W32_RET2WIN_C)
+    exe = tmp_path / "rw32.exe"
+    r = subprocess.run([cc, "-O1", "-fno-stack-protector", "-w", str(c), "-o", str(exe)],
+                       capture_output=True, timeout=180)
+    if r.returncode != 0:
+        pytest.skip("i686 mingw cannot link here: " + r.stderr.decode(errors="replace")[:200])
+    return exe
+
+
+def test_pe_wow64_32bit_l2_and_ret2win_l3(store, case, pool, tmp_path):
+    """WoW64: a 32-bit PE reaches a confirmed L2 (clean EIP, recovered from the faulting address --
+    Wine's dump shows the WoW64 wrapper in rip, but the guest's controlled EIP is the AV address)
+    and a confirmed L3 ret2win to an in-image win() under 32-bit Wine."""
+    exe = _mingw32_ret2win(tmp_path)
+    q = JobQueue(store.conn)
+    t = ingest(store, case.id, exe, filename="rw32.exe")
+    for enq in (enqueue_triage, enqueue_disassemble):
+        enq(q, t, force=True)
+        assert pool.wait_idle(180)
+    t = store.targets.get(t.id)
+    assert t.file_type == "pe" and (t.bits or 64) == 32, (t.file_type, t.bits)
+
+    crash = store.put_artifact(case.id, "crash", data=b"A" * 200).sha256
+    pr = enqueue_primitive(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 30})
+    assert pool.wait_idle(300) and q.runs.get(pr.id).status == "done"
+    l2 = next(e.payload for e in q.events.list(run_id=pr.id, limit=80)
+              if e.type == "primitive.done")
+    assert l2["primitive"] == "instruction-pointer-control" and l2["confirmed"], l2
+    assert l2["source"] == "eip"
+
+    xr = enqueue_exploit(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 30})
+    assert pool.wait_idle(240) and q.runs.get(xr.id).status == "done"
+    xp = next(e.payload for e in q.events.list(run_id=xr.id, limit=80)
+              if e.type == "exploit.done")
+    assert xp.get("confirmed") and xp.get("exploit") == "ret2win", xp
+
+    l3 = [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L3"]
+    assert l3, "no verified 32-bit L3 ret2win PoC filed"
+    fs = FindingDAO(store.conn).list_by_target(t.id)
+    assert any("ret2win (win32)" in (f.title or "").lower() and f.severity == "critical"
+               for f in fs), [(f.title, f.severity) for f in fs]

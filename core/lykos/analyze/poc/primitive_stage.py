@@ -1653,14 +1653,8 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
     word = 8 if (target.bits or 64) >= 64 else 4
     arch = target.arch or "x86-64"
     # Pass 1 scopes to 64-bit PE: `make_wine_capture` parses the x64 `+seh` dump (rip/rsp/rbp); a
-    # 32-bit (WoW64) guest reports eip/esp/ebp through a different dump -- a real but separate lane.
-    if word != 8:
-        ctx.emit("primitive.done", payload={"primitive": None, "supported": False,
-                 "note": "L2 for a 32-bit PE: the Wine crash dump is 32-bit (eip/esp/ebp) and the "
-                         "WoW64 capture lane is not built yet; the PE is still analysed statically "
-                         "and reproduced to L1 under Wine"})
-        ctx.progress(pct=100, msg="L2 not yet supported for a 32-bit PE")
-        return {}
+    # 32-bit (WoW64) guest: handled below -- Wine's dump shows the WoW64 wrapper in rip, but the
+    # guest's controlled EIP surfaces as the faulting access-violation ADDRESS, which is enough.
     endian = "little"
     length = min(max(len(orig) * 2, 256), 4096)
     pattern = primitive.cyclic(length)
@@ -1683,6 +1677,35 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
                      % ", ".join(tried))
         return {}
     capture = make_wine_capture(exe, used_mode, base_argv, timeout, arch=arch, bits=word * 8)
+
+    # 0) 32-bit (WoW64): the dump's rip is Wine's WoW64 wrapper, not the guest, but the guest's
+    #    controlled EIP IS the faulting access-violation address -- the `ret` jumped there. So the
+    #    offset reads straight out of fault_addr (the cyclic 4-byte EIP), no probe needed, and the
+    #    canonical 4-byte marker confirms it (fault_addr == MARKER32). No seh-frame fallback here:
+    #    a 32-bit SEH-overwrite is frame-based and a separate primitive, left for a follow-up.
+    if word == 4:
+        fa = cap0.get("fault_addr")
+        off = (primitive.cyclic_find((fa & 0xFFFFFFFF).to_bytes(4, "little"), length, 4)
+               if fa else -1)
+        if off != -1:
+            m = primitive._ip_marker(4)
+            ctx.progress(msg=f"confirming 32-bit instruction-pointer control at offset {off}")
+            control = primitive.control_input(off, off + 4, 4, endian)
+            confirmed = (capture(control).get("fault_addr") == m)
+            prim = {"type": "instruction-pointer-control", "offset": off, "source": "eip",
+                    "marker": m, "observed_pc": fa, "confirmed": confirmed,
+                    "registers": {}, "substrate": "wine"}
+            extra = (f"instruction-pointer control at offset {off} (32-bit EIP via the faulting "
+                     f"address), " + ("confirmed" if confirmed else "unconfirmed") + " under Wine")
+            return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
+                             prim, confirmed, extra)
+        ctx.emit("primitive.done", payload={
+            "primitive": None, "supported": True, "input_modes_tried": tried,
+            "note": "the 32-bit PE faults under Wine but the faulting address does not hold the "
+                    "cyclic pattern -- reproduced at L1, no clean EIP control recovered (a "
+                    "frame-based SEH overwrite is a separate primitive, not yet built)"})
+        ctx.progress(pct=100, msg="32-bit Wine crash reproduced; no clean EIP control")
+        return {}
 
     # 1) a true instruction-pointer hijack: the faulting PC holds the cyclic bytes. Confirm with
     #    the canonical marker (a `ret` lands on it, PC==MARKER), exactly as the native path does.

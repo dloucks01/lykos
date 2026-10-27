@@ -106,10 +106,21 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   ASLR defeat would be an **unverifiable** claim, which the “never ship unverified exploit code” rule
   forbids. This is a documented environment ceiling (like mips L3 with no cross-compiler), not a
   code gap: the fixed-address ROP/ret2win is confirmed and honestly qualified; the defeat waits on a
-  randomizing runtime. **Also still missing:** SEH-overwrite chains, ROP arg setup beyond rcx
-  (rdx/r8/r9 for multi-arg sinks), the 32-bit (WoW64) capture lane (the `+seh` dump is eip/esp/ebp),
-  and structure-preserving framing for a structured PE input. A PE with no exec sink / gadget and no
-  reachable win is declined honestly and the confirmed L2 stands.
+  randomizing runtime.
+- **WoW64 32-bit now reached (2026-10-27):** a 32-bit PE reaches a confirmed L2 (clean EIP) and L3
+  (ret2win). The WoW64 `+seh` dump shows Wine's 64-bit wrapper in `rip`, but the guest's controlled
+  EIP IS the faulting access-violation **address**, so `_pe_ip_primitive` reads the control offset
+  straight out of `fault_addr` (the cyclic 4-byte EIP — no probe) and confirms it with the 4-byte
+  canonical marker (`fault_addr == MARKER32`). `_pe_ret2win_exploit` is word-aware (4-byte control
+  slot), adds undecorated aliases for Win32's `_`-prefixed cdecl symbols so `find_win` matches, and
+  skips the x64 alignment gadget (x86 has no 16-byte rule). A 32-bit crash makes Wine auto-attach
+  **winedbg**, which dumps a multi-KB report to **stdout**, so the ret2win effect check strips that
+  dump (`_strip_crash_dump`) before comparing to the negative control. **Still missing (WoW64):** the
+  32-bit stdcall ROP → WinExec/system (needs the guest stack address of the command string, which the
+  WoW64 dump does not expose reliably), and a frame-based 32-bit SEH-overwrite primitive.
+- **Also still missing:** SEH-overwrite chains, ROP arg setup beyond rcx (rdx/r8/r9 for multi-arg
+  sinks), and structure-preserving framing for a structured PE input. A PE with no exec sink / gadget
+  and no reachable win is declined honestly and the confirmed L2 stands.
   *(2026-10-27 static: **Win32 dangerous-API detection** — `detect/detectors.py
   windows_dangerous_imports` reads the PE import table and flags the high-signal sinks (WinExec /
   ShellExecute / CreateProcess / wsprintf / lstrcpy / URLDownloadToFile / msvcrt copies), the static
@@ -119,11 +130,12 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   and Wine runs **~1 exec/s** (`substrate.py:83/372`); depth collapses to static + concolic.
 
 **Current max for a PE, one line:** parsed statically (incl. Windows mitigations) + disassembled +
-Wine-executed to a verified **L1** crash, a **confirmed L2** primitive (clean RIP at the return
-offset, or a controlled saved-frame-pointer / SEH frame), and **confirmed L3** — a Win64 single-call
-ROP that runs an attacker-chosen command through an imported WinExec/system (demonstrated RCE), or a
-ret2win to an in-image win function — all proved under Wine against a negative control; L3 beyond this
-(a leak-based ROP / ASLR defeat, SEH-overwrite chains, WoW64 32-bit) is the remaining Windows work.
+Wine-executed to a verified **L1** crash, a **confirmed L2** primitive (clean RIP/EIP at the return
+offset, 64- and 32-bit, or a controlled saved-frame-pointer / SEH frame), and **confirmed L3** — a
+Win64 single-call ROP that runs an attacker-chosen command through an imported WinExec/system
+(demonstrated RCE), or a ret2win to an in-image win function (Win64 and WoW64 32-bit) — all proved
+under Wine against a negative control; L3 beyond this (a leak-based ROP / ASLR defeat, SEH-overwrite
+chains, a 32-bit stdcall ROP→WinExec) is the remaining Windows work.
 
 ## Large binaries (100 MB+)
 
