@@ -1707,18 +1707,61 @@ def _index_slot_sources(ctx, ir, slot_names):
     return out
 
 
+def _x86_lea_incr_steps(ir, slot_names):
+    """The register-mediated slot increment gcc -O0 emits for `arr[i++]`: `mov slot,R; lea k(R),D;
+    mov D,slot` == slot += k (the PRE-increment value is needed for the subscript, so a direct
+    `add $k,slot` cannot be used). Returns {slot: [(k, store_addr)]} -- recognised as an induction
+    step by `_induction_slots`, which otherwise reads the `mov D,slot` as an opaque writer."""
+    out: dict = defaultdict(list)
+    for b in (ir.get("blocks") or []):
+        rdef: dict = {}                       # reg -> ('slot', s) after `mov R,slot`; ('inc', s, k) after lea
+        for i in b.get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops:
+                continue
+            dst = _X86_CANON.get(ops[0].lower())
+            if mnem == "mov" and dst and len(ops) == 2:                 # mov R, <src>
+                t = _mem_terms(ops[1], slot_names)
+                s = _frame_slot(t) if t else None
+                rdef[dst] = ("slot", s) if (s is not None and t[0] in ("dword", "qword", None)) else None
+                continue
+            if mnem == "lea" and dst and len(ops) == 2:                 # lea D, [R + k]
+                t = _mem_terms(ops[1], slot_names)
+                v = None
+                if t and len(t[1]) == 1 and t[1][0][1] == 1 and not t[3] and t[2] > 0:
+                    base = rdef.get(t[1][0][0])
+                    v = ("inc", base[1], t[2]) if (base and base[0] == "slot") else None
+                rdef[dst] = v
+                continue
+            if mnem == "mov" and len(ops) == 2 and dst is None:         # mov slot, D  (the store-back)
+                s = _frame_slot(_mem_terms(ops[0], slot_names))
+                d = rdef.get(_X86_CANON.get(ops[1].lower()))
+                if s is not None and d and d[0] == "inc" and d[1] == s:
+                    out[s].append((d[2], i.get("addr")))
+                continue
+            if dst:
+                rdef[dst] = None                                        # any other write clobbers it
+    return out
+
+
 def _induction_slots(ir, slot_names):
     """Frame slots that are LOOP INDUCTION VARIABLES: exactly one constant initialiser
-    (`mov $c, slot`) and exactly one constant-step update (`add $k, slot` / `inc slot`), with the
-    slot's address never taken and no other writer. Returned as index sources (kind 'induction') so
-    the dominating-guard analysis reads the loop's OWN exit bound and the induction verdict compares
-    the index the loop reaches to the array -- flagging a counted loop that walks off a fixed array
-    (`for(i=0;i<=10;i++) t[i]`). Forward (positive-step) counters only; anything else is dropped."""
+    (`mov $c, slot`) and exactly one constant-step update (`add $k, slot` / `inc slot`, or the
+    register-mediated `arr[i++]` form via `_x86_lea_incr_steps`), with the slot's address never taken
+    and no other writer. Returned as index sources (kind 'induction') so the dominating-guard analysis
+    reads the loop's OWN exit bound and the induction verdict compares the index the loop reaches to
+    the array -- flagging a counted loop that walks off a fixed array (`for(i=0;i<=10;i++) t[i]`).
+    Forward (positive-step) counters only; anything else is dropped."""
     flat = _block_flat(ir)
+    incr = _x86_lea_incr_steps(ir, slot_names)             # register-mediated `slot += k` stores
+    incr_addrs = {_naddr(a) for lst in incr.values() for (_k, a) in lst}
     inits: dict = defaultdict(list)                        # slot -> [(addr, const, block)]
     steps: dict = defaultdict(list)                        # slot -> [step]
     other: dict = defaultdict(int)                         # slot -> count of writes we cannot model
     leas: dict = defaultdict(int)
+    for s, lst in incr.items():
+        for (k, _a) in lst:
+            steps[s].append(k)
     for (blk, _j, addr, body) in flat:
         mnem, ops = _ops(body)
         if not ops:
@@ -1739,6 +1782,8 @@ def _induction_slots(ir, slot_names):
             steps[s].append(int(ops[1].lstrip("$"), 0) * (1 if mnem == "add" else -1))
         elif mnem in ("inc", "dec"):
             steps[s].append(1 if mnem == "inc" else -1)
+        elif _naddr(addr) in incr_addrs:
+            continue                                       # the `arr[i++]` store-back, counted above
         else:
             other[s] += 1
     out = {}
@@ -2023,6 +2068,15 @@ def _access_loops_single_exit(blocks, preds, succ_map, access_block, dom):
     has exactly ONE exit edge; exit_src is the exit-edge source of the SMALLEST such loop (where the
     loop's termination test lives). A second exit is an early `break`/`return` that can stop the loop
     before the induction variable reaches the header's bound, so the claim is then withheld."""
+    # Successors reached by a CALL (`bl getchar`), not by control flow: the ghidra backend lists a
+    # call's target as a block successor, which would otherwise read as a second loop exit and defeat
+    # the single-exit gate. A call target is never a loop exit, so drop it from the exit computation.
+    call_targets = set()
+    for b in blocks:
+        for i in b.get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if mnem in ("call", "bl", "blx") and ops:
+                call_targets.add(_naddr(ops[0]))
     found = False
     best = None                                           # (loop size, exit source) of the innermost
     for b in blocks:
@@ -2041,7 +2095,8 @@ def _access_loops_single_exit(blocks, preds, succ_map, access_block, dom):
             if access_block not in loop:
                 continue
             found = True
-            exits = [(nn, s) for nn in loop for s in succ_map.get(nn, ()) if s not in loop]
+            exits = [(nn, s) for nn in loop for s in succ_map.get(nn, ())
+                     if s not in loop and _naddr(s) not in call_targets]
             if len(exits) != 1:
                 return (False, None)                      # a break/second exit -> not sound to claim
             if best is None or len(loop) < best[0]:
@@ -2068,18 +2123,89 @@ def _exit_input_slot(exit_blk, i_slot, input_slots, slot_names):
     return nslot if reads_i else None
 
 
+# Stream/input readers whose RETURN VALUE drives a loop: `while((c=getchar())!=EOF)`. A single-exit
+# loop whose exit test consumes one of these each iteration runs an INPUT-controlled, unbounded number
+# of times -- so a counter/pointer that walks a fixed array in that loop overruns it.
+_LOOP_INPUT_CALLS = {"getchar", "getc", "fgetc", "getchar_unlocked", "getc_unlocked",
+                     "fgetc_unlocked", "getline", "getdelim", "read", "recv", "recvfrom",
+                     "fread", "pread", "pread64", "scanf", "fscanf"}
+
+
+def _mem_bracket(op):
+    """The whitespace-stripped inner text of a `[...]` memory operand, for matching a spill slot to
+    its reload by identical address text (`[sp, #24]` / `[rbp - 0x8]`), or None."""
+    m = re.search(r"\[([^\]]*)\]", op or "")
+    return re.sub(r"\s+", "", m.group(1)) if m else None
+
+
+def _call_name(ops):
+    return normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", ops[0])) if ops else ""
+
+
+def _exit_driven_by_input_call(exit_blk, ret_regs, canon, call_names=None):
+    """True when the loop's single-exit block runs an input-reading call (getchar/getc/read/...) whose
+    result -- held in the return register OR spilled to a frame slot and reloaded/compared -- feeds the
+    block's terminating comparison. That makes the trip count input-/EOF-controlled (unbounded), not a
+    bound on any counter. ISA-neutral: `ret_regs` are the call's result registers, `canon` the register
+    canonicaliser, `call_names` (site addr -> name) resolves a call the decompiler left as a bare
+    address (the ghidra arm32 backend). Handles both operand orders (ARM `str REG,[slot]` and x86
+    `mov [slot],REG`)."""
+    ins = (exit_blk or {}).get("instructions") or []
+    call_j = None
+    for j, i in enumerate(ins):
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        name = (call_names or {}).get(_naddr(i.get("addr"))) or _call_name(ops)
+        if mnem in ("call", "bl", "blx") and name in _LOOP_INPUT_CALLS:
+            call_j = j
+    if call_j is None:
+        return False
+    treg = {canon(r) for r in ret_regs}
+    tslot: set = set()
+    tainted_cmp = False
+    for i in ins[call_j + 1:]:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if not ops:
+            continue
+        br = [_mem_bracket(o) for o in ops]
+        reg0 = canon(ops[0].lower()) if ops else None
+        if mnem in ("cmp", "cmn", "test", "subs", "tst", "teq"):
+            if any(canon(o.lower()) in treg for o in ops) or any(b in tslot for b in br if b):
+                tainted_cmp = True
+            continue
+        # a spill of the tainted result to a frame slot (ARM `str REG,[slot]`; x86 `mov [slot],REG`)
+        if mnem in ("str", "strb", "strh", "stur") and len(ops) >= 2 and reg0 in treg and br[-1]:
+            tslot.add(br[-1])
+            continue
+        if mnem == "mov" and len(ops) == 2 and br[0] and canon(ops[1].lower()) in treg:
+            tslot.add(br[0])
+            continue
+        # a reload / move that propagates the taint onward
+        if reg0 and mnem in ("ldr", "ldrsw", "ldrb", "ldrh", "ldrsb", "ldrsh") and br[-1] in tslot:
+            treg.add(reg0)
+            continue
+        if reg0 and mnem in ("mov", "movzx", "movsx", "movsxd", "cpy") and len(ops) == 2:
+            if br[1] in tslot or canon(ops[1].lower()) in treg:
+                treg.add(reg0)
+            elif reg0 in treg:
+                treg.discard(reg0)                        # overwritten by an untainted value
+            continue
+    return tainted_cmp
+
+
 def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, cond_term,
-                     exit_input=None, exit_const=None, loop_body=None):
+                     exit_input=None, exit_const=None, loop_body=None, exit_unbounded=None):
     """The bound on a LOOP INDUCTION index at the access, as a check tuple or None (ISA-neutral:
     `cond_term(mnem)` says a block ends in a conditional branch, `exit_input(exit_blk)` names the
     unvalidated-input loop length or None, `exit_const(exit_blk)` the greatest header value a
     constant equality exit permits -- the `-O2` register-counter `cmp reg,C; jne` form whose test
-    sits in the access block itself, so no DOMINATING branch carries it). Reads the loop's own exit
-    bound WITHOUT guard_bound's increment-store bail (the step runs AFTER the iteration's access, and
-    the slot has only its init + single increment, so the bound is not stale). The access must sit in
-    a SINGLE-EXIT loop -- an early break could stop before the bound, so otherwise the claim is
-    withheld. ('bounded', k, True) for a CONSTANT loop bound k; ('unchecked',) when the length is
-    UNVALIDATED INPUT; None otherwise."""
+    sits in the access block itself, so no DOMINATING branch carries it; `exit_unbounded(exit_blk)`
+    is True when the loop's exit is driven by an input-reading call (getchar/read/...), so the counter
+    walks an input-controlled, unbounded number of times -- the `table[i++]` copy-until-EOF loop).
+    Reads the loop's own exit bound WITHOUT guard_bound's increment-store bail (the step runs AFTER
+    the iteration's access, and the slot has only its init + single increment, so the bound is not
+    stale). The access must sit in a SINGLE-EXIT loop -- an early break could stop before the bound,
+    so otherwise the claim is withheld. ('bounded', k, True) for a CONSTANT loop bound k; ('unchecked',)
+    when the length is UNVALIDATED INPUT or the trip count is input-driven; None otherwise."""
     from . import bounds
     succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
     ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
@@ -2118,6 +2244,8 @@ def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, con
     # makes it safe; the input-slot detectors already excluded an n clamped by re-assignment)
     if nslot is not None and bounds.guard_bound(blocks, exit_src, nslot, bases=bases, dom=dom) is None:
         return ("unchecked",)                             # loop length is unvalidated input -> overrun
+    if exit_unbounded is not None and exit_src is not None and exit_unbounded(by_addr.get(exit_src)):
+        return ("unchecked",)                             # trip count is input-call-driven -> unbounded
     return None
 
 
@@ -2469,6 +2597,93 @@ def _tail_resolver(ctx):
     return resolve_tail
 
 
+def _x86_global_ptr_init(ctx, by_addr, dom, header, body, p):
+    """Resolve a register's INITIAL value to a known-size global object (`lea p,[obj.table]` in a
+    dominating preheader), as ('global', name, addr, sz), or None. Used by the walking-pointer
+    detector; a bare address / unknown-size symbol is dropped."""
+    g = None
+    for d in sorted((x for x in dom.get(header, ()) if x != header and x not in body),
+                    key=lambda x: len(dom.get(x, ()))):              # farthest dominator first (exec order)
+        for i in (by_addr.get(d) or {}).get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops or _X86_CANON.get(ops[0].lower()) != p:
+                continue
+            if mnem == "lea" and len(ops) == 2:
+                t = _mem_terms(ops[1])
+                gb = None
+                if t and t[3]:
+                    gb = _global_base(ctx, sym=t[3][0])
+                elif t and not t[1] and t[2] >= 0x1000:
+                    gb = _global_base(ctx, addr=t[2])
+                g = ("global", gb[0], gb[1], gb[2]) if (gb and gb[1] is not None and gb[2]) else None
+            else:
+                g = None                                            # p redefined by something else
+    return g
+
+
+def _store_through_ptr_x86(mnem, ops, slot_names):
+    """(ptr_reg, store_width) for an x86 store through a base pointer with NO index -- `mov [p],src`
+    / `mov [p+disp],src` (not a frame slot) -- else None. The write a `-O2` walking-pointer copy loop
+    makes each iteration."""
+    if mnem != "mov" or len(ops) != 2:
+        return None
+    t = _mem_terms(ops[0], slot_names)
+    if not t or len(t[1]) != 1 or t[1][0][1] != 1 or t[3] or t[1][0][0] in ("rbp", "rsp"):
+        return None
+    return (t[1][0][0], {"byte": 1, "word": 2, "dword": 4, "qword": 8}.get(t[0], 4))
+
+
+def _x86_unbounded_walk(ctx, faddr, blocks, preds, succ_map, dom, by_addr, slot_names, out):
+    """x86-64 `-O2` UNBOUNDED walking-pointer write: `for(..) *q++ = getchar()` becomes a pointer that
+    walks a fixed global (`lea rbx,[table]; mov [rbx],eax; add rbx,4`) with the loop exit driven by an
+    input-reading call (`call getc; cmp eax,-1; jne`), no counter and no bound -- so the write runs an
+    input-controlled number of times and overruns the array. Flagged `unchecked`. Single-exit loop,
+    an input-call-driven exit, a known-size global base, and p walked only by its one step are all
+    required, so a bounded or non-input loop stays silent (no false positive)."""
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, header, dom)
+        if not ok or exit_src is None:
+            continue
+        if not _exit_driven_by_input_call(by_addr.get(exit_src), ("rax",), _X86_CANON.get):
+            continue
+        steps: dict = defaultdict(list)
+        stores: dict = {}
+        writes: dict = defaultdict(int)
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                if not ops:
+                    continue
+                sw = _store_through_ptr_x86(mnem, ops, slot_names)
+                if sw:
+                    stores.setdefault(sw[0], (sw[1], i.get("addr")))
+                dst = _X86_CANON.get(ops[0].lower())
+                if dst is None or mnem in _NO_WRITE:
+                    continue
+                if mnem in ("add", "sub") and len(ops) == 2 and _NUM.match(ops[1]):
+                    steps[dst].append(int(ops[1], 0) * (1 if mnem == "add" else -1))
+                elif mnem in ("inc", "dec") and len(ops) == 1:
+                    steps[dst].append(1 if mnem == "inc" else -1)
+                else:
+                    writes[dst] += 1
+        for p, st in steps.items():
+            if p not in stores or writes.get(p) or len(st) != 1 or st[0] <= 0:
+                continue
+            gbase = _x86_global_ptr_init(ctx, by_addr, dom, header, body, p)
+            if gbase is None:
+                continue
+            width, site = stores[p]
+            v = _index_verdict(("unchecked",), gbase, width, 0)
+            if v is None:
+                continue
+            verdict, oob = v
+            src = {"source": "a walking pointer", "source_site": site, "slot": None,
+                   "slot_name": None, "kind": "walk"}
+            out.append(_array_index_cand(faddr, site, gbase, width, 0, src, "write",
+                                         ("unchecked",), verdict, oob))
+            return                                                   # one walking-pointer finding/function
+
+
 def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail=None):
     """Pass 1 of array_index over ONE function (see array_index)."""
     from . import bounds
@@ -2547,7 +2762,8 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             c = _induction_bound(
                 blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("RBP", "RSP"),
                 lambda m: m.startswith("j") and m != "jmp",
-                exit_const=lambda eb: _x86_exit_const(eb, src), loop_body=src["loop"])
+                exit_const=lambda eb: _x86_exit_const(eb, src), loop_body=src["loop"],
+                exit_unbounded=lambda eb: _exit_driven_by_input_call(eb, ("rax",), _X86_CANON.get))
             if c is not None:
                 return c
             return _reg_loop_input_bound(src, ba, head, cx, by_addr, dom, preds, blocks,
@@ -2559,7 +2775,8 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                 return _induction_bound(
                     blocks, by_addr, preds, ba, src["slot"], dom, ("RBP", "RSP"),
                     lambda m: m.startswith("j") and m != "jmp",
-                    exit_input=lambda eb: _exit_input_slot(eb, src["slot"], input_slots, slot_names))
+                    exit_input=lambda eb: _exit_input_slot(eb, src["slot"], input_slots, slot_names),
+                    exit_unbounded=lambda eb: _exit_driven_by_input_call(eb, ("rax",), _X86_CANON.get))
             return _slot_check(blocks, ba, src["slot"], dom, slot_names)
         if id(src) not in origin:
             return None
@@ -3013,16 +3230,114 @@ def _a64_const_oob_stores(ctx, faddr, blocks, out):
                 gaddr.pop(dst, None)                       # any other write clobbers the pointer
 
 
+def _a64_global_ptr_init(ctx, by_addr, dom, header, body, p):
+    """A register's INITIAL value as a known-size global object (`adrp p,page; add p,p,#off`) in a
+    dominating preheader, as ('global', name, addr, sz), or None."""
+    g = None
+    page: dict = {}
+    for d in sorted((x for x in dom.get(header, ()) if x != header and x not in body),
+                    key=lambda x: len(dom.get(x, ()))):
+        for i in (by_addr.get(d) or {}).get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops:
+                continue
+            dst = _a64_canon(ops[0])
+            if mnem == "adrp":
+                c = _a64_adrp_const(i)
+                page[dst] = c
+                if dst == p:
+                    g = None
+            elif mnem == "add" and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")) \
+                    and _a64_canon(ops[1]) in page and page[_a64_canon(ops[1])] is not None:
+                gb = _global_base(ctx, addr=page[_a64_canon(ops[1])] + int(ops[2].lstrip("#"), 0))
+                if dst == p:
+                    g = ("global", gb[0], gb[1], gb[2]) if (gb and gb[1] is not None and gb[2]) else None
+            elif dst == p and re.fullmatch(r"[wx]\d+", ops[0].lower()):
+                g = None                                            # p redefined by something else
+    return g
+
+
+def _store_through_ptr_a64(mnem, ops):
+    """(ptr_reg, stride, width) for an aarch64 POST-INDEX store `str REG,[p],#k` (p walks by k each
+    iteration, storing through p) -- the `-O2` `*q++ = ...` walking write -- else None."""
+    if not mnem.startswith("st") or mnem in ("stp", "stnp") or len(ops) != 3:
+        return None
+    m = re.fullmatch(r"\[([wx]\d+|sp)\]", ops[1].replace(" ", ""))
+    if not m or not _NUM.match(ops[2].lstrip("#")):
+        return None
+    w = {"strb": 1, "sturb": 1, "strh": 2, "sturh": 2}.get(mnem,
+                                                           4 if ops[0].lower().startswith("w") else 8)
+    return (_a64_canon(m.group(1)), int(ops[2].lstrip("#"), 0), w)
+
+
+def _a64_reg_written_in(body, by_addr, reg):
+    """True if `reg` is the explicit destination of any non-store write in the loop body -- i.e. some
+    write OTHER than the walking store's own implicit post-index writeback (whose operand-0 is the
+    stored value, not the pointer). Such a write means it is not a clean one-step walk."""
+    for la in body:
+        for i in (by_addr.get(la) or {}).get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if ops and re.fullmatch(r"[wx]\d+", ops[0].lower()) and _a64_canon(ops[0]) == reg \
+                    and mnem not in _A64_NO_IDX_WRITE:
+                return True
+    return False
+
+
+def _a64_unbounded_walk(ctx, faddr, blocks, preds, succ_map, dom, by_addr, out, call_names=None):
+    """aarch64 `-O2` UNBOUNDED walking-pointer write: `adrp/add x19,table; str w0,[x19],#4` (post-index)
+    with the loop exit driven by an input-reading call (`bl getc; cmn w0,#1; b.ne`), no counter, no
+    bound -- an input-controlled overrun of the fixed array -> unchecked. Single-exit, input-call exit,
+    a known-size global base, and p walked only by its one post-index step are all required."""
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, header, dom)
+        if not ok or exit_src is None:
+            continue
+        if not _exit_driven_by_input_call(by_addr.get(exit_src), ("x0", "w0"), _a64_canon, call_names):
+            continue
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                sw = _store_through_ptr_a64(mnem, ops)
+                if sw is None or sw[1] <= 0 or _a64_reg_written_in(body, by_addr, sw[0]):
+                    continue
+                gbase = _a64_global_ptr_init(ctx, by_addr, dom, header, body, sw[0])
+                if gbase is None:
+                    continue
+                v = _index_verdict(("unchecked",), gbase, sw[2], 0)
+                if v is None:
+                    continue
+                verdict, oob = v
+                src = {"source": "a walking pointer", "source_site": i.get("addr"), "slot": None,
+                       "slot_name": None, "kind": "walk"}
+                out.append(_array_index_cand(faddr, i.get("addr"), gbase, sw[2], 0, src, "write",
+                                             ("unchecked",), verdict, oob))
+                return
+
+
 def _array_index_arm(ctx, summaries, calls, targets, resolve_tail, out):
     """aarch64 CWE-129, pass 1. Per function: an access indexed by self-parsed input is emitted
     directly; an access indexed by a PARAMETER is recorded in `summaries`, and a call (or tail call)
     forwarding an input/parameter value in `calls`, for the shared cross-function join."""
+    from . import bounds
+    # a `bl` target is a bare address on the ghidra backend, so resolve the callee NAME through the
+    # call graph (as arm32 does) -- the input-reading-call exit test needs the name
+    call_names = {_naddr(e.site_addr): normalize(re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "",
+                                                        e.dst_name))
+                  for e in (ctx.call_edges or []) if getattr(e, "dst_name", None)}
     for faddr, ir in ctx.func_irs.items():
         blocks = [b for b in ((ir or {}).get("blocks") or [])
                   if isinstance(b, dict) and b.get("addr")]
         if blocks and len(blocks) <= 2000:
-            _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out)
+            _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out,
+                               call_names)
             _a64_const_oob_stores(ctx, faddr, blocks, out)
+            preds: dict = defaultdict(list)
+            succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
+            for b in blocks:
+                for sc in b.get("succ") or []:
+                    preds[sc].append(b.get("addr"))
+            _a64_unbounded_walk(ctx, faddr, blocks, preds, succ_map, bounds.dominators(blocks),
+                                {b.get("addr"): b for b in blocks}, out, call_names)
 
 
 def _has_pcode(blocks) -> bool:
@@ -3033,7 +3348,8 @@ def _has_pcode(blocks) -> bool:
     return any((i.get("pcode") for b in blocks for i in (b.get("instructions") or [])))
 
 
-def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out):
+def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out,
+                       call_names=None):
     """The aarch64 CWE-129 scan over ONE function (its own scope, so `check_for` binds cleanly).
     A self-parsed input index is emitted here; a parameter index goes to `summaries` and a
     forwarded argument to `calls`, both joined across call edges by `_array_index_join`."""
@@ -3095,7 +3411,9 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                 return _induction_bound(blocks, by_addr, preds, ba, ("SP", src["slot"][1]), dom,
                                         ("SP", "X29"), _A64_COND_TERM,
                                         exit_input=lambda eb: _a64_exit_input_slot(
-                                            eb, src["slot"][1], a64_input_slots, names))
+                                            eb, src["slot"][1], a64_input_slots, names),
+                                        exit_unbounded=lambda eb: _exit_driven_by_input_call(
+                                            eb, ("x0", "w0"), _a64_canon, call_names))
             nm = src["slot_name"]
             return _arm_slot_check(blocks, by_addr, ba, ("SP", src["slot"][1]), dom, ("SP", "X29"),
                                    _A64_COND_TERM, lambda t: ("[" + nm) in t)
@@ -3218,7 +3536,10 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                     and mm[0] == "slot" and mm[1] in slots:
                 reg[dst] = ("idx", 1, 0, slots[mm[1]])          # the index value, from its slot
                 continue
-            if mnem == "mov" and len(ops) == 2 and re.fullmatch(r"[wx]\d+", ops[1].lower()):
+            if mnem in ("mov", "sxtw", "sxtb", "sxth", "uxtw", "uxtb", "uxth") and len(ops) == 2 \
+                    and re.fullmatch(r"[wx]\d+", ops[1].lower()):
+                # a sign/zero extension of the index IS the index value used for the access (`sxtw
+                # x0,w0` on a non-negative loop counter) -- carry the source's tracked value through
                 reg[dst] = reg.get(_a64_canon(ops[1]))
                 continue
             if mnem not in _A64_NO_IDX_WRITE and re.fullmatch(r"[wx]\d+", ops[0].lower()):
@@ -3742,7 +4063,9 @@ def _arm32_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_
                 return _induction_bound(blocks, by_addr, preds, ba, ("R11", src["slot"][1]), dom,
                                         ("SP", "R11"), _ARM32_COND_TERM,
                                         exit_input=lambda eb: _arm32_exit_input_slot(
-                                            eb, src["slot"][1], arm32_input_slots, names))
+                                            eb, src["slot"][1], arm32_input_slots, names),
+                                        exit_unbounded=lambda eb: _exit_driven_by_input_call(
+                                            eb, ("r0",), _arm32_canon, call_names))
             return _arm_slot_check(blocks, by_addr, ba, ("R11", src["slot"][1]), dom, ("SP", "R11"),
                                    _ARM32_COND_TERM, _arm32_touch(src["slot"][1]))
         if id(src) not in origin:
@@ -3901,6 +4224,7 @@ def array_index(ctx: DetectContext):
     a parameter passed on again is not followed."""
     if not ctx.func_irs:
         return []
+    from . import bounds
     out: list = []
     summaries: dict = defaultdict(list)    # callee addr -> [(cfaddr, site, base, scale, off, k, access, check)]
     calls: list = []                       # (caller, call site, callee addr, {k: (src, check)})
@@ -3928,6 +4252,14 @@ def array_index(ctx: DetectContext):
         if not blocks or len(blocks) > 2000:
             continue
         _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, resolve_tail)
+        preds: dict = defaultdict(list)
+        succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
+        for b in blocks:
+            for sc in b.get("succ") or []:
+                preds[sc].append(b.get("addr"))
+        _vs, slot_names = _frame_vars(ctx.frames.get(faddr) or {})
+        _x86_unbounded_walk(ctx, faddr, blocks, preds, succ_map, bounds.dominators(blocks),
+                            {b.get("addr"): b for b in blocks}, slot_names, out)
     _array_index_join(summaries, calls, out)
     return out
 

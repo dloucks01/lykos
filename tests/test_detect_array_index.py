@@ -1006,3 +1006,70 @@ def test_arm32_walking_pointer_input_length_O2_silent(store, case, pool, arm32_g
     The result is a sound MISS, never a false positive -- n_over/n_clamp/n_guard all stay silent."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _IVN_SRC, ["-O2", "-marm"], True,
                    monkeypatch, "arm", 32) == {}
+
+
+# ----------------------------------------- UNBOUNDED write: table[i++] until EOF (CWE-787) ----------
+# A loop that walks a fixed array with NO bound on the write position, driven by an input-reading call
+# (`while((c=getchar())!=EOF) table[i++]=c;`): the position is input-controlled and overruns. Flagged
+# `unchecked`. The companions are all safe and must stay silent: s_bound bounds i with `i<10` (two
+# exits), s_guard guards the write with `if(i<10)`, and s_par's loop is bounded by a parallel counter
+# `j<5` (and is not input-driven). -O0 keeps a slot counter; -O2 x86/aarch64 emit a walking pointer
+# (no counter); arm32 -O2 carries a predicated return and is soundly skipped.
+_UNB_SRC = r"""
+#include <stdio.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void u_copy(void){ int c,i=0; while((c=getchar())!=EOF) table[i++]=c; }           /* unbounded */
+NX void s_bound(void){ int c,i=0; while(i<10 && (c=getchar())!=EOF) table[i++]=c; }  /* i<10 -> silent */
+NX void s_guard(void){ int c,i=0; while((c=getchar())!=EOF){ if(i<10) table[i]=c; i++; } } /* guard */
+NX void s_par(void){ int i=0; for(int j=0;j<5;j++){ table[i]=j; i++; } }             /* bounded -> silent */
+int main(int c,char**v){ u_copy(); s_bound(); s_guard(); s_par(); return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_x86_unbounded_input_copy(store, case, pool, gcc, tmp_path, opt):
+    """x86-64: `while((c=getchar())!=EOF) table[i++]=c;` walks a fixed array an INPUT-controlled number
+    of times -> unchecked (CWE-787). -O0 keeps a slot counter (the `arr[i++]` lea-increment form), -O2
+    a walking pointer (`mov [rbx],eax; add rbx,4`); both exit on the getchar/getc result, so neither
+    bounds the write. s_bound/s_guard/s_par stay silent (no false positive)."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "unb.c"; c.write_text(_UNB_SRC)
+    out = tmp_path / "unb"
+    if subprocess.run([gcc, opt, "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="unb")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"u_copy": {"unchecked"}}
+
+
+def test_aarch64_unbounded_input_copy_O0(store, case, pool, a64_gcc, tmp_path):
+    """aarch64 -O0: a getchar-until-EOF copy into a fixed array -> unchecked. Slot counter
+    (load-add-store step, sign-extended index); exit on the getchar result (input-driven)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _UNB_SRC, ["-O0"], False, None,
+                   "aarch64") == {"u_copy": {"unchecked"}}
+
+
+def test_aarch64_unbounded_input_copy_O2(store, case, pool, a64_gcc, tmp_path, monkeypatch):
+    """aarch64 -O2: the copy becomes a walking pointer (`adrp/add x19,table; str w0,[x19],#4`) with a
+    getc-driven exit -> unchecked. Uses the ghidra backend: the native (rizin) backend is
+    pathologically slow on this getc/stdin binary (it recovers no functions within budget)."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _UNB_SRC, ["-O2"], True, monkeypatch,
+                   "aarch64") == {"u_copy": {"unchecked"}}
+
+
+def test_arm32_unbounded_input_copy_O0(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """arm32 -O0: a getchar-until-EOF copy into a fixed array -> unchecked (ghidra backend)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _UNB_SRC, ["-O0", "-marm"], True,
+                   monkeypatch, "arm", 32) == {"u_copy": {"unchecked"}}
+
+
+def test_arm32_unbounded_input_copy_O2_silent(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
+    """arm32 -O2: the walking-pointer copy carries a predicated return (`popeq {..,pc}`), so the
+    `_arm32_pred_unsound` gate skips the function -- a sound MISS, never a false positive (silent)."""
+    assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _UNB_SRC, ["-O2", "-marm"], True,
+                   monkeypatch, "arm", 32) == {}
