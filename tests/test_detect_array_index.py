@@ -927,3 +927,63 @@ def test_arm32_loop_induction(store, case, pool, arm32_gcc, tmp_path, monkeypatc
 def test_arm32_loop_input_length(store, case, pool, arm32_gcc, tmp_path, monkeypatch):
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _IVN_SRC, ["-O0", "-marm"], True,
                    monkeypatch, "arm", 32) == {"n_over": {"unchecked"}}
+
+
+# ----------------------------------------------- loop induction at -O2 (register counter) ----------
+# At -O2 the induction variable is promoted out of its stack slot into a register, and gcc unrolls /
+# vectorises. Three distinct shapes result (verified per arch): x86 keeps a 2x-unrolled register-
+# counter loop with a derived index (`t[i]; t[i+1]`) and a `cmp reg,C; jne` equality exit; aarch64
+# FULLY vectorises the constant overrun into straight-line SIMD plus a constant out-of-bounds store
+# (`str w1,[x0,#40]`), so there is no loop at all; and the input-length loop survives on aarch64 as a
+# clean register counter. Each is handled without a single false positive on the safe companions.
+def test_x86_loop_induction_overrun_O2(store, case, pool, gcc, tmp_path):
+    """x86-64 -O2: the register-counter + 2x-unroll form of the counted overrun. The derived access
+    `t[i+1]` reaches index 10 past the 10-int array -> bound; c_safe/c_break (vectorised away) and
+    c_inner (register inner guard) stay silent."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "iv.c"; c.write_text(_IV_SRC)
+    out = tmp_path / "iv"
+    if subprocess.run([gcc, "-O2", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="iv")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {"c_over": {"bound"}}
+
+
+def test_x86_loop_input_length_O2_no_false_positive(store, case, pool, gcc, tmp_path):
+    """x86-64 -O2: gcc peels the loop remainder, branching on the loop-length value's parity, which
+    the length analysis cannot see through -- so an input-length overrun is a sound MISS here. The
+    point under test is that it produces NO false positive: n_clamp and n_guard (both safe) and even
+    n_over all stay silent rather than being wrongly flagged by the register-counter machinery."""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    c = tmp_path / "ivn.c"; c.write_text(_IVN_SRC)
+    out = tmp_path / "ivn"
+    if subprocess.run([gcc, "-O2", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="ivn")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(180)
+    assert _merge_verdicts(store, t, pool, q) == {}
+
+
+def test_aarch64_const_oob_store_O2(store, case, pool, a64_gcc, tmp_path):
+    """aarch64 -O2: the constant overrun is fully unrolled/vectorised into a constant out-of-bounds
+    store (`str w1,[x0,#40]` into a 10-int array) -- the induction loop is gone. The constant-offset
+    OOB-store detector flags it as bound; c_safe/c_break (in-bounds SIMD) and c_inner stay silent."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _IV_SRC, ["-O2"], False, None,
+                   "aarch64") == {"c_over": {"bound"}}
+
+
+def test_aarch64_loop_input_length_O2(store, case, pool, a64_gcc, tmp_path):
+    """aarch64 -O2: the input-length loop survives as a clean register counter (`str w1,[x2,x1,lsl
+    #2]; add x1,x1,#1; cmp w0,w1; b.gt`) with no remainder peeling, so the length value traces to
+    the strtol result with no dominating bound -> unchecked; n_clamp/n_guard stay silent."""
+    assert _run_iv(store, case, pool, a64_gcc, tmp_path, _IVN_SRC, ["-O2"], False, None,
+                   "aarch64") == {"n_over": {"unchecked"}}

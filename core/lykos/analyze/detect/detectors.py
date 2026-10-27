@@ -1491,7 +1491,9 @@ class _IdxTracker:
             if g is not None:
                 base = ("global", g[0], g[1], g[2], g[3])
         if base is None:
-            return ("idx",) + idx if idx else None
+            # a bare index with a small addend: `lea rdx, [rax + 1]` -- keep the +1 in the offset so
+            # a later `[base + rdx*s]` scales it (the -O2 unrolled `t[i]; t[i+1]` derived index).
+            return ("idx", idx[0], idx[1] + disp, idx[2]) if idx else None
         if base[0] == "stack":
             base = ("stack", base[1], disp)
             if base[1] == "RBP" and disp >= 0:
@@ -1751,6 +1753,179 @@ def _induction_slots(ir, slot_names):
     return out
 
 
+def _reg_natural_loops(blocks, preds, succ_map, dom):
+    """{header -> body set} for every natural loop, INCLUDING a single-block self-loop (the shape
+    `-O2` emits for a tight counted loop). Back edges to one header union their bodies."""
+    loops: dict = defaultdict(set)
+    for b in blocks:
+        bb = b.get("addr")
+        for h in succ_map.get(bb, ()):
+            if h != bb and h not in dom.get(bb, ()):
+                continue                                  # not a back edge
+            body = {bb} if h == bb else {h, bb}
+            stack = [] if h == bb else [bb]
+            while stack:
+                n = stack.pop()
+                for p in preds.get(n, ()):
+                    if p not in body:
+                        body.add(p)
+                        stack.append(p)
+            loops[h].update(body)
+    return loops
+
+
+def _reg_const_init(by_addr, dom, header, body, reg):
+    """The non-negative constant `reg` holds on entry to a loop, read from its single dominating
+    preheader (`mov $c,%reg` / `xor %reg,%reg` as that block's last write to reg), or None. Used
+    only to confirm a forward counter starting at a known value; the bound itself comes elsewhere."""
+    pre = [d for d in dom.get(header, ()) if d != header and d not in body]
+    if len(pre) != 1:
+        return None                                       # no single, unambiguous preheader
+    init = None
+    for i in (by_addr.get(pre[0]) or {}).get("instructions") or []:
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if not ops:
+            continue
+        dreg = _X86_CANON.get(ops[0].lower())
+        if dreg != reg:
+            continue
+        if mnem == "xor" and len(ops) == 2 and _X86_CANON.get(ops[1].lower()) == reg:
+            init = 0
+        elif mnem == "mov" and len(ops) == 2 and _NUM.match(ops[1]):
+            init = int(ops[1], 0)
+        else:
+            init = None                                   # an opaque write: value unknown from here
+    return init
+
+
+def _induction_regs(blocks, preds, succ_map, dom, by_addr):
+    """Registers that are LOOP INDUCTION VARIABLES held in a REGISTER, not a frame slot (the `-O2`
+    shape: the counter is promoted out of the stack). For each natural loop a register qualifies iff
+    it has EXACTLY ONE constant positive step (`add $k,%reg`/`inc`) inside the loop and no other
+    writer in the loop -- so inside the loop it only ever increments, a monotone forward counter.
+    The ENTRY value is not required to be a known constant: the bound comes from the loop's own exit
+    test (a constant equality exit reaches `C - step`, which termination proves is hit; an unvalidated
+    input length is unbounded), and neither reading uses the init, so a `-O2` loop whose first
+    iteration gcc peeled into an odd/even remainder (no single dominating init) is still handled.
+    Returns {header -> {reg: src}} (src carries reg/step/init/loop, no slot)."""
+    out: dict = defaultdict(dict)
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        steps: dict = defaultdict(list)                   # reg -> [(k, site)]
+        other: dict = defaultdict(int)                    # reg -> count of writes we cannot model
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                if not ops:
+                    continue
+                dreg = _X86_CANON.get(ops[0].lower())
+                if dreg is None or mnem in _NO_WRITE:
+                    continue                              # not a write to a general register
+                if mnem in ("add", "sub") and len(ops) == 2 and _NUM.match(ops[1]):
+                    steps[dreg].append((int(ops[1], 0) * (1 if mnem == "add" else -1), i.get("addr")))
+                elif mnem in ("inc", "dec") and len(ops) == 1:
+                    steps[dreg].append((1 if mnem == "inc" else -1, i.get("addr")))
+                else:
+                    other[dreg] += 1
+        for reg, st in steps.items():
+            if other.get(reg) or len(st) != 1 or st[0][0] <= 0:
+                continue                                  # not a lone, positive, otherwise-stable step
+            init = _reg_const_init(by_addr, dom, header, body, reg)
+            out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
+                                "kind": "induction", "reg": reg, "step": st[0][0],
+                                "init": init if (init is not None and init >= 0) else 0,
+                                "header": header, "loop": frozenset(body)}
+    return out
+
+
+def _x86_exit_const(exit_blk, src):
+    """R0_max (the greatest value the counter holds at the loop header) for a register-counter loop
+    whose own exit test is the `-O2` equality form `cmp reg, C; jne <in-loop>`: termination requires
+    the counter to hit C exactly, so the last header value is C - step (a value provably reached).
+    None when the exit is not this counter-vs-constant equality shape (an inequality or a register
+    bound is read elsewhere). Using the full step as the header-to-test distance never over-states
+    R0_max, so a flagged overrun is always one the loop actually reaches."""
+    ins = (exit_blk or {}).get("instructions") or []
+    if not ins:
+        return None
+    mnem, ops = _ops((ins[-1].get("text") or "").split(";")[0].strip())
+    if mnem not in ("jne", "jnz") or not ops:
+        return None
+    loop_n = {_naddr(a) for a in src["loop"]}
+    if _naddr(ops[0]) not in loop_n:                      # the not-equal edge must continue the loop
+        return None
+    reg = src["reg"]
+    for i in reversed(ins[:-1]):
+        m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
+        if m2 not in ("cmp", "test"):
+            continue
+        if m2 == "cmp" and len(o2) == 2:
+            a, b = o2[0].lower(), o2[1].lower()
+            if _X86_CANON.get(a) == reg and _NUM.match(b):
+                return int(b, 0) - src["step"]
+            if _X86_CANON.get(b) == reg and _NUM.match(a):
+                return int(a, 0) - src["step"]
+        return None                                       # the flag-setter is not counter-vs-constant
+    return None
+
+
+_IND_INPUT_KINDS = ("register", "parsed", "pointer")
+
+
+def _loop_exit_other_reg(exit_blk, counter_reg, canon, cmp_mnems):
+    """The NON-counter register a loop's exit test compares the counter against (`cmp i, n` -> n), or
+    None. `canon(tok)` gives a register's canonical name (None for a non-register); `cmp_mnems` is the
+    ISA's flag-setting compare set. A constant operand (handled by the equality-exit path) returns
+    None here, as does a compare that does not involve the counter."""
+    ins = (exit_blk or {}).get("instructions") or []
+    for i in reversed(ins[:-1]):
+        mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+        if mnem not in cmp_mnems:
+            continue
+        if len(ops) < 2:
+            return None
+        a, b = ops[0], ops[1]
+        ca = canon(a.lower()) if not _NUM.match(a.lstrip("#")) else None
+        cb = canon(b.lower()) if not _NUM.match(b.lstrip("#")) else None
+        if ca == counter_reg and cb and cb != counter_reg:
+            return cb
+        if cb == counter_reg and ca and ca != counter_reg:
+            return ca
+        return None                                       # first flag-setter is not counter-vs-register
+    return None
+
+
+def _reg_loop_input_bound(src, access_block, head, cx, by_addr, dom, preds, blocks, canon, cmp_mnems):
+    """Bound for a register counter whose loop LENGTH is held in another register (`for(i=0;i<n;i++)`
+    at -O2, n in a register). The length value's OWN dominating-check bound -- via `_reg_bound`, which
+    follows the value across register-identity changes, so a guard tested on a different register that
+    held the same value (`cmp eax,#10` before `mov esi,eax`) is still seen -- decides: UNVALIDATED
+    input gives ('unchecked',); a guard/clamp `n<=k` means the counter reaches at most `k - step`, so
+    ('bounded', k-step, nn) (an inner guard on the index clamps tighter through `_induction_bound`,
+    which runs first). None when the exit is not a counter-vs-input-register test, or the length is not
+    a raw tracked input value -- a clamp that rewrites n into an opaque register drops it here, silent."""
+    succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
+    ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
+    if not ok or exit_src is None:
+        return None
+    rb = _loop_exit_other_reg(by_addr.get(exit_src), src["reg"], canon, cmp_mnems)
+    if rb is None:
+        return None
+    v = (head.get(exit_src) or {}).get(rb)
+    if not (v and v[0] == "idx" and v[1] == 1 and v[2] == 0):
+        return None                                       # the loop length is not a raw tracked value
+    rbsrc = v[3]
+    if rbsrc.get("kind") not in _IND_INPUT_KINDS or id(rbsrc) not in cx["origin"]:
+        return None                                       # not unvalidated input -> no claim
+    chk = _reg_bound(rbsrc, exit_src, cx)
+    if chk is None:
+        return None
+    if chk[0] == "unchecked":
+        return ("unchecked",)
+    if chk[0] == "bounded":
+        return ("bounded", max(0, chk[1] - src["step"]), bool(chk[2]))
+    return None
+
+
 def _access_loops_single_exit(blocks, preds, succ_map, access_block, dom):
     """(ok, exit_src): ok iff `access_block` sits inside a loop AND every natural loop containing it
     has exactly ONE exit edge; exit_src is the exit-edge source of the SMALLEST such loop (where the
@@ -1761,10 +1936,10 @@ def _access_loops_single_exit(blocks, preds, succ_map, access_block, dom):
     for b in blocks:
         bb = b.get("addr")
         for h in succ_map.get(bb, ()):                    # a back edge bb -> h (h dominates bb)
-            if h == bb or h not in dom.get(bb, ()):
-                continue
-            loop = {h, bb}
-            stack = [bb]
+            if h != bb and h not in dom.get(bb, ()):
+                continue                                  # not a back edge (h == bb is a self-loop)
+            loop = {bb} if h == bb else {h, bb}
+            stack = [] if h == bb else [bb]               # a self-loop's body is just the block
             while stack:                                  # natural loop: preds of the latch up to h
                 n = stack.pop()
                 for p in preds.get(n, ()):
@@ -1802,14 +1977,17 @@ def _exit_input_slot(exit_blk, i_slot, input_slots, slot_names):
 
 
 def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, cond_term,
-                     exit_input=None):
+                     exit_input=None, exit_const=None, loop_body=None):
     """The bound on a LOOP INDUCTION index at the access, as a check tuple or None (ISA-neutral:
     `cond_term(mnem)` says a block ends in a conditional branch, `exit_input(exit_blk)` names the
-    unvalidated-input loop length or None). Reads the loop's own exit bound WITHOUT guard_bound's
-    increment-store bail (the step runs AFTER the iteration's access, and the slot has only its init +
-    single increment, so the bound is not stale). The access must sit in a SINGLE-EXIT loop -- an
-    early break could stop before the bound, so otherwise the claim is withheld. ('bounded', k, True)
-    for a CONSTANT loop bound k; ('unchecked',) when the length is UNVALIDATED INPUT; None otherwise."""
+    unvalidated-input loop length or None, `exit_const(exit_blk)` the greatest header value a
+    constant equality exit permits -- the `-O2` register-counter `cmp reg,C; jne` form whose test
+    sits in the access block itself, so no DOMINATING branch carries it). Reads the loop's own exit
+    bound WITHOUT guard_bound's increment-store bail (the step runs AFTER the iteration's access, and
+    the slot has only its init + single increment, so the bound is not stale). The access must sit in
+    a SINGLE-EXIT loop -- an early break could stop before the bound, so otherwise the claim is
+    withheld. ('bounded', k, True) for a CONSTANT loop bound k; ('unchecked',) when the length is
+    UNVALIDATED INPUT; None otherwise."""
     from . import bounds
     succ_map = {b.get("addr"): tuple(b.get("succ") or ()) for b in blocks}
     ok, exit_src = _access_loops_single_exit(blocks, preds, succ_map, access_block, dom)
@@ -1819,6 +1997,13 @@ def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, con
     reaching = dom.get(access_block, ())
     for d in reaching:
         if d == access_block:
+            continue
+        if loop_body is not None and d not in loop_body:
+            # A REGISTER counter: trust a dominating guard only INSIDE the loop (an inner `if(i<10)`),
+            # where the register provably still holds the counter. Out-of-loop, the SAME register held
+            # a different value before the counter's init -- a pre-loop guard on it (`cmp eax,10` on
+            # the input n that later becomes the index register) would be misread as bounding the
+            # counter, a false "safe"/overrun. A frame slot does not alias, so it passes loop_body=None.
             continue
         blk = by_addr.get(d)
         ins = (blk or {}).get("instructions") or []
@@ -1830,6 +2015,10 @@ def _induction_bound(blocks, by_addr, preds, access_block, slot, dom, bases, con
         e = bounds._edge_pred_bound(got, blk.get("succ") or [], reaching, access_block)
         if e is not None and (best is None or e[0] < best):
             best = e[0]                                   # the tightest dominating bound (inner guards)
+    if exit_const is not None and exit_src is not None:
+        c0 = exit_const(by_addr.get(exit_src))            # the loop's OWN equality bound (-O2 self-loop)
+        if c0 is not None and (best is None or c0 < best):
+            best = c0                                     # tightest wins, so an inner guard still clamps
     if best is not None:
         return ("bounded", best, True)
     nslot = exit_input(by_addr.get(exit_src)) if (exit_input and exit_src) else None
@@ -2204,10 +2393,26 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
         slots.setdefault(sl, src)
     dom = bounds.dominators(blocks)
     preds: dict = defaultdict(list)
+    succ_map: dict = {}
     for b in blocks:
+        succ_map[b.get("addr")] = tuple(b.get("succ") or ())
         for sc in b.get("succ") or []:
             preds[sc].append(b.get("addr"))
     by_addr = {b.get("addr"): b for b in blocks}
+    # Registers that are loop induction counters (the -O2 shape: the counter lives in a register, not
+    # a stack slot). Seeded at each loop header below so the array accesses it indexes resolve; its
+    # bound comes from the loop's own exit test (_induction_bound with exit_const/exit_input).
+    reg_inductions = _induction_regs(blocks, preds, succ_map, dom, by_addr)
+    ind_writes: dict = {}                                 # header -> regs written anywhere in its loop
+    for h, regs in reg_inductions.items():
+        body = next(iter(regs.values()))["loop"] if regs else frozenset()
+        w = set()
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
+                if o2 and _X86_CANON.get(o2[0].lower()):
+                    w.add(_X86_CANON[o2[0].lower()])
+        ind_writes[h] = w
     # A value held in a REGISTER is followed within its block and into a block whose SOLE
     # predecessor computed it. origin: id(src) -> (block, index of the instruction after which
     # it holds); a parameter arrives before the entry block's first instruction.
@@ -2218,12 +2423,43 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                      "kind": "param", "param": k}
         origin[id(params[r])] = (entry, -1, r)            # (block, instr index, defining register)
     tail: dict = {}
+    tail_all: dict = {}                                   # full end-of-block state, for base carry
     head: dict = {}
     cx = {"origin": origin, "tail": tail, "head": head, "preds": preds, "dom": dom,
           "by_addr": by_addr, "bases": ("RBP", "RSP"),
           "cond_term": lambda m: m.startswith("j") and m != "jmp"}
 
+    def seed_induction(ba, seed):
+        """Seed a loop header with its register counter(s) at their header value, plus the
+        loop-invariant base registers the preheader left live (`lea rcx,[table]`), which `tail`
+        (idx-only) does not carry -- without the base the in-loop access cannot resolve its array."""
+        regs = reg_inductions.get(ba)
+        if not regs:
+            return
+        body = next(iter(regs.values()))["loop"]
+        written = ind_writes.get(ba, set())
+        # loop-invariant array bases the preheader(s) left live: `tail` carries only idx values, so a
+        # base register (`lea rcx,[table]`) is lost without this. Take each from the NEAREST dominating
+        # block that defines it (most dominators = closest); a base reaches on every path, so it is safe
+        # to seed. gcc's remainder peeling gives the header several dominators, hence not just one.
+        for d in sorted((d for d in dom.get(ba, ()) if d != ba and d not in body and d in tail_all),
+                        key=lambda x: -len(dom.get(x, ()))):
+            for r, v in tail_all[d].items():
+                if v and v[0] in ("ga", "fa", "sa", "ptr") and r not in written and r not in seed:
+                    seed[r] = v
+        for r, src in regs.items():
+            seed[r] = ("idx", 1, 0, src)                  # the counter at its header value (R0)
+
     def check_for(src, ba, pred):
+        if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
+            c = _induction_bound(
+                blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("RBP", "RSP"),
+                lambda m: m.startswith("j") and m != "jmp",
+                exit_const=lambda eb: _x86_exit_const(eb, src), loop_body=src["loop"])
+            if c is not None:
+                return c
+            return _reg_loop_input_bound(src, ba, head, cx, by_addr, dom, preds, blocks,
+                                         _X86_CANON.get, {"cmp"})
         if src.get("slot"):
             if src["block"] != ba and src["block"] not in dom.get(ba, ()):
                 return None                           # the value does not reach on every path
@@ -2253,6 +2489,7 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
                 for r, v in tail[proc[0]].items():        # a MERGE: carry a register common to all
                     if v and v[0] == "idx" and all(_same_idx(tail[p].get(r), v) for p in proc[1:]):
                         seed[r] = v
+        seed_induction(ba, seed)                          # register loop counter + its array base
         head[ba] = dict(seed)
         tr = _IdxTracker(ctx, slots, slot_names, seed)
         for j, i in enumerate(ins):
@@ -2305,6 +2542,7 @@ def _index_scan_function(ctx, faddr, blocks, targets, summaries, calls, out, res
             out.append(_array_index_cand(faddr, i.get("addr"), base, scale, off, src, access,
                                          check, verdict, oob))
         tail[ba] = {r: v for r, v in tr.st.items() if v[0] == "idx"}
+        tail_all[ba] = dict(tr.st)
 
 
 # ---- aarch64 CWE-129 ---------------------------------------------------------------------------
@@ -2474,6 +2712,37 @@ def _a64_classify_store(ins, j, src_reg, off, names):
     return ("other",)
 
 
+def _a64_induction_regs(blocks, preds, succ_map, dom, by_addr):
+    """Registers that are LOOP INDUCTION VARIABLES held in a REGISTER on aarch64 (the `-O2` shape, e.g.
+    `str w1,[x2,x1,lsl #2]; add x1,x1,#1; cmp w0,w1; b.gt`). A register qualifies iff it has EXACTLY
+    ONE constant positive self-increment (`add xD,xD,#k`) in the loop and no other writer -- so inside
+    the loop it only increments. The entry value is not required (the bound comes from the loop's exit
+    test, not the init). Returns {header -> {reg: src}}. See `_induction_regs` (the x86 twin)."""
+    out: dict = defaultdict(dict)
+    for header, body in _reg_natural_loops(blocks, preds, succ_map, dom).items():
+        steps: dict = defaultdict(list)
+        other: dict = defaultdict(int)
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+                if not ops or not re.fullmatch(r"[wx]\d+", ops[0].lower()):
+                    continue                              # not a write to a general register
+                dst = _a64_canon(ops[0])
+                if mnem in ("add", "sub") and len(ops) == 3 and _a64_canon(ops[1]) == dst \
+                        and _NUM.match(ops[2].lstrip("#")):
+                    steps[dst].append((int(ops[2].lstrip("#"), 0) * (1 if mnem == "add" else -1),
+                                       i.get("addr")))
+                elif mnem not in _A64_NO_IDX_WRITE:
+                    other[dst] += 1
+        for reg, st in steps.items():
+            if other.get(reg) or len(st) != 1 or st[0][0] <= 0:
+                continue
+            out[header][reg] = {"source": "loop counter", "source_site": st[0][1], "slot": None,
+                                "slot_name": None, "kind": "induction", "reg": reg, "step": st[0][0],
+                                "init": 0, "header": header, "loop": frozenset(body)}
+    return out
+
+
 def _a64_induction_slots(blocks, names):
     """Frame slots that are LOOP INDUCTION VARIABLES on aarch64: one constant initialiser (`str wzr`
     / `mov w,#c; str w`) and one load-add-store step (`ldr w,[s]; add w,w,#k; str w,[s]`), &addr never
@@ -2591,6 +2860,67 @@ def _record_forward(calls, reg, arg_regs, faddr, site, callee, check_for, ba, pr
         calls.append((faddr, site, callee, passed))
 
 
+def _a64_store_width(mnem, regops):
+    """The byte width an aarch64 store writes: strb/strh are 1/2; otherwise the stored register's
+    view (w/s=4, x/d=8, q=16), doubled for a store-pair (`stp`). None when not a plain store."""
+    if mnem in ("strb", "sturb"):
+        return 1
+    if mnem in ("strh", "sturh"):
+        return 2
+    regs = [o for o in regops if re.fullmatch(r"[wxsdq]\d+", (o or "").lower())]
+    if not regs:
+        return None
+    per = {"w": 4, "s": 4, "x": 8, "d": 8, "q": 16}.get(regs[0][0].lower())
+    if per is None:
+        return None
+    return per * (2 if mnem in ("stp", "stnp") else 1)
+
+
+def _a64_const_oob_stores(ctx, faddr, blocks, out):
+    """A CONSTANT-OFFSET store that writes past a known-size global array -- the `-O2` fully unrolled /
+    vectorised overrun (`for(i=0;i<=10;i++) t[i]=i` becomes straight-line SIMD plus `str w1,[x0,#40]`
+    into a 10-int array), which carries no loop or index register for the induction path to see.
+    `adrp+add` gives the base pointer's absolute address; a store at `[base, #imm]` whose byte offset
+    into the RESOLVED object plus the store width exceeds the object's st_size is a CWE-129 overrun.
+    Straight-line within a block (the unrolled body has no branches); a known symbol size is required,
+    so an opaque base or a size-0 symbol (a flexible array) stays silent -- never a false positive."""
+    for b in blocks:
+        gaddr: dict = {}                                  # reg -> absolute address of a global pointer
+        for i in b.get("instructions") or []:
+            mnem, ops = _ops((i.get("text") or "").split(";")[0].strip())
+            if not ops:
+                continue
+            dst = _a64_canon(ops[0])
+            if mnem == "adrp":
+                c = _a64_adrp_const(i)
+                gaddr[dst] = c if c is not None else gaddr.pop(dst, None)
+                continue
+            if mnem == "add" and len(ops) == 3 and _NUM.match(ops[2].lstrip("#")):
+                s = _a64_canon(ops[1])
+                gaddr[dst] = gaddr[s] + int(ops[2].lstrip("#"), 0) if s in gaddr else gaddr.pop(dst, None)
+                continue
+            if mnem.startswith("st"):
+                mm = _a64_mem(ops[-1], None)
+                if mm and mm[0] == "base" and mm[1] in gaddr:
+                    width = _a64_store_width(mnem, ops[:-1])
+                    g = _global_base(ctx, addr=gaddr[mm[1]]) if width else None
+                    if g and g[1] is not None and g[2]:   # resolved to a global with a known size
+                        eff = g[3] + mm[2]                 # byte offset into the object
+                        base = ("global", g[0], g[1], g[2])
+                        v = _index_verdict(("bounded", eff // width, True), base, width, eff % width) \
+                            if eff >= 0 else None
+                        if v is not None:
+                            verdict, oob = v
+                            src = {"source": "a constant offset", "source_site": i.get("addr"),
+                                   "slot": None, "kind": "constant"}
+                            out.append(_array_index_cand(
+                                faddr, i.get("addr"), base, width, eff % width, src, "write",
+                                ("bounded", eff // width, True), verdict, oob))
+                continue
+            if dst and dst in gaddr and re.fullmatch(r"[wx]\d+", ops[0].lower()):
+                gaddr.pop(dst, None)                       # any other write clobbers the pointer
+
+
 def _array_index_arm(ctx, summaries, calls, targets, resolve_tail, out):
     """aarch64 CWE-129, pass 1. Per function: an access indexed by self-parsed input is emitted
     directly; an access indexed by a PARAMETER is recorded in `summaries`, and a call (or tail call)
@@ -2600,6 +2930,7 @@ def _array_index_arm(ctx, summaries, calls, targets, resolve_tail, out):
                   if isinstance(b, dict) and b.get("addr")]
         if blocks and len(blocks) <= 2000:
             _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_tail, out)
+            _a64_const_oob_stores(ctx, faddr, blocks, out)
 
 
 def _has_pcode(blocks) -> bool:
@@ -2628,9 +2959,22 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
     dom = bounds.dominators(blocks)
     by_addr = {b.get("addr"): b for b in blocks}
     preds: dict = defaultdict(list)
+    succ_map: dict = {}
     for b in blocks:
+        succ_map[b.get("addr")] = tuple(b.get("succ") or ())
         for sc in b.get("succ") or []:
             preds[sc].append(b.get("addr"))
+    reg_inductions = _a64_induction_regs(blocks, preds, succ_map, dom, by_addr)   # -O2 register counters
+    ind_writes: dict = {}
+    for h, regs in reg_inductions.items():
+        body = next(iter(regs.values()))["loop"] if regs else frozenset()
+        w = set()
+        for la in body:
+            for i in (by_addr.get(la) or {}).get("instructions") or []:
+                m2, o2 = _ops((i.get("text") or "").split(";")[0].strip())
+                if o2 and re.fullmatch(r"[wx]\d+", o2[0].lower()):
+                    w.add(_a64_canon(o2[0]))
+        ind_writes[h] = w
     # A register-held index is followed within its block and into a block whose SOLE predecessor
     # defined it. origin: id(src) -> (block, instr index after which it holds); a parameter
     # arrives before the entry block. tail: block -> {reg: idx-value} live at the block end.
@@ -2641,11 +2985,19 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                      "slot_name": None, "kind": "param", "param": k}
         origin[id(params[r])] = (entry, -1, r)            # (block, instr index, defining register)
     tail: dict = {}
+    tail_all: dict = {}
     head: dict = {}
     cx = {"origin": origin, "tail": tail, "head": head, "preds": preds, "dom": dom,
           "by_addr": by_addr, "bases": ("SP", "X29"), "cond_term": _A64_COND_TERM}
 
     def check_for(src, ba, pred, idx_reg):
+        if src.get("kind") == "induction" and not src.get("slot"):   # a register-held loop counter
+            c = _induction_bound(blocks, by_addr, preds, ba, ("reg", src["reg"]), dom, ("SP", "X29"),
+                                 _A64_COND_TERM, loop_body=src["loop"])
+            if c is not None:
+                return c
+            return _reg_loop_input_bound(src, ba, head, cx, by_addr, dom, preds, blocks,
+                                         _a64_canon, {"cmp", "cmn", "subs"})
         if src.get("slot"):
             if src.get("kind") == "induction":            # a loop counter: read the loop's own bound
                 return _induction_bound(blocks, by_addr, preds, ba, ("SP", src["slot"][1]), dom,
@@ -2658,6 +3010,23 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
         if id(src) not in origin:
             return None
         return _reg_bound(src, ba, cx)                    # backward edge-aware walk (handles merges)
+
+    def seed_induction(ba, reg):
+        """Seed a loop header with its register counter(s) and the loop-invariant array base the
+        preheader left live (`adrp/add x2,table` -- a ('ga',...) value `tail` does not carry); see the
+        x86 twin in `_index_scan_function`."""
+        regs = reg_inductions.get(ba)
+        if not regs:
+            return
+        body = next(iter(regs.values()))["loop"]
+        written = ind_writes.get(ba, set())
+        for d in sorted((d for d in dom.get(ba, ()) if d != ba and d not in body and d in tail_all),
+                        key=lambda x: -len(dom.get(x, ()))):
+            for r, v in tail_all[d].items():
+                if v and v[0] in ("ga", "sa") and r not in written and r not in reg:
+                    reg[r] = v
+        for r, src in regs.items():
+            reg[r] = ("idx", 1, 0, src)
 
     for b in blocks:
         ba = b.get("addr")
@@ -2675,6 +3044,7 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
                 for r, v in tail[proc[0]].items():        # a MERGE: carry a register common to all
                     if v and v[0] == "idx" and all(_same_idx(tail[p].get(r), v) for p in proc[1:]):
                         reg[r] = v
+        seed_induction(ba, reg)                           # -O2 register loop counter + its array base
         head[ba] = dict(reg)
         ins = b.get("instructions") or []
         for j, i in enumerate(ins):
@@ -2762,6 +3132,7 @@ def _a64_scan_function(ctx, faddr, blocks, summaries, calls, targets, resolve_ta
             if mnem not in _A64_NO_IDX_WRITE and re.fullmatch(r"[wx]\d+", ops[0].lower()):
                 reg[dst] = None                                # any other write clobbers it
         tail[ba] = {r: v for r, v in reg.items() if v and v[0] == "idx"}
+        tail_all[ba] = dict(reg)
 
 
 # ---- arm32 CWE-129 -----------------------------------------------------------------------------
@@ -3360,7 +3731,9 @@ def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict
                "size": None, "elements": None, "element_size": scale}
     slot = src.get("slot")
     sname = src["source"] if " " in src["source"] else src["source"] + "()"
-    idx_from = (f"{sname} at {src['source_site']}"
+    constant = src.get("kind") == "constant"
+    idx_from = (f"a constant offset emitted at {src['source_site']}" if constant else
+                f"{sname} at {src['source_site']}"
                 + (f", held in {slot[0].lower()}{slot[1]:+#x}" if slot else ""))
     via = src.get("via")
     if via:
@@ -3377,7 +3750,8 @@ def _array_index_cand(faddr, site, base, scale, off, src, access, check, verdict
     else:
         why = (f"the dominating check admits index <= {check[1]}, past the array's "
                f"{arr['elements']} elements")
-    detail = (f"{access} of {where} at {site}: the index comes from input ({idx_from}) and {why}. "
+    origin = "is a compile-time constant" if constant else "comes from input"
+    detail = (f"{access} of {where} at {site}: the index {origin} ({idx_from}) and {why}. "
               f"Address = base + {expr}. An index of {', '.join(str(x) for x in oob)} "
               f"{'writes' if access == 'write' else 'reads'} outside the array "
               f"(CWE-129). Static: the path to this access is not proven feasible.")
