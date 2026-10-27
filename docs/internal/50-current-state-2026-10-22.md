@@ -118,9 +118,15 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   dump (`_strip_crash_dump`) before comparing to the negative control. **Still missing (WoW64):** the
   32-bit stdcall ROP → WinExec/system (needs the guest stack address of the command string, which the
   WoW64 dump does not expose reliably), and a frame-based 32-bit SEH-overwrite primitive.
-- **Also still missing:** SEH-overwrite chains, ROP arg setup beyond rcx (rdx/r8/r9 for multi-arg
-  sinks), and structure-preserving framing for a structured PE input. A PE with no exec sink / gadget
-  and no reachable win is declined honestly and the confirmed L2 stands.
+- **Structure-preserving framing (2026-10-27):** a PE that overflows only when its record structure
+  is intact (a header before and a trailer after the smash — a whole-buffer cyclic is rejected and
+  never faults) now reaches L2 and L3. `_pe_ip_primitive` reads the (prefix, suffix) from the crashing
+  input (`_overflow_frame`) and puts the cyclic/marker exactly where the filler run was; the frame
+  travels on the L2 (`frame_prefix`/`frame_suffix`), and both L3 paths (ret2win, ROP) re-apply it to
+  every delivered payload — including the ROP's stack-address probe, so the prefix shift cancels.
+  Identity `(b"", b"")` for an unstructured input, so the common case is unchanged.
+- **Also still missing:** SEH-overwrite chains, and ROP arg setup beyond rcx (rdx/r8/r9 for multi-arg
+  sinks). A PE with no exec sink / gadget and no reachable win is declined honestly and the L2 stands.
   *(2026-10-27 static: **Win32 dangerous-API detection** — `detect/detectors.py
   windows_dangerous_imports` reads the PE import table and flags the high-signal sinks (WinExec /
   ShellExecute / CreateProcess / wsprintf / lstrcpy / URLDownloadToFile / msvcrt copies), the static

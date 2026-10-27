@@ -1658,13 +1658,22 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
     endian = "little"
     length = min(max(len(orig) * 2, 256), 4096)
     pattern = primitive.cyclic(length)
+    # Structure-preserving framing: a structured crash (a header, the overflowing field, a trailer)
+    # only faults when the bytes AROUND the smash stay intact -- a whole-buffer cyclic is not a valid
+    # record, so the target never reaches the sink and L2 reports a false "no fault". Put the cyclic
+    # (and every later payload) exactly where the filler run was. `_overflow_frame` returns (b"", b"")
+    # for an unstructured input, so this is identity there -- no change to the common case.
+    _pre, _post = _overflow_frame(orig)
+
+    def frame(b: bytes) -> bytes:
+        return bytes(_pre) + bytes(b) + bytes(_post)
 
     # Feed the cyclic down the recorded channel first, then the others -- a crashing input fed the
     # wrong way does not fault, and reporting that as "no L2" turns a wrong setup into a negative.
     cap0, used_mode, tried = {}, mode, []
-    for m in sweep_modes(mode, pattern):
+    for m in sweep_modes(mode, frame(pattern)):
         tried.append(m)
-        cap0 = make_wine_capture(exe, m, base_argv, timeout, arch=arch, bits=word * 8)(pattern)
+        cap0 = make_wine_capture(exe, m, base_argv, timeout, arch=arch, bits=word * 8)(frame(pattern))
         if cap0.get("ok") and cap0.get("signal_name"):
             used_mode = m
             break
@@ -1690,7 +1699,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
         if off != -1:
             m = primitive._ip_marker(4)
             ctx.progress(msg=f"confirming 32-bit instruction-pointer control at offset {off}")
-            control = primitive.control_input(off, off + 4, 4, endian)
+            control = frame(primitive.control_input(off, off + 4, 4, endian))
             confirmed = (capture(control).get("fault_addr") == m)
             prim = {"type": "instruction-pointer-control", "offset": off, "source": "eip",
                     "marker": m, "observed_pc": fa, "confirmed": confirmed,
@@ -1698,7 +1707,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
             extra = (f"instruction-pointer control at offset {off} (32-bit EIP via the faulting "
                      f"address), " + ("confirmed" if confirmed else "unconfirmed") + " under Wine")
             return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
-                             prim, confirmed, extra)
+                             prim, confirmed, extra, frame=(_pre, _post))
         ctx.emit("primitive.done", payload={
             "primitive": None, "supported": True, "input_modes_tried": tried,
             "note": "the 32-bit PE faults under Wine but the faulting address does not hold the "
@@ -1715,7 +1724,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
     regs = primitive.controlled_registers(cap0, length, endian=endian, word=word)
     if pc_off != -1:
         ctx.progress(msg=f"confirming instruction-pointer control at offset {pc_off} (pc)")
-        control = primitive.control_input(pc_off, length, word, endian)
+        control = frame(primitive.control_input(pc_off, length, word, endian))
         confirmed = primitive.marker_confirmed(capture(control), word, endian)
         prim = {"type": "instruction-pointer-control", "offset": pc_off, "source": "pc",
                 "marker": primitive._ip_marker(word), "observed_pc": pc, "confirmed": confirmed,
@@ -1723,7 +1732,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
         extra = (f"instruction-pointer control at offset {pc_off} (pc), "
                  + ("confirmed" if confirmed else "unconfirmed") + " under Wine +seh")
         return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
-                         prim, confirmed, extra)
+                         prim, confirmed, extra, frame=(_pre, _post))
 
     # 1b) a return-address overwrite that faults AT the `ret`. On Win64 a stack overflow usually
     #     overwrites the return address, but the CYCLIC value there is non-canonical, so the CPU
@@ -1739,7 +1748,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
     m = primitive._ip_marker(word)
     for off in _pe_rip_offset_candidates(ctx, target, regs, word, orig):
         ctx.progress(msg=f"probing instruction-pointer control at return offset {off}")
-        control = primitive.control_input(off, off + word, word, endian)    # short: filler+marker
+        control = frame(primitive.control_input(off, off + word, word, endian))  # short: filler+marker
         if capture(control).get("pc") == m:
             prim = {"type": "instruction-pointer-control", "offset": off, "source": "ret",
                     "marker": m, "observed_pc": pc, "confirmed": True,
@@ -1747,7 +1756,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
             extra = (f"instruction-pointer control at offset {off} (return address), confirmed "
                      f"under Wine +seh: the `ret` transfers to the planted address (pc == marker)")
             return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
-                             prim, True, extra)
+                             prim, True, extra, frame=(_pre, _post))
 
     # 2) controlled saved frame pointer / SEH registration frame -- the honest SEH-overwrite lead.
     seh = cap0.get("seh_frame")
@@ -1757,7 +1766,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
     off = fp_off if fp_off != -1 else seh_off
     if off != -1:
         ctx.progress(msg=f"confirming saved-frame-pointer / SEH-frame control at offset {off}")
-        control = primitive.pe_frame_control_input(off, length, word)
+        control = frame(primitive.pe_frame_control_input(off, length, word))
         where = primitive.pe_frame_confirmed(capture(control), word)
         confirmed = bool(where)
         prim = {"type": "seh-frame-control", "offset": off,
@@ -1773,7 +1782,7 @@ def _pe_ip_primitive(ctx, target, exe, target_bytes, mode, base_argv, orig, time
                  + " -- a Windows SEH-overwrite / stack-pivot lead; x64 SEH is table-based, so "
                  "this is not an automatic instruction-pointer hijack")
         return _finalize(ctx, target, target_bytes, used_mode, base_argv, cap0, control,
-                         prim, confirmed, extra)
+                         prim, confirmed, extra, frame=(_pre, _post))
 
     # 3) the crash reproduces under Wine but no register/frame carries attacker bytes.
     ctx.emit("primitive.done", payload={

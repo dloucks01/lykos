@@ -332,3 +332,63 @@ def test_pe_wow64_32bit_l2_and_ret2win_l3(store, case, pool, tmp_path):
     fs = FindingDAO(store.conn).list_by_target(t.id)
     assert any("ret2win (win32)" in (f.title or "").lower() and f.severity == "critical"
                for f in fs), [(f.title, f.severity) for f in fs]
+
+
+_STRUCT_C = (
+    "#include <windows.h>\n#include <stdio.h>\n#include <string.h>\n"
+    "void win(void){ DWORD w; WriteFile(GetStdHandle((DWORD)-11),\"PWNEDHDR\\n\",9,&w,0);"
+    " ExitProcess(0x66); }\n"
+    "int vuln(char *s, int n){ char buf[32];\n"
+    "  if (n < 8 || memcmp(s,\"HDR:\",4) || memcmp(s+n-4,\";END\",4)) return 0;\n"
+    "  memcpy(buf, s+4, n-8); return buf[n%32]; }\n"
+    "int main(int argc,char**argv){ if(argc<2) return 2;\n"
+    "  FILE*f=fopen(argv[1],\"rb\"); if(!f) return 3;\n"
+    "  char tmp[512]; int n=(int)fread(tmp,1,sizeof tmp,f); fclose(f); return vuln(tmp,n); }\n")
+
+
+def _mingw_struct(tmp_path):
+    cc = shutil.which("x86_64-w64-mingw32-gcc")
+    if not cc:
+        pytest.skip("no mingw cross compiler")
+    if not sandbox._wine():
+        pytest.skip("no wine to execute the PE")
+    c = tmp_path / "struct.c"
+    c.write_text(_STRUCT_C)
+    exe = tmp_path / "struct.exe"
+    r = subprocess.run([cc, "-O1", "-fno-stack-protector", "-w", str(c), "-o", str(exe)],
+                       capture_output=True, timeout=180)
+    if r.returncode != 0:
+        pytest.skip("mingw cannot link here: " + r.stderr.decode(errors="replace")[:200])
+    return exe
+
+
+def test_pe_structured_overflow_frames_through_to_l3(store, case, pool, tmp_path):
+    """Structure-preserving framing: a PE that overflows only when its record structure is intact
+    (must start `HDR:` and end `;END`) -- a raw cyclic is rejected and never faults. The stage must
+    recover the (prefix, suffix) from the crashing input, put the cyclic/marker/exploit where the
+    filler was, and reach a confirmed L2 (clean RIP) AND a confirmed L3 ret2win, framing preserved."""
+    exe = _mingw_struct(tmp_path)
+    q = JobQueue(store.conn)
+    t = ingest(store, case.id, exe, filename="struct.exe")
+    for enq in (enqueue_triage, enqueue_disassemble):
+        enq(q, t, force=True)
+        assert pool.wait_idle(180)
+    t = store.targets.get(t.id)
+
+    # the crashing input HAS the structure (HDR: ... ;END) around a long filler run
+    crash = store.put_artifact(case.id, "crash", data=b"HDR:" + b"A" * 200 + b";END").sha256
+    pr = enqueue_primitive(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 25})
+    assert pool.wait_idle(300) and q.runs.get(pr.id).status == "done"
+    l2 = next(e.payload for e in q.events.list(run_id=pr.id, limit=80)
+              if e.type == "primitive.done")
+    assert l2["primitive"] == "instruction-pointer-control" and l2["confirmed"], l2
+    # the measured framing is the record's header/trailer, carried on the L2 for L3 to reuse
+    assert bytes.fromhex(l2.get("frame_prefix") or "") == b"HDR:"
+    assert bytes.fromhex(l2.get("frame_suffix") or "") == b";END"
+
+    xr = enqueue_exploit(q, t, params={"input_sha": crash, "input_mode": "file", "timeout": 25})
+    assert pool.wait_idle(240) and q.runs.get(xr.id).status == "done"
+    xp = next(e.payload for e in q.events.list(run_id=xr.id, limit=80)
+              if e.type == "exploit.done")
+    assert xp.get("confirmed") and xp.get("exploit") == "ret2win", xp
+    assert [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L3"]
