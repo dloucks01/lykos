@@ -2976,12 +2976,15 @@ def _x86_const_oob_stores(ctx, faddr, blocks, out):
     register for the induction path to read. A direct store to an absolute address shows in p-code as
     `<op> ... -> ram:A:W`; when A lands INSIDE a known-size object and the W-byte write crosses the
     object's st_size, it is a CWE-129 overrun -- a wide SIMD store straddling the array's end. A store
-    whose START address is AT or PAST the object end is NOT attributed to it: the linked binary has
-    lost the symbol+addend origin, so that address could belong to an adjacent global -- a bare
-    one-past scalar store is left silent, never a false positive. A known symbol size is required (an
-    opaque .data/.bss address or a size-0 flexible array stays silent). The aarch64 twin
-    `_a64_const_oob_stores` reads the same overrun off an `adrp+add` base pointer instead, since
-    aarch64 cannot express an absolute-address store in one instruction."""
+    whose START address is AT or PAST the object end is normally NOT attributed to it: the linked
+    binary has lost the symbol+addend origin, so that address could belong to an ADJACENT global --
+    attributing it would be a false positive. The ONE exception, handled here, is a store whose
+    address lands PAST EVERY object AND every writable data section (`_global_base` returns None --
+    the image's data boundary, e.g. `&table[10]` == `_end` when table is the last global): nothing
+    valid can be there, so a store to it is unambiguously an overrun of the array whose end abuts it.
+    A known symbol size is required. The aarch64 twin `_a64_const_oob_stores` reads the same overrun
+    off an `adrp+add` base pointer instead, since aarch64 cannot express an absolute store in one op."""
+    objs = _global_objects(ctx)
     for b in blocks:
         for i in b.get("instructions") or []:
             seen = set()
@@ -2996,7 +2999,26 @@ def _x86_const_oob_stores(ctx, faddr, blocks, out):
                     continue
                 seen.add((addr, width))
                 g = _global_base(ctx, addr=addr)
-                if not (g and g[1] is not None and g[2]):      # resolved to a known-size object
+                if g is None:
+                    # past EVERY object and data section -> the image's data boundary. A store here
+                    # overruns the array whose end abuts `addr` (exactly one such array; nothing valid
+                    # sits past it, so no adjacent-global ambiguity -- the sound one-past scalar case).
+                    ends = [(nm, a, sz) for nm, (a, sz) in objs.items() if sz and a + sz == addr]
+                    if len(ends) != 1 or any(a2 == addr for a2, _s in objs.values()):
+                        continue                            # not exactly one array ends here (ambiguous)
+                    nm, a, sz = ends[0]
+                    base = ("global", nm, a, sz)
+                    chk = ("bounded", sz // width, True)
+                    v = _index_verdict(chk, base, width, sz % width)
+                    if v is None:
+                        continue
+                    verdict, oob = v
+                    src = {"source": "a constant offset", "source_site": i.get("addr"),
+                           "slot": None, "kind": "constant"}
+                    out.append(_array_index_cand(faddr, i.get("addr"), base, width, sz % width,
+                                                 src, "write", chk, verdict, oob))
+                    continue
+                if not (g[1] is not None and g[2]):            # resolved to a known-size object
                     continue
                 eff = g[3]                                      # byte offset of the store START in it
                 if eff < 0 or eff + width <= g[2]:              # start inside and no crossing -> in bounds

@@ -1517,3 +1517,31 @@ def test_arm32_descending_walking_pointer_O1(store, case, pool, arm32_gcc, tmp_p
     adjacent-array false positive. ghidra backend (arm32 P-Code)."""
     assert _run_iv(store, case, pool, arm32_gcc, tmp_path, _DW_SRC, ["-O1", "-marm"], True,
                    monkeypatch, "arm", 32) == {"w_over": {"bound"}}
+
+
+# -------------------------- one-past scalar const store at the data boundary (CWE-129) -----------
+# At -O2 gcc peels a descending overrun's first iteration into a SCALAR const store at the array's
+# one-past address (`mov dword [table+40],C`, == _end when table is the last global). The linked
+# binary has lost the symbol+addend origin, so a one-past store is normally ambiguous with an adjacent
+# global and left silent. The ONE sound case: the address lands past EVERY object AND every writable
+# section (_global_base -> None, the image's data boundary) -- nothing valid can be there, so it is
+# unambiguously an overrun of the array whose end abuts it. op_over (table last) flags; op_safe silent.
+_OPS_SRC = r"""
+#include <stdlib.h>
+int table[10];
+#define NX __attribute__((noipa))
+NX void op_over(void){ for(int i=10;i>=0;i--) table[i]=i; }  /* table[10] one-past -> _end (table last) */
+NX void op_safe(void){ for(int i=9;i>=0;i--) table[i]=i; }   /* in bounds -> silent */
+int main(void){ op_over(); op_safe(); return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_x86_one_past_const_store(store, case, pool, gcc, tmp_path, opt):
+    """x86-64 -O2: the peeled first iteration of a descending overrun is a scalar const store to
+    table's one-past address (== _end, since table is the last global); _global_base returns None
+    (past all data), so it is soundly attributed to table[10] -> bound. op_safe stays silent. (-O1
+    reaches the same verdict through the register descending counter.)"""
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("array_index reads x86-64 operands; the e2e backend is host-arch bound")
+    assert _run_host(store, case, pool, gcc, tmp_path, _OPS_SRC, [opt], "ops") == {"op_over": {"bound"}}
