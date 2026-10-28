@@ -21,6 +21,7 @@ import base64
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 
 from . import concolic as _concolic
 
@@ -120,6 +121,10 @@ def _rung_template(h, *, timeout, ctx):
 
 
 def _rung_concolic(h, *, timeout, ctx):
+    # needs the STATIC clean build (angr must see the parser in the ELF). Absent (e.g. a project whose
+    # static link does not resolve) -> skip this rung; the smart-fuzz floor covers it.
+    if not h.get("explore_binary"):
+        return None
     return concolic_confirm(
         h["explore_binary"], h.get("replay_binary") or h["explore_binary"],
         harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
@@ -127,10 +132,50 @@ def _rung_concolic(h, *, timeout, ctx):
         targets=h.get("targets"), timeout=timeout, ctx=ctx)
 
 
+def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096, timeout=90,
+                      workdir=None) -> dict:
+    """Directed, structure-seeded SMART fuzzing of an ASan harness -- the ladder's floor rung, for
+    deep parser bugs the solver cannot reach, and the rung that works on a SHARED build (so it runs on
+    projects whose static link the concolic rung cannot produce). Coverage-guided libFuzzer seeded with
+    `seeds` (format specimens / concolic hand-offs); the first ASan-faulting crash is the proof, with an
+    empty-input negative control. Returns the concolic_confirm result shape with rung="smart-fuzz"."""
+    from ..libfuzzer import run_libfuzzer
+    out = {"confirmed": False, "input": None, "report": None, "source": None, "class": None,
+           "rung": "smart-fuzz", "reason": None}
+    own_wd = workdir is None
+    wd = Path(tempfile.mkdtemp(prefix="lykos-sf-")) if own_wd else Path(workdir)
+    try:
+        corpus = list(seeds or []) + [b"A" * n for n in (16, 64, 256, 1024)]
+        res = run_libfuzzer(fuzz_binary, wd, seconds=int(timeout), max_len=int(input_size),
+                            corpus=corpus, lib_dirs=lib_dirs)
+        from ..debug.rootcause import parse_asan_report
+        for cr in res.get("crashes", []):
+            rep = cr.get("report") or ""
+            cls = parse_asan_report(rep) or {}
+            if not (cls or "AddressSanitizer" in rep):
+                continue                                     # oom/timeout artifact, not a fault
+            neg = _asan_replay(fuzz_binary, b"", lib_dirs, timeout=min(30.0, timeout))
+            if neg["faulted"]:
+                out["reason"] = "negative control (empty input) also faulted -- not attributable"
+                return out
+            out.update(confirmed=True, input=cr.get("input"), report=rep, source=cls.get("source"))
+            out["class"] = cls.get("class") or cls.get("cwe")
+            return out
+        out["reason"] = f"no crash in {int(timeout)}s of smart fuzzing"
+        return out
+    finally:
+        if own_wd:
+            import shutil
+            shutil.rmtree(wd, ignore_errors=True)
+
+
 def _rung_smartfuzz(h, *, timeout, ctx):
-    """B3 (directed, structure-seeded, concolic-assisted smart fuzzing -- the floor for deep parser
-    bugs concolic cannot reach). Not yet implemented -- an ordered hook below concolic."""
-    return None
+    # needs the SHARED ASan build (coverage-guided libFuzzer); the floor rung below concolic.
+    if not h.get("fuzz_binary"):
+        return None
+    return smartfuzz_confirm(h["fuzz_binary"], lib_dirs=h.get("lib_dirs"), seeds=h.get("seeds"),
+                             input_size=int(h.get("input_size", 4096)), timeout=timeout,
+                             workdir=(ctx.scratch() / f"sf-{h.get('name', 'h')}") if ctx else None)
 
 
 _LADDER = (_rung_template, _rung_concolic, _rung_smartfuzz)

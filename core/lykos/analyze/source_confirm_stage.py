@@ -78,31 +78,42 @@ def source_confirm_stage(ctx) -> dict:
                  "note": "no in-tree libFuzzer harness to drive the parser"})
         return {"metrics": {"supported": False}}
 
-    # STATIC builds: clean (for angr to explore) + ASan (to confirm). A project whose static link
-    # needs unavailable -dev packages fails here -- the concolic rung then has nothing to run, which
-    # is reported, not faked.
-    bslice = max(60, int(budget * 0.4))
-    ctx.progress(msg="building in-tree harnesses (clean + ASan, static) for directed confirmation")
+    # Build the harnesses for the ladder's rungs. The CONCOLIC rung needs STATIC harnesses (parser in
+    # the ELF): a clean build for angr + an ASan build to confirm -- these fail on a project whose
+    # static link needs unavailable deps (FreeRDP's static OpenSSL cascade), and that rung then simply
+    # does not run. The SMART-FUZZ rung needs an ASan SHARED build, which succeeds where static does
+    # not -- so it is always attempted, and is the floor that covers the projects concolic cannot.
+    bslice = max(60, int(budget * 0.25))
+    ctx.progress(msg="building in-tree harnesses (static clean+ASan for concolic, shared ASan for fuzz)")
     explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice,
                                        build_name="_lykos_build_explore")
     replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice,
                                       build_name="_lykos_build_replay")
-    if not (explore["ok"] and replay["ok"]):
-        why = (explore["log"] if not explore["ok"] else replay["log"])[-400:]
+    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice,
+                                     build_name="_lykos_build_fuzz")
+    if not (explore["ok"] or fuzzb["ok"]):
         ctx.emit("source_confirm.done", payload={"supported": False,
-                 "note": "could not build static harnesses for concolic confirmation "
-                         "(a project needing unavailable static -dev libs declines this rung)",
-                 "log": why})
+                 "note": "could not build harnesses for confirmation (neither static nor shared linked)",
+                 "log": (fuzzb["log"] or explore["log"])[-400:]})
         return {"metrics": {"supported": False, "built": False}}
 
-    rp_by = {h["name"]: h for h in replay["harnesses"]}
-    harnesses = [{"name": h["name"], "explore_binary": h["binary"],
-                  "replay_binary": rp_by[h["name"]]["binary"], "lib_dirs": replay["lib_dirs"],
-                  "input_size": input_size}
-                 for h in explore["harnesses"] if h["name"] in rp_by]
+    ex_by = {h["name"]: h for h in explore["harnesses"]} if explore["ok"] else {}
+    rp_by = {h["name"]: h for h in replay["harnesses"]} if replay["ok"] else {}
+    fz_by = {h["name"]: h for h in fuzzb["harnesses"]} if fuzzb["ok"] else {}
+    names = sorted(set(ex_by) | set(fz_by))
+    harnesses = []
+    for n in names:
+        d = {"name": n, "input_size": input_size, "lib_dirs": fuzzb.get("lib_dirs") or []}
+        if n in ex_by and n in rp_by:                       # concolic (static clean + ASan)
+            d["explore_binary"] = ex_by[n]["binary"]
+            d["replay_binary"] = rp_by[n]["binary"]
+        if n in fz_by:                                      # smart-fuzz (shared ASan)
+            d["fuzz_binary"] = fz_by[n]["binary"]
+        if d.get("explore_binary") or d.get("fuzz_binary"):
+            harnesses.append(d)
     if not harnesses:
         ctx.emit("source_confirm.done", payload={"supported": False,
-                 "note": "harness binaries did not pair across the clean and ASan builds"})
+                 "note": "no usable harness binaries after building"})
         return {"metrics": {"supported": False}}
 
     per = max(30, int((budget * 0.6) / max(1, len(harnesses))))
