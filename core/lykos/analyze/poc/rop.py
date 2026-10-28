@@ -1438,6 +1438,24 @@ def find_sh4_r2libc_gadgets(data: bytes, endian: str = "little") -> dict:
     return {"callers": callers}
 
 
+def find_br_gadgets_sh4(data: bytes, endian: str = "little"):
+    """SuperH SH-4 `jmp @rN` gadgets as [{insn, reg, va}] -- the SH `jmp <reg>` (branch to the address
+    in rN), the no-leak way to reach injected shellcode on an execstack when rN points at the input
+    buffer. jmp @Rn = 0100nnnn00101011 = 0x402B | (n << 8); 16-bit, 2-byte aligned. r15 is the stack
+    pointer, skipped. SH-4 branches are DELAYED (the instruction after `jmp @rN` runs before control
+    transfers), but a real `jmp @rN` in the binary already carries a benign delay slot, and the
+    detonation + negative control confirm the hit. `endian` is the target byte order (sh4 little,
+    sh4eb big)."""
+    order = "big" if endian == "big" else "little"
+    out = []
+    for n in range(15):                                  # r0..r14; r15 = sp
+        enc = 0x402B | (n << 8)
+        va = _find_exec(data, enc.to_bytes(2, order), 2)
+        if va is not None:
+            out.append({"insn": "jmp", "reg": f"r{n}", "va": va})
+    return out
+
+
 # ---------------------------------------------------------------- PowerPC64 (ELFv2) ret2libc gadgets
 # PPC64 callee-saved GPRs are r14..r31 -- the registers a function epilogue restores from its frame,
 # hence the ones a stack overflow of that frame can control.

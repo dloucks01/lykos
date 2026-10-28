@@ -94,18 +94,27 @@ to a real file, prioritized, and sized — so the next session can start at the 
   real risk, since the per-arch paths need qemu/cross-toolchains and don't execute in CI here).
   Verified: pyflakes clean on both modules, no import cycle, dispatch + lazy refs resolve, the
   build_exploit stage still registers, and the exploit/crossarch/afl suites pass.
-- **Theme 5a capability track: STARTED — LoongArch64 ret2shellcode.** Filled the named 5a hole
-  "shellcode stubs for loongarch64 / sh4 (ret2libc-only today)" for LoongArch64:
-  `shellcode.execve_binsh_loongarch64` (20B code + "/bin/sh\0", `pcaddi` PIC) and
-  `write_marker_loongarch64` (length patched into the `ori $a2,$zero,len` immediate) — both ASSEMBLED
-  with the real `loongarch64-linux-gnu-as` (guaranteed-correct encoding) and run under qemu to prove
-  a real shell spawns / the marker is written; `rop.find_br_gadgets_loongarch64` (the `jr $rN` =
-  `jirl $zero,$rN,0` jump-reg gadget); and the `_shellcode_emu_exploit` arch gate + cfg branch.
-  LoongArch64 now reaches shellcode-based L3 on NX-off targets, not just ret2libc. VERIFIED end-to-end:
-  the auto pipeline drives a loongarch64 execstack overflow (`jr $t0` gadget) to a confirmed, verified
-  L3 (injected execve spawns a real shell under qemu-user + negative control). +1 test; all 50
-  shellcode-arch tests green. REMAINING 5a: the same for SH4; the cross-arch info-leak primitive (the
-  big PIE/ASLR unlock); generalize the ROP builders. (mips stays unbuildable here — no compiler.)
+- **Theme 5a capability track: LoongArch64 + SH4 ret2shellcode DONE.** Filled the named 5a hole
+  "shellcode stubs for loongarch64 / sh4 (ret2libc-only today)" for BOTH:
+  - **LoongArch64:** `shellcode.execve_binsh_loongarch64` (20B code + "/bin/sh\0", `pcaddi` PIC) and
+    `write_marker_loongarch64` (length patched into the `ori $a2,$zero,len` immediate);
+    `rop.find_br_gadgets_loongarch64` (the `jr $rN` = `jirl $zero,$rN,0` jump-reg gadget). VERIFIED:
+    the auto pipeline drives a loongarch64 execstack overflow (`jr $t0` gadget) to a confirmed L3.
+  - **SH-4:** `shellcode.execve_binsh_sh4` (12B code + "/bin/sh\0", `mova` PC-relative PIC) and
+    `write_marker_sh4` (length patched into the `mov #len,r6` immediate at offset 6); SH-4 Linux ABI
+    = syscall# in r3, args r4/r5/r6, `trapa #(0x10+nargs)` (extracted empirically, not from memory —
+    objdump of glibc showed `trapa #20`/`#17`); `rop.find_br_gadgets_sh4` (the `jmp @rN` = 0x402B|n<<8
+    delayed-branch jump-reg gadget). SH-4 saves the return in PR on the stack (`lds.l @r15+,pr; rts`),
+    and `rts` branches to the corrupted PR, so the candidate offset pins the saved-PR slot like
+    LoongArch — no special LR-on-stack discovery. VERIFIED end-to-end: the auto pipeline drives an
+    SH-4 execstack overflow (`jmp @r1` gadget) to a confirmed, verified L3 (`ret2shellcode-sh`,
+    confirm=shell: injected execve spawns a real /bin/sh under qemu-sh4 that evaluates a forgery-proof
+    marker + negative control).
+  Both stubs ASSEMBLED with the real cross `as` (guaranteed-correct encoding) and qemu-proven standalone
+  before embedding. +2 test files (`test_shellcode_loongarch64.py`, `test_shellcode_sh4.py`); all
+  shellcode-arch tests green. REMAINING 5a: the cross-arch info-leak primitive (the big PIE/ASLR
+  unlock, leak.py is x86-only); generalize the ROP builders. (mips stays unbuildable here — no
+  compiler; arm uses armhf, not arm-linux-gnueabi.)
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
