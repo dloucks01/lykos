@@ -1696,7 +1696,7 @@ def _cmake_disable_flags(pkg: str) -> list:
 
 
 def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = None,
-                          want=None) -> dict:
+                          want=None, shared: bool = True, sanitize: bool = True) -> dict:
     """Build a CMake project's IN-TREE libFuzzer harnesses (files defining LLVMFuzzerTestOneInput)
     with the project's OWN cmake -- which generates its config headers and resolves its include/link
     graph, neither of which a per-translation-unit compile can do for a large project (FreeRDP's
@@ -1747,8 +1747,16 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
 
     base = ["cmake", "-S", str(root), "-B", str(bd),
             f"-DCMAKE_C_COMPILER={cc}", f"-DCMAKE_CXX_COMPILER={cxx or cc}",
-            "-DBUILD_FUZZERS=ON", "-DOSS_FUZZ=OFF", "-DWITH_SANITIZE_ADDRESS=ON",
-            "-DBUILD_SHARED_LIBS=ON", "-DCMAKE_BUILD_TYPE=Debug"]
+            "-DBUILD_FUZZERS=ON", "-DOSS_FUZZ=OFF",
+            # ASan for the fuzz/replay build (faults are the proof); OFF for the concolic EXPLORE build
+            # -- angr gets confused by ASan's shadow-memory accesses, so it explores clean code and the
+            # solved input is replayed through the ASan build to confirm.
+            f"-DWITH_SANITIZE_ADDRESS={'ON' if sanitize else 'OFF'}",
+            # SHARED resolves a project's transitive system deps without the static -dev packages (the
+            # default, for the fuzz/replay harness). STATIC links the project's parser INTO the harness
+            # ELF, which the concolic rung needs -- angr loads the harness with auto_load_libs=False, so
+            # a parser left in a .so would never be explored.
+            f"-DBUILD_SHARED_LIBS={'ON' if shared else 'OFF'}", "-DCMAKE_BUILD_TYPE=Debug"]
     preload = _find_fuzz_preload(root)
     if preload:
         base += ["-C", str(preload)]

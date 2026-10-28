@@ -149,6 +149,21 @@ def main(spec_path, out_path):
         proj = _load_project(angr, spec, binary)
         symbytes = claripy.BVS("lykos_input", 8 * size)
         extras = {angr.options.LAZY_SOLVES}
+        # HARNESS mode: enter directly at a `LLVMFuzzerTestOneInput(data, size)` function with a
+        # symbolic buffer, instead of exploring from the ELF entry through the libFuzzer runtime main
+        # (which is intractable). This makes concolic usable on a fuzz harness as a bytes->parser
+        # driver: angr solves the parser's gates (magic/length checks) that blind fuzzing struggles
+        # with, and the generated input is replayed under ASan to CONFIRM.
+        _HARNESS_BUF = 0x5A5A0000                      # scratch region for the symbolic input buffer
+        harness_fn_addr = None
+        if mode == "harness":
+            fn = spec.get("harness_fn") or "LLVMFuzzerTestOneInput"
+            harness_fn_addr = _int(fn)
+            if harness_fn_addr is None:
+                sym = proj.loader.find_symbol(fn)
+                if sym is None:
+                    raise RuntimeError("harness function %r not found in %s" % (fn, binary))
+                harness_fn_addr = sym.rebased_addr
         # The operator's flags must reach the explored program too: exploring `prog <input>` and
         # certifying `prog -c <input>` would be a certificate for an invocation never explored.
         argv_tail, result["argv"] = build_args(spec.get("argv") or [], mode, symbytes)
@@ -174,7 +189,11 @@ def main(spec_path, out_path):
                 return proj.factory.full_init_state(args=args, add_options=extras)
 
         def make_state(preconstrain=None):
-            if mode == "arg":
+            if mode == "harness":
+                # call LLVMFuzzerTestOneInput(buf, size) with a symbolic buffer at _HARNESS_BUF
+                st = proj.factory.call_state(harness_fn_addr, _HARNESS_BUF, size, add_options=extras)
+                st.memory.store(_HARNESS_BUF, symbytes)
+            elif mode == "arg":
                 st = proj.factory.full_init_state(
                     args=[binary] + argv_tail, add_options=extras)
             elif mode == "file":
@@ -248,9 +267,7 @@ def main(spec_path, out_path):
             try:
                 if mode == "stdin":
                     data = st.posix.dumps(0)
-                elif mode == "arg":
-                    data = st.solver.eval(symbytes, cast_to=bytes)
-                else:
+                else:                                        # arg / file / harness: the symbolic buffer
                     data = st.solver.eval(symbytes, cast_to=bytes)
                 return {"input_b64": base64.b64encode(data[:size]).decode(),
                         "from_seed": from_seed}
