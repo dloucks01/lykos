@@ -14,6 +14,7 @@ smart-fuzz rung, B3, covers it) rather than fabricating a result.
 from __future__ import annotations
 
 import hashlib
+import re
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
@@ -28,10 +29,67 @@ _CWE = {"stack-buffer-overflow": "CWE-121", "heap-buffer-overflow": "CWE-122",
         "stack-use-after-return": "CWE-562", "double-free": "CWE-415",
         "dynamic-stack-buffer-overflow": "CWE-121"}
 
+#: the STATIC source detectors whose candidates a ladder crash can confirm by co-location.
+_STATIC_SOURCE_DETECTORS = ("source_sink", "int_overflow", "uaf", "cve_source", "embedded_config")
+_SRC_LOC = re.compile(r"([\w./+\-]+):(\d+)")
 
-def _file_confirmed(ctx, target, r) -> None:
+
+def _parse_loc(s):
+    """(path, line) from a `path:line[:col]` string, or (None, None)."""
+    m = _SRC_LOC.search(s or "")
+    return (m.group(1), int(m.group(2))) if m else (None, None)
+
+
+def _suffix_match(a, b) -> bool:
+    """True when two source paths name the same file (one is a path-component suffix of the other --
+    the relative candidate path vs the absolute build path the sanitizer prints)."""
+    if not a or not b:
+        return False
+    a, b = a.replace("\\", "/"), b.replace("\\", "/")
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> int:
+    """Upgrade a co-located STATIC source candidate to `confirmed` when this ladder crash proves it:
+    the crash's file:line matches the candidate's AND the CWE agrees. Sound -- an ASan fault at the
+    exact site with a matching class confirms the statically-suspected defect there; a mismatched
+    class is NOT treated as a confirmation (it stays a candidate). The upgrade is recorded on a
+    distinct `dynamic-confirm` verdict channel, so the static channel's own verdict is preserved and
+    the discoverer keeps credit. Returns how many candidates were upgraded."""
+    ap, aline = _parse_loc(src_line)
+    if ap is None or not crash_cwe:
+        return 0
+    fd = FindingDAO(ctx.conn)
+    upgraded = 0
+    for f in fd.list_by_target(target.id):
+        if (f.detector not in _STATIC_SOURCE_DETECTORS or f.cwe != crash_cwe
+                or (f.state or "candidate") not in ("candidate", "corroborated")):
+            continue
+        fp = fline = None
+        for e in (f.evidence or []):
+            if e.get("channel") == "source":
+                fp, fline = _parse_loc(e.get("detail"))
+                if fp:
+                    break
+        if fline != aline or not _suffix_match(ap, fp):
+            continue
+        fd.upsert(target.id, target.case_id, {
+            "cwe": f.cwe, "title": f.title, "severity": f.severity or "high",
+            "detector": f.detector, "dedup_key": f.dedup_key, "site_detail": f"{fp}:{fline}",
+            "state": "confirmed", "confidence": 0.95, "channel": "dynamic-confirm",
+            "evidence": [{"channel": "dynamic-confirm",
+                          "detail": (f"confirmed by source_confirm: an ASan {crash_cwe} fault "
+                                     f"reproduced at {src_line} via the {harness} harness "
+                                     f"(input {input_sha[:12]})")}]})
+        upgraded += 1
+    return upgraded
+
+
+def _file_confirmed(ctx, target, r) -> int:
     """File one ladder-confirmed bug: a CONFIRMED finding + a DynResult (so the exploit ladder can see
-    it) + the reproducing input as an artifact. `r` is a confirm_ladder result."""
+    it) + the reproducing input as an artifact, and CROSS-REFERENCE it against the static source
+    candidates (a co-located, class-matching candidate is upgraded to confirmed). `r` is a
+    confirm_ladder result. Returns the number of static candidates upgraded by this crash."""
     rep = r.get("report") or ""
     cls = parse_asan_report(rep) or {}
     klass = r.get("class") or cls.get("class") or "memory-safety fault"
@@ -56,6 +114,9 @@ def _file_confirmed(ctx, target, r) -> None:
         isolation=f"source_confirm/{harness}", defect_key=f"source_confirm:{key}",
         note=f"{rung} confirmation: {klass}" + (f" at {src_line}" if src_line else "")
              + f" [{harness}]")
+    # A static candidate at the SAME site with the SAME class is now dynamically proven -- link and
+    # upgrade it, so the discovery scanners' leads are promoted by the proof rather than left behind.
+    return _crossref_static(ctx, target, src_line, cwe, input_sha, harness)
 
 
 def source_confirm_stage(ctx) -> dict:
@@ -118,13 +179,16 @@ def source_confirm_stage(ctx) -> dict:
 
     per = max(30, int((budget * 0.6) / max(1, len(harnesses))))
     proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx)
+    upgraded = 0
     for r in proven:
-        _file_confirmed(ctx, target, r)
+        upgraded += _file_confirmed(ctx, target, r)
         ctx.progress(msg=f"CONFIRMED (non-fuzzing {r.get('rung')}): {r.get('class')} "
                          f"via {r.get('harness')}")
     ctx.emit("source_confirm.done", payload={"supported": True, "harnesses": len(harnesses),
-             "confirmed": len(proven), "rungs": sorted({r.get("rung") for r in proven})})
-    return {"metrics": {"supported": True, "harnesses": len(harnesses), "confirmed": len(proven)}}
+             "confirmed": len(proven), "upgraded": upgraded,
+             "rungs": sorted({r.get("rung") for r in proven})})
+    return {"metrics": {"supported": True, "harnesses": len(harnesses), "confirmed": len(proven),
+                        "upgraded": upgraded}}
 
 
 def register() -> None:

@@ -2094,6 +2094,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # strictly more. The stage no-ops without recovered stack buffers.
                 if _expensive_substrate(t):
                     _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
+                # NON-FUZZING FIRST on a SOURCE target: the confirmation LADDER (deterministic
+                # template -> concolic/AEG -> directed smart-fuzz) is the primary discovery+proof
+                # path, so it runs BEFORE the blind/coverage libFuzzer campaign below -- which is
+                # thereby demoted to a corroborator, the order the operator set. The ladder solves
+                # parser gates a blind campaign cannot (a 2-byte magic constant is 1/65536) and
+                # proves a bug with a concrete ASan fault under a negative control; its smart-fuzz
+                # floor covers the projects whose static link the concolic rung cannot build
+                # (FreeRDP's shared-OpenSSL cascade). The stage self-gates -- it reports unsupported
+                # cheaply (no build) for a binary-only target or a source tree with no in-tree
+                # harness -- so scheduling it unconditionally costs those nothing.
+                _staged(bud, store, t, "source_confirm", status, stop, want=240.0)
                 # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
                 # strongest crash finder available -- thousands of executions a second with a
                 # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
