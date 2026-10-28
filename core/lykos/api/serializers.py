@@ -11,6 +11,13 @@ _INGEST = "ingest_triage"
 _REPORT_FORMATS = {"html", "pdf", "sarif", "json"}
 
 
+def _stage_label(name):
+    """Human label for a finding's producing stage, from the stage registry. Lazy import keeps the
+    analyze package out of the server's import path until a finding is actually serialized."""
+    from ..analyze.stages import label_for
+    return label_for(name)
+
+
 def _csv(vals):
     """Parse a repeated/CSV query param into a list, or None if absent."""
     if not vals:
@@ -73,6 +80,9 @@ def _finding(f, sites=None, site_count=None, proven=0):
          "title": f.title, "severity": f.severity, "state": f.state,
          "confidence": f.confidence, "function_addr": f.function_addr,
          "site_addr": f.site_addr, "detector": f.detector, "evidence": f.evidence,
+         # The pipeline stage that discovered this finding (doc 49 Themes 1a/2b) + its human label,
+         # so the UI can link a finding back to the stage on the pipeline rail. None when unknown.
+         "stage": f.stage, "stage_label": _stage_label(f.stage),
          # the dedup key lets the UI fold an unlocated crash into its located, analysed twin
          "dedup_key": f.dedup_key}
     if sites is not None:

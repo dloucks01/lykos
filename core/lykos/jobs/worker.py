@@ -25,6 +25,7 @@ from ..casestore import ContentStore
 from ..db.connection import connect
 from ..db.models import AnalysisRun
 from .config import JobConfig
+from ..db.provenance import reset_current_stage, set_current_stage
 from .context import JobContext, StageCancelled, StageTimeout
 from .queue import JobQueue
 from .registry import StageDef, get_stage, validate_params
@@ -359,6 +360,10 @@ class WorkerPool:
                         stage=run.stage)
         hb.start()
         started = time.time()
+        # Stamp the ambient stage so findings this stage files record WHICH stage discovered them
+        # (doc 49 Themes 1a/2b). Per-thread, so concurrent workers never cross-contaminate; reset in
+        # the finally below whatever the stage's outcome.
+        _stage_tok = set_current_stage(run.stage)
         try:
             result = sd.fn(ctx)
             ctx.check_cancel()  # honor cancel/timeout requested during the stage
@@ -397,6 +402,7 @@ class WorkerPool:
             q.fail(run_id, repr(e), worker_id=wid)
             self._bump("error")
         finally:
+            reset_current_stage(_stage_tok)
             # Deregister -- but only if the supervisor has not already retired us and handed idx to
             # a replacement worker (identity check avoids clobbering the replacement's record).
             with self._alock:

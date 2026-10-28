@@ -143,6 +143,18 @@ def _by_name() -> dict:
     return {s.name: s for s in STAGES}
 
 
+def label_for(name: Optional[str]) -> Optional[str]:
+    """A human label for a stage name (for the GUI/report provenance link). Uses the declared plan
+    label; falls back to a titleised name for the on-demand stages (whose plan label is empty) and
+    returns the name unchanged for anything not in the registry. None maps to None."""
+    if not name:
+        return None
+    s = _by_name().get(name)
+    if s is None:
+        return name
+    return s.label or name.replace("_", " ").capitalize()
+
+
 def check_consistency() -> None:
     """Internal-consistency invariants of the registry (pinned by the scheduling-invariant test).
 

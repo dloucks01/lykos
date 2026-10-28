@@ -9,9 +9,30 @@ Captured from the operator's own words:
 > from one thing to the next.
 
 This is the roadmap for the **next** build, not a change to the one just shipped (the gate-verified
-`dist/lykos-offline-20261022-x86_64` bundle). Nothing here is applied yet. It is written to be
-**driven** — each item is anchored to a real file, prioritized, and sized — so the next session can
-start at the top and go.
+`dist/lykos-offline-20261022-x86_64` bundle). It is written to be **driven** — each item is anchored
+to a real file, prioritized, and sized — so the next session can start at the top and go.
+
+## Progress (updated as items land)
+
+- **1a — single stage registry: DONE.** `core/lykos/analyze/stages.py` is the one declarative
+  source; `orchestrate` derives `_TARGET`/`_CASE`/`_ON_DEMAND`/`_NO_PARAMS`/`_PLAN_STAGES` from it
+  (byte-identical to the old literals, verified against a pre-refactor oracle). `stages.check_consistency()`
+  fails loud on an inconsistent descriptor; `tests/test_stage_registry.py` pins that the declared
+  dispatchable set equals the job registry. (`directed._TARGET_DETECTORS` left as-is — it is a
+  finding-source steering set, not a stage list.)
+- **2b — finding-centric cross-links: mostly already shipped** (opportunistically, in 4984123):
+  `FindingCard` hops to the code view (`viewCode`), the call-graph node (`showInGraph`), the
+  per-channel evidence trail, and the PoC downloads; the evidence modal links onward. The remaining
+  spine piece was provenance, below.
+- **Finding→stage provenance: DONE.** `finding.stage` (migration 19) records WHICH stage discovered
+  a finding, stamped authoritatively by the worker from the running run's stage via a per-thread
+  contextvar (`db/provenance.py`); the discoverer keeps the credit (mirrors `detector`), and unknown
+  provenance stays NULL (never guessed). Exposed in the API + report model (`stage` + `stage_label`
+  from the registry) and shown on the finding card ("found by <stage>"). `tests/test_finding_stage_provenance.py`
+  pins the stamping, the discoverer rule, the blank-when-unknown rule, and the worker wiring
+  end-to-end. Remaining within 2b: make the "found by" chip and the pipeline rail clickable (a
+  finding↔stage navigation hop) — deferred because the GUI interaction cannot be execution-verified
+  in this environment.
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC

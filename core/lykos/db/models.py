@@ -232,6 +232,10 @@ class Finding:
     site_addr: Optional[str] = None
     detector: Optional[str] = None
     evidence: list = field(default_factory=list)
+    # The pipeline stage that discovered this finding (doc 49 Themes 1a/2b). Stamped at emission
+    # from the running run's stage; the discoverer keeps the credit, like `detector`. None when the
+    # finding predates the provenance migration or was written outside a stage.
+    stage: Optional[str] = None
 
 
 @dataclass

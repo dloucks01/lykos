@@ -716,6 +716,7 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
           <div class="find-meta">
             <span class="cwe cwe-info" title=${cweTip(finding)}>${finding.cwe}</span>
             ${finding.detector ? html`<span class="det">via ${finding.detector}</span>` : null}
+            ${finding.stage_label ? html`<span class="det stage-prov" title="the pipeline stage that discovered this finding">found by ${finding.stage_label}</span>` : null}
             ${site ? html`<span class="at">at <code>${site}</code></span>` : null}
             ${finding.group_count > 1 ? html`<span class="sites">${finding.group_count} occurrences</span>` : (finding.site_count ? html`<span class="sites">${finding.site_count} site${finding.site_count === 1 ? "" : "s"}${finding.proven_sites ? ` · ${finding.proven_sites} proven` : ""}</span>` : null)}
           </div>

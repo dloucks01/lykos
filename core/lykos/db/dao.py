@@ -15,6 +15,7 @@ from typing import Any, Optional
 from .. import observe
 from ..hashing import new_id
 from .connection import transaction
+from .provenance import current_stage
 from .models import (
     ARTIFACT_ROLES,
     FINDING_STATES,
@@ -648,19 +649,28 @@ class FindingDAO(BaseDAO):
                 # with a demonstrated effect -- may take it.
                 detector = (c.get("detector") if (c.get("authoritative") or not row["detector"])
                             else row["detector"])
+                # `stage` is provenance -- WHICH stage discovered this -- and follows the same
+                # discoverer-keeps-credit rule as `detector`: the stage that first filed the finding
+                # keeps the credit, and only an authoritative classifier (or an empty prior) may
+                # take it. The candidate's stage is its own `stage` if given, else the ambient stage
+                # of the run currently executing.
+                cand_stage = c.get("stage") or current_stage()
+                prev_stage = _opt_col(row, "stage")
+                stage = cand_stage if (c.get("authoritative") or not prev_stage) else prev_stage
                 self.conn.execute(
                     "UPDATE finding SET state=?, severity=?, confidence=?, evidence_json=?, "
-                    "detector=?, updated_at=? WHERE id=?",
-                    (state, severity, confidence, dumps(evidence), detector, now, row["id"]))
+                    "detector=?, stage=?, updated_at=? WHERE id=?",
+                    (state, severity, confidence, dumps(evidence), detector, stage, now, row["id"]))
             else:
                 self.conn.execute(
                     "INSERT INTO finding(id,target_id,case_id,cwe,title,severity,state,"
-                    "confidence,function_addr,site_addr,detector,dedup_key,evidence_json,"
-                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "confidence,function_addr,site_addr,detector,stage,dedup_key,evidence_json,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (new_id(), target_id, case_id, c.get("cwe"), c.get("title"),
                      c.get("severity", "info"), c.get("state", "candidate"),
                      c.get("confidence", 0.0), c.get("function_addr"), c.get("site_addr"),
-                     c.get("detector"), key, dumps(ev_new), now, now))
+                     c.get("detector"), c.get("stage") or current_stage(), key,
+                     dumps(ev_new), now, now))
             fid = self.conn.execute(
                 "SELECT id FROM finding WHERE target_id=? AND dedup_key=?",
                 (target_id, key)).fetchone()["id"]
@@ -923,7 +933,8 @@ class FindingDAO(BaseDAO):
                        updated_at=r["updated_at"], cwe=r["cwe"], title=r["title"],
                        severity=r["severity"], state=r["state"], confidence=r["confidence"],
                        function_addr=r["function_addr"], site_addr=r["site_addr"],
-                       detector=r["detector"], evidence=loads(r["evidence_json"]) or [])
+                       detector=r["detector"], evidence=loads(r["evidence_json"]) or [],
+                       stage=_opt_col(r, "stage"))
 
 
 def _opt_col(row: sqlite3.Row, name: str) -> Any:

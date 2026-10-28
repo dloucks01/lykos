@@ -21,6 +21,7 @@ from ..db.dao import (
     PocDAO,
     TargetDAO,
 )
+from ..analyze.stages import label_for as _stage_label_report
 from ..db.models import FINDING_STATES, SEVERITIES
 from ..jobs.registry import cached_output_json
 
@@ -569,6 +570,9 @@ def build_report(
                 "confidence": round(f.confidence or 0.0, 3),
                 "function_addr": f.function_addr, "site_addr": f.site_addr,
                 "detector": f.detector, "evidence": _ev_prose,
+                # The pipeline stage that discovered this finding (doc 49 Themes 1a/2b), so the
+                # report's provenance reads the same chain the GUI does. None when unknown.
+                "stage": f.stage, "stage_label": _stage_label_report(f.stage),
                 # Parsed, under its own key, so a renderer can present the effect LIST instead
                 # of the blob and nothing has to re-parse a string.
                 "effects": _ev_struct.get("effects") or [],

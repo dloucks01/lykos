@@ -366,4 +366,12 @@ ALTER TABLE target ADD COLUMN toolchain_hint TEXT;
 -- case-delete cascade) full-scans run_artifact to check for referencing rows. Index it.
 CREATE INDEX IF NOT EXISTS ix_run_artifact_sha ON run_artifact(artifact_sha256);
 """),
+    Migration(version=19, name="finding_stage", sql=r"""
+-- doc 49 Themes 1a/2b: the pipeline stage that DISCOVERED a finding, stamped authoritatively at
+-- emission time (the worker sets it from the running run's stage; the discoverer keeps the credit,
+-- mirroring `detector`). This is the provenance the GUI/report use to link a finding back to the
+-- stage that produced it. NULL for findings written before this migration or outside any stage --
+-- provenance we do not know is left blank, never guessed.
+ALTER TABLE finding ADD COLUMN stage TEXT;
+"""),
 ]
