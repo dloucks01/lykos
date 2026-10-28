@@ -2077,6 +2077,24 @@ const _sameSeg = (a, b) => a && b && a.severity === b.severity && a.cwe === b.cw
 // CWE bar calls onFilter to narrow the findings list (click again to clear); hovering shows a
 // native <title> tooltip. onFilter is optional, so this renders -- and tests -- with or without the
 // interactive wiring.
+// The engagement map (doc 49 Theme 2a): the analysis path recover -> detect -> search -> prove,
+// each phase a clickable node that jumps to the tab where that phase's work lives. A reached phase
+// is solid; an unreached one is muted and inert -- so the map shows honestly how far this run got.
+export function EngagementMap({ phases, onNav }) {
+  if (!phases || !phases.length) return null;
+  return html`<div class="engmap">
+    ${phases.map((p, i) => html`
+      ${i ? html`<span class="engmap-arrow" key=${"a" + i}>▸</span>` : null}
+      <div key=${p.label}
+        class=${`engmap-node${p.reached ? " reached" : " muted"}${p.reached && p.nav ? " clk" : ""}`}
+        onClick=${() => (p.reached && p.nav && onNav ? onNav(p.nav) : null)}
+        title=${p.reached ? (p.nav ? `Go to ${p.nav}` : "") : "not reached in this run"}>
+        <span class="engmap-lbl">${p.label}</span>
+        <span class="engmap-sub">${p.detail}</span>
+      </div>`)}
+  </div>`;
+}
+
 export function CaseOverview({ findings, pocs, filter, onFilter }) {
   const fs = findings || [];
   if (!fs.length) return null;

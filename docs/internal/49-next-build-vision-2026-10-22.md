@@ -74,8 +74,13 @@ to a real file, prioritized, and sized — so the next session can start at the 
   SVG→PDF translator). +3 tests. NOTE: the audit confirm-hardening (doc-48 follow-up) is already
   DONE — verified every leak.py shell confirm uses make_code_markers()+markers.proves and
   test_exploit_confirm_hardening.py (21) is green; the stale roadmap text is corrected in memory.
-  The engagement map's LIVE/clickable GUI home-view (driving the other tabs) remains — deferred as
-  GUI interaction is not execution-verifiable here.
+- **Theme 2a engagement map — LIVE in the GUI: DONE.** `EngagementMap` (components.js) renders the
+  path Recover → Detect → Search → Prove as clickable phase nodes in the findings tab; each reached
+  node jumps to the tab where that phase's evidence lives (Recover→functions, Detect→findings,
+  Search→coverage/crashes, Prove→exploits), and an unreached phase is muted and inert. Phases are
+  computed per active target from live data (functions, findings, coverage/crashes, verdict level).
+  VERIFIED by driving the running build in the browser: all four nodes render with correct state
+  (Prove correctly MUTED "no PoC"), and clicking Search navigated to the Crashes panel.
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC

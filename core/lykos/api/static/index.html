@@ -714,6 +714,18 @@
   .wb-rollup .rollup-bad { color: var(--bad); font-weight: 600; }
   .wb-rollup .rollup-warn { color: var(--warn); }
   .wb-rollup .rollup-muted { color: var(--faint); }
+  /* Engagement map (doc 49 Theme 2a): the analysis path as clickable phase nodes. */
+  .engmap { display: flex; align-items: stretch; flex-wrap: wrap; gap: 0; margin: 0 0 14px; }
+  .engmap-node { flex: 1 1 0; min-width: 110px; display: flex; flex-direction: column;
+    justify-content: center; padding: 9px 12px; border: 1px solid var(--line);
+    border-radius: var(--radius); background: var(--panel); cursor: pointer;
+    transition: border-color .15s, background .15s; }
+  .engmap-node.clk:hover { border-color: var(--accent); background: var(--panel-2); }
+  .engmap-node.reached { border-color: var(--accent); }
+  .engmap-node.muted { opacity: .5; cursor: default; }
+  .engmap-lbl { font-weight: 600; font-size: .9rem; color: var(--ink); }
+  .engmap-sub { font-size: .74rem; color: var(--muted); margin-top: 2px; }
+  .engmap-arrow { display: flex; align-items: center; color: var(--faint); padding: 0 7px; }
   /* compact target strip (2-pane: replaces the right drawer) */
   .wb-metabar { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
     padding: 8px 12px; margin-bottom: 12px; }

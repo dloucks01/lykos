@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction, failedTargets, operatorSettings } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, CurationFilter,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, EngagementMap, CurationFilter,
   RunSignalsStrip, DoctorPanel, SeedsField, BuildFoot,
 } from "./components.js";
 
@@ -1250,6 +1250,28 @@ function App() {
   // Tab metadata (label + optional count), and the GROUPING that keeps the top bar to one row:
   // the code views (functions/disasm/strings) and the dynamic views (crashes/coverage/heap/taint/
   // cves) each collapse under one group with a contextual sub-tab row, instead of 11 flat tabs.
+  // Engagement map phases (doc 49 Theme 2a) for the active target: the path from recovery to proof,
+  // each node clickable to the tab where that phase's evidence lives, muted when not reached.
+  const _acov = activeTarget ? coverage[activeTarget.id] : null;
+  const engPhases = activeTarget ? [
+    { label: "Recover",
+      detail: activeFuncs && activeFuncs.length ? `${activeFuncs.length} functions` : "binary loaded",
+      reached: true, nav: "functions" },
+    { label: "Detect",
+      detail: `${activeRanked.length} finding${activeRanked.length === 1 ? "" : "s"}`,
+      reached: activeRanked.length > 0, nav: "findings" },
+    { label: "Search",
+      detail: _acov && _acov.pct != null ? `${_acov.pct}% covered`
+        : activeCrashes.length ? `${activeCrashes.length} crash${activeCrashes.length === 1 ? "" : "es"}`
+        : "not executed",
+      reached: !!(hasCoverage || activeCrashes.length),
+      nav: hasCoverage ? "coverage" : activeCrashes.length ? "crashes" : null },
+    { label: "Prove",
+      detail: activeVerdict && activeVerdict.level ? `L${activeVerdict.level}`
+        : activeVerdict && activeVerdict.candidateLevel ? `candidate L${activeVerdict.candidateLevel}`
+        : "no PoC",
+      reached: !!(activeVerdict && activeVerdict.level), nav: "exploits" },
+  ] : [];
   const tabMeta = {
     findings: { label: "Findings", n: activeRanked.length },
     exploits: { label: "Exploits", n: activePocs.length },
@@ -1421,6 +1443,7 @@ function App() {
                      and the remedy (supply the target's libraries) belongs where the operator reads
                      the results, not only in the Console tab. -->
                 <${DynamicCoverageBanner} health=${fuzzHealth} ran=${ran} />
+                ${engPhases.length ? html`<${EngagementMap} phases=${engPhases} onNav=${setTab} />` : null}
                 ${activeRanked.length ? html`<${CaseOverview} findings=${activeRanked}
                   pocs=${activePocs} filter=${viz} onFilter=${setViz} />` : null}
                 ${activeRanked.length ? html`<${CurationFilter} mode=${curFilter} onChange=${setCurFilter} counts=${curCounts} />` : null}
