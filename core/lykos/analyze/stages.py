@@ -89,6 +89,8 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("net_fuzz", "Network fuzzing", "target", "..analyze.fuzz", "enqueue_net_fuzz", no_params=True),
     StageSpec("boundary_fuzz", "IPC boundary fuzzing", "target", "..analyze.link", "enqueue_boundary", no_params=True),
     StageSpec("libfuzzer", "libFuzzer harness", "target", "..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
+    StageSpec("source_confirm", "Directed source confirmation", "target",
+              "..analyze.source_confirm_stage", "enqueue_source_confirm"),
     StageSpec("env_fuzz", "Env-var fuzzing", "target", "..analyze.fuzz", "enqueue_env_fuzz", no_params=True),
     StageSpec("cve_poc", "CVE weaponization", "target", "..analyze.poc", "enqueue_cve_poc", no_params=True),
     StageSpec("cve_corroborate", "CVE corroboration", "target", "..analyze.fingerprint", "enqueue_cve_corroborate", no_params=True),

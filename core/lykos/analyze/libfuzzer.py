@@ -1696,7 +1696,8 @@ def _cmake_disable_flags(pkg: str) -> list:
 
 
 def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = None,
-                          want=None, shared: bool = True, sanitize: bool = True) -> dict:
+                          want=None, shared: bool = True, sanitize: bool = True,
+                          build_name: str = "_lykos_fuzzbuild") -> dict:
     """Build a CMake project's IN-TREE libFuzzer harnesses (files defining LLVMFuzzerTestOneInput)
     with the project's OWN cmake -- which generates its config headers and resolves its include/link
     graph, neither of which a per-translation-unit compile can do for a large project (FreeRDP's
@@ -1732,7 +1733,7 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
         return res
     if deadline is None:
         deadline = _time.time() + timeout * 4
-    bd = root / "_lykos_fuzzbuild"
+    bd = root / build_name              # distinct names let the explore + replay builds coexist
     confine = _configure_confinement(root)
     env = dict(os.environ)
     if confine:

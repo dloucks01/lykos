@@ -19,6 +19,7 @@ from .ingest import INGEST_TRIAGE_STAGE, ingest  # noqa: F401
 from .ingest import register as _register_ingest
 from .libfuzzer_stage import register as _register_libfuzzer
 from .link import register as _register_link
+from .source_confirm_stage import register as _register_source_confirm
 from .patch_diff_stage import register as _register_patch_diff
 from .poc import register as _register_poc
 from .scan_stages import register as _register_scans
@@ -34,6 +35,7 @@ def register() -> None:
     _register_fuzz()
     _register_harness()
     _register_libfuzzer()
+    _register_source_confirm()
     _register_poc()
     _register_patch_diff()
     _register_scans()
