@@ -58,3 +58,50 @@ needs_rizin = pytest.mark.skipif(
     shutil.which("rizin") is None,
     reason="SystemZ call-edge/import naming is validated against rizin; only r2/radare2 is present "
            "here, which recovers the s390 call graph but does not name the static `read` import")
+
+
+def find_old_glibc(max_ver=(2, 42), min_ver=(2, 36)):
+    """Locate the NEWEST glibc in [min_ver, max_ver] on this host as a (version, libc.so.6, ld.so)
+    triple -- the OLD-GLIBC CONFIRMATION LANE. The classic heap/FSOP/tcache chains skip on a
+    hardened (>=2.43) build host (`glibc_hardened_heap`); this finds a real pre-hardening glibc to
+    CONFIRM them end-to-end instead of only asserting their structure. Scans $LYKOS_OLD_GLIBC_DIR
+    (a directory holding both files) and the podman/docker container overlay stores. Newest-in-range
+    is chosen so a target compiled against the host's modern glibc still loads (symbol-version
+    compatibility) while the runtime heap is the unhardened one the technique targets. Returns None
+    (-> the lane skips cleanly) on a host with no such glibc. Cached."""
+    import glob
+    import re
+    cache = getattr(find_old_glibc, "_cache", {})
+    key = (max_ver, min_ver)
+    if key in cache:
+        return cache[key]
+    roots = []
+    env = os.environ.get("LYKOS_OLD_GLIBC_DIR")
+    if env:
+        roots.append(env)
+    roots += glob.glob(os.path.expanduser("~/.local/share/containers/storage/overlay/*/diff"))
+    roots += glob.glob("/var/lib/docker/overlay2/*/diff")
+    cands = []
+    for root in roots:
+        for libc in (glob.glob(f"{root}/lib/x86_64-linux-gnu/libc.so.6")
+                     + glob.glob(f"{root}/lib/libc.so.6") + glob.glob(f"{root}/libc.so.6")):
+            ld = next((c for c in (os.path.join(os.path.dirname(libc), "ld-linux-x86-64.so.2"),
+                                   os.path.join(root, "lib64/ld-linux-x86-64.so.2"),
+                                   os.path.join(root, "lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"))
+                       if os.path.exists(c)), None)
+            if not ld:
+                continue
+            try:
+                with open(libc, "rb") as f:
+                    m = re.search(rb"release version (\d+)\.(\d+)", f.read())
+            except OSError:
+                m = None
+            if not m:
+                continue
+            ver = (int(m.group(1)), int(m.group(2)))
+            if min_ver <= ver <= max_ver:
+                cands.append((ver, libc, ld))
+    result = max(cands, default=None)                    # newest in range
+    cache[key] = result
+    find_old_glibc._cache = cache
+    return result
