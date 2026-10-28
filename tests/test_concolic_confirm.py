@@ -84,6 +84,41 @@ def test_concolic_confirm_solves_gate_and_confirms(tmp_path):
     assert res["rung"] == "concolic"
 
 
+@pytest.mark.skipif(not (shutil.which("cmake") and shutil.which("clang")), reason="needs cmake + clang")
+def test_confirm_ladder_proves_via_concolic_rung(tmp_path):
+    """The ladder orchestration: given the harness descriptors, confirm_ladder tries the rungs
+    smartest-first (template -> concolic -> smart-fuzz) and returns the proven bug tagged with the
+    rung that proved it. The template/smart-fuzz rungs are not implemented yet, so the gated overflow
+    is proved by the concolic rung."""
+    from lykos.analyze import libfuzzer as LF
+    from lykos.analyze.symbolic import concolic as C
+    from lykos.analyze.symbolic import directed_confirm as DC
+    if C.locate_angr_python() is None:
+        pytest.skip("angr not available")
+    probe = tmp_path / "p.c"
+    probe.write_text("int LLVMFuzzerTestOneInput(const unsigned char*d,unsigned long s){return 0;}\n")
+    if subprocess_rc([shutil.which("clang"), "-fsanitize=fuzzer,address", str(probe),
+                      "-o", str(tmp_path / "p.bin")]):
+        pytest.skip("this clang cannot link -fsanitize=fuzzer")
+    de = tmp_path / "explore"
+    de.mkdir()
+    _mk(de)
+    dr = tmp_path / "replay"
+    dr.mkdir()
+    _mk(dr)
+    eb = LF.cmake_build_harnesses(de, timeout=180, shared=False, sanitize=False)
+    rb = LF.cmake_build_harnesses(dr, timeout=180, shared=False, sanitize=True)
+    assert eb["ok"] and rb["ok"]
+    harnesses = [{"name": "TestFuzzGate", "explore_binary": eb["harnesses"][0]["binary"],
+                  "replay_binary": rb["harnesses"][0]["binary"], "lib_dirs": rb["lib_dirs"],
+                  "input_size": 64}]
+    proven = DC.confirm_ladder(harnesses, timeout_per=120)
+    assert len(proven) == 1, f"ladder did not prove the bug: {proven}"
+    p = proven[0]
+    assert p["harness"] == "TestFuzzGate" and p["rung"] == "concolic"
+    assert "stack-buffer-overflow" in (p["report"] or "")
+
+
 def subprocess_rc(argv):
     import subprocess
     return subprocess.run(argv, capture_output=True).returncode

@@ -101,3 +101,61 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
         return out
     out["reason"] = f"no concolic-generated input faulted under ASan ({len(cands)} tried)"
     return out
+
+
+# ---- the confirmation LADDER ---------------------------------------------------------------------
+# Rungs tried SMARTEST-FIRST per the operator's order: a deterministic template (no solver, no
+# fuzzing), then concolic (solver, no fuzzing), then directed SMART fuzzing (stochastic but steered --
+# the floor). Discovery stays static; this only CONFIRMS a discovered bug by producing a concrete
+# ASan fault. Each rung takes a harness descriptor and returns a confirm dict (see concolic_confirm)
+# or None when it does not apply / cannot synthesize. The first rung that confirms wins, and the
+# result records WHICH rung proved it.
+
+
+def _rung_template(h, *, timeout, ctx):
+    """B2 (deterministic template synthesis): construct the triggering input directly from a
+    recognised bug shape (length-field -> oversized value, OOB index, %n, integer-overflow alloc).
+    Not yet implemented -- an ordered hook so the ladder tries it FIRST when it lands."""
+    return None
+
+
+def _rung_concolic(h, *, timeout, ctx):
+    return concolic_confirm(
+        h["explore_binary"], h.get("replay_binary") or h["explore_binary"],
+        harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
+        input_size=int(h.get("input_size", 256)), lib_dirs=h.get("lib_dirs"),
+        targets=h.get("targets"), timeout=timeout, ctx=ctx)
+
+
+def _rung_smartfuzz(h, *, timeout, ctx):
+    """B3 (directed, structure-seeded, concolic-assisted smart fuzzing -- the floor for deep parser
+    bugs concolic cannot reach). Not yet implemented -- an ordered hook below concolic."""
+    return None
+
+
+_LADDER = (_rung_template, _rung_concolic, _rung_smartfuzz)
+
+
+def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None) -> list:
+    """Run the non-fuzzing confirmation ladder over a set of harness descriptors and return the
+    CONFIRMED bugs. Each harness is {name, explore_binary, replay_binary?, lib_dirs?, input_size?,
+    harness_fn?, targets?}. For each harness the rungs are tried smartest-first; the first that
+    confirms wins. Returns [{harness, confirmed:True, input, report, source, class, rung}] -- the
+    proven PoCs, each tagged with the rung that proved it. Deduped by (source, class) so the same
+    defect reached through two harnesses is reported once (the first harness that proved it)."""
+    out: list = []
+    seen: set = set()
+    for h in harnesses:
+        for rung in _LADDER:
+            try:
+                r = rung(h, timeout=timeout_per, ctx=ctx)
+            except Exception as e:                           # noqa: BLE001 -- a rung must never abort
+                r = {"confirmed": False, "reason": f"{rung.__name__} error: {e}"}
+            if r and r.get("confirmed"):
+                key = (r.get("source"), r.get("class"))
+                if key in seen:
+                    break
+                seen.add(key)
+                out.append({"harness": h.get("name"), **r})
+                break
+    return out
