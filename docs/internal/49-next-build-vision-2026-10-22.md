@@ -157,11 +157,29 @@ to a real file, prioritized, and sized — so the next session can start at the 
   trampoline is often GC'd out of a static binary. So the generalizable cross-arch primitive stays
   ret2libc (needs a `system` symbol / libc), NOT raw syscall-ROP.
 
-  REMAINING 5a: (1) extend the leak→relocate path to the other verifiable arches (same recipe:
-  run_wrapper + word/endian + tight payload); (2) the biggest lever — wire the shared stack-ret2libc
-  builder into the PIE leak path (base-rebased `payload_for_base` + single-process leak_and_exploit
-  confirmation) for cross-arch NX-on static-PIE ret2libc; (3) cross-arch ORW/leak chains where
-  gadgets permit. (mips stays unbuildable here — no compiler; arm uses armhf, not arm-linux-gnueabi.)
+- **Theme 5a: cross-arch NX-on PIE ret2libc via info-leak DONE (riscv64 + loongarch64).** The
+  "biggest lever" — the NX-on PIE case where ret2win isn't available (no win()). `_pie_leak_exploit`'s
+  emulated branch now routes a foreign-CPU PIE with no win() to `_pie_cross_ret2libc_exploit`: it
+  leaks a code pointer, recovers the load base (`recover_pie_base`, arch-neutral), and drives the
+  SINGLE-PROCESS `leak_and_exploit` loop with a `payload_for_base` that rebases the shared RISC-style
+  ret2libc chain (loader+caller) onto the leaked base — loader/caller/system/"/bin/sh" are all at
+  base + their ELF vaddr. Confirmed by a spawned shell evaluating a forgery-proof nonce. A bounded
+  (trigger → pair → stack_pos) search finds the working layout; a trigger that discloses no base is
+  dropped after one attempt. Single-process is the point: the gdbstub ret2libc path
+  (drive_cross_ret2libc) confirms in SEPARATE processes and cannot hold one ASLR layout across the
+  leak and the hijack — so this is the route a randomized base needs.
+  Static-PIE collapses the two-base problem (one leaked code pointer rebases the whole chain); qemu
+  pins the static-PIE base (so the ASLR *entropy* isn't exercised under qemu, but the exploit is
+  base-recovered-from-leak by construction, so it defeats ASLR on real hardware / a randomized base).
+  VERIFIED end-to-end: static-PIE NX-on riscv64 AND loongarch64 (no win()) → confirmed L3
+  `leak+ret2libc-pie-<arch>`. +`test_pie_leak_ret2libc_cross.py` (both arches); native x86 PIE-leak +
+  cross-arch ret2libc + archgate suites green.
+
+  REMAINING 5a: (1) extend the leak→relocate paths to the other verifiable arches (ret2win is
+  near-free; ret2libc needs a per-arch loader-shape — aarch64's `ldp` pair vs the RISC regs-dict);
+  (2) DYNAMIC-pie cross-arch ret2libc (a libc-base leak + recover_pie_base against libc, for the
+  randomized-base two-base case); (3) cross-arch ORW/leak chains where gadgets permit. (mips stays
+  unbuildable here — no compiler; arm uses armhf, not arm-linux-gnueabi.)
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
