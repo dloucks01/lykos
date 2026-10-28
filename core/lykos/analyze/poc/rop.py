@@ -1060,6 +1060,22 @@ def find_aarch64_execve_site(data: bytes):
     return None
 
 
+def find_riscv64_execve_site(data: bytes):
+    """The address of a `li a7, 221 ; ecall` sequence -- libc's RISC-V 64 execve syscall site, the
+    riscv analogue of `find_aarch64_execve_site`. Reaching it with a0=&"/bin/sh", a1=0, a2=0 is
+    execve("/bin/sh", NULL, NULL): the no-`system` L3 route. 221 is the riscv64 execve syscall number;
+    jumping to the `li a7,221` sets a7 and the following `ecall` makes the call with a0/a1/a2 as set by
+    the chain. Returns the va of the `li a7,221`, or None. Pure byte decode (no riscv objdump here).
+
+    `li a7,221` is `addi a7,x0,221` = 0x0DD00893 (221 fits a 12-bit immediate, so there is no `lui`
+    pair), `ecall` is 0x00000073; both are 4-byte even under RVC, and the pair is contiguous in libc's
+    execve thunk. Searched at 2-byte alignment because preceding compressed code can place the `addi`
+    on a 2-byte boundary. (As on aarch64, a bare `ecall` reached with a7 already 221 would also work,
+    but the a7 would then need a gadget; the li+ecall pair sets it for us.)"""
+    pat = bytes((0x93, 0x08, 0xD0, 0x0D, 0x73, 0x00, 0x00, 0x00))   # addi a7,x0,221 ; ecall (LE)
+    return _find_exec(data, pat, align=2)
+
+
 def find_arm_r0pc_gadgets(data: bytes):
     """ARM (32-bit, ARM mode) `pop {r0, ..., pc}` gadgets -- LDMFD sp!, {rlist} with both r0 and pc
     in the list. LDM loads in register-number order from low memory, so r0 (lowest) comes off [sp]

