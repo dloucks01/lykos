@@ -103,6 +103,8 @@ def _hexrgb(h: str) -> tuple:
 # class token(s) -> (fill hex or None, stroke hex or None, line-width). Mirrors figures._STYLE's
 # light defaults. A token set is matched most-specific first.
 _FILL = {
+    ("map-node", "muted"): ("#f4f7fb", "#c4d2e3", 1.2),
+    ("map-node",): ("#e3efff", "#1f6feb", 1.6),
     ("node", "focus"): ("#e3efff", "#1f6feb", 2.0),
     ("node",): ("#f4f7fb", "#c4d2e3", 1.2),
     ("pill", "source"): ("#e3efff", "#1f6feb", 1.2),
@@ -116,8 +118,9 @@ _FILL = {
     ("arrow",): (None, "#9fb0c3", 1.6),
 }
 # text class -> (hex, size)
-_TEXT = {"nlabel": ("#1b2430", 12.0), "plabel": ("#1b2430", 12.0),
-         "nsub": ("#5b6b7d", 10.0), "psub": ("#5b6b7d", 10.0), "cap": ("#5b6b7d", 11.0)}
+_TEXT = {"nlabel": ("#1b2430", 12.0), "plabel": ("#1b2430", 12.0), "mlabel": ("#1b2430", 12.0),
+         "nsub": ("#5b6b7d", 10.0), "psub": ("#5b6b7d", 10.0), "msub": ("#5b6b7d", 10.0),
+         "cap": ("#5b6b7d", 11.0)}
 
 
 def _shape_style(tokens: list[str]):
@@ -266,6 +269,8 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
         f'{summ.get("findings", 0)} findings across {summ.get("targets", 0)} targets  ·  '
         f'{summ.get("confirmed", 0)} confirmed  ·  {summ.get("poc_backed", 0)} PoC-backed',
         "H", 10, 0, 4)
+    # The engagement map (doc 49 Theme 2a) leads the summary, as in the HTML.
+    L += _fig_block((report.get("figures") or {}).get("engagement"))
     # Impact first, and never a level-less result without WHY: the same verdicts the HTML leads
     # with (`model.target_verdict`), so the two deliverables cannot disagree about a level.
     targets = report.get("targets", [])

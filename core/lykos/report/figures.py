@@ -54,6 +54,11 @@ svg.lyk-fig .cap{fill:var(--muted);font-size:11px}
 svg.lyk-fig .bar-bg{fill:var(--box);stroke:var(--box-br);stroke-width:1}
 svg.lyk-fig .bar-fill.good{fill:var(--good)}svg.lyk-fig .bar-fill.warn{fill:var(--warn)}
 svg.lyk-fig .bar-fill.bad{fill:var(--bad)}
+svg.lyk-fig .map-node{fill:var(--accent-box);stroke:var(--accent);stroke-width:1.6}
+svg.lyk-fig .map-node.muted{fill:var(--box);stroke:var(--box-br);stroke-width:1.2}
+svg.lyk-fig .mlabel{fill:var(--fg);font-size:12px;font-weight:600}
+svg.lyk-fig .mlabel.muted{fill:var(--muted);font-weight:500}
+svg.lyk-fig .msub{fill:var(--muted);font-size:10px}
 svg.lyk-fig .pill{fill:var(--box);stroke:var(--box-br);stroke-width:1.2}
 svg.lyk-fig .pill.source{fill:var(--accent-box);stroke:var(--accent)}
 svg.lyk-fig .pill.sink{fill:var(--box);stroke:var(--bad);stroke-width:1.6}
@@ -305,6 +310,38 @@ def patch_diff_map_svg(rows: list[dict], *, title: str = "Patch-diff map") -> Op
         if len(ins) == 2:
             d += f", insns {ins[0]}→{ins[1]}"
         parts.append(f'<text class="nsub" x="{bx + bar_w + 8}" y="{y + 15}">{esc(d)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def engagement_map_svg(phases: list[dict], *, title: str = "Engagement map") -> Optional[str]:
+    """The analysis path as a left-to-right flow (doc 49 Theme 2a, figure 1): target → recover →
+    detect → search → prove → report, each phase a node showing what it produced for this case.
+    ``phases`` are ``{label, detail, reached}``; a reached phase is drawn solid, an unreached one
+    muted -- so the figure shows honestly how far down the path this engagement got. None if empty.
+    """
+    phases = [p for p in (phases or []) if p and p.get("label")]
+    if not phases:
+        return None
+    node_w, node_h, gap = 132, 46, 26
+    width = _MARGIN * 2 + len(phases) * node_w + (len(phases) - 1) * gap
+    height = _MARGIN * 2 + node_h
+    y = _MARGIN
+    xs = [_MARGIN + i * (node_w + gap) for i in range(len(phases))]
+    parts = [_svg_open(width, height, title,
+                       "how far this engagement walked the path from target to proof"), _ARROW_DEF]
+    for i in range(len(phases) - 1):
+        x1, x2 = xs[i] + node_w, xs[i + 1]
+        parts.append(f'<path class="arrow" d="M{x1},{y + node_h // 2} L{x2 - 2},{y + node_h // 2}"/>')
+    for i, p in enumerate(phases):
+        x = xs[i]
+        muted = not p.get("reached")
+        ncls = "map-node muted" if muted else "map-node"
+        lcls = "mlabel muted" if muted else "mlabel"
+        parts.append(f'<rect class="{ncls}" x="{x}" y="{y}" width="{node_w}" height="{node_h}" rx="7"/>')
+        parts.append(f'<text class="{lcls}" x="{x + 10}" y="{y + 19}">{esc(_clip(p["label"]))}</text>')
+        if p.get("detail"):
+            parts.append(f'<text class="msub" x="{x + 10}" y="{y + 34}">{esc(_clip(str(p["detail"])))}</text>')
     parts.append("</svg>")
     return "".join(parts)
 

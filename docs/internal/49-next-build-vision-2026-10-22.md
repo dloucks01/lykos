@@ -66,6 +66,16 @@ to a real file, prioritized, and sized — so the next session can start at the 
   provenance, reachability, patch-diff) now render in BOTH the HTML and the PDF. `test_report.py`
   pins that the PDF embeds vector ops + node labels and stays structurally valid (xref intact,
   deterministic). **Theme 4 (the figure library + all its figures in both renderers) is done.**
+- **Theme 2a engagement map (figure 1): DONE (report).** `figures.engagement_map_svg` draws the
+  analysis path — Recover → Detect → Search → Prove → Report — each phase a node showing what it
+  produced for this case, reached phases solid and unreached ones MUTED (so the figure shows
+  honestly how far the run got, never implying a phase ran). `model.build_report` derives the phases
+  from the case totals; it leads the executive summary in HTML and the summary in PDF (via the same
+  SVG→PDF translator). +3 tests. NOTE: the audit confirm-hardening (doc-48 follow-up) is already
+  DONE — verified every leak.py shell confirm uses make_code_markers()+markers.proves and
+  test_exploit_confirm_hardening.py (21) is green; the stale roadmap text is corrected in memory.
+  The engagement map's LIVE/clickable GUI home-view (driving the other tabs) remains — deferred as
+  GUI interaction is not execution-verifiable here.
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC

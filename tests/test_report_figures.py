@@ -195,6 +195,45 @@ def test_report_finding_has_provenance_and_reachability_figures(store):
     _parse(figs["reachability"])
 
 
+# -- engagement map ---------------------------------------------------------------------------
+
+def test_engagement_map_wellformed_deterministic_reached_and_muted():
+    phases = [{"label": "Recover", "detail": "1 target", "reached": True},
+              {"label": "Detect", "detail": "2 findings", "reached": True},
+              {"label": "Prove", "detail": "no PoC", "reached": False}]
+    a = F.engagement_map_svg(phases)
+    b = F.engagement_map_svg(phases)
+    assert a == b
+    _parse(a)
+    assert 'class="map-node"' in a and 'class="map-node muted"' in a   # reached vs not
+    assert "Recover" in a and "Prove" in a and "no PoC" in a
+
+
+def test_engagement_map_empty_is_none_and_escapes():
+    assert F.engagement_map_svg([]) is None
+    assert F.engagement_map_svg([{"detail": "x", "reached": True}]) is None   # no label
+    svg = F.engagement_map_svg([{"label": "<x>", "detail": "<y>", "reached": True}])
+    _parse(svg)
+    assert "<x>" not in svg and "&lt;x&gt;" in svg
+
+
+def test_report_engagement_map_shows_how_far_the_path_got(store):
+    """A case with findings but no PoC: Recover/Detect reached, Prove muted (honest)."""
+    from lykos.db.dao import CaseDAO, FindingDAO, TargetDAO
+    from lykos.report.model import build_report
+    case = CaseDAO(store.conn).create("em")
+    t = TargetDAO(store.conn).upsert(case.id, "x", "d" * 64, size=1, arch="x86_64",
+                                     bits=64, endianness="little", file_type="elf")
+    FindingDAO(store.conn).upsert(t.id, case.id, {
+        "dedup_key": "k", "cwe": "CWE-121", "severity": "high", "state": "candidate",
+        "function_addr": "0x1100", "detector": "dangerous_api"})
+    rep = build_report(store, case.id, min_state="candidate")
+    emap = rep["figures"]["engagement"]
+    assert emap and "Recover" in emap and "Report" in emap
+    # no verified PoC -> the Prove phase is drawn muted (not implied done)
+    assert "no PoC" in emap
+
+
 # -- patch-diff map ---------------------------------------------------------------------------
 
 def _pd_rows():

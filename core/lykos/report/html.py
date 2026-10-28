@@ -230,6 +230,12 @@ def to_html(report: dict[str, Any]) -> str:
         headline += " Dynamic analysis was degraded on at least one target (an engine failed)."
     parts.append('<section class="card"><h2>Executive summary</h2>')
     parts.append(f'<p class="headline tone-{htone}">{esc(headline)}</p>')
+    # The engagement map (doc 49 Theme 2a) leads the summary: the path from target to proof, with
+    # each phase showing what it produced and how far this run got. Trusted, internally-escaped SVG.
+    emap = (report.get("figures") or {}).get("engagement")
+    if emap:
+        parts.append('<div class="figure engagement"><div class="fig-h">Analysis path</div>'
+                     + emap + '</div>')
     parts.append('<div class="stats">')
     parts.append(_stat(summ.get("targets", 0), "targets"))
     parts.append(_stat(summ.get("findings", 0), "findings"))

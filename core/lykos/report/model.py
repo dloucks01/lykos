@@ -402,6 +402,37 @@ def _call_graph_svg(call_edges, findings_out: list[dict]) -> Optional[str]:
         return None
 
 
+def _engagement_map_svg(targets_out: list[dict], *, findings: int, highest_level: str,
+                        poc_backed: int, confirmed: int) -> Optional[str]:
+    """The case's engagement map (doc 49 Theme 2a): the analysis path recover → detect → search →
+    prove → report, each phase showing what it produced and whether it was reached. Derived honestly
+    from the case totals -- an unreached phase is drawn muted, never implied done."""
+    nt = len(targets_out)
+    executed = sum(1 for t in targets_out if not (t.get("verdict") or {}).get("nothing_executed"))
+    best_cov = None
+    for t in targets_out:
+        fc = t.get("fuzz_coverage") or {}
+        if fc.get("pct") is not None:
+            best_cov = fc["pct"] if best_cov is None else max(best_cov, fc["pct"])
+    phases = [
+        {"label": "Recover", "detail": f"{nt} target" + ("" if nt == 1 else "s"), "reached": nt > 0},
+        {"label": "Detect", "detail": f"{findings} finding" + ("" if findings == 1 else "s"),
+         "reached": findings > 0},
+        {"label": "Search",
+         "detail": (f"{best_cov}% covered" if best_cov is not None
+                    else (f"{executed}/{nt} executed" if nt else "—")),
+         "reached": executed > 0},
+        {"label": "Prove", "detail": (f"{highest_level}, {poc_backed} PoC" if highest_level
+                                      else "no PoC"), "reached": bool(highest_level)},
+        {"label": "Report", "detail": f"{confirmed} confirmed", "reached": True},
+    ]
+    try:
+        return _figures.engagement_map_svg(phases)
+    except Exception:                               # noqa: BLE001
+        observe.absorbed(_log, "engagement map skipped")
+        return None
+
+
 def _patch_diff_map_svg(findings_out: list[dict]) -> Optional[str]:
     """The per-target patch-diff map (doc 49 Theme 4, figure 5): the changed functions this build's
     patch_diff leads name, ranked by moved score. Built from the structured patch-diff data on the
@@ -808,9 +839,16 @@ def build_report(
             "curation": {s: cur_counts[s] for s in CURATION_STATUSES if cur_counts.get(s)},
         },
         "targets": targets_out,
-        # Case-level static figures (doc 49 Theme 4). HTML/PDF embed these; SARIF stays
+        # Case-level static figures (doc 49 Themes 2a/4). HTML/PDF embed these; SARIF stays
         # machine-faithful and ignores them.
-        "figures": {"coverage": _coverage_figure(targets_out)},
+        "figures": {
+            "coverage": _coverage_figure(targets_out),
+            "engagement": _engagement_map_svg(
+                targets_out, findings=tot_findings,
+                highest_level=(max(_levels) if _levels else ""),
+                poc_backed=by_state.get("poc-backed", 0),
+                confirmed=by_state.get("confirmed", 0) + by_state.get("poc-backed", 0)),
+        },
     }
 
 
