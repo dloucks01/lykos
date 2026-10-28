@@ -37,29 +37,29 @@ from typing import Callable
 # survives arithmetic (`sub a1,a1,a5` with a5=TAG|15, a4=TAG|14 cancels to 1, then a1=TAG|10), which
 # aliases to a FALSE "a1 <- x10 copy". High-entropy independent seeds make such a coincidence
 # (a derived value equalling some other register's seed) astronomically unlikely, so only a GENUINE
-# copy/load matches -- a derived/arithmetic value matches nothing and is correctly reported as "not
-# cleanly controlled". Deterministic (fixed PRNG seed) for reproducible results.
-_MASK64 = (1 << 64) - 1
-_RNG = _random.Random(0xC0FFEE1234)
-_REG_SEED = {}                                       # reg index 1..31 -> seed value
-_STACK_SEED = {}                                     # byte offset 0..0xFF8 (step 8) -> seed value
-_used = set()
+# copy/load matches -- a derived/arithmetic value is reported as "not cleanly controlled". The seeds
+# are built PER CALL, keyed by the physical register CONSTANT (so register aliases -- riscv a1==x11,
+# or x86's own single set -- share one seed), deterministic via a fixed PRNG seed.
 
 
-def _fresh():
-    while True:
-        v = _RNG.getrandbits(62) | (1 << 62)         # canonical-ish, non-zero, high-entropy
-        if v not in _used:
-            _used.add(v)
-            return v
+def _make_seeds(reg_consts):
+    """{const: seed} for each physical register, {offset: seed} for each 8-byte stack slot in the
+    scratch stack, all distinct high-entropy values. Returns (reg_seed, reg_by_val, stack_seed,
+    stack_by_val, stack_bytes)."""
+    rng = _random.Random(0xC0FFEE1234)
+    used = set()
 
-
-for _i in range(1, 32):
-    _REG_SEED[_i] = _fresh()
-for _o in range(0, 0x1000, 8):
-    _STACK_SEED[_o] = _fresh()
-_REG_BY_VAL = {v: i for i, v in _REG_SEED.items()}   # seed value -> reg index
-_STACK_BY_VAL = {v: o for o, v in _STACK_SEED.items()}  # seed value -> stack byte offset
+    def fresh():
+        while True:
+            v = rng.getrandbits(62) | (1 << 62)
+            if v not in used:
+                used.add(v)
+                return v
+    reg_seed = {c: fresh() for c in reg_consts}
+    stack_seed = {o: fresh() for o in range(0, 0x1000, 8)}
+    stack_bytes = b"".join(stack_seed[o].to_bytes(8, "little") for o in range(0, 0x1000, 8))
+    return (reg_seed, {v: c for c, v in reg_seed.items()},
+            stack_seed, {v: o for o, v in stack_seed.items()}, stack_bytes)
 
 
 def available() -> bool:
@@ -122,7 +122,67 @@ def _riscv64_cfg() -> _ArchCfg:
         all_gpr=[f"x{i}" for i in range(1, 32)], is_term=_riscv64_is_term)
 
 
-_ARCHS = {"riscv64": _riscv64_cfg, "riscv": _riscv64_cfg}
+# ---- x86-64 --------------------------------------------------------------------------------------
+# System V: rdi,rsi,rdx,rcx,r8,r9 carry syscall/call args; rax the syscall number. A gadget TAIL here
+# is `ret` (0xC3) -- which POPS the next gadget address off the stack, so chaining is the classic
+# stack layout (no ra register). `ret imm16` (0xC2) adjusts rsp and is handled too. (A `syscall`
+# site is the chain's FINAL target, supplied to the solver, not a chaining terminator.)
+def _x86_64_is_term(data: bytes, i: int):
+    b = data[i]
+    if b == 0xC3:
+        return (1, "ret", None)
+    if b == 0xC2 and i + 3 <= len(data):
+        return (3, "ret", None)                           # ret imm16 (rsp += imm); still a tail
+    return None
+
+
+def _x86_64_cfg() -> _ArchCfg:
+    names = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+    gpr = {n: f"UC_X86_REG_{n.upper()}" for n in names}
+    return _ArchCfg(
+        name="x86-64", uc_arch="UC_ARCH_X86", uc_mode="UC_MODE_64",
+        cs_arch="CS_ARCH_X86", cs_mode="CS_MODE_64", word=8,
+        const_mod="x86_const", gpr=gpr, sp="rsp", ret_reg=None, pc="UC_X86_REG_RIP",
+        all_gpr=[n for n in names if n != "rsp"], is_term=_x86_64_is_term)
+
+
+# ---- AArch64 ------------------------------------------------------------------------------------
+# a0..a7 = x0..x7, lr = x30 (the return register), sp = sp. A gadget TAIL is `ret` (= `ret x30`,
+# 0xD65F03C0 -- jump to lr, the chainable shape a loader's `ldp x29,x30,[sp],#M; ret` continues) or a
+# register-indirect `br xN` (0xD61F0000|N<<5) / `blr xN` (0xD63F0000|N<<5) -- the `mov x0,xS; br/blr
+# xB` callers. `ret xN` (N!=30) is also a register branch.
+def _aarch64_is_term(data: bytes, i: int):
+    if i + 4 > len(data):
+        return None
+    w = int.from_bytes(data[i:i + 4], "little")
+    if w == 0xD65F03C0:
+        return (4, "ret", None)                           # ret (x30)
+    if (w & 0xFFFFFC1F) == 0xD65F0000:                    # ret xN
+        n = (w >> 5) & 0x1F
+        return (4, "ret", None) if n == 30 else (4, "jr", n)
+    if (w & 0xFFFFFC1F) == 0xD61F0000:                    # br xN
+        return (4, "jr", (w >> 5) & 0x1F)
+    if (w & 0xFFFFFC1F) == 0xD63F0000:                    # blr xN
+        return (4, "jr", (w >> 5) & 0x1F)
+    return None
+
+
+def _aarch64_cfg() -> _ArchCfg:
+    gpr = {f"x{i}": f"UC_ARM64_REG_X{i}" for i in range(31)}
+    gpr.update({f"a{i}": gpr[f"x{i}"] for i in range(8)})  # a0..a7 == x0..x7
+    gpr["ra"] = "UC_ARM64_REG_X30"                         # lr -- the return register
+    gpr["sp"] = "UC_ARM64_REG_SP"
+    return _ArchCfg(
+        name="aarch64", uc_arch="UC_ARCH_ARM64", uc_mode="UC_MODE_ARM",
+        cs_arch="CS_ARCH_ARM64", cs_mode="CS_MODE_ARM", word=8,
+        const_mod="arm64_const", gpr=gpr, sp="sp", ret_reg="ra", pc="UC_ARM64_REG_PC",
+        all_gpr=[f"x{i}" for i in range(31)], is_term=_aarch64_is_term)
+
+
+_ARCHS = {"riscv64": _riscv64_cfg, "riscv": _riscv64_cfg,
+          "x86-64": _x86_64_cfg, "x86_64": _x86_64_cfg, "amd64": _x86_64_cfg,
+          "aarch64": _aarch64_cfg, "arm64": _aarch64_cfg}
 
 
 def arch_supported(arch: str) -> bool:
@@ -136,20 +196,20 @@ _STK_SIZE = 0x1_0000
 _SP0 = _STK_BASE + 0x800            # start sp mid-stack, headroom below and above
 
 
-def _classify(val: int, own_idx: int):
+def _classify(val, own_const, reg_by_val, stack_by_val, name_of):
     """Describe a final register value by provenance against the random seeds: zero / stack@<offset>
-    / reg:x<k> / None. A value matching the register's OWN seed means UNCHANGED (not control); a
+    / reg:<name> / None. A value matching the register's OWN seed means UNCHANGED (not control); a
     value matching no seed is a DERIVED/arithmetic value (not a clean, controllable primitive) and
     returns None -- only an exact match on another register's seed or a stack slot's seed, or a
     clean zero, is reported."""
     if val == 0:
         return "zero"
-    o = _STACK_BY_VAL.get(val)
+    o = stack_by_val.get(val)
     if o is not None:
         return f"stack@{o}"                          # byte offset from the gadget's entry sp
-    k = _REG_BY_VAL.get(val)
-    if k is not None and k != own_idx:
-        return f"reg:x{k}"
+    c = reg_by_val.get(val)
+    if c is not None and c != own_const:
+        return f"reg:{name_of[c]}"
     return None
 
 
@@ -179,8 +239,10 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
     _hook_code = getattr(uc, "UC_HOOK_CODE")
     _reg = {name: getattr(rc, cfg.gpr[name]) for name in set(cfg.gpr)}
     want_regs = [w for w in want if w in cfg.gpr]
-    _own = {w: int(cfg.gpr[w].rsplit("_X", 1)[1]) for w in want_regs}   # each want-reg's GPR index
-    _stack = b"".join(_STACK_SEED[off].to_bytes(8, "little") for off in range(0, 0x1000, 8))
+    _own = {w: _reg[w] for w in want_regs}                          # each want-reg's physical const
+    _seed_consts = [_reg[n] for n in cfg.all_gpr]                   # physical regs to seed (sp excluded)
+    _name_of = {_reg[n]: n for n in cfg.all_gpr}                    # const -> canonical display name
+    reg_seed, reg_by_val, _stk_seed, stack_by_val, _stack = _make_seeds(_seed_consts)
     results, seen = [], set()
     scanned = 0
 
@@ -204,11 +266,9 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             mu.mem_map(_CODE_BASE, 0x1000)
             mu.mem_map(_STK_BASE, _STK_SIZE)
             mu.mem_write(_CODE_BASE, window.ljust(0x1000, b"\x00"))
-            mu.mem_write(_SP0, _stack)                            # stack sentinels: tag | byte-offset
-            for i in range(1, 32):
-                name = f"x{i}"
-                if name in _reg:
-                    mu.reg_write(_reg[name], _REG_SEED[i])
+            mu.mem_write(_SP0, _stack)                            # per-slot random stack seeds
+            for c in _seed_consts:
+                mu.reg_write(c, reg_seed[c])                       # per-register random seeds
             mu.reg_write(_reg[cfg.sp], _SP0)
             mu.hook_add(_hook_code, _hook)
             mu.emu_start(_CODE_BASE, _CODE_BASE + len(window), count=max_insns + 4)
@@ -247,7 +307,7 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
                     continue
                 eff = {}
                 for r in want_regs:
-                    c = _classify(regs[r], _own[r])
+                    c = _classify(regs[r], _own[r], reg_by_val, stack_by_val, _name_of)
                     if c is not None:
                         eff[r] = c
                 if eff and (best is None or len(eff) > len(best[1])):
