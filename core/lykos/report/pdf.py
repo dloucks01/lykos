@@ -88,6 +88,160 @@ def _flow(text, font, size, indent, gap, color=None) -> list[_Line]:
             for i, t in enumerate(_wrap(text, font, size, CONTENT_W, indent))]
 
 
+# ---- figures (doc 49 Theme 4): embed a lykos SVG figure as PDF vector graphics --------------
+# The report figures (report.figures) are a small, self-generated SVG subset -- rects, cubic/line
+# paths, and text. PDF draws vector graphics natively, so rather than rasterize (which would need a
+# non-stdlib engine and break the air-gap guarantee) we translate that SVG straight into PDF content
+# operators. One geometry source (the SVG), no new dependency. The PDF is a single, light-themed
+# document, so the figures' theme CSS variables resolve to this fixed light palette here.
+
+def _hexrgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0)
+
+
+# class token(s) -> (fill hex or None, stroke hex or None, line-width). Mirrors figures._STYLE's
+# light defaults. A token set is matched most-specific first.
+_FILL = {
+    ("node", "focus"): ("#e3efff", "#1f6feb", 2.0),
+    ("node",): ("#f4f7fb", "#c4d2e3", 1.2),
+    ("pill", "source"): ("#e3efff", "#1f6feb", 1.2),
+    ("pill", "sink"): ("#f4f7fb", "#c0392b", 1.6),
+    ("pill",): ("#f4f7fb", "#c4d2e3", 1.2),
+    ("bar-bg",): ("#f4f7fb", "#c4d2e3", 1.0),
+    ("bar-fill", "good"): ("#1f8a4c", None, 0.0),
+    ("bar-fill", "warn"): ("#b9770e", None, 0.0),
+    ("bar-fill", "bad"): ("#c0392b", None, 0.0),
+    ("edge",): (None, "#9fb0c3", 1.4),
+    ("arrow",): (None, "#9fb0c3", 1.6),
+}
+# text class -> (hex, size)
+_TEXT = {"nlabel": ("#1b2430", 12.0), "plabel": ("#1b2430", 12.0),
+         "nsub": ("#5b6b7d", 10.0), "psub": ("#5b6b7d", 10.0), "cap": ("#5b6b7d", 11.0)}
+
+
+def _shape_style(tokens: list[str]):
+    ts = set(tokens)
+    for key, val in _FILL.items():
+        if set(key) <= ts:
+            return val
+    return (None, None, 1.0)
+
+
+class _Figure:
+    """A figure block in the flow: a lykos SVG scaled to fit the content width (and page height),
+    drawn as PDF vector graphics. Treated by the paginator as one unit that never splits."""
+    __slots__ = ("svg", "w", "h", "scale", "draw_w", "draw_h", "gap", "rule")
+
+    def __init__(self, svg: str, gap: float = 10.0):
+        import re as _re
+        self.svg = svg
+        self.rule = False
+        self.gap = gap
+        m = _re.search(r'viewBox="0 0 (\d+) (\d+)"', svg)
+        self.w, self.h = (float(m.group(1)), float(m.group(2))) if m else (CONTENT_W, 40.0)
+        max_h = PAGE_H - 2 * MARGIN - 40        # never taller than a page's content area
+        self.scale = min(CONTENT_W / self.w, max_h / self.h, 1.0)
+        self.draw_w = self.w * self.scale
+        self.draw_h = self.h * self.scale
+
+
+def _fig_block(svg, gap: float = 10.0):
+    return [_Figure(svg, gap)] if svg else []
+
+
+def _pdf_str(s: str) -> str:
+    return s.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+
+def _nums(d: str) -> list:
+    import re as _re
+    return [float(x) for x in _re.findall(r"-?\d+\.?\d*", d)]
+
+
+def _svg_to_pdf_ops(svg: str, x0: float, yt: float, scale: float) -> list:
+    """Translate one lykos figure SVG into PDF content operators, top-left at (x0, yt), scaled by
+    `scale`. Per-point transform (no CTM flip) so text stays upright. Only the self-generated subset
+    (rect / cubic+line path / text) is handled; defs/markers/style are skipped."""
+    import xml.dom.minidom as _md
+    try:
+        doc = _md.parseString(svg)
+    except Exception:                               # noqa: BLE001 -- a malformed figure is skipped
+        return []
+    ops: list = []
+
+    def px(v):
+        return x0 + v * scale
+
+    def py(v):
+        return yt - v * scale
+
+    def rgb(h):
+        r, g, b = _hexrgb(h)
+        return f"{r:.3f} {g:.3f} {b:.3f}"
+
+    def emit(el):
+        tag = el.tagName
+        toks = (el.getAttribute("class") or "").split()
+        if tag == "rect":
+            sx, sy = float(el.getAttribute("x")), float(el.getAttribute("y"))
+            sw, sh = float(el.getAttribute("width")), float(el.getAttribute("height"))
+            fill, stroke, lw = _shape_style(toks)
+            if fill:
+                ops.append(f"{rgb(fill)} rg")
+            if stroke:
+                ops.append(f"{rgb(stroke)} RG {lw * scale:.2f} w")
+            ops.append(f"{px(sx):.2f} {py(sy + sh):.2f} {sw * scale:.2f} {sh * scale:.2f} re")
+            ops.append("B" if (fill and stroke) else ("f" if fill else "S"))
+        elif tag == "path":
+            _, stroke, lw = _shape_style(toks)
+            n = _nums(el.getAttribute("d"))
+            stroke = stroke or "#9fb0c3"
+            ops.append(f"{rgb(stroke)} RG {lw * scale:.2f} w")
+            if "C" in el.getAttribute("d") and len(n) >= 8:
+                ops.append(f"{px(n[0]):.2f} {py(n[1]):.2f} m "
+                           f"{px(n[2]):.2f} {py(n[3]):.2f} {px(n[4]):.2f} {py(n[5]):.2f} "
+                           f"{px(n[6]):.2f} {py(n[7]):.2f} c S")
+            elif len(n) >= 4:
+                ops.append(f"{px(n[0]):.2f} {py(n[1]):.2f} m {px(n[2]):.2f} {py(n[3]):.2f} l S")
+                if "arrow" in toks:
+                    _arrowhead(ops, px(n[0]), py(n[1]), px(n[2]), py(n[3]), rgb(stroke))
+        elif tag == "text":
+            hexc, size = _TEXT.get(next((t for t in toks if t in _TEXT), ""), ("#1b2430", 11.0))
+            content = el.firstChild.data if el.firstChild else ""
+            sx, sy = float(el.getAttribute("x")), float(el.getAttribute("y"))
+            ops.append(f"{rgb(hexc)} rg")
+            ops.append(f"BT /H {size * scale:.1f} Tf {px(sx):.2f} {py(sy):.2f} Td "
+                       f"({_pdf_str(content)}) Tj ET")
+
+    def walk(node):
+        for ch in node.childNodes:
+            if ch.nodeType != ch.ELEMENT_NODE:
+                continue
+            if ch.tagName in ("defs", "style", "title", "desc", "marker"):
+                continue
+            if ch.tagName in ("rect", "path", "text"):
+                emit(ch)
+            walk(ch)
+
+    walk(doc.documentElement)
+    return ops
+
+
+def _arrowhead(ops, x1, y1, x2, y2, rgbstr):
+    """A small filled triangle at (x2,y2) pointing along (x1,y1)->(x2,y2) (PDF has no line marker)."""
+    import math
+    dx, dy = x2 - x1, y2 - y1
+    d = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / d, dy / d
+    size = 4.5
+    bx, by = x2 - ux * size, y2 - uy * size           # base centre, back from the tip
+    lx, ly = bx - uy * size * 0.6, by + ux * size * 0.6
+    rx, ry = bx + uy * size * 0.6, by - ux * size * 0.6
+    ops.append(f"{rgbstr} rg")
+    ops.append(f"{x2:.2f} {y2:.2f} m {lx:.2f} {ly:.2f} l {rx:.2f} {ry:.2f} l f")
+
+
 def _report_lines(report: dict[str, Any]) -> list[_Line]:
     L: list[_Line] = []
     case = report.get("case", {})
@@ -159,6 +313,12 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
                "re-running the same tool versions on the same inputs reproduces these "
                "results.", "HO", 8.5, 0, 4, (0.4, 0.4, 0.45))
 
+    # Case-level coverage figure (doc 49 Theme 4), as in the HTML report.
+    _cov = (report.get("figures") or {}).get("coverage")
+    if _cov:
+        L.append(_Line("Fuzzing coverage", "HB", 10, 0, 16, (0.2, 0.2, 0.25)))
+        L += _fig_block(_cov)
+
     # targets + findings
     for t in report.get("targets", []):
         L.append(_Line("Target", "HB", 8, 0, 20, (0.6, 0.6, 0.65)))
@@ -222,6 +382,10 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
                 txt += ". Could not be supplied: " + "; ".join(renv["degraded"])
             L += _flow(txt, "HO", 8.5, 0, 1, (0.4, 0.4, 0.45))
         L += _health_lines(t)
+        # Figures (doc 49 Theme 4): the call graph and the patch-diff map, as in the HTML report.
+        _tf = t.get("figures") or {}
+        L += _fig_block(_tf.get("call_graph"))
+        L += _fig_block(_tf.get("patch_diff"))
 
         findings = t.get("findings") or []
         if not findings:
@@ -306,6 +470,10 @@ def _finding_lines(f: dict) -> list[_Line]:
         loc.append(f'site={f["site_addr"]}')
     if loc:
         L += _flow("  ".join(loc), "H", 8.5, 0, 1, (0.4, 0.4, 0.45))
+    # Per-finding figures (doc 49 Theme 4): provenance chain + source-reachability, as in the HTML.
+    _ff = f.get("figures") or {}
+    L += _fig_block(_ff.get("provenance"))
+    L += _fig_block(_ff.get("reachability"))
     ev = f.get("evidence", [])
     if ev:
         L.append(_Line("Evidence trail", "HB", 8, 0, 6, (0.5, 0.5, 0.55)))
@@ -341,13 +509,12 @@ def _paginate(lines: list[_Line]) -> list[list[tuple]]:
     cur: list[tuple] = []
     y = top
     for ln in lines:
-        lh = ln.size * 1.32
+        lh = ln.draw_h if isinstance(ln, _Figure) else ln.size * 1.32
         y -= ln.gap
         if y - lh < bottom:
             pages.append(cur)
             cur = []
             y = top
-            y -= 0  # first line at top
         cur.append((ln, y))
         y -= lh
     pages.append(cur)
@@ -357,6 +524,11 @@ def _paginate(lines: list[_Line]) -> list[list[tuple]]:
 def _content_stream(page: list[tuple], page_no: int, total: int, report: dict) -> bytes:
     ops: list[str] = []
     for ln, y in page:
+        if isinstance(ln, _Figure):
+            ops.append("q")
+            ops += _svg_to_pdf_ops(ln.svg, MARGIN, y, ln.scale)
+            ops.append("Q")
+            continue
         x = MARGIN + ln.indent
         if ln.rule:
             ops.append("0.85 0.85 0.87 RG 0.7 w")

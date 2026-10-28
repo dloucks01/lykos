@@ -136,6 +136,27 @@ def test_pdf_is_valid(store, case):
     assert pdf[startxref:startxref + 4] == b"xref"
 
 
+def test_pdf_embeds_figures_as_vector_graphics_and_stays_valid(store, case):
+    """doc 49 Theme 4: the report figures are translated into PDF vector ops (not rasterized), and
+    the document stays structurally valid with the figures in it."""
+    from lykos.db.dao import CallEdgeDAO
+    t, _f = _seed(store, case)
+    CallEdgeDAO(store.conn).replace_for_target(t.id, [
+        {"src_addr": "0x401000", "dst_addr": "0x401136", "dst_name": "main"},
+        {"src_addr": "0x401136", "dst_addr": "0x401200", "dst_name": "strcpy"}])
+    r = build_report(store, case.id)
+    assert r["targets"][0]["figures"]["call_graph"], "precondition: a call-graph figure exists"
+    pdf = to_pdf(r)
+    # structurally valid (same invariants as test_pdf_is_valid)
+    assert pdf[:5] == b"%PDF-" and b"%%EOF" in pdf[-8:]
+    startxref = int(pdf.split(b"startxref")[1].split(b"%%EOF")[0].strip())
+    assert pdf[startxref:startxref + 4] == b"xref"
+    # the figure became PDF vector graphics (a rect path op) + a function label from the call graph
+    assert b" re\n" in pdf, "no rectangle operator -- the figure was not drawn as vector graphics"
+    assert b"(strcpy)" in pdf or b"(main)" in pdf, "the call-graph node labels are missing"
+    assert to_pdf(r) == pdf, "PDF output must be deterministic"
+
+
 def test_case_json_export(store, case):
     _seed(store, case)
     r = build_report(store, case.id, embed_pocs=True)

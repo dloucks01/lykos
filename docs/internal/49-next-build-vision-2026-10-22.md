@@ -57,8 +57,15 @@ to a real file, prioritized, and sized — so the next session can start at the 
   `html.to_html` renders it. +7 tests (figure determinism/ranking/cap/escaping + report integration;
   the stage integration test asserts the structured channel end-to-end). All three Theme-4 figure
   families (call-graph+coverage, provenance+reachability, patch-diff) now render in the HTML report.
-  REMAINING in Theme 4: embed the SVGs in the **PDF** (`pdf.py` is a hand-rolled renderer, not
-  `to_html` — a larger job).
+- **Theme 4 PDF figure embedding: DONE — Theme 4 COMPLETE.** `pdf.py` now translates each figure's
+  SVG (a known, self-generated subset: rect / cubic+line path / text) straight into PDF vector
+  operators via stdlib `minidom` — no rasterizer, no new dep, air-gap preserved, one geometry source
+  (the SVG). A `_Figure` flow block the paginator treats as one unit (scaled to the content width and
+  page height, never split); a per-point coordinate transform keeps text upright; the figures' theme
+  CSS vars resolve to a fixed light palette for the PDF. All five figures (call-graph, coverage,
+  provenance, reachability, patch-diff) now render in BOTH the HTML and the PDF. `test_report.py`
+  pins that the PDF embeds vector ops + node labels and stays structurally valid (xref intact,
+  deterministic). **Theme 4 (the figure library + all its figures in both renderers) is done.**
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
