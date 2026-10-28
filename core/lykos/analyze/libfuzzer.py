@@ -1970,11 +1970,47 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     ensure_configured(root, timeout=timeout)
     tmp = Path(tempfile.mkdtemp(prefix="lykos-lf-"))
     try:
-        return _build_in(root, out, tmp, spec, kind, cxx, timeout, cache)
+        res = _build_in(root, out, tmp, spec, kind, cxx, timeout, cache)
     finally:
         # any raise between mkdtemp and the old trailing rmtree (a synth helper, a path outside
         # the tree, a compile-pool error) leaked one lykos-lf-* directory per call
         shutil.rmtree(tmp, ignore_errors=True)
+    # FALLBACK for a cmake project's IN-TREE harness: the per-TU compile above cannot generate the
+    # project's config headers (FreeRDP's `winpr/config.h`) or resolve its include/link graph, so it
+    # fails on every such tree. Build the harness through the project's OWN cmake instead (additive --
+    # only when the per-TU build failed for an in-tree harness of a cmake project, so a project that
+    # builds per-TU today is unaffected). The cmake build is cached across the plan's specs.
+    if (not res.get("ok") and kind == "in-tree" and (root / "CMakeLists.txt").is_file()
+            and spec.get("path")):
+        cres = _cmake_cached(cache, root, timeout)
+        if cres and cres.get("ok"):
+            want = Path(spec["path"]).stem
+            h = next((x for x in cres["harnesses"] if x["name"] == want), None)
+            if h:
+                rel = Path(spec["path"]).resolve()
+                try:
+                    rel = rel.relative_to(root)
+                except ValueError:
+                    pass
+                return {"ok": True, "binary": h["binary"], "lib_dirs": cres.get("lib_dirs", []),
+                        "harness": f"in-tree (cmake) {rel}",
+                        "log": (res.get("log") or "") + "\n-- per-TU build failed; built via the "
+                               "project's cmake --\n" + (cres.get("log") or "")[-1500:]}
+    return res
+
+
+def _cmake_cached(cache, root, timeout):
+    """cmake_build_harnesses(root), cached on the BuildCache so the plan's several in-tree specs share
+    one project build (it builds all harness targets at once). `cache` may be None (one-off build)."""
+    root = str(Path(root).resolve())
+    if cache is not None and getattr(cache, "_cmake", None) is not None:
+        prev_root, prev = cache._cmake
+        if prev_root == root:
+            return prev
+    res = cmake_build_harnesses(root, timeout=timeout)
+    if cache is not None:
+        cache._cmake = (root, res)
+    return res
 
 
 def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
@@ -2350,7 +2386,7 @@ def _replay_report(binary, workdir: Path, data: bytes) -> str:
 
 
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
-                  corpus: list | None = None) -> dict:
+                  corpus: list | None = None, lib_dirs: list | None = None) -> dict:
     """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
     Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed."""
     workdir = Path(workdir)
@@ -2365,6 +2401,9 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
             pass
     env = dict(os.environ)
     env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0:" + env.get("ASAN_OPTIONS", "")
+    if lib_dirs:                                          # a cmake-built (shared) harness needs its
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(        # project's .so dirs to load
+            [str(d) for d in lib_dirs] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     argv = [str(binary), str(corpus_dir), f"-max_total_time={seconds}", f"-max_len={max_len}",
             f"-artifact_prefix={art}/", "-print_final_stats=1", "-rss_limit_mb=2048"]
     crashes = []

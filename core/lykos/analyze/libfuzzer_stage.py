@@ -336,7 +336,7 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     ctx.progress(msg=f"libFuzzer: {spec.get('entry')} for {int(seconds)}s"
                      + (f", {len(corpus)} seeds" if corpus else ""))
     res = LF.run_libfuzzer(build["binary"], ctx.scratch() / spec["id"], seconds=int(seconds),
-                           max_len=max_len, corpus=corpus or None)
+                           max_len=max_len, corpus=corpus or None, lib_dirs=build.get("lib_dirs"))
     row["execs"] = int(res.get("execs") or 0)
     row["corpus_in"] = len(corpus)
     row["corpus_kept"] = _save_corpus(cache_dir, res.get("corpus") or [])
