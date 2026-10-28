@@ -1313,6 +1313,20 @@ def find_loongarch64_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers, "loaders": loaders}
 
 
+def find_br_gadgets_loongarch64(data: bytes):
+    """LoongArch64 `jr <rN>` gadgets as [{insn, reg, va}] -- the LoongArch `jmp <reg>`
+    (`jirl $zero, $rN, 0`), the no-leak way to reach injected shellcode on an execstack when a
+    register points at the input buffer. 4-byte aligned (fixed-width ISA). jr rN = jirl zero,rN,0 =
+    0x4C000000 | (rN << 5); r0 is the zero register, so it holds no address and is skipped."""
+    out = []
+    for n in range(1, 32):
+        enc = 0x4C000000 | (n << 5)
+        va = _find_exec(data, enc.to_bytes(4, "little"), 4)
+        if va is not None:
+            out.append({"insn": "jr", "reg": f"r{n}", "va": va})
+    return out
+
+
 # ---------------------------------------------------------------- s390x (IBM Z) ret2libc gadgets
 def _s390_decode(data: bytes, p: int):
     """Decode the s390x (z/Architecture) instructions a ret2libc caller cares about, at byte `p`.

