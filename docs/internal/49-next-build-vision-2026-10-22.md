@@ -139,10 +139,29 @@ to a real file, prioritized, and sized — so the next session can start at the 
   shell evaluating a forgery-proof nonce. Native x86 PIE-leak suite (25 tests) still green; the
   `aslr=True` fix strengthened it (now genuinely ASLR-on). +`test_pie_leak_aarch64.py`.
 
-  REMAINING 5a: extend the leak→relocate path to the other verifiable arches (same recipe:
-  run_wrapper + word/endian + tight payload); generalize the ROP builders (ret2libc/mprotect chains
-  are still x86-only). (mips stays unbuildable here — no compiler; arm uses armhf, not
-  arm-linux-gnueabi.)
+- **Theme 5a: ROP-builder generalization STARTED — shared RISC-style stack-ret2libc builder +
+  the cross-arch syscall-ROP ceiling, mapped.** First step of generalizing the x86-centric ROP
+  builders. The RISC-V 64 and LoongArch64 ret2libc exploits were byte-for-byte duplicates (the
+  LoongArch finder's docstring even says "Mirrors the RISC-V finder; the structure is identical") —
+  loader (epilogue restores two callee-saved regs + ra) + caller (`mv/move a0,sS; jr sB`). Extracted
+  into one `exploit_crossarch._risc_stack_ret2libc(..., arches, gadgets_fn, ra_reg, label, regpfx,
+  mnemonic)`; the two exploits are now thin wrappers. Byte-identical payloads (verified: both e2e
+  tests + the full cross-arch suite green, 34 passed/1 skipped).
+  FINDING (the ceiling, mapped so the roadmap can plan around it): extending the *syscall*-ROP
+  techniques (execve-syscall, ORW, SROP) cross-arch is GADGET-BLOCKED on load-store RISC arches, not
+  just unimplemented. The blocker is argument-register control: epilogue loaders restore only
+  callee-saved regs, so a0/a1/a2 (execve's path/argv/envp) can't be set the way x86 does with
+  pop-rdi/rsi/rdx. aarch64 is the lucky exception — `ldp x1,x2` loads the *argument* registers
+  directly, which is why aarch64 alone has execve-syscall. riscv64/loongarch64/etc. have no such
+  idiom; SROP's bootstrap (set a7=rt_sigreturn, then ecall) hits the same wall and the sigreturn
+  trampoline is often GC'd out of a static binary. So the generalizable cross-arch primitive stays
+  ret2libc (needs a `system` symbol / libc), NOT raw syscall-ROP.
+
+  REMAINING 5a: (1) extend the leak→relocate path to the other verifiable arches (same recipe:
+  run_wrapper + word/endian + tight payload); (2) the biggest lever — wire the shared stack-ret2libc
+  builder into the PIE leak path (base-rebased `payload_for_base` + single-process leak_and_exploit
+  confirmation) for cross-arch NX-on static-PIE ret2libc; (3) cross-arch ORW/leak chains where
+  gadgets permit. (mips stays unbuildable here — no compiler; arm uses armhf, not arm-linux-gnueabi.)
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
