@@ -51,6 +51,16 @@ def test_classifies_known_gadget(tmp_path, src, want, expect):
 
 @pytest.mark.skipif(not ge.available(), reason="needs unicorn + capstone")
 @pytest.mark.skipif(not (_AS and _OC), reason="needs riscv64-linux-gnu-as/objcopy")
+def test_jr_terminated_caller_gadget(tmp_path):
+    """A jr/jalr-terminated CALLER gadget (`mv a1,a3; jr a5`) is discovered -- without these the
+    argument-register control the execve-syscall chain needs (a0<-a loaded reg, then branch on) is
+    invisible to a ret-only scan. The terminator is recorded as jr:x<target>."""
+    g = ge.find_reg_control_gadgets(_asm("mv a1,a3\n jr a5\n", tmp_path), "riscv64", want=("a1",))
+    assert g and g[0]["effects"] == {"a1": "reg:x13"} and g[0]["term"] == "jr:x15"
+
+
+@pytest.mark.skipif(not ge.available(), reason="needs unicorn + capstone")
+@pytest.mark.skipif(not (_AS and _OC), reason="needs riscv64-linux-gnu-as/objcopy")
 def test_unchanged_register_is_not_reported(tmp_path):
     """A register the gadget leaves alone (its own input survives) is NOT control -- only registers
     the gadget actually sets are returned."""

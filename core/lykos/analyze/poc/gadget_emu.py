@@ -57,17 +57,31 @@ class _ArchCfg:
     ret_reg: str                 # the register a `ret` branches to (ra/x30/lr); None for stack-pop arches
     pc: str                      # pc reg-const attribute name in const_mod
     all_gpr: list = field(default_factory=list)   # every GPR to seed (names into gpr)
-    is_ret: Callable = None      # (bytes, i) -> ret byte-length or None
+    is_term: Callable = None     # (bytes, i) -> (byte_len, kind, target_reg) | None; kind ret|jr
     endian: str = "little"
 
 
 # ---- RISC-V 64 -----------------------------------------------------------------------------------
-# a0..a7 = x10..x17, ra = x1, sp = x2. `ret` = jalr x0,0(ra) = 0x00008067; `c.jr ra` = 0x8082.
-def _riscv64_is_ret(data: bytes, i: int):
-    if i + 4 <= len(data) and int.from_bytes(data[i:i + 4], "little") == 0x00008067:
-        return 4
-    if i + 2 <= len(data) and int.from_bytes(data[i:i + 2], "little") == 0x8082:
-        return 2
+# a0..a7 = x10..x17, ra = x1, sp = x2. A gadget TAIL is a return OR a register-indirect branch (the
+# `mv aX,sY; jr sZ` callers that set the argument registers -- without these the arg-register control
+# the execve-syscall chain needs is invisible). `ret` = jalr x0,0(ra) = 0x00008067; `c.jr ra` =
+# 0x8082; a general `jr/jalr rs` = jalr with opcode 0x67 + funct3 0 (rs in bits 19:15); `c.jr rs` =
+# 0x8002|(rs<<7) and `c.jalr rs` = 0x9002|(rs<<7) (rs != 0; distinct from c.mv, which has rs2 != 0).
+def _riscv64_is_term(data: bytes, i: int):
+    if i + 4 <= len(data):
+        w = int.from_bytes(data[i:i + 4], "little")
+        if w == 0x00008067:
+            return (4, "ret", None)
+        if (w & 0x707F) == 0x0067:                        # jalr rd, rs, imm (any) -> indirect branch
+            return (4, "jr", (w >> 15) & 0x1F)
+    if i + 2 <= len(data):
+        h = int.from_bytes(data[i:i + 2], "little")
+        if h == 0x8082:
+            return (2, "ret", None)                       # c.jr ra
+        if (h & 0xF07F) == 0x8002 and ((h >> 7) & 0x1F):
+            return (2, "jr", (h >> 7) & 0x1F)             # c.jr rs
+        if (h & 0xF07F) == 0x9002 and ((h >> 7) & 0x1F):
+            return (2, "jr", (h >> 7) & 0x1F)             # c.jalr rs
     return None
 
 
@@ -80,7 +94,7 @@ def _riscv64_cfg() -> _ArchCfg:
         name="riscv64", uc_arch="UC_ARCH_RISCV", uc_mode="UC_MODE_RISCV64",
         cs_arch="CS_ARCH_RISCV", cs_mode="CS_MODE_RISCV64|CS_MODE_RISCVC", word=8,
         const_mod="riscv_const", gpr=gpr, sp="sp", ret_reg="ra", pc="UC_RISCV_REG_PC",
-        all_gpr=[f"x{i}" for i in range(1, 32)], is_ret=_riscv64_is_ret)
+        all_gpr=[f"x{i}" for i in range(1, 32)], is_term=_riscv64_is_term)
 
 
 _ARCHS = {"riscv64": _riscv64_cfg, "riscv": _riscv64_cfg}
@@ -188,9 +202,13 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
         # gadget is the k instructions preceding it, entered at a true boundary.
         insns = _disasm_stream(md, seg)
         for j, ins in enumerate(insns):
-            rl = cfg.is_ret(seg, ins.address)
-            if rl is None or rl != ins.size:
+            term = cfg.is_term(seg, ins.address)
+            if term is None or term[0] != ins.size:
                 continue
+            rl, kind, tgt = term
+            # how the gadget hands control on: "ret" chains via the stack-restored return; "jr:x<k>"
+            # chains via a register the chain must set (a caller gadget) -- its target register.
+            term_desc = "ret" if kind == "ret" else f"jr:x{tgt}"
             ret_end = ins.address + rl
             best = None                                           # (entry_off, effects) richest found
             for k in range(1, max_insns + 1):
@@ -212,7 +230,8 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
                 va = vaddr + best[0]
                 if va not in seen:
                     seen.add(va)
-                    results.append({"va": va, "insns": best[2], "effects": best[1]})
+                    results.append({"va": va, "insns": best[2], "effects": best[1],
+                                    "term": term_desc})
                     if len(results) >= max_results:
                         return results
             if scanned >= scan_cap:
