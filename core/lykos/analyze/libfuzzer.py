@@ -1655,6 +1655,147 @@ def ensure_configured(root, *, timeout: int = 300, report: dict | None = None) -
         return False
 
 
+def _is_elf_exec(p: Path) -> bool:
+    """True for an ELF executable (ET_EXEC or ET_DYN) -- a harness binary, not a shell wrapper or a
+    library we matched by name. Reads the 18-byte ELF header only."""
+    try:
+        with open(p, "rb") as f:
+            hdr = f.read(18)
+        return len(hdr) >= 18 and hdr[:4] == b"\x7fELF" and hdr[16] in (2, 3)   # ET_EXEC / ET_DYN
+    except OSError:
+        return False
+
+
+#: A cmake cache-preload (`cmake -C <file>`) a project ships for a minimal, fuzzer-oriented build --
+#: how OSS-Fuzz / ClusterFuzzLite onboarded projects pin the knobs (disable heavy optional deps,
+#: BUILD_FUZZERS ON). Recognised by name so it is the project's OWN authoritative config, not a guess.
+_FUZZ_PRELOAD_DIRS = ("ci", "cmake", ".clusterfuzzlite", "tools", "")
+_RE_CMAKE_NOTFOUND = re.compile(r"Could NOT find (\w+)")
+_RE_CMAKE_PROVIDED = re.compile(r'provided by "([\w\-]+)"')
+
+
+def _find_fuzz_preload(root: Path):
+    """A cmake cache-preload the project ships for a minimal+fuzzers build, or None."""
+    for d in _FUZZ_PRELOAD_DIRS:
+        base = root / d if d else root
+        if not base.is_dir():
+            continue
+        for p in sorted(base.rglob("*.cmake"))[:400]:
+            n = p.name.lower()
+            if "fuzz" in n and any(k in n for k in ("oss", "preload", "preset", "config", "clusterfuzz")):
+                return p
+    return None
+
+
+def _cmake_disable_flags(pkg: str) -> list:
+    """Best-effort `-D` flags to turn OFF the feature that pulls in a missing package. The option
+    name is not mechanical (PulseAudio -> WITH_PULSE), so try the common conventions; a flag the
+    project does not define is harmlessly ignored by cmake."""
+    P = re.sub(r"[^A-Za-z0-9]", "", pkg).upper()
+    return [f"-DWITH_{P}=OFF", f"-DENABLE_{P}=OFF", f"-DUSE_{P}=OFF", f"-DWITH_{P}=0"]
+
+
+def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = None,
+                          want=None) -> dict:
+    """Build a CMake project's IN-TREE libFuzzer harnesses (files defining LLVMFuzzerTestOneInput)
+    with the project's OWN cmake -- which generates its config headers and resolves its include/link
+    graph, neither of which a per-translation-unit compile can do for a large project (FreeRDP's
+    `winpr/config.h` is generated at configure time, so `build_libfuzzer`'s own compile fails
+    "winpr/config.h: No such file or directory" on every file).
+
+    A harness is the bytes->parser DRIVER the directed/concolic confirmation runs a candidate input
+    through; fuzzing merely reuses it. clang + ASan + standalone libFuzzer (`-fsanitize=fuzzer`, so
+    no OSS-Fuzz `LIB_FUZZING_ENGINE` is needed), and BUILD_SHARED_LIBS=ON so a project's transitive
+    system deps resolve through shared libraries without the static `-dev` packages.
+
+    Configure uses the project's own fuzz cache-preload when it ships one (the authoritative minimal
+    knob set); on a configure failure from a missing REQUIRED `find_package`, the offending feature
+    is disabled and configure retried (bounded), so a project that hard-requires an absent optional
+    dependency still reaches a buildable core.
+
+    Returns {ok, harnesses:[{name, source, binary}], lib_dirs:[str], log, system:"cmake"}. `lib_dirs`
+    is where the shared libraries landed -- a runner must put them on LD_LIBRARY_PATH. `want` (harness
+    basenames) narrows which harnesses to collect; None collects all."""
+    import time as _time
+    root = Path(root).resolve()
+    res = {"ok": False, "harnesses": [], "lib_dirs": [], "log": "", "system": "cmake"}
+    if not (root / "CMakeLists.txt").is_file():
+        res["log"] = "not a cmake project"
+        return res
+    intree = find_harnesses(root, limit=64)
+    if not intree:
+        res["log"] = "no in-tree LLVMFuzzerTestOneInput harness"
+        return res
+    cc, cxx = _clang(False), _clang(True)
+    if not cc:
+        res["log"] = "clang not found (standalone libFuzzer needs clang -fsanitize=fuzzer)"
+        return res
+    if deadline is None:
+        deadline = _time.time() + timeout * 4
+    bd = root / "_lykos_fuzzbuild"
+    confine = _configure_confinement(root)
+    env = dict(os.environ)
+    if confine:
+        env["CCACHE_DISABLE"] = "1"
+
+    def _run(argv):
+        slice_s = min(float(timeout), max(1.0, deadline - _time.time()))
+        try:
+            return _run_group(confine + list(argv), cwd=str(root), timeout=slice_s, env=env)
+        except subprocess.TimeoutExpired as e:
+            return subprocess.CompletedProcess(argv, 124, e.output or "", e.stderr or "")
+
+    base = ["cmake", "-S", str(root), "-B", str(bd),
+            f"-DCMAKE_C_COMPILER={cc}", f"-DCMAKE_CXX_COMPILER={cxx or cc}",
+            "-DBUILD_FUZZERS=ON", "-DOSS_FUZZ=OFF", "-DWITH_SANITIZE_ADDRESS=ON",
+            "-DBUILD_SHARED_LIBS=ON", "-DCMAKE_BUILD_TYPE=Debug"]
+    preload = _find_fuzz_preload(root)
+    if preload:
+        base += ["-C", str(preload)]
+    flags: list = []
+    disabled: set = set()
+    log = ""
+    rc = None
+    for _ in range(12):                                   # configure, disabling a missing dep each pass
+        shutil.rmtree(bd, ignore_errors=True)             # a cached REQUIRED-find failure sticks; fresh
+        r = _run(base + flags)
+        log = (log + (r.stdout or "") + (r.stderr or ""))[-20000:]
+        rc = r.returncode
+        if rc == 0 or _time.time() >= deadline:
+            break
+        out = (r.stdout or "") + (r.stderr or "")
+        pkgs = (set(_RE_CMAKE_NOTFOUND.findall(out)) | set(_RE_CMAKE_PROVIDED.findall(out))) - disabled
+        if not pkgs:
+            break
+        for pk in pkgs:
+            flags += _cmake_disable_flags(pk)
+            disabled.add(pk)
+    res["log"] = log
+    if rc != 0:
+        return res
+    names = {p.stem for p in intree}
+    if want:
+        names &= set(want)
+    # Prefer the project's `fuzzers` aggregate target; fall back to building each harness by name.
+    br = _run(["cmake", "--build", str(bd), "-j", "--target", "fuzzers"])
+    res["log"] = (log + (br.stdout or "") + (br.stderr or ""))[-20000:]
+    if br.returncode != 0:
+        for n in sorted(names):
+            if _time.time() >= deadline:
+                break
+            _run(["cmake", "--build", str(bd), "-j", "--target", n])
+    # collect the produced harness ELFs (match by stem; exclude libraries)
+    found: dict = {}
+    for p in bd.rglob("*"):
+        if p.is_file() and p.stem in names and p.suffix == "" and os.access(p, os.X_OK) and _is_elf_exec(p):
+            found.setdefault(p.stem, p)
+    harnesses = [{"name": s.stem, "source": str(s), "binary": str(found[s.stem])}
+                 for s in intree if s.stem in found]
+    lib_dirs = sorted({str(p.parent) for p in bd.rglob("*.so*") if p.is_file()})
+    res["harnesses"], res["lib_dirs"], res["ok"] = harnesses, lib_dirs, bool(harnesses)
+    return res
+
+
 def config_defines(root) -> list:
     """`-D` flags for the config headers this tree GENERATES, which autoconf would have supplied.
 
