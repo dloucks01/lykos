@@ -16,12 +16,14 @@ from .. import observe
 from ..analyze.detect import catalog
 from ..db.dao import (
     AnalysisRunDAO,
+    CallEdgeDAO,
     DynResultDAO,
     FindingDAO,
     PocDAO,
     TargetDAO,
 )
 from ..analyze.stages import label_for as _stage_label_report
+from . import figures as _figures
 from ..db.models import FINDING_STATES, SEVERITIES
 from ..jobs.registry import cached_output_json
 
@@ -386,6 +388,37 @@ def has_execution_gaps(t: dict) -> bool:
                 or (ex.get("runtime_env") or {}).get("gate_closed"))
 
 
+def _target_call_graph_svg(store, target_id: str, findings_out: list[dict]) -> Optional[str]:
+    """A per-target call-graph figure (doc 49 Theme 4), focused on the worst located finding's
+    function when there is one, so the report draws the same graph the GUI's Code tab does. None
+    when the target has no recovered call edges. Best-effort -- a figure never fails the report."""
+    try:
+        edges = [{"src_addr": e.src_addr, "dst_addr": e.dst_addr, "dst_name": e.dst_name}
+                 for e in CallEdgeDAO(store.conn).list_by_target(target_id)]
+        focus = next((f.get("function_addr") for f in findings_out if f.get("function_addr")), None)
+        return _figures.call_graph_svg(edges, focus_addr=focus)
+    except Exception:                               # noqa: BLE001
+        observe.absorbed(_log, "call-graph figure skipped")
+        return None
+
+
+def _coverage_figure(targets_out: list[dict]) -> Optional[str]:
+    """The case-level coverage figure (doc 49 Theme 4): one bar per binary, from the per-target
+    fuzz coverage the model already computes. None when no target reached measurable coverage."""
+    rows = []
+    for t in targets_out:
+        fc = t.get("fuzz_coverage")
+        if fc and fc.get("pct") is not None:
+            detail = (f"{fc.get('edges')} edges" if fc.get("kind") == "edge"
+                      else (f"{fc.get('hit')}/{fc.get('known')} blocks" if fc.get("known") else ""))
+            rows.append({"name": t["filename"], "pct": fc["pct"], "detail": detail})
+    try:
+        return _figures.coverage_bars_svg(rows)
+    except Exception:                               # noqa: BLE001
+        observe.absorbed(_log, "coverage figure skipped")
+        return None
+
+
 def build_report(
     store,
     case_id: str,
@@ -605,6 +638,9 @@ def build_report(
                 "engine_health": engine_health(execution),
                 "exploited_build": _exploited_build(store, case_id, t.id),
                 "findings": findings_out,
+                # Static figures (doc 49 Theme 4) so the air-gap report draws the call graph the
+                # GUI's Code tab shows. None when there is nothing to draw.
+                "figures": {"call_graph": _target_call_graph_svg(store, t.id, findings_out)},
             }
             tout["execution"]["has_gaps"] = has_execution_gaps(tout)
             tout["verdict"] = target_verdict(tout)
@@ -654,6 +690,9 @@ def build_report(
             "curation": {s: cur_counts[s] for s in CURATION_STATUSES if cur_counts.get(s)},
         },
         "targets": targets_out,
+        # Case-level static figures (doc 49 Theme 4). HTML/PDF embed these; SARIF stays
+        # machine-faithful and ignores them.
+        "figures": {"coverage": _coverage_figure(targets_out)},
     }
 
 

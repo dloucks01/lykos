@@ -278,6 +278,13 @@ def to_html(report: dict[str, Any]) -> str:
                  'inputs reproduces these results.</p>')
     parts.append('</section>')
 
+    # ---- case-level coverage figure (doc 49 Theme 4) ----
+    cov_fig = (report.get("figures") or {}).get("coverage")
+    if cov_fig:
+        parts.append('<section class="card"><h2>Fuzzing coverage</h2>'
+                     '<p class="muted">How much of each binary\'s recovered code the search '
+                     'actually exercised.</p>' + cov_fig + '</section>')
+
     # ---- targets + findings ----
     for t in report.get("targets", []):
         parts.append(_target_html(t))
@@ -437,6 +444,13 @@ def _target_html(t: dict) -> str:
             p.append(' Could not be supplied: ' + esc("; ".join(renv["degraded"])) + '.')
         p.append('</p>')
     p.append(_engine_health_html(t))
+    # Call-graph figure (doc 49 Theme 4) -- the structure the GUI's Code tab shows, as a static
+    # SVG. Trusted, internally-escaped markup from report.figures: inserted raw, never through esc.
+    cg = (t.get("figures") or {}).get("call_graph")
+    if cg:
+        p.append('<div class="figure callgraph"><div class="fig-h">Call graph '
+                 '<span class="muted">— the recovered call structure; the finding\'s function is '
+                 'highlighted</span></div>' + cg + '</div>')
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
                  f'{esc(rt["ceiling_why"])}</p>')
@@ -685,6 +699,9 @@ h2{font-size:16px;margin:0 0 12px;letter-spacing:-.01em}
 .stat .num{font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1.05}
 .stat .lbl{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.figure{margin:12px 0;overflow-x:auto}
+.figure .fig-h{font-weight:600;font-size:13px;margin-bottom:6px}
+.figure svg{max-width:100%;height:auto}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;
   font-size:11px;font-weight:600;color:var(--bc);border:1px solid var(--bc);
   background:color-mix(in srgb,var(--bc) 12%,transparent);white-space:nowrap}

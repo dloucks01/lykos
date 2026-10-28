@@ -33,6 +33,16 @@ to a real file, prioritized, and sized — so the next session can start at the 
   end-to-end. Remaining within 2b: make the "found by" chip and the pipeline rail clickable (a
   finding↔stage navigation hop) — deferred because the GUI interaction cannot be execution-verified
   in this environment.
+- **Theme 4 figure library (phase 3): STARTED.** `core/lykos/report/figures.py` — a stdlib,
+  deterministic, air-gap-safe, theme-robust SVG engine (a general layered-DAG layout +
+  `call_graph_svg` + `coverage_bars_svg`; byte-stable, escaped, node-capped). Wired into the HTML
+  report (`model.build_report` attaches a per-target call-graph figure focused on the worst finding's
+  function, and a case-level coverage figure; `html.to_html` embeds them). This closes the explicit
+  "call graph + coverage are GUI-only, absent from the air-gap report" gap. `tests/test_report_figures.py`
+  (11: determinism, XML well-formedness, content, the node cap, no-external-request, escaping, cycle
+  safety). SARIF stays machine-faithful (ignores `figures`). REMAINING in Theme 4: embed the SVGs in
+  the PDF (`pdf.py` is a hand-rolled renderer, not `to_html` — a larger job), and add the taint-path,
+  provenance-chain, and patch-diff figures (figures 2/5/6).
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
