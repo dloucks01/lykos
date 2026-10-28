@@ -147,6 +147,23 @@ def main(spec_path, out_path):
         num_find = int(spec.get("num_find", 6))
 
         proj = _load_project(angr, spec, binary)
+        # Finding-directed steering: resolve each named function to its rebased address through
+        # angr's loader and add it to the find set, so exploration heads for the statically-suspected
+        # sites. Best-effort -- a static/inlined function absent from the symbol table is skipped, so
+        # the explore falls back to coverage mode. Steering never affects SOUNDNESS: a generated input
+        # is still confirmed downstream by the ASan replay + negative control, so a mis-steer only
+        # costs exploration efficiency, never a false positive.
+        steered = []
+        for _name in (spec.get("target_syms") or []):
+            try:
+                _s = proj.loader.find_symbol(_name)
+            except Exception:                              # noqa: BLE001 -- a loader quirk, just skip
+                _s = None
+            if _s is not None:
+                targets.append(_s.rebased_addr)
+                steered.append(_name)
+        targets = sorted(set(targets))
+        result["steered_syms"] = steered
         symbytes = claripy.BVS("lykos_input", 8 * size)
         extras = {angr.options.LAZY_SOLVES}
         # HARNESS mode: enter directly at a `LLVMFuzzerTestOneInput(data, size)` function with a

@@ -59,15 +59,17 @@ def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -
 
 
 def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFuzzerTestOneInput",
-                     input_size: int = 256, lib_dirs=None, targets=None, timeout: int = 120,
-                     ctx=None) -> dict:
+                     input_size: int = 256, lib_dirs=None, targets=None, target_syms=None,
+                     timeout: int = 120, ctx=None) -> dict:
     """Confirm a memory-safety bug via concolic input synthesis + ASan replay. See module docstring.
 
     `explore_binary` is the NON-ASan harness angr explores; `replay_binary` the ASan harness used to
     confirm (may be the same file, but ASan makes angr worse). `targets` optionally lists sink
-    addresses to steer angr toward (directedness for deep bugs); without it angr explores and every
-    generated input is replayed. Returns {confirmed, input (bytes), report, source, class,
-    rung:"concolic", reason}."""
+    addresses to steer angr toward, and `target_syms` function NAMES to steer toward (resolved by
+    angr's loader -- finding-directed, so angr heads for the statically-suspected functions). Steering
+    only changes exploration efficiency: every generated input is still replayed under ASan with a
+    negative control, so it can never cause a false positive. Returns {confirmed, input (bytes),
+    report, source, class, rung:"concolic", reason}."""
     out = {"confirmed": False, "input": None, "report": None, "source": None, "class": None,
            "rung": "concolic", "reason": None}
     py = _concolic.locate_angr_python()
@@ -78,6 +80,8 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
             "input_size": int(input_size), "max_seconds": int(timeout), "num_find": 16}
     if targets:
         spec["targets"] = list(targets)
+    if target_syms:
+        spec["target_syms"] = list(target_syms)
     try:
         res = _concolic.run_explore(py, spec, ctx=ctx, timeout=timeout)
     except Exception as e:                                   # noqa: BLE001 -- a stuck/failed explore
@@ -129,7 +133,7 @@ def _rung_concolic(h, *, timeout, ctx):
         h["explore_binary"], h.get("replay_binary") or h["explore_binary"],
         harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
         input_size=int(h.get("input_size", 256)), lib_dirs=h.get("lib_dirs"),
-        targets=h.get("targets"), timeout=timeout, ctx=ctx)
+        targets=h.get("targets"), target_syms=h.get("target_syms"), timeout=timeout, ctx=ctx)
 
 
 def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096, timeout=90,

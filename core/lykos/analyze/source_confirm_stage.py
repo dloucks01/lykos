@@ -14,12 +14,14 @@ smart-fuzz rung, B3, covers it) rather than fabricating a result.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
 from .debug.rootcause import parse_asan_report
 from .libfuzzer_stage import _materialize_source
+from .symbolic import dwarfline
 
 TOOL, TOOL_VERSION = "source_confirm", "source-confirm-1"
 
@@ -47,6 +49,31 @@ def _suffix_match(a, b) -> bool:
         return False
     a, b = a.replace("\\", "/"), b.replace("\\", "/")
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _steer_sites(ctx, target) -> list:
+    """The (basename, line) SITES of the static source candidates, to steer the concolic rung toward
+    the statically-suspected bug LINES (not the enclosing function entry -- that would stop before the
+    guard the defect sits behind). Resolved per harness against its own DWARF line table. Returns a
+    de-duplicated, bounded list of (basename, line)."""
+    sites: list = []
+    seen: set = set()
+    for f in FindingDAO(ctx.conn).list_by_target(target.id):
+        if f.detector not in _STATIC_SOURCE_DETECTORS or len(sites) >= 128:
+            continue
+        fp = fline = None
+        for e in (f.evidence or []):
+            if e.get("channel") == "source":
+                fp, fline = _parse_loc(e.get("detail"))
+                if fp:
+                    break
+        if not fp or not fline:
+            continue
+        key = (os.path.basename(fp), fline)
+        if key not in seen:
+            seen.add(key)
+            sites.append(key)
+    return sites
 
 
 def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> int:
@@ -161,6 +188,12 @@ def source_confirm_stage(ctx) -> dict:
     ex_by = {h["name"]: h for h in explore["harnesses"]} if explore["ok"] else {}
     rp_by = {h["name"]: h for h in replay["harnesses"]} if replay["ok"] else {}
     fz_by = {h["name"]: h for h in fuzzb["harnesses"]} if fuzzb["ok"] else {}
+    # Finding-directed steering: the LINE sites of the static source candidates, to point the concolic
+    # rung at the statically-suspected bug lines (resolved per harness against its own DWARF line
+    # table). Only computed when a concolic (explore) build exists -- the only rung that consumes it --
+    # so a project that builds only the shared harness (FreeRDP) pays nothing. Steering only affects
+    # exploration efficiency, never soundness (the ASan replay + negative control still gate confirms).
+    sites = _steer_sites(ctx, target) if ex_by else []
     names = sorted(set(ex_by) | set(fz_by))
     harnesses = []
     for n in names:
@@ -168,6 +201,10 @@ def source_confirm_stage(ctx) -> dict:
         if n in ex_by and n in rp_by:                       # concolic (static clean + ASan)
             d["explore_binary"] = ex_by[n]["binary"]
             d["replay_binary"] = rp_by[n]["binary"]
+            if sites:
+                addrs = dwarfline.site_addrs(ex_by[n]["binary"], sites)
+                if addrs:
+                    d["targets"] = [hex(a) for a in addrs]
         if n in fz_by:                                      # smart-fuzz (shared ASan)
             d["fuzz_binary"] = fz_by[n]["binary"]
         if d.get("explore_binary") or d.get("fuzz_binary"):
