@@ -27,14 +27,39 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import random as _random
 from dataclasses import dataclass, field
 from typing import Callable
 
-# Tag the initial state so a final register value reveals its PROVENANCE. The tags sit in the
-# non-canonical high bits so they never collide with a plausible small constant a gadget might load.
-_STACK_TAG = 0x5A5A_5A00_0000_0000
-_REG_TAG = 0x4242_4200_0000_0000
-_TAG_MASK = 0xFFFF_FF00_0000_0000
+# Seed each register and each stack slot with a distinct RANDOM 64-bit value, so a final register's
+# PROVENANCE (zeroed / copied from reg R / loaded from stack slot S) is read by matching its value
+# against those seeds. Random -- not a structured tag -- is the point: a tagged seed like `TAG|i`
+# survives arithmetic (`sub a1,a1,a5` with a5=TAG|15, a4=TAG|14 cancels to 1, then a1=TAG|10), which
+# aliases to a FALSE "a1 <- x10 copy". High-entropy independent seeds make such a coincidence
+# (a derived value equalling some other register's seed) astronomically unlikely, so only a GENUINE
+# copy/load matches -- a derived/arithmetic value matches nothing and is correctly reported as "not
+# cleanly controlled". Deterministic (fixed PRNG seed) for reproducible results.
+_MASK64 = (1 << 64) - 1
+_RNG = _random.Random(0xC0FFEE1234)
+_REG_SEED = {}                                       # reg index 1..31 -> seed value
+_STACK_SEED = {}                                     # byte offset 0..0xFF8 (step 8) -> seed value
+_used = set()
+
+
+def _fresh():
+    while True:
+        v = _RNG.getrandbits(62) | (1 << 62)         # canonical-ish, non-zero, high-entropy
+        if v not in _used:
+            _used.add(v)
+            return v
+
+
+for _i in range(1, 32):
+    _REG_SEED[_i] = _fresh()
+for _o in range(0, 0x1000, 8):
+    _STACK_SEED[_o] = _fresh()
+_REG_BY_VAL = {v: i for i, v in _REG_SEED.items()}   # seed value -> reg index
+_STACK_BY_VAL = {v: o for o, v in _STACK_SEED.items()}  # seed value -> stack byte offset
 
 
 def available() -> bool:
@@ -112,20 +137,19 @@ _SP0 = _STK_BASE + 0x800            # start sp mid-stack, headroom below and abo
 
 
 def _classify(val: int, own_idx: int):
-    """Describe a final register value by provenance: zero / stack@<sp-offset> / reg:x<k> / None.
-    A value equal to the register's OWN input tag means it was left UNCHANGED -- not control -- so
-    that returns None (the caller only wants registers the gadget actually sets)."""
+    """Describe a final register value by provenance against the random seeds: zero / stack@<offset>
+    / reg:x<k> / None. A value matching the register's OWN seed means UNCHANGED (not control); a
+    value matching no seed is a DERIVED/arithmetic value (not a clean, controllable primitive) and
+    returns None -- only an exact match on another register's seed or a stack slot's seed, or a
+    clean zero, is reported."""
     if val == 0:
         return "zero"
-    if (val & _TAG_MASK) == _STACK_TAG:
-        return f"stack@{val & 0xFFFF}"            # byte offset from the gadget's entry sp
-    if (val & _TAG_MASK) == _REG_TAG:
-        # A CLEAN copy leaves the input tag intact: low bits == a valid GPR index. Arithmetic on a
-        # tagged register (`addi a0, sX, imm`) perturbs the low bits (giving e.g. "x108"), which is a
-        # derived value, not a controllable copy -- report only the clean copies.
-        k = val & (~_TAG_MASK & 0xFFFFFFFFFFFFFFFF)
-        if k <= 31 and k != own_idx:
-            return f"reg:x{k}"
+    o = _STACK_BY_VAL.get(val)
+    if o is not None:
+        return f"stack@{o}"                          # byte offset from the gadget's entry sp
+    k = _REG_BY_VAL.get(val)
+    if k is not None and k != own_idx:
+        return f"reg:x{k}"
     return None
 
 
@@ -156,7 +180,7 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
     _reg = {name: getattr(rc, cfg.gpr[name]) for name in set(cfg.gpr)}
     want_regs = [w for w in want if w in cfg.gpr]
     _own = {w: int(cfg.gpr[w].rsplit("_X", 1)[1]) for w in want_regs}   # each want-reg's GPR index
-    _stack = b"".join((_STACK_TAG | off).to_bytes(8, "little") for off in range(0, 0x1000, 8))
+    _stack = b"".join(_STACK_SEED[off].to_bytes(8, "little") for off in range(0, 0x1000, 8))
     results, seen = [], set()
     scanned = 0
 
@@ -184,7 +208,7 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             for i in range(1, 32):
                 name = f"x{i}"
                 if name in _reg:
-                    mu.reg_write(_reg[name], _REG_TAG | i)
+                    mu.reg_write(_reg[name], _REG_SEED[i])
             mu.reg_write(_reg[cfg.sp], _SP0)
             mu.hook_add(_hook_code, _hook)
             mu.emu_start(_CODE_BASE, _CODE_BASE + len(window), count=max_insns + 4)
@@ -192,7 +216,9 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             pass
         if not reached[0]:                                        # body faulted before the return
             return None
-        return {w: mu.reg_read(_reg[w]) for w in want_regs}
+        regs = {w: mu.reg_read(_reg[w]) for w in want_regs}
+        regs["__spadj__"] = mu.reg_read(_reg[cfg.sp]) - _SP0       # sp delta at the terminator
+        return regs
 
     for off, size, vaddr in segs:
         seg = data[off:off + size]
@@ -225,13 +251,13 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
                     if c is not None:
                         eff[r] = c
                 if eff and (best is None or len(eff) > len(best[1])):
-                    best = (entry, eff, k + 1)
+                    best = (entry, eff, k + 1, regs["__spadj__"])
             if best:
                 va = vaddr + best[0]
                 if va not in seen:
                     seen.add(va)
                     results.append({"va": va, "insns": best[2], "effects": best[1],
-                                    "term": term_desc})
+                                    "term": term_desc, "spadj": best[3]})
                     if len(results) >= max_results:
                         return results
             if scanned >= scan_cap:
