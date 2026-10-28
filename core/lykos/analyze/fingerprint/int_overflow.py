@@ -21,6 +21,7 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
+from . import srctaint
 from .srcwalk import source_files
 
 _log = logging.getLogger(__name__)
@@ -28,6 +29,8 @@ _log = logging.getLogger(__name__)
 INT_OVERFLOW_STAGE = "int_overflow_scan"
 TOOL = "int-overflow"
 TOOL_VERSION = "int-overflow-1"
+#: cap on corroborated recipes filed per scan.
+_MAX_SOURCE_RECIPES = 64
 
 
 # calloc/reallocarray are the SAFE allocators (they check the product internally) -> never flagged.
@@ -121,14 +124,23 @@ def scan_source(root: Path) -> list:
             if any(g in window for g in _GUARD):
                 continue            # an overflow guard is present -> not flagged (e.g. fixed code)
             alloc = m.group(1)
+            # TAINT-LITE: are the size OPERANDS derived from an untrusted source? For a size variable
+            # the operands live in its assignment; for inline arithmetic they are in `frag` itself.
+            expr = lines[size_vars[via]] if (via and via in size_vars) else frag
+            operands = [o for o in re.findall(_IDENT, expr) if not _MACRO.match(o)]
+            taint = srctaint.any_untrusted(lines, i, operands)
             detail = (f"{label}:{i + 1}: {alloc}() size is overflow-prone arithmetic "
                       f"({frag}) with no nearby overflow check")
+            ev = [{"channel": "source", "detail": detail}]
+            if taint:
+                ev.append({"channel": "source-flow",
+                           "detail": f"a size operand flows from {taint['source']} ({taint['via']})"})
             findings.append({
                 "cwe": "CWE-190", "severity": "medium",
                 "title": f"Unchecked size arithmetic into {alloc}() (integer-overflow allocation)",
                 "dedup_key": f"intovf:{label}:{i + 1}:{alloc}",
-                "evidence": [{"channel": "source", "detail": detail}],
-                "via": via})
+                "evidence": ev, "via": via,
+                "fn": alloc, "arg": frag, "file": label, "line": i + 1, "taint": taint})
     return findings
 
 
@@ -160,15 +172,27 @@ def int_overflow_stage(ctx) -> dict:
     ctx.progress(msg="scanning for integer-overflow allocations")
     findings = scan_source(root)
     fd = FindingDAO(ctx.conn)
+    recipes = 0
     for f in findings:
+        # An operand proven to flow from input makes this more than a guard-absence match: raise it
+        # and give it the non-fuzzing weaponization FLOOR (a corroborated CWE-190 recipe).
+        linked = bool(f.get("taint"))
         fd.upsert(target.id, target.case_id, {
             "cwe": f["cwe"], "severity": f["severity"], "detector": "int_overflow",
             "title": f["title"], "evidence": f["evidence"],
             "function_addr": None, "site_addr": None, "dedup_key": f["dedup_key"],
-            "state": "candidate", "confidence": 0.45})
-    ctx.emit("int_overflow.done", payload={"applicable": True, "findings": len(findings)})
-    ctx.progress(pct=100, msg=f"{len(findings)} unguarded size-arithmetic allocation(s)")
-    return {}
+            "site_detail": f"{f['file']}:{f['line']}",
+            "state": "candidate", "confidence": 0.6 if linked else 0.45})
+        if linked and recipes < _MAX_SOURCE_RECIPES:
+            from ..poc.source_recipe import file_source_recipe
+            if file_source_recipe(ctx, target, cwe=f["cwe"], fn=f["fn"], arg=f["arg"],
+                                  file=f["file"], line=f["line"], taint=f["taint"]) is not None:
+                recipes += 1
+    ctx.emit("int_overflow.done", payload={"applicable": True, "findings": len(findings),
+             "recipes": recipes})
+    ctx.progress(pct=100, msg=f"{len(findings)} unguarded size-arithmetic allocation(s), "
+                             f"{recipes} recipe(s)")
+    return {"metrics": {"findings": len(findings), "recipes": recipes}}
 
 
 def register() -> None:

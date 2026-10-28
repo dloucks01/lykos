@@ -25,6 +25,7 @@ from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
 from .srcwalk import source_files
+from . import srctaint
 
 _log = logging.getLogger(__name__)
 
@@ -126,94 +127,6 @@ def _is_literal(arg: str) -> bool:
     return bool(re.match(r'^(?:L|u8|u|U)?"', a))
 
 
-# ---- taint-lite: link the dangerous argument to an UNTRUSTED SOURCE (sound, intraprocedural) -----
-# The sink finding on its own only proves the argument is non-literal. A corroborated exploitation
-# recipe is warranted only when that value is syntactically derived from input, so these report a
-# CHECKABLE SYNTACTIC FACT (the base identifier is a function parameter, or is filled by a known
-# input reader in the same function) -- never an inferred guess. They under-report by design (a
-# multi-line signature or a transitive copy yields no link -> the finding stays a candidate with no
-# recipe) so a recipe is never filed on a fabricated flow.
-# a column-0 function-definition header: `<type> name(params)` ending at the body's `{` (which may
-# be on this line, with the body after it, or on the next line -> end-of-line). The two-identifier
-# `<type> <name>` shape (return type THEN name) is what separates a definition from a bare call.
-_SIG = re.compile(r'^[A-Za-z_][\w \t\*]*\b[A-Za-z_]\w*\s*\(([^;{]*)\)\s*(?:\{|$)')
-
-
-def _base_ident(arg: str):
-    """The leading identifier of the sink argument (`msg->fmt` -> `msg`, `&buf[0]` -> `buf`). A
-    call or a literal has no simple base and yields None (-> no taint link)."""
-    a = arg.strip().lstrip("&").lstrip("*").strip()
-    m = re.match(r"([A-Za-z_]\w*)", a)
-    if not m:
-        return None
-    ident = m.group(1)
-    rest = a[m.end():].lstrip()
-    if rest.startswith("("):                                # a function call, not a variable
-        return None
-    return ident
-
-
-def _param_idents(params: str) -> set:
-    """Identifier names of a (single-line) function signature's parameter list."""
-    out = set()
-    for part in params.split(","):
-        toks = re.findall(r"[A-Za-z_]\w*", part)
-        if toks and part.strip() not in ("void", ""):
-            out.add(toks[-1])                              # the declared name is the last token
-    return out
-
-
-def _enclosing(lines: list, idx: int):
-    """Conservative enclosing-function bounds: start just after the previous function's column-0
-    closing brace (normal multi-line C), but not earlier than the NEAREST column-0 signature above
-    the sink (so a one-line definition, whose `}` is not at column 0, is handled too). Returns
-    (signature_or_start_index, param_name_set); an empty set means the params could not be parsed
-    (e.g. a multi-line signature) -> no parameter link is claimed."""
-    start = 0
-    for s in range(idx - 1, -1, -1):
-        if lines[s][:1] == "}":                            # column-0 '}' = end of the prior function
-            start = s + 1
-            break
-    for s in range(idx, start - 1, -1):                    # nearest column-0 signature above the sink
-        m = _SIG.match(lines[s])
-        if m:
-            return s, _param_idents(m.group(1))
-    return start, set()
-
-
-def _reader_source(body: str, base: str):
-    """If `base` is filled by a known input reader in `body`, name that reader; else None. Readers
-    are matched at the exact destination/return position so a count or fd argument is not mistaken
-    for the data buffer."""
-    b = re.escape(base)
-    if re.search(rf"\b{b}\s*=\s*argv\s*\[", body):
-        return "argv[]"
-    for fn in ("getenv", "secure_getenv", "fgetln"):       # data-returning readers (assigned-from)
-        if re.search(rf"\b{b}\s*=\s*{fn}\s*\(", body):
-            return f"{fn}()"
-    for fn in ("read", "recv", "recvfrom"):                # destination = 2nd argument
-        if re.search(rf"\b{fn}\s*\(\s*[^,;()]+,\s*(?:&)?{b}\b", body):
-            return f"{fn}()"
-    for fn in ("fgets", "gets", "fread"):                  # destination = 1st argument
-        if re.search(rf"\b{fn}\s*\(\s*(?:&)?{b}\b", body):
-            return f"{fn}()"
-    return None
-
-
-def _taint_link(lines: list, idx: int, arg: str):
-    """Syntactic link from the sink argument to an untrusted source, or None. {"via","source"}."""
-    base = _base_ident(arg)
-    if not base:
-        return None
-    start, params = _enclosing(lines, idx)
-    if base in params:
-        return {"via": "parameter", "source": f"function parameter '{base}'"}
-    rdr = _reader_source("\n".join(lines[start:idx + 1]), base)
-    if rdr:
-        return {"via": "input-reader", "source": f"{rdr} into '{base}'"}
-    return None
-
-
 def scan_source(root: Path) -> list:
     findings: list = []
     for label, _p, text in source_files(root):
@@ -243,7 +156,7 @@ def scan_source(root: Path) -> list:
                 # a bare numeric / sizeof / NULL is not a tainted string either
                 if re.fullmatch(r"(?:NULL|0|nullptr)", arg):
                     continue
-                taint = _taint_link(lines, i, arg)
+                taint = srctaint.untrusted_link(lines, i, arg)
                 if fn in _CMDI:
                     findings.append(_mk(label, i, fn, arg, "CWE-78",
                                         f"{fn}() runs a non-literal command ('{arg}')",

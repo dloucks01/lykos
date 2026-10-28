@@ -22,6 +22,7 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
+from . import srctaint
 from .srcwalk import source_files
 
 _log = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ _log = logging.getLogger(__name__)
 UAF_STAGE = "uaf_scan"
 TOOL = "uaf"
 TOOL_VERSION = "uaf-1"
+#: cap on corroborated recipes filed per scan.
+_MAX_SOURCE_RECIPES = 64
 
 
 _IDENT = r"[A-Za-z_]\w*"
@@ -108,13 +111,14 @@ def _scan_text(name: str, lines: list) -> list:
             ref = _FREE.search(ln) or _DELETE.search(ln)
             if ref and ref.group(1) == var:
                 findings.append(_mk(name, fi, i, var, dealloc, "CWE-415", "Double-free",
-                                    f"freed by {dealloc}() at line {fi + 1}, freed again"))
+                                    f"freed by {dealloc}() at line {fi + 1}, freed again", lines))
                 freed.pop(var, None)
                 continue
             how = _uses(ln, var)
             if how:
                 findings.append(_mk(name, fi, i, var, dealloc, "CWE-416", "Use-after-free",
-                                    f"freed by {dealloc}() at line {fi + 1}, then used ({how})"))
+                                    f"freed by {dealloc}() at line {fi + 1}, then used ({how})",
+                                    lines))
                 freed.pop(var, None)
         # 2) record new frees on this line -- unless the free's own block RETURNS on the same line
         # (`if (err) { free(p); return -1; }`): that path never reaches the code below, so a later
@@ -171,13 +175,21 @@ def _returns_after(line: str, pos: int) -> bool:
     return False
 
 
-def _mk(name, free_line, use_line, var, dealloc, cwe, label, detail_tail) -> dict:
+def _mk(name, free_line, use_line, var, dealloc, cwe, label, detail_tail, lines) -> dict:
     detail = f"{name}:{use_line + 1}: pointer '{var}' {detail_tail}"
+    # TAINT-LITE: is the freed pointer derived from an untrusted source in its function? That link
+    # (not proof of reachability) is what earns the corroborated weaponization recipe.
+    taint = srctaint.untrusted_link(lines, use_line, var)
+    ev = [{"channel": "source", "detail": detail}]
+    if taint:
+        ev.append({"channel": "source-flow",
+                   "detail": f"the pointer '{var}' flows from {taint['source']} ({taint['via']})"})
     return {
         "cwe": cwe, "severity": "high",
         "title": f"{label} of '{var}' ({cwe})",
         "dedup_key": f"uaf:{name}:{free_line + 1}:{use_line + 1}:{var}",
-        "evidence": [{"channel": "source", "detail": detail}]}
+        "fn": f"{dealloc}()", "arg": var, "file": name, "line": use_line + 1, "taint": taint,
+        "evidence": ev}
 
 
 def scan_source(root: Path) -> list:
@@ -217,15 +229,26 @@ def uaf_stage(ctx) -> dict:
     ctx.progress(msg="scanning for use-after-free / double-free")
     findings = scan_source(root)
     fd = FindingDAO(ctx.conn)
+    recipes = 0
     for f in findings:
+        # A freed pointer proven to flow from input raises the row and earns the non-fuzzing
+        # weaponization FLOOR (a corroborated UAF/double-free recipe).
+        linked = bool(f.get("taint"))
         fd.upsert(target.id, target.case_id, {
             "cwe": f["cwe"], "severity": f["severity"], "detector": "uaf",
             "title": f["title"], "evidence": f["evidence"],
             "function_addr": None, "site_addr": None, "dedup_key": f["dedup_key"],
-            "state": "candidate", "confidence": 0.45})
-    ctx.emit("uaf.done", payload={"applicable": True, "findings": len(findings)})
-    ctx.progress(pct=100, msg=f"{len(findings)} use-after-free / double-free candidate(s)")
-    return {}
+            "site_detail": f"{f['file']}:{f['line']}",
+            "state": "candidate", "confidence": 0.6 if linked else 0.45})
+        if linked and recipes < _MAX_SOURCE_RECIPES:
+            from ..poc.source_recipe import file_source_recipe
+            if file_source_recipe(ctx, target, cwe=f["cwe"], fn=f["fn"], arg=f["arg"],
+                                  file=f["file"], line=f["line"], taint=f["taint"]) is not None:
+                recipes += 1
+    ctx.emit("uaf.done", payload={"applicable": True, "findings": len(findings), "recipes": recipes})
+    ctx.progress(pct=100, msg=f"{len(findings)} use-after-free / double-free candidate(s), "
+                             f"{recipes} recipe(s)")
+    return {"metrics": {"findings": len(findings), "recipes": recipes}}
 
 
 def register() -> None:
