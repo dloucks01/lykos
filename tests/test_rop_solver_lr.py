@@ -377,3 +377,62 @@ def test_auto_execve_solver_fallback_aarch64(store, tmp_path, monkeypatch):
     tb = _stage_auto_target(store, exe, "aevB")
     assert fda.id_for_dedup(tb.id, f"exploit:{sol}:{tb.id}"), \
         "the execve solver did not engage under auto when the pattern path declined"
+
+
+def test_autopilot_files_execve_solver_l3_aarch64(store, tmp_path, monkeypatch):
+    """END-TO-END through the REAL autopilot: run_case_autopilot triages the target then drives
+    build_exploit(strategy="auto") in its recover phase. On an aarch64 no-`system` target whose
+    byte-pattern loaders are absent (monkeypatched empty, = a non-canonical target), the auto path
+    reaches the semantic execve SOLVER, which composes execve("/bin/sh",0,0) and files the verified L3.
+    This is the FULL pipeline (triage -> recover -> build_exploit -> solver -> confirm -> file), not a
+    bare enqueue_exploit. The heavy campaigns are skipped so the run is fast; build_exploit runs early
+    in the recover phase and is unaffected by the skips."""
+    import threading
+    if not (_AA_GCC and _AA_QEMU and gadget_emu.available()):
+        pytest.skip("needs aarch64 toolchain + qemu + unicorn/capstone")
+    from lykos.analyze import orchestrate as O
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.db.dao import FindingDAO, PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    src = tmp_path / "v.c"
+    src.write_text(_ASM_EXECVE_AA)
+    exe = tmp_path / "v"
+    if subprocess.run([_AA_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build aarch64 execve fixture")
+    register()
+    case = store.cases.create("evauto")
+    t = ingest(store, case.id, exe, filename="v")
+    # Non-canonical target: no byte-pattern loaders, so the pattern ret2libc/execve clauses decline and
+    # (with no `system`) neither ret2libc path fires -- the auto path must reach the execve solver. The
+    # autopilot runs in-process, so this process-global patch reaches its build_exploit stage.
+    monkeypatch.setattr(rop, "find_aarch64_r2libc_gadgets",
+                        lambda data: {"callers": [], "loaders": []})
+    # The autopilot ENQUEUES stages to the case JobQueue; a WorkerPool on the same DB executes them
+    # (exactly how cli.py / the API drive it). Without a running pool every stage just waits out its
+    # slice. build_exploit(auto) runs FIRST, in the recover phase, and files the L3 there; skip the
+    # rest so the end-to-end run is fast and build_exploit gets an ample slice.
+    skip = ["behavior_trace", "boundary_fuzz", "build_poc", "chain_primitive", "concolic",
+            "coverage_fuzz", "cve_corroborate", "cve_poc", "cve_scan", "debug_monitor", "detect_cwe",
+            "directed_fuzz", "disassemble", "dynamic_run", "dynamic_taint", "embedded_audit",
+            "env_fuzz", "extract_secrets", "firmware_carve", "firmware_rehost", "fuzz",
+            "int_overflow_scan", "libfuzzer", "mem_oracle", "multi_debug", "net_fuzz",
+            "poc_primitive", "root_cause", "source_cve_scan", "source_sink_scan",
+            "synthesize_injection", "synthesize_poc", "synthesize_secret", "uaf_scan", "unpack",
+            "heap_check", "heap_trace", "oob_index"]
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    status: dict = {}
+    try:
+        enqueue_triage(JobQueue(store.conn), t, force=True)      # triage first, as cli.py does
+        assert pool.wait_idle(180)
+        O.run_case_autopilot(store.dir, case.id, [t.id], status, threading.Event(),
+                             budget_seconds=300, skip_stages=skip)
+    finally:
+        pool.stop(grace=3.0)
+    assert status.get("state") == "done"
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    assert l3, "the autopilot filed no verified L3"
+    fid = FindingDAO(store.conn).id_for_dedup(t.id, f"exploit:aarch64-execve-syscall-solver:{t.id}")
+    assert fid, "the autopilot's L3 was not filed by the execve semantic solver"
