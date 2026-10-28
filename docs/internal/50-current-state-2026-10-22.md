@@ -107,6 +107,15 @@ A PE is first-class **through triage, static analysis, disassembly, and dynamic 
   forbids. This is a documented environment ceiling (like mips L3 with no cross-compiler), not a
   code gap: the fixed-address ROP/ret2win is confirmed and honestly qualified; the defeat waits on a
   randomizing runtime.
+- **The sound HALF of ASLR defeat — a confirmed info leak (2026-10-27):** `_pe_format_leak` probes a
+  PE with a sentinel + many `%p` and confirms a **format-string address leak** (CWE-200) under Wine:
+  if live runtime addresses come back that a benign same-shape control does not, the input reaches a
+  printf-family format and discloses the layout — a **code pointer** gives the image base (defeats
+  image ASLR), a **stack pointer** the stack. It files its own info-disclosure finding (high) from
+  the PE exploit branch, independent of the overflow path. The leak is the real artefact an ASLR’d
+  target’s defeat would require; the finding states plainly that, under Wine’s fixed layout, the
+  end-to-end relocation against randomization is **not exercised here** — only the leak is confirmed.
+  (64-bit PE for now; 32-bit `%p` width and OOB-read leaks are follow-ups.)
 - **WoW64 32-bit now reached (2026-10-27):** a 32-bit PE reaches a confirmed L2 (clean EIP) and L3
   (ret2win). The WoW64 `+seh` dump shows Wine's 64-bit wrapper in `rip`, but the guest's controlled
   EIP IS the faulting access-violation **address**, so `_pe_ip_primitive` reads the control offset

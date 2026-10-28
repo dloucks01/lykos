@@ -392,3 +392,52 @@ def test_pe_structured_overflow_frames_through_to_l3(store, case, pool, tmp_path
               if e.type == "exploit.done")
     assert xp.get("confirmed") and xp.get("exploit") == "ret2win", xp
     assert [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L3"]
+
+
+_FMT_C = (
+    "#include <stdio.h>\n"
+    "int main(int argc, char **argv){ if(argc<2) return 2; printf(argv[1]); fflush(stdout);"
+    " return 0; }\n")
+
+
+def _mingw_fmt(tmp_path):
+    cc = shutil.which("x86_64-w64-mingw32-gcc")
+    if not cc:
+        pytest.skip("no mingw cross compiler")
+    if not sandbox._wine():
+        pytest.skip("no wine to execute the PE")
+    c = tmp_path / "fmt.c"
+    c.write_text(_FMT_C)
+    exe = tmp_path / "fmt.exe"
+    r = subprocess.run([cc, "-O1", "-w", str(c), "-o", str(exe)], capture_output=True, timeout=180)
+    if r.returncode != 0:
+        pytest.skip("mingw cannot link here: " + r.stderr.decode(errors="replace")[:200])
+    return exe
+
+
+def test_pe_format_string_address_leak_confirmed(store, case, pool, tmp_path):
+    """A PE with a format-string bug (printf of attacker input) has a CONFIRMED information
+    disclosure (CWE-200): `%p` specifiers leak live runtime addresses -- a code pointer (the image
+    base) and stack pointers -- that a benign same-shape control does not. The sound half of an
+    ASLR defeat, confirmed under Wine; the finding says the end-to-end defeat is not exercised here."""
+    exe = _mingw_fmt(tmp_path)
+    q = JobQueue(store.conn)
+    t = ingest(store, case.id, exe, filename="fmt.exe")
+    for enq in (enqueue_triage, enqueue_disassemble):
+        enq(q, t, force=True)
+        assert pool.wait_idle(180)
+    t = store.targets.get(t.id)
+
+    dummy = store.put_artifact(case.id, "probe", data=b"x").sha256
+    xr = enqueue_exploit(q, t, params={"input_sha": dummy, "input_mode": "arg", "timeout": 25})
+    assert pool.wait_idle(180) and q.runs.get(xr.id).status == "done"
+    leak = next((e.payload for e in q.events.list(run_id=xr.id, limit=80)
+                 if e.type == "exploit.leak"), None)
+    assert leak and leak.get("confirmed") and leak.get("kind") == "format-string", leak
+    assert leak["leak"].get("image_base") and leak["leak"].get("code"), leak
+
+    fs = FindingDAO(store.conn).list_by_target(t.id)
+    lf = [f for f in fs if f.cwe == "CWE-200" and "format string" in (f.title or "").lower()]
+    assert lf and lf[0].severity == "high", [(f.title, f.cwe) for f in fs]
+    ev = " ".join(e.get("detail", "") for f in lf for e in (f.evidence or []))
+    assert "image base" in ev and "ASLR" in ev and "not exercised here" in ev, ev[:200]
