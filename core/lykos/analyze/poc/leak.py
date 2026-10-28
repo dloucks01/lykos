@@ -45,7 +45,7 @@ def _kill(p):
 def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                      payload_for_base, success_regex: str, timeout: float = 8.0,
                      mem_mb: int = 2048, base_from_leaks=None, leak_trigger: bytes = b"",
-                     shell_probe: bytes = b"") -> dict:
+                     shell_probe: bytes = b"", run_wrapper=None, run_env=None) -> dict:
     """Interactive single-process leak → relocate → exploit over stdin/stdout.
 
     Two ways to turn the leak into an image base:
@@ -64,6 +64,12 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
     exited without ever running anything. With a probe, stdin stays open, the command goes in,
     and the caller grades the reply (`attribution.CodeMarkers.proves`, which an echoing target
     cannot fake). The only thing that changes without a probe is nothing at all.
+
+    `run_wrapper` is a command prefix the target is launched behind (e.g. `[qemu-aarch64]` for an
+    EMULATED foreign-CPU target, so the same leak -> relocate -> exploit loop defeats a non-x86
+    PIE's runtime-randomised load base under qemu-user); `run_env` adds environment variables the
+    wrapper needs (e.g. `QEMU_LD_PREFIX` so a dynamically linked foreign ELF finds its loader).
+    Both default to None -- a native x86-64 target is spawned exactly as before.
     """
     if leak_base_offset is None and base_from_leaks is None:
         raise ValueError("leak_and_exploit needs exactly one of leak_base_offset= "
@@ -80,13 +86,28 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
     # The leak harness reads only the target's stdout, so it needs no control channel: contain
     # it fully (read-only fs, tmpfs, private pid + network namespace) when bwrap is available.
     exedir = str(Path(exe).resolve().parent)
-    cmd = sandbox.isolate_prefix(exedir, net=False) + \
-        [str(exe)] + [str(a) for a in base_argv]
+    # An emulated target is launched behind `run_wrapper` (the qemu-user binary); the host
+    # read-only bind in isolate_prefix makes that binary and the guest loader reachable inside the
+    # sandbox, and `run_env` (QEMU_LD_PREFIX) is inherited through bwrap. A native target gets an
+    # empty wrapper -- the exact command as before.
+    #
+    # aslr=True: this harness's whole contract is to defeat LIVE randomization, so it must NOT get
+    # the default `setarch -R` that isolate_prefix injects inside the namespace (which pinned the
+    # child at a fixed base and made "defeated ASLR" a claim against a static layout -- and, for an
+    # emulated target, pinned qemu-user's guest base too). With it left on the load base varies
+    # run-to-run and the base this files is genuinely recovered from the leak. Mirrors the
+    # `_rlimits(aslr=True)` already set below.
+    cmd = sandbox.isolate_prefix(exedir, net=False, aslr=True) + \
+        list(run_wrapper or ()) + [str(exe)] + [str(a) for a in base_argv]
+    _env = None
+    if run_env:
+        _env = dict(os.environ)
+        _env.update(run_env)
     try:
         p = subprocess.Popen(cmd,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, start_new_session=True,
-                             preexec_fn=preexec)
+                             env=_env, preexec_fn=preexec)
     except Exception as e:
         return {"ok": False, "reason": f"spawn failed: {e!r}"}
 

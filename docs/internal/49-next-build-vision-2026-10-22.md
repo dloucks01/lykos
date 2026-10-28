@@ -112,9 +112,37 @@ to a real file, prioritized, and sized — so the next session can start at the 
     marker + negative control).
   Both stubs ASSEMBLED with the real cross `as` (guaranteed-correct encoding) and qemu-proven standalone
   before embedding. +2 test files (`test_shellcode_loongarch64.py`, `test_shellcode_sh4.py`); all
-  shellcode-arch tests green. REMAINING 5a: the cross-arch info-leak primitive (the big PIE/ASLR
-  unlock, leak.py is x86-only); generalize the ROP builders. (mips stays unbuildable here — no
-  compiler; arm uses armhf, not arm-linux-gnueabi.)
+  shellcode-arch tests green.
+
+- **Theme 5a: cross-arch INFO-LEAK primitive STARTED — AArch64 PIE leak→ret2win (the PIE/ASLR
+  unlock).** The info-leak path (`poc/leak.py`) was x86-64 only, so an emulated PIE target was
+  declined outright ("the info-leak path is x86-64 only"). Now a foreign-CPU PIE with strategy
+  auto/ret2win is driven under qemu-user through the SAME interactive leak→relocate→exploit loop:
+  - `leak.leak_and_exploit` gained `run_wrapper`/`run_env` (default None → native path byte-for-byte
+    unchanged) so the target launches behind the qemu-user binary with the guest loader on
+    `QEMU_LD_PREFIX`.
+  - `_pie_leak_exploit` detects emulated, builds the qemu wrapper, arch-parameterizes the ret2win
+    payload (`ret2win_input(word=bits//8, endian=…)` — already supported), recovers the offset via
+    the qemu gdbstub capture, and keeps the payload TIGHT (offset+word+16) — a large overflow past
+    the saved return corrupts the stack the win()/execve needs and floods the spawned shell's stdin,
+    so the nonce probe is never read (measured: 4096/512 → no confirm, offset+word+16 → confirmed).
+  - The x86-only PIE strategies (mprotect/ret2libc ROP, BROP/canary oracles) are honestly declined
+    for a foreign CPU; the self-contained re-leaking `exploit.py` reproducer is skipped for emulated
+    (it would need qemu on the replay host) — the L3 is still filed from the live qemu-user run.
+  - LATENT BUG fixed along the way: `leak_and_exploit`'s own docstring says "ASLR ON … the only
+    honest test of 'defeated ASLR'" and it set `_rlimits(aslr=True)`, but its `isolate_prefix(…)`
+    call omitted `aslr=True`, so `setarch -R` silently re-pinned the child at a FIXED base (native
+    AND emulated). Passing `aslr=True` restores real run-to-run randomization.
+  VERIFIED end-to-end: the auto pipeline drives an AArch64 PIE (leaks `&main`, win() execve's a
+  shell) to a confirmed, verified L3 (`leak+ret2win-pie`) — the randomized-at-load base recovered
+  from the leak (4 distinct bases across 4 runs), relocated ret2win, hijack confirmed by a spawned
+  shell evaluating a forgery-proof nonce. Native x86 PIE-leak suite (25 tests) still green; the
+  `aslr=True` fix strengthened it (now genuinely ASLR-on). +`test_pie_leak_aarch64.py`.
+
+  REMAINING 5a: extend the leak→relocate path to the other verifiable arches (same recipe:
+  run_wrapper + word/endian + tight payload); generalize the ROP builders (ret2libc/mprotect chains
+  are still x86-only). (mips stays unbuildable here — no compiler; arm uses armhf, not
+  arm-linux-gnueabi.)
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
