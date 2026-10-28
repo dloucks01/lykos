@@ -129,3 +129,94 @@ def test_lr_solver_stage_files_l3_riscv64(store, tmp_path):
 
 def test_lr_solver_stage_files_l3_aarch64(store, tmp_path):
     _run_stage("aarch64", _AA_GCC, _AA_QEMU, store, tmp_path)
+
+
+# A fixture that keeps values live across the overflowing read(), forcing callee-saved usage (the
+# registers the ret2libc gadgets need the overflow to control); system + "/bin/sh" stay in the static
+# image but off the pre-overflow path. This is the SAME source the pattern-path cross-arch test
+# (test_ret2libc_cross) drives to a confirmed shell under "auto", so phase A below is guaranteed to
+# compose on the natural libc gadgets.
+_SRC_ORD = (
+    '#include <stdlib.h>\n#include <unistd.h>\n'
+    'void never(int c,char**v){ if(c>99){ char*s="/bin/sh"; system(s); } }\n'
+    'long sink(long x){ volatile long v=x; return v*2654435761UL + 1; }\n'
+    'void vuln(long s){\n'
+    '    char buf[64];\n'
+    '    long a=sink(s), b=sink(s^0x55), c=sink(s^0xAA);\n'
+    '    read(0, buf, 512);\n'
+    '    sink(a); sink(b); sink(c);\n'
+    '}\n'
+    'int main(int argc,char**argv){ never(argc,argv); vuln(argc); write(1,"ok\\n",3); return 0; }\n')
+
+
+def _stage_auto_target(store, exe, name):
+    """Ingest a copy of `exe` and drive build_exploit under strategy="auto"; return the target."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, store.cases.create(name).id, exe, filename="v")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(180)
+        assert (store.targets.get(t.id).mitigations or {}).get("nx") != "off"   # NX on, no PIE
+        run = enqueue_exploit(q, t, params={"strategy": "auto", "timeout": 12})
+        assert pool.wait_idle(600) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    return t
+
+
+def _run_auto_ordering(arch, gcc, qemu, store, tmp_path, monkeypatch):
+    """FALLBACK ORDERING under strategy="auto": the semantic solver is a FALLBACK the pattern path
+    pre-empts, not a path that runs unconditionally. Proven on ONE binary, two phases:
+
+      A (unpatched): the byte-pattern ret2libc clause composes on the natural libc gadgets and,
+        running FIRST, files the L3 -- the solver clause never runs (pattern slug present, solver
+        slug ABSENT).
+      B (pattern finder neutered to empty -- exactly what a target with non-canonical loader/caller
+        encodings yields): the "auto" path falls THROUGH the declining pattern clause to the solver
+        fallback, which composes from the real binary by emulation and files the L3 (solver slug
+        present).
+
+    The monkeypatch touches only the byte-DECODER (rop.find_<arch>_r2libc_gadgets); the solver reaches
+    its gadgets through gadget_emu, so phase B's chain is still discovered in the real binary -- the
+    patch only removes the pattern path's ability to compose, which is the fallback's trigger."""
+    if not (gcc and qemu and gadget_emu.available()):
+        pytest.skip(f"needs {arch} toolchain + qemu + unicorn/capstone")
+    from lykos.analyze import register
+    from lykos.db.dao import FindingDAO
+    src = tmp_path / "v.c"
+    src.write_text(_SRC_ORD)
+    exe = tmp_path / "v"
+    if subprocess.run([gcc, "-O1", "-fno-stack-protector", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+                       "-no-pie", "-static", "-w", str(src), "-o", str(exe)],
+                      capture_output=True).returncode:
+        pytest.skip(f"cannot build {arch} ordering fixture")
+    register()
+    pattern_slug, solver_slug = f"{arch}-ret2libc", f"{arch}-ret2libc-solver"
+    fda = FindingDAO(store.conn)
+
+    # PHASE A -- pattern path wins (and the solver does NOT pre-empt it).
+    ta = _stage_auto_target(store, exe, "ordA")
+    assert fda.id_for_dedup(ta.id, f"exploit:{pattern_slug}:{ta.id}"), \
+        f"{arch}: the pattern ret2libc path did not win under auto"
+    assert not fda.id_for_dedup(ta.id, f"exploit:{solver_slug}:{ta.id}"), \
+        f"{arch}: the solver pre-empted the pattern path -- fallback ordering is wrong"
+
+    # PHASE B -- pattern finder returns nothing; the auto path must fall through to the solver.
+    monkeypatch.setattr(rop, f"find_{arch}_r2libc_gadgets",
+                        lambda data: {"callers": [], "loaders": []})
+    tb = _stage_auto_target(store, exe, "ordB")
+    assert fda.id_for_dedup(tb.id, f"exploit:{solver_slug}:{tb.id}"), \
+        f"{arch}: the solver fallback did not engage under auto when the pattern path declined"
+
+
+def test_auto_fallback_ordering_riscv64(store, tmp_path, monkeypatch):
+    _run_auto_ordering("riscv64", _RV_GCC, _RV_QEMU, store, tmp_path, monkeypatch)
+
+
+def test_auto_fallback_ordering_aarch64(store, tmp_path, monkeypatch):
+    _run_auto_ordering("aarch64", _AA_GCC, _AA_QEMU, store, tmp_path, monkeypatch)
