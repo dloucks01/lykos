@@ -42,11 +42,15 @@ from typing import Callable
 # or x86's own single set -- share one seed), deterministic via a fixed PRNG seed.
 
 
-def _make_seeds(reg_consts):
+def _make_seeds(reg_consts, salt: int = 0):
     """{const: seed} for each physical register, {offset: seed} for each 8-byte stack slot in the
     scratch stack, all distinct high-entropy values. Returns (reg_seed, reg_by_val, stack_seed,
-    stack_by_val, stack_bytes)."""
-    rng = _random.Random(0xC0FFEE1234)
+    stack_by_val, stack_bytes). `salt` selects an INDEPENDENT seeding (same shape, different values):
+    emulating a gadget under several independent seedings and keeping only the classification they
+    AGREE on is what tells a genuine zero/stack-load/reg-copy (consistent across seedings) from a
+    value DERIVED by arithmetic (e.g. a bitfield extract that is 0 under one seeding but not another),
+    and likewise tells a PRESERVED register (always its own seed) from a clobbered one."""
+    rng = _random.Random(0xC0FFEE1234 ^ (salt * 0x9E3779B97F4A7C15))
     used = set()
 
     def fresh():
@@ -213,16 +217,29 @@ def _classify(val, own_const, reg_by_val, stack_by_val, name_of):
     return None
 
 
+_SEEDINGS = 3                        # independent seedings an effect must AGREE across to be reported
+
+
 def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segments=None,
-                             max_insns: int = 6, max_results: int = 64, scan_cap: int = 200000):
+                             max_insns: int = 6, max_results: int = 64, scan_cap: int = 200000,
+                             preserve=()):
     """Emulate short windows ending in a return and return the gadgets that CONTROL any `want`
     register (zero it, load it from the attacker stack, or copy it from another GPR).
 
     `data` is the image bytes; `segments` is an optional list of (file_off, size, vaddr) EXECUTABLE
     ranges (default: scan `data` as one range at vaddr 0). Each result is
-    {"va", "len", "insns", "effects": {regname: "zero"|"stack@<off>"|"reg:x<k>"}} -- `va` is the
-    gadget entry, and for a `stack@N` effect the overflow places the desired value N bytes past the
-    gadget's entry sp. Returns [] when Unicorn/Capstone are unavailable or the arch is unsupported."""
+    {"va", "len", "insns", "effects": {regname: "zero"|"stack@<off>"|"reg:x<k>"}, "term", "spadj",
+    "preserved"} -- `va` is the gadget entry, and for a `stack@N` effect the overflow places the
+    desired value N bytes past the gadget's entry sp.
+
+    SOUNDNESS: every window is emulated under _SEEDINGS INDEPENDENT random seedings and a register's
+    classification is reported ONLY when all seedings agree. A value a gadget DERIVES by arithmetic
+    (e.g. `ubfx`/`and` that lands on 0, or a sum that aliases a seed) is 0 / that alias under one
+    seeding but not another, so it is dropped -- only a genuine clear / stack-load / register-copy is
+    consistent. `preserve` names registers to certify as UNTOUCHED: `result["preserved"]` is the
+    subset whose final value equals its own seed under every seeding (a chain can then rely on a
+    caller not clobbering a1/a2, or a loader not clobbering the callee-saved regs set before it).
+    Returns [] when Unicorn/Capstone are unavailable or the arch is unsupported."""
     cfg_fn = _ARCHS.get((arch or "").lower())
     if cfg_fn is None or not available():
         return []
@@ -232,28 +249,45 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
 
     rc = importlib.import_module("unicorn." + cfg.const_mod)       # per-arch register constants
     md = cs.Cs(getattr(cs, cfg.cs_arch), _mode(cfg.cs_mode, cs))
-    md.detail = False
+    md.detail = True              # need instruction groups to reject control-flow in a gadget BODY
+    # Control-flow groups (arch-independent capstone ids): JUMP, CALL, RET, INT, IRET, BRANCH_RELATIVE.
+    # A gadget BODY containing any of these is PATH-DEPENDENT -- emulating one straight-line path does
+    # not model what running it at the exploit's register/memory values does (e.g. a `b.eq` taken the
+    # other way, or an `svc` firing a syscall) -- so such a window is rejected. Only a straight run of
+    # data-processing/load/store instructions ending in the terminator is a sound gadget.
+    _CFLOW = {getattr(cs, "CS_GRP_" + g) for g in
+              ("JUMP", "CALL", "RET", "INT", "IRET", "BRANCH_RELATIVE") if hasattr(cs, "CS_GRP_" + g)}
+
+    def _is_cflow(ins):
+        try:
+            return bool(set(ins.groups) & _CFLOW)
+        except Exception:
+            return False
     segs = segments if segments is not None else [(0, len(data), 0)]
 
     _uc_arch, _uc_mode = getattr(uc, cfg.uc_arch), _mode(cfg.uc_mode, uc)
     _hook_code = getattr(uc, "UC_HOOK_CODE")
     _reg = {name: getattr(rc, cfg.gpr[name]) for name in set(cfg.gpr)}
     want_regs = [w for w in want if w in cfg.gpr]
+    preserve_regs = [r for r in preserve if r in cfg.gpr]
     _own = {w: _reg[w] for w in want_regs}                          # each want-reg's physical const
+    read_regs = list(dict.fromkeys(want_regs + preserve_regs))      # regs whose final value we read
     _seed_consts = [_reg[n] for n in cfg.all_gpr]                   # physical regs to seed (sp excluded)
     _name_of = {_reg[n]: n for n in cfg.all_gpr}                    # const -> canonical display name
-    reg_seed, reg_by_val, _stk_seed, stack_by_val, _stack = _make_seeds(_seed_consts)
+    # Independent seedings. seed[0] ranks (cheap first pass); the rest VERIFY (only for windows that
+    # showed control under seed[0], so the extra emulations are few).
+    seeds = [_make_seeds(_seed_consts, salt=i) for i in range(_SEEDINGS)]
     results, seen = [], set()
     scanned = 0
 
-    def _emu(window: bytes, rl: int):
-        """Emulate the gadget body in a FRESH, isolated emulator and STOP right before its return,
-        returning the register state at that point. A fresh Uc per gadget is deliberate: reusing one
-        across thousands of gadgets let faults/stores leave state that silently killed every later
-        emulation (the scan then found only the first handful). Stopping AT the ret (a code hook)
-        reads the effect regardless of what the return does -- so an epilogue that restores ra from
-        the stack (`ld ra,X(sp); ret`, the common chainable shape) is handled, not rejected. A fault
-        in the body (an unmapped load/branch) aborts before the ret, so the gadget is rejected."""
+    def _emu(window: bytes, rl: int, seeding):
+        """Emulate the gadget body in a FRESH, isolated emulator under `seeding` and STOP right before
+        its return, returning the read_regs' final values + the sp delta. A fresh Uc per gadget is
+        deliberate: reusing one across thousands of gadgets let faults/stores leave state that
+        silently killed every later emulation. Stopping AT the ret (a code hook) reads the effect
+        regardless of what the return does -- so a `ld ra,X(sp); ret` epilogue is handled, not
+        rejected. A fault in the body aborts before the ret, so the gadget is rejected (None)."""
+        reg_seed, _rbv, _ss, _sbv, stack_bytes = seeding
         reached = [False]
         stop_at = _CODE_BASE + len(window) - rl                   # the ret instruction's address
 
@@ -266,7 +300,7 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             mu.mem_map(_CODE_BASE, 0x1000)
             mu.mem_map(_STK_BASE, _STK_SIZE)
             mu.mem_write(_CODE_BASE, window.ljust(0x1000, b"\x00"))
-            mu.mem_write(_SP0, _stack)                            # per-slot random stack seeds
+            mu.mem_write(_SP0, stack_bytes)                       # per-slot random stack seeds
             for c in _seed_consts:
                 mu.reg_write(c, reg_seed[c])                       # per-register random seeds
             mu.reg_write(_reg[cfg.sp], _SP0)
@@ -276,9 +310,35 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             pass
         if not reached[0]:                                        # body faulted before the return
             return None
-        regs = {w: mu.reg_read(_reg[w]) for w in want_regs}
-        regs["__spadj__"] = mu.reg_read(_reg[cfg.sp]) - _SP0       # sp delta at the terminator
-        return regs
+        vals = {w: mu.reg_read(_reg[w]) for w in read_regs}
+        vals["__spadj__"] = mu.reg_read(_reg[cfg.sp]) - _SP0       # sp delta at the terminator
+        return vals
+
+    def _classify_seed(val, own, seeding):
+        _rs, reg_by_val, _ss, stack_by_val, _sb = seeding
+        return _classify(val, own, reg_by_val, stack_by_val, _name_of)
+
+    def _verified(window, rl):
+        """The classification + preserved set that ALL seedings agree on, or (None, None) if seed[0]
+        shows no control (so later seedings are skipped). `scanned` counts only the seed[0] pass."""
+        v0 = _emu(window, rl, seeds[0])
+        if v0 is None:
+            return None, None
+        eff0 = {r: _classify_seed(v0[r], _own[r], seeds[0]) for r in want_regs}
+        eff0 = {r: c for r, c in eff0.items() if c is not None}
+        if not eff0:
+            return None, None
+        others = [_emu(window, rl, s) for s in seeds[1:]]
+        if any(v is None for v in others):
+            return None, None                                     # must emulate cleanly every time
+        eff = {}
+        for r, c in eff0.items():
+            if all(_classify_seed(v[r], _own[r], s) == c for v, s in zip(others, seeds[1:])):
+                eff[r] = c                                        # same classification under every seeding
+        kept = {r for r in preserve_regs
+                if v0[r] == seeds[0][0][_reg[r]]
+                and all(v[r] == s[0][_reg[r]] for v, s in zip(others, seeds[1:]))}
+        return (eff, kept, v0["__spadj__"]), None
 
     for off, size, vaddr in segs:
         seg = data[off:off + size]
@@ -296,28 +356,28 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             # chains via a register the chain must set (a caller gadget) -- its target register.
             term_desc = "ret" if kind == "ret" else f"jr:x{tgt}"
             ret_end = ins.address + rl
-            best = None                                           # (entry_off, effects) richest found
+            best = None                                           # (entry_off, eff, len, spadj, kept)
             for k in range(1, max_insns + 1):
                 if j - k < 0:
                     break
+                if _is_cflow(insns[j - k]):
+                    break                                         # a branch/call/int in the body ->
+                    #                 path-dependent; this and every longer window are unsound, stop.
                 entry = insns[j - k].address
-                regs = _emu(seg[entry:ret_end], rl)
+                v, _ = _verified(seg[entry:ret_end], rl)
                 scanned += 1
-                if regs is None:
+                if v is None:
                     continue
-                eff = {}
-                for r in want_regs:
-                    c = _classify(regs[r], _own[r], reg_by_val, stack_by_val, _name_of)
-                    if c is not None:
-                        eff[r] = c
+                eff, kept, spadj = v
                 if eff and (best is None or len(eff) > len(best[1])):
-                    best = (entry, eff, k + 1, regs["__spadj__"])
+                    best = (entry, eff, k + 1, spadj, kept)
             if best:
                 va = vaddr + best[0]
                 if va not in seen:
                     seen.add(va)
                     results.append({"va": va, "insns": best[2], "effects": best[1],
-                                    "term": term_desc, "spadj": best[3]})
+                                    "term": term_desc, "spadj": best[3],
+                                    "preserved": best[4]})
                     if len(results) >= max_results:
                         return results
             if scanned >= scan_cap:

