@@ -337,3 +337,43 @@ def test_lr_execve_solver_stage_files_l3_aarch64(store, tmp_path, monkeypatch):
     assert l3, "the stage filed no solver-composed aarch64 execve L3"
     fid = FindingDAO(store.conn).id_for_dedup(t.id, f"exploit:aarch64-execve-syscall-solver:{t.id}")
     assert fid, "L3 filed but not via the execve semantic solver"
+
+
+def test_auto_execve_solver_fallback_aarch64(store, tmp_path, monkeypatch):
+    """FALLBACK ORDERING for the execve solver under strategy="auto" -- it is a fallback the pattern
+    execve path pre-empts, not an always-on clause. ONE binary (the inline-asm fixture: NO `system`
+    symbol so both ret2libc paths decline, clean arg-zero/loader/caller gadgets + a svc gateway), two
+    phases:
+      A (unpatched): the pattern execve path composes on the clean gadgets and files the L3 FIRST --
+        pattern slug present, solver slug ABSENT (the solver did not pre-empt).
+      B (the byte-pattern loader finder neutered -> pattern ret2libc AND pattern execve both decline;
+        no `system`, so neither ret2libc path fires): the auto path falls through to the execve SOLVER,
+        which composes via gadget_emu and files the L3 -- solver slug present.
+    Proves solve_lr_execve_chain is reachable under "auto" as a genuine fallback."""
+    if not (_AA_GCC and _AA_QEMU and gadget_emu.available()):
+        pytest.skip("needs aarch64 toolchain + qemu + unicorn/capstone")
+    from lykos.analyze import register
+    from lykos.db.dao import FindingDAO
+    src = tmp_path / "v.c"
+    src.write_text(_ASM_EXECVE_AA)
+    exe = tmp_path / "v"
+    if subprocess.run([_AA_GCC, "-no-pie", "-static", "-fno-stack-protector", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build aarch64 execve fixture")
+    register()
+    fda = FindingDAO(store.conn)
+    pat, sol = "aarch64-execve-syscall", "aarch64-execve-syscall-solver"
+
+    # PHASE A -- the pattern execve path wins under auto (and the solver does NOT pre-empt it).
+    ta = _stage_auto_target(store, exe, "aevA")
+    assert fda.id_for_dedup(ta.id, f"exploit:{pat}:{ta.id}"), \
+        "the pattern execve path did not win under auto"
+    assert not fda.id_for_dedup(ta.id, f"exploit:{sol}:{ta.id}"), \
+        "the execve solver pre-empted the pattern path -- fallback ordering is wrong"
+
+    # PHASE B -- byte-pattern loader finder neutered; auto must fall through to the execve solver.
+    monkeypatch.setattr(rop, "find_aarch64_r2libc_gadgets",
+                        lambda data: {"callers": [], "loaders": []})
+    tb = _stage_auto_target(store, exe, "aevB")
+    assert fda.id_for_dedup(tb.id, f"exploit:{sol}:{tb.id}"), \
+        "the execve solver did not engage under auto when the pattern path declined"
