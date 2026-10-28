@@ -449,6 +449,21 @@ def _source_tree_tgz(root, *, skip_binary=None) -> bytes:
     return buf.getvalue()
 
 
+def _is_program_elf(p) -> bool:
+    """True for an ELF that can be RUN as a target -- ET_EXEC, or a PIE (ET_DYN not named a shared
+    library). A plain `.so`/`.a` the loose builder may return as a 'binary' is not runnable as a
+    target, so it must not pre-empt a tree's in-tree fuzz harnesses."""
+    try:
+        p = Path(p)
+        if p.suffix in (".so", ".a") or ".so." in p.name:
+            return False
+        with open(p, "rb") as f:
+            h = f.read(18)
+        return len(h) >= 18 and h[:4] == b"\x7fELF" and h[16] in (2, 3)   # ET_EXEC / ET_DYN(PIE)
+    except OSError:
+        return False
+
+
 def _ingest_built_project(store, case_id, root, built, filename):
     """Ingest the binary produced by building a source PROJECT: store the primary instrumented
     executable as the target, keep the source TREE (tar.gz) keyed to its hash so the code view can
@@ -463,6 +478,9 @@ def _ingest_built_project(store, case_id, root, built, filename):
     store.put_artifact(case_id, "source-project", data=buf_bytes,
                        meta={"binary_sha": info["sha256"], "filename": filename,
                              "build_system": built.get("system"), "compiler": built.get("compiler"),
+                             # shared-linked harness targets (cmake fuzz build) need these on
+                             # LD_LIBRARY_PATH to run; a stage that executes the target reads them.
+                             "lib_dirs": built.get("lib_dirs") or [],
                              "other_binaries": [b.name for b in built.get("binaries", [])[1:8]]})
     store.put_artifact(case_id, "target-blob", src=primary)
     main = store.targets.upsert(case_id, filename, info["sha256"],
@@ -493,7 +511,8 @@ def _ingest_built_project(store, case_id, root, built, filename):
             store.put_artifact(case_id, "source-project", data=buf_bytes,
                                meta={"binary_sha": xi["sha256"], "filename": ex.name,
                                      "build_system": built.get("system"),
-                                     "compiler": built.get("compiler")})
+                                     "compiler": built.get("compiler"),
+                                     "lib_dirs": built.get("lib_dirs") or []})
         except OSError:
             continue
     return main
@@ -517,10 +536,34 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
         build_log: Optional[str] = None
         if source_project.is_source_project(path):
             built = source_project.build_source_project(path)
-            if built["ok"] and built["primary"]:
+            # A runnable PROGRAM the build produced is the normal target (libtiff's tools, a CTF ELF).
+            if built["ok"] and built["primary"] and _is_program_elf(built["primary"]):
                 return _ingest_built_project(store, case_id, path, built,
                                              filename or path.name)
             build_log = built.get("log")       # keep WHY the build failed for the error below
+            # NO runnable program (the build failed, or produced only libraries) -- but a tree that
+            # ships IN-TREE libFuzzer harnesses (an OSS-Fuzz / ClusterFuzzLite onboarded project like
+            # FreeRDP) has a BETTER entry point than a loose library or the main program: the harness
+            # IS the bytes->parser driver the confirmation ladder runs candidate inputs through. Build
+            # those with the project's own cmake (generated headers, include/link graph) and register
+            # them as the case's targets. Preferred over a lib-only build precisely because a `.so`
+            # cannot be executed as a target, while a harness can.
+            try:
+                from . import libfuzzer as _libfuzzer
+                hb = _libfuzzer.cmake_build_harnesses(path)
+            except Exception:                   # noqa: BLE001 -- best-effort; fall through on any error
+                hb = None
+            if hb and hb.get("ok") and hb.get("harnesses"):
+                bins = [Path(h["binary"]) for h in hb["harnesses"]]
+                return _ingest_built_project(
+                    store, case_id, path,
+                    {"ok": True, "primary": bins[0], "binaries": bins, "system": "cmake-fuzzers",
+                     "compiler": "clang", "lib_dirs": hb.get("lib_dirs") or []},
+                    filename or path.name)
+            # No harnesses either, but the build DID produce something (a library) -- keep the old
+            # behaviour: register it so the source detectors still have an archived tree to read.
+            if built.get("ok") and built.get("primary"):
+                return _ingest_built_project(store, case_id, path, built, filename or path.name)
         # a challenge BUNDLE (prebuilt binary + loader/libc), or a source project that did not build
         main, dep_files = gather_bundle(path)
         if main is None:

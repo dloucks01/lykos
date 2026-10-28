@@ -25,7 +25,10 @@ if(BUILD_FUZZERS)
   add_executable(TestFuzzVuln TestFuzzVuln.c)
   target_link_libraries(TestFuzzVuln vuln)
   target_link_options(TestFuzzVuln PRIVATE -fsanitize=fuzzer,address)
-  add_custom_target(fuzzers DEPENDS TestFuzzVuln)
+  add_executable(TestFuzzVuln2 TestFuzzVuln2.c)
+  target_link_libraries(TestFuzzVuln2 vuln)
+  target_link_options(TestFuzzVuln2 PRIVATE -fsanitize=fuzzer,address)
+  add_custom_target(fuzzers DEPENDS TestFuzzVuln TestFuzzVuln2)
 endif()
 """
 
@@ -68,6 +71,7 @@ def _write_fixture(d):
     (d / "gen_config.h.in").write_text(_GEN_IN)
     (d / "vuln.c").write_text(_VULN_C)
     (d / "TestFuzzVuln.c").write_text(_HARNESS_C)
+    (d / "TestFuzzVuln2.c").write_text(_HARNESS_C)
 
 
 def _libfuzzer_ok(d):
@@ -136,3 +140,37 @@ def test_build_libfuzzer_cmake_fallback_and_run(tmp_path):
                                   corpus=[b"\x42\xff" + b"A" * 64], lib_dirs=build["lib_dirs"])
     assert res["crashes"], f"seeded directed crash not reproduced:\n{res['log'][-1500:]}"
     assert any("AddressSanitizer" in (c.get("report") or "") for c in res["crashes"])
+
+
+@pytest.mark.skipif(not _have("cmake", "clang"), reason="needs cmake + clang")
+def test_ingest_registers_cmake_harnesses(store, tmp_path):
+    """ingest(folder) on a cmake project that ships in-tree harnesses but produces no runnable main
+    binary registers the HARNESSES as the case's targets (not a junk gather_bundle pick), archives the
+    source tree keyed to them, and records lib_dirs. This is the 'give it a folder' flow working."""
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import ArtifactDAO
+    src = tmp_path / "proj"
+    src.mkdir()
+    _write_fixture(src)
+    if not _libfuzzer_ok(tmp_path):
+        pytest.skip("this clang cannot link -fsanitize=fuzzer (no libFuzzer runtime)")
+
+    case = store.cases.create("fdp-like")
+    t = ingest(store, case.id, src, filename="proj")
+    assert t is not None
+
+    # the in-tree harnesses were built via the project's cmake and registered as the case's targets --
+    # NOT a junk gather_bundle pick. The primary carries the `filename`; the extra harness is named by
+    # its own name, so a harness name appears among the targets.
+    names = {x.filename for x in store.targets.list_by_case(case.id)}
+    assert "TestFuzzVuln2" in names, f"in-tree harness not registered as a target: {names}"
+
+    # the source tree is archived, keyed to the harness targets, tagged as the cmake-fuzzers build and
+    # carrying the shared-lib dirs a runner needs (the definitive signal the harness path fired, not
+    # the loose-library fallback).
+    arts = [a for a in ArtifactDAO(store.conn).list_by_case(case.id) if a.kind == "source-project"]
+    assert arts, "no source-project artifact archived"
+    assert any((a.meta or {}).get("build_system") == "cmake-fuzzers" for a in arts), \
+        f"harness path did not fire (build_system): {[(a.meta or {}).get('build_system') for a in arts]}"
+    assert any((a.meta or {}).get("lib_dirs") for a in arts), \
+        f"lib_dirs not recorded: {[a.meta for a in arts]}"
