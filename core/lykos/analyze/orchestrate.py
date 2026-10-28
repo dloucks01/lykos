@@ -31,102 +31,31 @@ from ..jobs.queue import JobQueue
 from . import budget as budget_mod
 from . import substrate
 
-# stage -> (module, enqueue-fn). Target-scoped unless listed in _CASE.
-_TARGET = {
-    # Normally run by the ingest path, before any autopilot exists for the case. It is here
-    # because the executables a source project ALSO builds are registered by `ingest` and
-    # nothing triages them -- so the pass has to. See the call site.
-    "ingest_triage": ("..analyze.ingest", "enqueue_triage"),
-    # The FLOOR: one execution, before any analysis. See the call site for why it was missing.
-    "dynamic_run": ("..analyze.dynamic", "enqueue_dynamic"),
-    "disassemble": ("..analyze.disassemble", "enqueue_disassemble"),
-    "detect_cwe": ("..analyze.detect", "enqueue_detect"),
-    "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
-    "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
-    "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
-    "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
-    "uaf_scan": ("..analyze.fingerprint", "enqueue_uaf_scan"),
-    "source_sink_scan": ("..analyze.fingerprint", "enqueue_source_sink_scan"),
-    "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
-    "env_fuzz": ("..analyze.fuzz", "enqueue_env_fuzz"),
-    "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
-    "cve_poc": ("..analyze.poc", "enqueue_cve_poc"),
-    "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
-    "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
-    "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
-    "harness": ("..analyze.harness", "enqueue_harness"),
-    "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
-    "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
-    "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
-    "mem_oracle": ("..analyze.dynamic", "enqueue_mem_oracle"),
-    "chain_primitive": ("..analyze.poc", "enqueue_chain"),
-    "concolic": ("..analyze.symbolic", "enqueue_concolic"),
-    "root_cause": ("..analyze.debug", "enqueue_root_cause"),
-    "build_poc": ("..analyze.poc", "enqueue_build_poc"),
-    "poc_primitive": ("..analyze.poc", "enqueue_primitive"),
-    "build_exploit": ("..analyze.poc", "enqueue_exploit"),
-    "synthesize_poc": ("..analyze.poc", "enqueue_synthesize"),
-    "synthesize_injection": ("..analyze.poc", "enqueue_inject"),
-    "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
-    "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
-    "unpack": ("..analyze.unpack", "enqueue_unpack"),
-    "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
-    "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
-    # These seven were REGISTERED and reachable only by a human clicking in the web UI --
-    # nothing in the autopilot named them and no other stage chained to them, so for an
-    # unattended run the capability did not exist. `multi_debug` in particular was the only
-    # follow-fork/exec capture in the engine, which means a crash in a forked child or an
-    # exec'd helper was never attributed to the input that caused it.
-    "extract_secrets": ("..analyze.debug", "enqueue_extract"),
-    "synthesize_secret": ("..analyze.poc", "enqueue_secret"),
-    "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
-    "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
-    "libfuzzer": ("..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
-    "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
-    "poc_diff": ("..analyze.poc", "enqueue_poc_diff"),
-    "patch_diff": ("..analyze.patch_diff_stage", "enqueue_patch_diff"),
-    "variant_scan": ("..analyze.scan_stages", "enqueue_variant_scan"),
-    "weggli_scan": ("..analyze.scan_stages", "enqueue_weggli_scan"),
-}
-_CASE = {
-    "link_case": ("..analyze.link", "enqueue_link"),
-    "ipc_model": ("..analyze.link", "enqueue_ipc"),
-    "cross_taint": ("..analyze.link", "enqueue_cross_taint"),
-    "whole_system": ("..analyze.link", "enqueue_whole_system"),
-    "diff_test": ("..analyze.scan_stages", "enqueue_diff_test"),
-}
+# ---- Pipeline stages: DERIVED from the single declarative registry (doc 49, Theme 1a) -------
+# These five structures used to be hand-synced literals; a stage present in some and not the
+# others is the bug class that dropped patch_diff from the schedule (583f1fe). They are now
+# derived from `stages.STAGES`, the one place a stage is declared -- adding a stage is a single
+# append there and cannot fall out of sync. The names and values are byte-identical to the old
+# literals, so every consumer (the API dispatch tables, the plan, the no-params gate) is
+# preserved; see tests/test_stage_registry.py for the pin.
+from . import stages as _stages
+
+_stages.check_consistency()  # fail LOUD at import if any descriptor is internally inconsistent
+
+#: stage -> (module, enqueue-fn), resolved lazily by `_enqueue_fn`. Target-scoped unless in _CASE.
+_TARGET = {s.name: (s.module, s.enqueue) for s in _stages.STAGES if s.scope == "target"}
+_CASE = {s.name: (s.module, s.enqueue) for s in _stages.STAGES if s.scope == "case"}
 #: In the dispatch table (so the API and CLI can run them) but deliberately NOT scheduled by the
 #: autopilot: each needs an operator decision a run does not have. Listed so the plan does not show
-#: them as "skipped / no budget" on every run, and so a stage cannot fall out of the schedule unseen.
-_ON_DEMAND = {
-    "harness": "started from the Code tab's function view on the functions the operator picks",
-    "patch_diff": "needs a second build chosen as the baseline to diff against",
-    "variant_scan": "needs the vulnerable function named by the operator (from the Scans panel)",
-    "weggli_scan": "an operator source-pattern scan, started from the Scans panel",
-    "diff_test": "needs the operator to pick 2+ implementations of the same thing to compare",
-}
-# Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
-# require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
-# them dropped that input and every one failed with "requires params.input_sha".
-_NO_PARAMS = {# `enqueue_triage` takes no params at all, only `force`.
-              "ingest_triage",
-              "disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
-              "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
-              "int_overflow_scan", "uaf_scan", "source_sink_scan", "net_fuzz", "env_fuzz",
-              "cve_corroborate", "cve_poc",
-              # extract_secrets feeds itself a probe input when given none; synthesize_secret
-              # reads static findings and never executes; libfuzzer builds its own harness from
-              # source; boundary_fuzz discovers its own IPC channel. Each declines for itself
-              # when it does not apply, which is why none of them needs a gate here.
-              # NOT libfuzzer: it reads `max_seconds` for its campaign length, and listing it
-              # here meant the budget's slice never reached it -- it ran its 30 s default on a
-              # 900 s case, which is the "30-second smoke test" defect in the stage that is the
-              # most productive engine there is on a library.
-              "extract_secrets", "synthesize_secret", "boundary_fuzz",
-              # mem_oracle picks its own probe inputs (a recorded crash if there is one, else an
-              # empty probe -- a default-path uninitialised read needs no input at all).
-              "mem_oracle"}
-_CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
+#: them as "skipped / no budget" on every run, and so a stage cannot fall out of the schedule
+#: unseen. {name: reason}.
+_ON_DEMAND = {s.name: s.on_demand for s in _stages.STAGES if s.on_demand}
+#: Stages whose enqueue-fn the autopilot calls with NO params. root_cause/build_poc/poc_primitive
+#: are NOT here (they require params["input_sha"], the crashing input the prove loop threads in);
+#: libfuzzer/fuzz/coverage_fuzz/concolic are NOT here (they read max_seconds -- dropping it runs
+#: their own default, the "30-second smoke test" defect). See stages.StageSpec.no_params.
+_NO_PARAMS = frozenset(s.name for s in _stages.STAGES if s.no_params and s.scope == "target")
+_CASE_NO_PARAMS = frozenset(s.name for s in _stages.STAGES if s.no_params and s.scope == "case")
 
 _TERMINAL = {"done", "cancelled", "error"}
 
@@ -179,41 +108,12 @@ def _best_block_pct(store, target_id) -> Optional[float]:
 # running, and still to come -- not just a live log. Conditional steps (concolic, the exploit
 # ladder) start `pending` and become `skipped` if the run does not reach them. Repeats (directed
 # fuzz runs twice; root_cause/build_poc run per crash) update the same entry.
-_PLAN_STAGES = [
-    # Nine scheduled stages used to be missing from this list, and the plan is what the operator
-    # WATCHES -- so the run showed them doing nothing. `fuzz` was the costly one: on /usr/bin/xxd
-    # it performed 4,513 of the run's 7,272 executions and never appeared, so the live view sat
-    # on another stage's name while the main campaign ran. A stage absent from the plan is
-    # invisible progress, which is the same defect the test below it already names.
-    ("ingest_triage", "Triage"),
-    ("unpack", "Unpack (packed executable)"),
-    ("firmware_carve", "Carve firmware image"), ("firmware_rehost", "Rehost firmware"),
-    ("dynamic_run", "Baseline execution"),
-    ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
-    ("whole_system", "Whole-system emulation"),
-    ("ipc_model", "IPC model"), ("link_case", "Link related targets"),
-    ("cross_taint", "Cross-component taint"),
-    ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
-    ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
-    ("uaf_scan", "Use-after-free scan"), ("source_sink_scan", "Tainted-sink scan"),
-    ("extract_secrets", "Recover gate values"), ("synthesize_secret", "Secret PoC"),
-    ("net_fuzz", "Network fuzzing"), ("boundary_fuzz", "IPC boundary fuzzing"),
-    ("libfuzzer", "libFuzzer harness"), ("env_fuzz", "Env-var fuzzing"),
-    ("cve_poc", "CVE weaponization"),
-    ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
-    ("fuzz", "Black-box fuzzing"),
-    ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
-    ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
-    ("oob_index", "Array-index probes"), ("mem_oracle", "Uninitialised-memory oracle"),
-    ("chain_primitive", "Primitive chaining"),
-    ("concolic", "Concolic execution"), ("synthesize_poc", "Synthesize PoC"),
-    ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
-    ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
-    ("behavior_trace", "Behaviour trace"), ("dynamic_taint", "Dynamic taint"),
-    ("multi_debug", "Follow fork/exec"), ("debug_monitor", "Runtime monitor"),
-    ("poc_diff", "Regression diff"),
-    ("verify", "False-positive review"),
-]
+# The pipeline PLAN -- the ordered steps a target goes through, so the UI can show what is done,
+# running, and still to come. It is DERIVED from `stages.STAGES` in declaration order (the one
+# place that order lives), taking every stage flagged `in_plan`. Conditional steps (concolic, the
+# exploit ladder) start `pending` and become `skipped` if the run does not reach them; repeats
+# (directed fuzz twice; root_cause/build_poc per crash) update the same entry.
+_PLAN_STAGES = [(s.name, s.label) for s in _stages.STAGES if s.in_plan]
 _PLAN_LABEL = dict(_PLAN_STAGES)
 # how far along a phase is, so a repeat/cache cannot regress a finished one back to running
 # `declined` ranks with the other TERMINAL states: a stage that ran and refused is finished, and
