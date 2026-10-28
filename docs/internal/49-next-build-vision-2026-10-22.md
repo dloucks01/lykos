@@ -175,10 +175,26 @@ to a real file, prioritized, and sized — so the next session can start at the 
   `leak+ret2libc-pie-<arch>`. +`test_pie_leak_ret2libc_cross.py` (both arches); native x86 PIE-leak +
   cross-arch ret2libc + archgate suites green.
 
-  REMAINING 5a: (1) extend the leak→relocate paths to the other verifiable arches (ret2win is
-  near-free; ret2libc needs a per-arch loader-shape — aarch64's `ldp` pair vs the RISC regs-dict);
-  (2) DYNAMIC-pie cross-arch ret2libc (a libc-base leak + recover_pie_base against libc, for the
-  randomized-base two-base case); (3) cross-arch ORW/leak chains where gadgets permit. (mips stays
+- **Theme 5a: DYNAMIC-PIE cross-arch ret2libc via a libc-leak DONE (riscv64 + loongarch64) — the
+  common real-world case, and a GENUINELY randomised base.** `_pie_cross_ret2libc_exploit` now picks
+  the image + base-recovery by linking: STATIC-PIE → the main image + recover_pie_base (one base);
+  DYNAMIC-PIE → the loading libc + recover_libc_base (a SEPARATE, randomised base). For a dynamic
+  target the main image has no `system` and few gadgets, so the whole chain lives in libc and is
+  rebased by the LIBC base — disclosed by a leaked libc pointer (an _IO_ FILE* etc.). `_libc_bytes_for`
+  gained a qemu-sysroot branch (QEMU_LD_PREFIX's libc.so.6) so an emulated target resolves the libc
+  that actually loads under qemu; the host-x86 paths are unchanged (qemu_ld_prefix is None for the
+  host arch). Unlike static-PIE, qemu RANDOMISES the dynamic libc base run-to-run (verified: 4
+  distinct bases), so this is an unimpeachable ASLR defeat. Detection uses `target.linking` ("static"
+  / "static-pie" → image; "dynamic" → libc). VERIFIED end-to-end: dynamic-PIE NX-on riscv64 AND
+  loongarch64 (no win(), no system/"/bin/sh" in the image) → confirmed L3
+  `leak+ret2libc-pie-<arch>-libc`, base_kind=libc, chain entirely from the sysroot libc.
+  +`test_pie_leak_ret2libc_cross.py` now covers static AND dynamic × both arches (5 tests w/ the
+  aarch64 ret2win); native x86 libc-resolution + leak + cross-arch + archgate suites green.
+
+  REMAINING 5a: (1) extend the leak→relocate paths to the OTHER verifiable arches (ret2win is
+  near-free; ret2libc needs a per-arch loader shape — aarch64's `ldp` pair / ppc mtctr-bctr / s390
+  lmg / sh4 delay-slot vs the RISC regs-dict); (2) cross-arch ORW ("read the flag") chains where
+  gadgets permit (rare on load-store arches — same arg-register ceiling as syscall-ROP). (mips stays
   unbuildable here — no compiler; arm uses armhf, not arm-linux-gnueabi.)
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path

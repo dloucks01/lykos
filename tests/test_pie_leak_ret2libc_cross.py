@@ -12,28 +12,39 @@ import subprocess
 
 import pytest
 
-# NO win() -> the ret2win leak path declines, forcing the ret2libc chain. Two leaked code pointers
-# corroborate the base. The `if(getpid()==-1)` keeps system()+"/bin/sh" linked without ever running.
-_SRC = (
+# STATIC-PIE: NO win() -> the ret2win leak path declines, forcing the ret2libc chain. Two leaked
+# code pointers corroborate the base. `if(getpid()==-1)` keeps system()+"/bin/sh" linked (never run);
+# everything (gadgets, system, "/bin/sh") is in the one image, rebased by the single leaked base.
+_SRC_STATIC = (
     '#include <stdio.h>\n#include <unistd.h>\n#include <stdlib.h>\n'
     'void vuln(void){ char b[64]; read(0,b,1024); }\n'
     'int main(void){ setbuf(stdout,0); printf("a=%p b=%p\\n",(void*)main,(void*)vuln);'
     ' vuln(); if(getpid()==-1) system("/bin/sh"); return 0; }\n'
 )
+# DYNAMIC-PIE: no win(), no system/"/bin/sh" in the image -> the ret2libc chain lives entirely in a
+# SEPARATELY-based libc. Leaks two libc data pointers (stdout, stderr) so recover_libc_base
+# corroborates the (genuinely randomised) libc base; the chain is rebased onto it.
+_SRC_DYNAMIC = (
+    '#include <stdio.h>\n#include <unistd.h>\n'
+    'void vuln(void){ char b[64]; read(0,b,1024); }\n'
+    'int main(void){ setbuf(stdout,0); printf("o=%p e=%p\\n",(void*)stdout,(void*)stderr);'
+    ' vuln(); return 0; }\n'
+)
 
 
-def _run(store, tmp_path, gcc, arch_hint):
+def _run(store, tmp_path, gcc, arch_hint, *, link):
     from lykos.analyze import register
     from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc import enqueue_exploit
     from lykos.db.dao import PocDAO
     from lykos.jobs import JobConfig, JobQueue, WorkerPool
     src = tmp_path / "v.c"
-    src.write_text(_SRC)
+    src.write_text(_SRC_STATIC if link == "static-pie" else _SRC_DYNAMIC)
     exe = tmp_path / "v"
-    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-static-pie", "-fPIE", "-w",
+    flags = ["-static-pie"] if link == "static-pie" else ["-pie"]
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", *flags, "-fPIE", "-w",
                        str(src), "-o", str(exe)], capture_output=True).returncode:
-        pytest.skip(f"cannot build {arch_hint} static-PIE fixture")
+        pytest.skip(f"cannot build {arch_hint} {link} fixture")
     register()
     pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
     pool.start()
@@ -59,11 +70,24 @@ _LA_QEMU = shutil.which("qemu-loongarch64") or shutil.which("qemu-loongarch64-st
 
 
 @pytest.mark.skipif(not (_RV_GCC and _RV_QEMU), reason="needs riscv64-linux-gnu-gcc + qemu-riscv64")
-def test_auto_pie_leak_ret2libc_riscv64(store, tmp_path):
-    _run(store, tmp_path, _RV_GCC, "riscv64")
+def test_auto_static_pie_leak_ret2libc_riscv64(store, tmp_path):
+    _run(store, tmp_path, _RV_GCC, "riscv64", link="static-pie")
 
 
 @pytest.mark.skipif(not (_LA_GCC and _LA_QEMU),
                     reason="needs loongarch64-linux-gnu-gcc + qemu-loongarch64")
-def test_auto_pie_leak_ret2libc_loongarch64(store, tmp_path):
-    _run(store, tmp_path, _LA_GCC, "loongarch64")
+def test_auto_static_pie_leak_ret2libc_loongarch64(store, tmp_path):
+    _run(store, tmp_path, _LA_GCC, "loongarch64", link="static-pie")
+
+
+@pytest.mark.skipif(not (_RV_GCC and _RV_QEMU), reason="needs riscv64-linux-gnu-gcc + qemu-riscv64")
+def test_auto_dynamic_pie_leak_ret2libc_riscv64(store, tmp_path):
+    """DYNAMIC-PIE: the chain lives in a separately-randomised libc, recovered from a leaked libc
+    pointer -- the common real-world case, and the libc base genuinely randomises under qemu."""
+    _run(store, tmp_path, _RV_GCC, "riscv64", link="dynamic-pie")
+
+
+@pytest.mark.skipif(not (_LA_GCC and _LA_QEMU),
+                    reason="needs loongarch64-linux-gnu-gcc + qemu-loongarch64")
+def test_auto_dynamic_pie_leak_ret2libc_loongarch64(store, tmp_path):
+    _run(store, tmp_path, _LA_GCC, "loongarch64", link="dynamic-pie")
