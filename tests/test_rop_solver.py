@@ -104,3 +104,60 @@ def test_solver_execve_shell_x86_64(tmp_path):
         data, "x86-64", sets={"rdi": binsh ^ 0xFFFF, "rsi": 0, "rdx": 0, "rax": 59},
         final_va=gsys, offset=72)
     assert not m2.proves(_detonate(exe, bad["payload"], m2))
+
+
+# gadgets separated from their `ret` by a `nop` -- the byte-pattern finder (rop.execve_feasible,
+# which matches exact `5f c3` etc.) MISSES them, so only the SEMANTIC solver can compose the chain.
+# Proves the autopilot's build_exploit stage files the L3 via the solver fallback.
+_SRC_NOP = (
+    '#include <unistd.h>\n'
+    'char binsh[] = "/bin/sh";\n'
+    '__asm__(".text\\n"\n'
+    '  ".global grdi\\n grdi: pop %rdi\\n nop\\n ret\\n"\n'
+    '  ".global grsi\\n grsi: pop %rsi\\n nop\\n ret\\n"\n'
+    '  ".global grdx\\n grdx: pop %rdx\\n nop\\n ret\\n"\n'
+    '  ".global grax\\n grax: pop %rax\\n nop\\n ret\\n"\n'
+    '  ".global gsys\\n gsys: syscall\\n ret\\n");\n'
+    'void vuln(void){ char b[64]; read(0,b,512); }\n'
+    'int main(void){ vuln(); return 0; }\n')
+
+
+@pytest.mark.skipif(not gadget_emu.available(), reason="needs unicorn + capstone")
+@pytest.mark.skipif(not _GCC, reason="needs a C compiler")
+def test_solver_files_l3_via_exploit_stage(store, tmp_path):
+    """The build_exploit stage (which the autopilot drives) files a CONFIRMED L3 execve PoC for a
+    target whose register-setters the byte-pattern finder cannot match -- so the L3 is composed by
+    the semantic solver and confirmed (shell + negative control) by the stage's own detonation."""
+    if not _host_x86_64():
+        pytest.skip("x86-64 native only")
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.analyze.poc import rop as _rop
+    from lykos.db.dao import PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    src = tmp_path / "v.c"
+    src.write_text(_SRC_NOP)
+    exe = tmp_path / "v"
+    if subprocess.run([_GCC, "-no-pie", "-fno-stack-protector", "-static", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build fixture")
+    # precondition: the pattern finder is genuinely incomplete here (so the solver is REQUIRED)
+    feo = _rop.execve_feasible(exe.read_bytes())
+    assert not all(feo.get(k) for k in ("pop_rdi", "pop_rsi", "pop_rdx")), \
+        "pattern finder unexpectedly found the pops; fixture no longer forces the solver"
+
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, store.cases.create("solv").id, exe, filename="v")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(180)
+        run = enqueue_exploit(q, t, params={"strategy": "execve", "offset": 72})
+        assert pool.wait_idle(300) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    assert l3, "the exploit stage did not file a solver-composed L3 execve PoC"
