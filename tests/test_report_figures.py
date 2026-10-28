@@ -195,6 +195,71 @@ def test_report_finding_has_provenance_and_reachability_figures(store):
     _parse(figs["reachability"])
 
 
+# -- patch-diff map ---------------------------------------------------------------------------
+
+def _pd_rows():
+    return [{"name": "parse_hdr", "moved": 14, "blocks": [4, 7], "insns": [40, 61]},
+            {"name": "copy_field", "moved": 6, "blocks": [2, 3], "insns": [12, 18]},
+            {"name": "noop", "moved": 1, "blocks": [1, 1], "insns": [3, 4]}]
+
+
+def test_patch_diff_map_wellformed_ranked_and_deterministic():
+    a = F.patch_diff_map_svg(_pd_rows())
+    b = F.patch_diff_map_svg(_pd_rows())
+    assert a == b
+    _parse(a)
+    # ranked most-moved first regardless of input order
+    assert a.index("parse_hdr") < a.index("copy_field") < a.index("noop")
+    assert "moved 14" in a and "blocks 4→7" in a
+
+
+def test_patch_diff_map_input_order_does_not_change_output():
+    import random
+    rows = _pd_rows()
+    shuffled = rows[::-1]
+    assert F.patch_diff_map_svg(rows) == F.patch_diff_map_svg(shuffled)
+
+
+def test_patch_diff_map_empty_and_caps():
+    assert F.patch_diff_map_svg([]) is None
+    assert F.patch_diff_map_svg([{"moved": 3}]) is None          # no name -> dropped
+    big = [{"name": f"fn{i}", "moved": i, "blocks": [1, 2], "insns": [1, 2]}
+           for i in range(F._MAX_NODES + 20)]
+    svg = F.patch_diff_map_svg(big)
+    _parse(svg)
+    assert svg.count('class="bar-bg"') <= F._MAX_NODES
+
+
+def test_patch_diff_map_escapes_names():
+    svg = F.patch_diff_map_svg([{"name": "<x>", "moved": 2, "blocks": [1, 1], "insns": [1, 1]}])
+    _parse(svg)
+    assert "<x>" not in svg and "&lt;x&gt;" in svg
+
+
+def test_report_attaches_patch_diff_map_from_structured_evidence(store):
+    """The report builds the map from the patch-diff-map evidence channel the stage records."""
+    import json
+    from lykos.db.dao import CaseDAO, FindingDAO, TargetDAO
+    from lykos.report.model import build_report
+    case = CaseDAO(store.conn).create("pd")
+    t = TargetDAO(store.conn).upsert(case.id, "patched", "c" * 64, size=10, arch="x86_64",
+                                     bits=64, endianness="little", file_type="elf")
+    for nm, mv, addr in [("parse_hdr", 14, "0x1100"), ("copy_field", 6, "0x1200")]:
+        FindingDAO(store.conn).upsert(t.id, case.id, {
+            "dedup_key": f"patch_diff:{nm}:{addr}", "cwe": "NVD-CWE-noinfo", "severity": "medium",
+            "state": "candidate", "title": f"Patch-diff lead: '{nm}'", "detector": "patch_diff",
+            "function_addr": addr,
+            "evidence": [{"channel": "patch-diff", "detail": f"{nm} changed"},
+                         {"channel": "patch-diff-map", "detail": json.dumps(
+                             {"name": nm, "moved": mv, "blocks": [1, 2], "insns": [3, 4]})}]})
+    rep = build_report(store, case.id, min_state="candidate")
+    fig = rep["targets"][0]["figures"]["patch_diff"]
+    assert fig and "parse_hdr" in fig and fig.index("parse_hdr") < fig.index("copy_field")
+    # the structured data is surfaced on the finding, and the prose channel still reads in the trail
+    f0 = next(f for f in rep["targets"][0]["findings"] if f["detector"] == "patch_diff")
+    assert f0["patch_diff"]["moved"] in (6, 14)
+
+
 def test_reachability_is_none_without_a_source_path(store):
     """No input-source call -> no honest reachability path -> the figure is omitted, not faked."""
     from lykos.db.dao import CallEdgeDAO, CaseDAO, FindingDAO, TargetDAO

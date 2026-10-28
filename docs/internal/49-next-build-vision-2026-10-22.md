@@ -48,8 +48,17 @@ to a real file, prioritized, and sized — so the next session can start at the 
   function that reads external input (SOURCES vocabulary) to the finding's function. The reachability
   figure is labelled "control-flow reachability, not verified dataflow" and is omitted (never faked)
   when no such path exists — an honest rendering of figure 2 at the call-graph level, not a claim of
-  byte-level taint. +6 tests. REMAINING in Theme 4: the **patch-diff map** (figure 5); embed the SVGs
-  in the **PDF** (`pdf.py` is a hand-rolled renderer, not `to_html` — a larger job).
+  byte-level taint. +6 tests.
+- **Theme 4 patch-diff map (figure 5): DONE.** `figures.patch_diff_map_svg` draws the changed
+  functions ranked by moved-score as a bar map (warm-toned top third = where the fix most likely
+  lives). The patch_diff stage now records the numbers as a STRUCTURED `patch-diff-map` evidence
+  channel (JSON, like `effects`) alongside the existing prose, so the report draws from numbers,
+  never by re-parsing the sentence. `model.build_report` attaches a per-target `figures.patch_diff`;
+  `html.to_html` renders it. +7 tests (figure determinism/ranking/cap/escaping + report integration;
+  the stage integration test asserts the structured channel end-to-end). All three Theme-4 figure
+  families (call-graph+coverage, provenance+reachability, patch-diff) now render in the HTML report.
+  REMAINING in Theme 4: embed the SVGs in the **PDF** (`pdf.py` is a hand-rolled renderer, not
+  `to_html` — a larger job).
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC

@@ -73,3 +73,12 @@ def test_patch_diff_localizes_the_changed_function(store, case, pool, gcc, tmp_p
     assert not any("main" in (f.title or "") for f in leads), "main() did not change; must not be flagged"
     # a lead carries a function address so the directed/concolic search can steer at it
     assert all(f.function_addr for f in leads)
+    # doc 49 Theme 4 figure 5: each lead ALSO carries structured patch-diff data (not just the
+    # prose line), so the report draws the patch-diff map from numbers, never by re-parsing text.
+    import json as _json
+    for f in leads:
+        pdm = next((e for e in (f.evidence or []) if e.get("channel") == "patch-diff-map"), None)
+        assert pdm, "patch_diff lead is missing the structured patch-diff-map evidence"
+        data = _json.loads(pdm["detail"])
+        assert data.get("name") and isinstance(data.get("moved"), int)
+        assert isinstance(data.get("blocks"), list) and isinstance(data.get("insns"), list)

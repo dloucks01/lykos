@@ -13,6 +13,8 @@ Honest: a changed function is a LEAD, not a proven weakness. Leads are filed can
 """
 from __future__ import annotations
 
+import json
+
 from ..db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ..jobs.registry import register_stage
 from . import patchdiff
@@ -100,7 +102,16 @@ def patch_diff_stage(ctx) -> dict:
             "detector": "patch_diff", "state": "candidate", "confidence": 0.4,
             "function_addr": addr,
             "dedup_key": f"patch_diff:{c['name']}:{addr}",
-            "evidence": [{"channel": "patch-diff", "detail": detail}]})
+            # The prose line for the evidence trail, plus the SAME facts as structured data (a JSON
+            # channel, like `effects`) so the report can draw the patch-diff map (doc 49 Theme 4,
+            # figure 5) from numbers, never by re-parsing the sentence above.
+            "evidence": [{"channel": "patch-diff", "detail": detail},
+                         {"channel": "patch-diff-map", "detail": json.dumps({
+                             "name": c["name"], "moved": c["moved"],
+                             "blocks": c["blocks"], "insns": c["insns"],
+                             "new_callees": nc[:8],
+                             "dropped_callees": (c.get("dropped_callees") or [])[:8],
+                             "baseline": a.filename}, sort_keys=True)}]})
         filed += 1
 
     ctx.emit("patch_diff.done", payload={

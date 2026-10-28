@@ -264,6 +264,51 @@ def chain_svg(steps: list[dict], *, title: str, caption: str = "") -> Optional[s
     return "".join(parts)
 
 
+def patch_diff_map_svg(rows: list[dict], *, title: str = "Patch-diff map") -> Optional[str]:
+    """Changed functions ranked by how much the body moved (doc 49 Theme 4, figure 5), so "this is
+    the fix" is obvious at a glance. ``rows`` are ``{name, moved, blocks:[a,b], insns:[a,b]}`` as the
+    patch_diff stage records them; bar length is proportional to ``moved`` within this set. Returns
+    None if there is nothing to draw. The rows are drawn most-moved first, capped at _MAX_NODES."""
+    clean = []
+    for r in rows or []:
+        if not r or not r.get("name"):
+            continue
+        try:
+            mv = int(r.get("moved") or 0)
+        except (TypeError, ValueError):
+            mv = 0
+        clean.append({"name": str(r["name"]), "moved": mv,
+                      "blocks": r.get("blocks") or [], "insns": r.get("insns") or []})
+    if not clean:
+        return None
+    clean.sort(key=lambda r: (-r["moved"], r["name"]))
+    clean = clean[:_MAX_NODES]
+    peak = max((r["moved"] for r in clean), default=0) or 1
+    bar_w, row_h, lbl_w, val_w = 240, 22, 170, 150
+    width = _MARGIN * 2 + lbl_w + bar_w + val_w
+    height = _MARGIN * 2 + len(clean) * (row_h + 8) - 8
+    parts = [_svg_open(width, height, title,
+                       "changed functions ranked by how much the body moved")]
+    for i, r in enumerate(clean):
+        y = _MARGIN + i * (row_h + 8)
+        parts.append(f'<text class="nlabel" x="{_MARGIN}" y="{y + 15}">{esc(_clip(r["name"]))}</text>')
+        bx = _MARGIN + lbl_w
+        parts.append(f'<rect class="bar-bg" x="{bx}" y="{y}" width="{bar_w}" height="{row_h}" rx="4"/>')
+        w = max(2, min(bar_w, int(round(bar_w * r["moved"] / peak))))
+        # the biggest mover is where the fix most likely lives: warm-tone the top third
+        tone = "bad" if r["moved"] >= peak * 0.66 else "warn" if r["moved"] >= peak * 0.33 else "good"
+        parts.append(f'<rect class="bar-fill {tone}" x="{bx}" y="{y}" width="{w}" height="{row_h}" rx="4"/>')
+        bl, ins = r["blocks"], r["insns"]
+        d = f"moved {r['moved']}"
+        if len(bl) == 2:
+            d += f"  ·  blocks {bl[0]}→{bl[1]}"
+        if len(ins) == 2:
+            d += f", insns {ins[0]}→{ins[1]}"
+        parts.append(f'<text class="nsub" x="{bx + bar_w + 8}" y="{y + 15}">{esc(d)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def _cov_tone(pct) -> str:
     try:
         p = float(pct)

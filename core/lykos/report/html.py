@@ -451,6 +451,12 @@ def _target_html(t: dict) -> str:
         p.append('<div class="figure callgraph"><div class="fig-h">Call graph '
                  '<span class="muted">— the recovered call structure; the finding\'s function is '
                  'highlighted</span></div>' + cg + '</div>')
+    pdf = (t.get("figures") or {}).get("patch_diff")
+    if pdf:
+        p.append('<div class="figure patchdiff"><div class="fig-h">Patch-diff map '
+                 '<span class="muted">— functions that changed vs the baseline build, ranked by '
+                 'how much the body moved (where the fix most likely lives)</span></div>'
+                 + pdf + '</div>')
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
                  f'{esc(rt["ceiling_why"])}</p>')

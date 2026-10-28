@@ -95,7 +95,7 @@ def _iso(ts: Optional[int]) -> Optional[str]:
 #: measured in a SARIF message, where it lands in a GitHub code-scanning alert, and the same in
 #: the HTML and PDF. The data is kept, parsed, under its own key; only the prose stays in the
 #: line a reader sees.
-_STRUCTURED_EVIDENCE = frozenset({"effects"})
+_STRUCTURED_EVIDENCE = frozenset({"effects", "patch-diff-map"})
 
 
 def _split_evidence(ev: list) -> tuple:
@@ -402,6 +402,18 @@ def _call_graph_svg(call_edges, findings_out: list[dict]) -> Optional[str]:
         return None
 
 
+def _patch_diff_map_svg(findings_out: list[dict]) -> Optional[str]:
+    """The per-target patch-diff map (doc 49 Theme 4, figure 5): the changed functions this build's
+    patch_diff leads name, ranked by moved score. Built from the structured patch-diff data on the
+    findings (never by parsing prose). None when the target has no patch_diff leads."""
+    rows = [f["patch_diff"] for f in findings_out if f.get("patch_diff")]
+    try:
+        return _figures.patch_diff_map_svg(rows)
+    except Exception:                               # noqa: BLE001
+        observe.absorbed(_log, "patch-diff figure skipped")
+        return None
+
+
 def _provenance_chain_svg(f: dict) -> Optional[str]:
     """The finding's provenance as a chain (doc 49 Theme 4, figure 6): how it was established, left
     to right -- the stage that found it -> the detector -> the corroborating evidence -> the rung it
@@ -703,6 +715,9 @@ def build_report(
                 # Parsed, under its own key, so a renderer can present the effect LIST instead
                 # of the blob and nothing has to re-parse a string.
                 "effects": _ev_struct.get("effects") or [],
+                # Structured patch-diff facts (doc 49 Theme 4, figure 5), when this is a patch_diff
+                # lead -- the moved score, block/insn deltas, callee churn. None otherwise.
+                "patch_diff": _ev_struct.get("patch-diff-map"),
                 "pocs": f_pocs, "crashes": f_crashes, "verification": fv,
                 # The highest rung a VERIFIED PoC reached -- the level every renderer claims.
                 "level": best_verified_level({"pocs": f_pocs}) or None,
@@ -740,7 +755,8 @@ def build_report(
             except Exception:                       # noqa: BLE001
                 observe.absorbed(_log, "call edges unavailable")
                 _edges = []
-            tout["figures"] = {"call_graph": _call_graph_svg(_edges, findings_out)}
+            tout["figures"] = {"call_graph": _call_graph_svg(_edges, findings_out),
+                               "patch_diff": _patch_diff_map_svg(findings_out)}
             for _f in findings_out:
                 _f["figures"] = {"provenance": _provenance_chain_svg(_f),
                                  "reachability": _reachability_path_svg(_edges, _f)}
