@@ -81,6 +81,19 @@ to a real file, prioritized, and sized — so the next session can start at the 
   computed per active target from live data (functions, findings, coverage/crashes, verdict level).
   VERIFIED by driving the running build in the browser: all four nodes render with correct state
   (Prove correctly MUTED "no PoC"), and clicking Search navigated to the Crashes panel.
+- **1b god-module split: STARTED (exploit_stage.py).** First extraction: the cross-architecture
+  ret2libc family (AArch64 incl. its execve-syscall variant, ARM, RISC-V64, PPC64, PPC32,
+  LoongArch64, s390x, SH4) + the qemu register-offset helpers → `poc/exploit_crossarch.py`
+  (exploit_stage.py 7479 → 6821 lines, −658). The cluster was cohesive but reached two things in the
+  shared confirm base (`_try_shell_effect`, `TOOL_VERSION`); rather than move that base (used by every
+  family) it is reached lazily via `_es` (an `exploit_stage` module alias), which avoids an import
+  cycle because both are touched only at call time. exploit_stage imports the drivers back for its
+  arch dispatch. SAFE-EXTRACTION RECIPE (reusable for the remaining families — PE, format-GOT,
+  shellcode, leak-pivot): move a cohesive cluster, rewrite its references into the shared base to
+  `_es.`, and GATE on `pyflakes` (zero undefined names proves no reference was silently missed — the
+  real risk, since the per-arch paths need qemu/cross-toolchains and don't execute in CI here).
+  Verified: pyflakes clean on both modules, no import cycle, dispatch + lazy refs resolve, the
+  build_exploit stage still registers, and the exploit/crossarch/afl suites pass.
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
