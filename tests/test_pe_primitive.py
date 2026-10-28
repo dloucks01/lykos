@@ -400,29 +400,34 @@ _FMT_C = (
     " return 0; }\n")
 
 
-def _mingw_fmt(tmp_path):
-    cc = shutil.which("x86_64-w64-mingw32-gcc")
+def _mingw_fmt(tmp_path, cc_name="x86_64-w64-mingw32-gcc", out="fmt.exe"):
+    cc = shutil.which(cc_name)
     if not cc:
-        pytest.skip("no mingw cross compiler")
+        pytest.skip("no %s" % cc_name)
     if not sandbox._wine():
         pytest.skip("no wine to execute the PE")
-    c = tmp_path / "fmt.c"
+    c = tmp_path / (out + ".c")
     c.write_text(_FMT_C)
-    exe = tmp_path / "fmt.exe"
+    exe = tmp_path / out
     r = subprocess.run([cc, "-O1", "-w", str(c), "-o", str(exe)], capture_output=True, timeout=180)
     if r.returncode != 0:
         pytest.skip("mingw cannot link here: " + r.stderr.decode(errors="replace")[:200])
     return exe
 
 
-def test_pe_format_string_address_leak_confirmed(store, case, pool, tmp_path):
+@pytest.mark.parametrize("cc,out,tag", [
+    ("x86_64-w64-mingw32-gcc", "fmt64.exe", "x64"),
+    ("i686-w64-mingw32-gcc", "fmt32.exe", "wow64"),
+])
+def test_pe_format_string_address_leak_confirmed(store, case, pool, tmp_path, cc, out, tag):
     """A PE with a format-string bug (printf of attacker input) has a CONFIRMED information
     disclosure (CWE-200): `%p` specifiers leak live runtime addresses -- a code pointer (the image
     base) and stack pointers -- that a benign same-shape control does not. The sound half of an
-    ASLR defeat, confirmed under Wine; the finding says the end-to-end defeat is not exercised here."""
-    exe = _mingw_fmt(tmp_path)
+    ASLR defeat, confirmed under Wine (64- and 32-bit); the finding says the end-to-end defeat is
+    not exercised here."""
+    exe = _mingw_fmt(tmp_path, cc, out)
     q = JobQueue(store.conn)
-    t = ingest(store, case.id, exe, filename="fmt.exe")
+    t = ingest(store, case.id, exe, filename=out)
     for enq in (enqueue_triage, enqueue_disassemble):
         enq(q, t, force=True)
         assert pool.wait_idle(180)
