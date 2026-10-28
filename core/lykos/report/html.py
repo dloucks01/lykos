@@ -567,6 +567,16 @@ def _finding_html(f: dict) -> str:
         ("Function", f.get("function_addr")),
         ("Site", f.get("site_addr")),
     ]))
+    # Provenance + source-reachability figures (doc 49 Theme 4) -- trusted, internally-escaped SVG
+    # from report.figures, inserted raw. Each is None when there is nothing honest to draw.
+    figs = f.get("figures") or {}
+    if figs.get("provenance"):
+        p.append('<div class="figure prov"><div class="fig-h">Provenance</div>'
+                 + figs["provenance"] + '</div>')
+    if figs.get("reachability"):
+        p.append('<div class="figure reach"><div class="fig-h">Reachable from an input source '
+                 '<span class="muted">— control-flow reachability, not verified dataflow</span>'
+                 '</div>' + figs["reachability"] + '</div>')
     ev = f.get("evidence", [])
     if ev:
         p.append('<div class="evlabel">Evidence trail</div><ul class="ev">')

@@ -40,9 +40,16 @@ to a real file, prioritized, and sized — so the next session can start at the 
   function, and a case-level coverage figure; `html.to_html` embeds them). This closes the explicit
   "call graph + coverage are GUI-only, absent from the air-gap report" gap. `tests/test_report_figures.py`
   (11: determinism, XML well-formedness, content, the node cap, no-external-request, escaping, cycle
-  safety). SARIF stays machine-faithful (ignores `figures`). REMAINING in Theme 4: embed the SVGs in
-  the PDF (`pdf.py` is a hand-rolled renderer, not `to_html` — a larger job), and add the taint-path,
-  provenance-chain, and patch-diff figures (figures 2/5/6).
+  safety). SARIF stays machine-faithful (ignores `figures`).
+- **Theme 4 provenance + reachability figures: DONE.** Added `chain_svg` (a linear `a→b→c` pill
+  chain) and two per-finding figures wired into the report finding card: (6) the **provenance chain**
+  — `found-by stage → detector → N evidence signals → verified rung` — drawn from the finding model
+  ONLY (authoritative); and (2) the **source-reachability path** — the shortest call path from a
+  function that reads external input (SOURCES vocabulary) to the finding's function. The reachability
+  figure is labelled "control-flow reachability, not verified dataflow" and is omitted (never faked)
+  when no such path exists — an honest rendering of figure 2 at the call-graph level, not a claim of
+  byte-level taint. +6 tests. REMAINING in Theme 4: the **patch-diff map** (figure 5); embed the SVGs
+  in the **PDF** (`pdf.py` is a hand-rolled renderer, not `to_html` — a larger job).
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC

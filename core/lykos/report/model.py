@@ -388,17 +388,111 @@ def has_execution_gaps(t: dict) -> bool:
                 or (ex.get("runtime_env") or {}).get("gate_closed"))
 
 
-def _target_call_graph_svg(store, target_id: str, findings_out: list[dict]) -> Optional[str]:
+def _call_graph_svg(call_edges, findings_out: list[dict]) -> Optional[str]:
     """A per-target call-graph figure (doc 49 Theme 4), focused on the worst located finding's
     function when there is one, so the report draws the same graph the GUI's Code tab does. None
     when the target has no recovered call edges. Best-effort -- a figure never fails the report."""
     try:
         edges = [{"src_addr": e.src_addr, "dst_addr": e.dst_addr, "dst_name": e.dst_name}
-                 for e in CallEdgeDAO(store.conn).list_by_target(target_id)]
+                 for e in call_edges]
         focus = next((f.get("function_addr") for f in findings_out if f.get("function_addr")), None)
         return _figures.call_graph_svg(edges, focus_addr=focus)
     except Exception:                               # noqa: BLE001
         observe.absorbed(_log, "call-graph figure skipped")
+        return None
+
+
+def _provenance_chain_svg(f: dict) -> Optional[str]:
+    """The finding's provenance as a chain (doc 49 Theme 4, figure 6): how it was established, left
+    to right -- the stage that found it -> the detector -> the corroborating evidence -> the rung it
+    reached. Drawn from the finding model ONLY (authoritative); nothing is inferred."""
+    steps: list[dict] = []
+    if f.get("stage_label"):
+        steps.append({"label": f["stage_label"], "sub": "found by", "tone": "source"})
+    if f.get("detector"):
+        steps.append({"label": f["detector"], "sub": "detector"})
+    ev = f.get("evidence") or []
+    if ev:
+        steps.append({"label": f"{len(ev)} signal" + ("" if len(ev) == 1 else "s"),
+                      "sub": "evidence"})
+    if f.get("level"):
+        steps.append({"label": f["level"], "sub": "verified rung", "tone": "sink"})
+    elif f.get("state"):
+        steps.append({"label": f["state"], "sub": "confidence", "tone": "sink"})
+    if len(steps) < 2:
+        return None                                 # a single pill is not a chain worth drawing
+    try:
+        return _figures.chain_svg(steps, title="How this finding was established")
+    except Exception:                               # noqa: BLE001
+        observe.absorbed(_log, "provenance figure skipped")
+        return None
+
+
+def _bare_sym(n) -> str:
+    n = str(n or "")
+    for p in ("sym.imp.", "sym.", "imp.", "_"):
+        if n.startswith(p):
+            n = n[len(p):]
+    return n.split("@")[0]
+
+
+def _reachability_path_svg(call_edges, f: dict) -> Optional[str]:
+    """A source-reachability path (doc 49 Theme 4, figure 2): the shortest call path from a function
+    that reads EXTERNAL INPUT to this finding's function. This is control-flow reachability from an
+    input source -- NOT a verified byte-level dataflow taint -- and is labelled exactly that, so the
+    figure never overstates what was proven. None when the finding has no function, or no such path
+    exists (a path is never fabricated)."""
+    fa = f.get("function_addr")
+    if not fa:
+        return None
+    try:
+        from ..analyze.detect.taint import SOURCES
+    except Exception:                               # noqa: BLE001
+        return None
+    succ: dict[str, set] = {}
+    name: dict[str, str] = {}
+    source_callers: set[str] = set()
+    for e in call_edges:
+        if e.src_addr is None or e.dst_addr is None:
+            continue
+        s, d = str(e.src_addr), str(e.dst_addr)
+        succ.setdefault(s, set()).add(d)
+        if e.dst_name:
+            name.setdefault(d, str(e.dst_name))
+        if _bare_sym(e.dst_name) in SOURCES:
+            source_callers.add(s)
+    target = str(fa)
+    if not source_callers or target in source_callers:
+        return None
+    from collections import deque
+    seen = set(source_callers)
+    q = deque((s, [s]) for s in sorted(source_callers))
+    path = None
+    while q:
+        node, p = q.popleft()
+        if node == target:
+            path = p
+            break
+        if len(p) >= 8:                             # bound the drawn path; shortest paths are short
+            continue
+        for nxt in sorted(succ.get(node, ())):
+            if nxt not in seen:
+                seen.add(nxt)
+                q.append((nxt, p + [nxt]))
+    if not path or len(path) < 2:
+        return None
+    steps = []
+    for i, a in enumerate(path):
+        tone = "source" if i == 0 else ("sink" if i == len(path) - 1 else "")
+        sub = "reads input" if i == 0 else ("the finding" if i == len(path) - 1 else None)
+        steps.append({"label": name.get(a) or a, "sub": sub, "tone": tone})
+    try:
+        return _figures.chain_svg(
+            steps, title="Reachable from an input source",
+            caption="shortest call path from a function that reads external input "
+                    "(reachability, not verified dataflow)")
+    except Exception:                               # noqa: BLE001
+        observe.absorbed(_log, "reachability figure skipped")
         return None
 
 
@@ -638,10 +732,18 @@ def build_report(
                 "engine_health": engine_health(execution),
                 "exploited_build": _exploited_build(store, case_id, t.id),
                 "findings": findings_out,
-                # Static figures (doc 49 Theme 4) so the air-gap report draws the call graph the
-                # GUI's Code tab shows. None when there is nothing to draw.
-                "figures": {"call_graph": _target_call_graph_svg(store, t.id, findings_out)},
             }
+            # Static figures (doc 49 Theme 4). Call edges are fetched once and fed to the target's
+            # call graph AND each finding's reachability path. None where there is nothing to draw.
+            try:
+                _edges = CallEdgeDAO(store.conn).list_by_target(t.id)
+            except Exception:                       # noqa: BLE001
+                observe.absorbed(_log, "call edges unavailable")
+                _edges = []
+            tout["figures"] = {"call_graph": _call_graph_svg(_edges, findings_out)}
+            for _f in findings_out:
+                _f["figures"] = {"provenance": _provenance_chain_svg(_f),
+                                 "reachability": _reachability_path_svg(_edges, _f)}
             tout["execution"]["has_gaps"] = has_execution_gaps(tout)
             tout["verdict"] = target_verdict(tout)
             targets_out.append(tout)

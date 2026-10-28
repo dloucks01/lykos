@@ -54,7 +54,17 @@ svg.lyk-fig .cap{fill:var(--muted);font-size:11px}
 svg.lyk-fig .bar-bg{fill:var(--box);stroke:var(--box-br);stroke-width:1}
 svg.lyk-fig .bar-fill.good{fill:var(--good)}svg.lyk-fig .bar-fill.warn{fill:var(--warn)}
 svg.lyk-fig .bar-fill.bad{fill:var(--bad)}
+svg.lyk-fig .pill{fill:var(--box);stroke:var(--box-br);stroke-width:1.2}
+svg.lyk-fig .pill.source{fill:var(--accent-box);stroke:var(--accent)}
+svg.lyk-fig .pill.sink{fill:var(--box);stroke:var(--bad);stroke-width:1.6}
+svg.lyk-fig .arrow{stroke:var(--line);stroke-width:1.6;fill:none;marker-end:url(#lyk-arr)}
+svg.lyk-fig .plabel{fill:var(--fg);font-size:12px}svg.lyk-fig .psub{fill:var(--muted);font-size:10px}
 </style>"""
+
+# One shared arrowhead marker, referenced by chain edges.
+_ARROW_DEF = ('<defs><marker id="lyk-arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" '
+              'markerHeight="6" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--line)"/>'
+              "</marker></defs>")
 
 
 def esc(s) -> str:
@@ -211,6 +221,47 @@ def call_graph_svg(edges: Iterable[dict], *, focus_addr: Optional[str] = None,
              for n in sorted(keep)]
     cap = f"{len(keep)} of {total} functions" + (f"  ·  +{hidden} more not shown" if hidden > 0 else "")
     return layered_dag_svg(nodes, sub_edges, title=title, caption=cap, focus=focus_addr)
+
+
+def chain_svg(steps: list[dict], *, title: str, caption: str = "") -> Optional[str]:
+    """A left-to-right chain of labelled pills joined by arrows -- a linear ``a -> b -> c`` flow.
+
+    Each step is ``{label, sub?, tone?}`` where ``tone`` in ``{"", "source", "sink"}`` colours the
+    ends. Used for the finding provenance chain (discovery -> detector -> evidence -> level) and the
+    source-reachability path (input source -> ... -> the vulnerable function). Deterministic; labels
+    escaped. Returns None for an empty chain.
+    """
+    steps = [s for s in (steps or []) if s and s.get("label")]
+    if not steps:
+        return None
+    pill_w, pill_h, gap = 150, 34, 30
+    cap_h = 20 if caption else 0
+    width = _MARGIN * 2 + len(steps) * pill_w + (len(steps) - 1) * gap
+    height = _MARGIN * 2 + pill_h + cap_h
+    y = _MARGIN
+    parts = [_svg_open(width, height, title, caption), _ARROW_DEF]
+    xs = [_MARGIN + i * (pill_w + gap) for i in range(len(steps))]
+    # arrows between consecutive pills (drawn first, under the pills)
+    for i in range(len(steps) - 1):
+        x1 = xs[i] + pill_w
+        x2 = xs[i + 1]
+        parts.append(f'<path class="arrow" d="M{x1},{y + pill_h // 2} L{x2 - 2},{y + pill_h // 2}"/>')
+    for i, s in enumerate(steps):
+        x = xs[i]
+        tone = s.get("tone") or ""
+        cls = "pill" + (f" {tone}" if tone in ("source", "sink") else "")
+        parts.append(f'<rect class="{cls}" x="{x}" y="{y}" width="{pill_w}" height="{pill_h}" rx="7"/>')
+        sub = s.get("sub")
+        if sub:
+            parts.append(f'<text class="plabel" x="{x + 10}" y="{y + 15}">{esc(_clip(s["label"]))}</text>')
+            parts.append(f'<text class="psub" x="{x + 10}" y="{y + 27}">{esc(_clip(sub))}</text>')
+        else:
+            parts.append(f'<text class="plabel" x="{x + 10}" y="{y + pill_h // 2 + 4}">'
+                         f'{esc(_clip(s["label"]))}</text>')
+    if caption:
+        parts.append(f'<text class="cap" x="{_MARGIN}" y="{height - 6}">{esc(caption)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def _cov_tone(pct) -> str:
