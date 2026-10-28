@@ -31,6 +31,8 @@ _log = logging.getLogger(__name__)
 SOURCE_SINK_STAGE = "source_sink_scan"
 TOOL = "source-sinks"
 TOOL_VERSION = "source-sinks-1"
+#: cap on corroborated recipes filed per scan, so a huge tree cannot flood the finding table.
+_MAX_SOURCE_RECIPES = 64
 
 
 _IDENT = r"[A-Za-z_]\w*"
@@ -124,6 +126,94 @@ def _is_literal(arg: str) -> bool:
     return bool(re.match(r'^(?:L|u8|u|U)?"', a))
 
 
+# ---- taint-lite: link the dangerous argument to an UNTRUSTED SOURCE (sound, intraprocedural) -----
+# The sink finding on its own only proves the argument is non-literal. A corroborated exploitation
+# recipe is warranted only when that value is syntactically derived from input, so these report a
+# CHECKABLE SYNTACTIC FACT (the base identifier is a function parameter, or is filled by a known
+# input reader in the same function) -- never an inferred guess. They under-report by design (a
+# multi-line signature or a transitive copy yields no link -> the finding stays a candidate with no
+# recipe) so a recipe is never filed on a fabricated flow.
+# a column-0 function-definition header: `<type> name(params)` ending at the body's `{` (which may
+# be on this line, with the body after it, or on the next line -> end-of-line). The two-identifier
+# `<type> <name>` shape (return type THEN name) is what separates a definition from a bare call.
+_SIG = re.compile(r'^[A-Za-z_][\w \t\*]*\b[A-Za-z_]\w*\s*\(([^;{]*)\)\s*(?:\{|$)')
+
+
+def _base_ident(arg: str):
+    """The leading identifier of the sink argument (`msg->fmt` -> `msg`, `&buf[0]` -> `buf`). A
+    call or a literal has no simple base and yields None (-> no taint link)."""
+    a = arg.strip().lstrip("&").lstrip("*").strip()
+    m = re.match(r"([A-Za-z_]\w*)", a)
+    if not m:
+        return None
+    ident = m.group(1)
+    rest = a[m.end():].lstrip()
+    if rest.startswith("("):                                # a function call, not a variable
+        return None
+    return ident
+
+
+def _param_idents(params: str) -> set:
+    """Identifier names of a (single-line) function signature's parameter list."""
+    out = set()
+    for part in params.split(","):
+        toks = re.findall(r"[A-Za-z_]\w*", part)
+        if toks and part.strip() not in ("void", ""):
+            out.add(toks[-1])                              # the declared name is the last token
+    return out
+
+
+def _enclosing(lines: list, idx: int):
+    """Conservative enclosing-function bounds: start just after the previous function's column-0
+    closing brace (normal multi-line C), but not earlier than the NEAREST column-0 signature above
+    the sink (so a one-line definition, whose `}` is not at column 0, is handled too). Returns
+    (signature_or_start_index, param_name_set); an empty set means the params could not be parsed
+    (e.g. a multi-line signature) -> no parameter link is claimed."""
+    start = 0
+    for s in range(idx - 1, -1, -1):
+        if lines[s][:1] == "}":                            # column-0 '}' = end of the prior function
+            start = s + 1
+            break
+    for s in range(idx, start - 1, -1):                    # nearest column-0 signature above the sink
+        m = _SIG.match(lines[s])
+        if m:
+            return s, _param_idents(m.group(1))
+    return start, set()
+
+
+def _reader_source(body: str, base: str):
+    """If `base` is filled by a known input reader in `body`, name that reader; else None. Readers
+    are matched at the exact destination/return position so a count or fd argument is not mistaken
+    for the data buffer."""
+    b = re.escape(base)
+    if re.search(rf"\b{b}\s*=\s*argv\s*\[", body):
+        return "argv[]"
+    for fn in ("getenv", "secure_getenv", "fgetln"):       # data-returning readers (assigned-from)
+        if re.search(rf"\b{b}\s*=\s*{fn}\s*\(", body):
+            return f"{fn}()"
+    for fn in ("read", "recv", "recvfrom"):                # destination = 2nd argument
+        if re.search(rf"\b{fn}\s*\(\s*[^,;()]+,\s*(?:&)?{b}\b", body):
+            return f"{fn}()"
+    for fn in ("fgets", "gets", "fread"):                  # destination = 1st argument
+        if re.search(rf"\b{fn}\s*\(\s*(?:&)?{b}\b", body):
+            return f"{fn}()"
+    return None
+
+
+def _taint_link(lines: list, idx: int, arg: str):
+    """Syntactic link from the sink argument to an untrusted source, or None. {"via","source"}."""
+    base = _base_ident(arg)
+    if not base:
+        return None
+    start, params = _enclosing(lines, idx)
+    if base in params:
+        return {"via": "parameter", "source": f"function parameter '{base}'"}
+    rdr = _reader_source("\n".join(lines[start:idx + 1]), base)
+    if rdr:
+        return {"via": "input-reader", "source": f"{rdr} into '{base}'"}
+    return None
+
+
 def scan_source(root: Path) -> list:
     findings: list = []
     for label, _p, text in source_files(root):
@@ -153,23 +243,29 @@ def scan_source(root: Path) -> list:
                 # a bare numeric / sizeof / NULL is not a tainted string either
                 if re.fullmatch(r"(?:NULL|0|nullptr)", arg):
                     continue
+                taint = _taint_link(lines, i, arg)
                 if fn in _CMDI:
                     findings.append(_mk(label, i, fn, arg, "CWE-78",
                                         f"{fn}() runs a non-literal command ('{arg}')",
-                                        "OS command injection"))
+                                        "OS command injection", taint))
                 else:
                     findings.append(_mk(label, i, fn, arg, "CWE-134",
                                         f"{fn}() uses a non-literal format string ('{arg}')",
-                                        "format string"))
+                                        "format string", taint))
     return findings
 
 
-def _mk(name, line, fn, arg, cwe, detail_tail, label) -> dict:
+def _mk(name, line, fn, arg, cwe, detail_tail, label, taint=None) -> dict:
+    ev = [{"channel": "source", "detail": f"{name}:{line + 1}: {detail_tail}"}]
+    if taint:                                              # a proven source->sink link raises the row
+        ev.append({"channel": "source-flow",
+                   "detail": f"the sink argument flows from {taint['source']} ({taint['via']})"})
     return {
         "cwe": cwe, "severity": "high",
         "title": f"{label} via {fn}() ({cwe})",
         "dedup_key": f"srcsink:{cwe}:{name}:{line + 1}:{fn}",
-        "evidence": [{"channel": "source", "detail": f"{name}:{line + 1}: {detail_tail}"}]}
+        "fn": fn, "arg": arg, "file": name, "line": line + 1, "taint": taint,
+        "evidence": ev}
 
 
 def source_sink_stage(ctx) -> dict:
@@ -199,16 +295,32 @@ def source_sink_stage(ctx) -> dict:
 
     ctx.progress(msg="scanning for tainted command / format-string sinks")
     findings = scan_source(root)
+    recipes = _file_findings(ctx, target, findings)
+    ctx.emit("source_sink.done", payload={"applicable": True, "findings": len(findings),
+             "recipes": recipes})
+    ctx.progress(pct=100, msg=f"{len(findings)} tainted-sink candidate(s), {recipes} recipe(s)")
+    return {"metrics": {"findings": len(findings), "recipes": recipes}}
+
+
+def _file_findings(ctx, target, findings) -> int:
+    """File each sink as a `candidate`, and for every one with a proven source->sink link also file
+    the corroborated exploitation recipe (the non-fuzzing weaponization floor). Returns the number
+    of recipes filed. A linked finding carries more confidence than a flat pattern match."""
+    from ..poc.source_recipe import file_source_recipe
     fd = FindingDAO(ctx.conn)
+    recipes = 0
     for f in findings:
+        linked = bool(f.get("taint"))
         fd.upsert(target.id, target.case_id, {
             "cwe": f["cwe"], "severity": f["severity"], "detector": "source_sink",
-            "title": f["title"], "evidence": f["evidence"],
+            "title": f["title"], "evidence": f["evidence"], "site_detail": f"{f['file']}:{f['line']}",
             "function_addr": None, "site_addr": None, "dedup_key": f["dedup_key"],
-            "state": "candidate", "confidence": 0.4})
-    ctx.emit("source_sink.done", payload={"applicable": True, "findings": len(findings)})
-    ctx.progress(pct=100, msg=f"{len(findings)} tainted-sink candidate(s)")
-    return {}
+            "state": "candidate", "confidence": 0.6 if linked else 0.4})
+        if linked and recipes < _MAX_SOURCE_RECIPES:
+            if file_source_recipe(ctx, target, cwe=f["cwe"], fn=f["fn"], arg=f["arg"],
+                                  file=f["file"], line=f["line"], taint=f["taint"]) is not None:
+                recipes += 1
+    return recipes
 
 
 def register() -> None:
