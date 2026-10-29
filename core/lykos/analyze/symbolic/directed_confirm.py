@@ -108,6 +108,52 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
     return out
 
 
+def _default_templates(input_size: int = 4096) -> list:
+    """The deterministic known-bad shapes, SMALLEST-first so the minimal triggering input wins.
+
+    Two families cover the common directly-triggerable memory-safety bugs without solving or fuzzing:
+      * oversized blobs -- a length-driven copy (`memcpy(buf, in, len)`, unbounded strcpy/sprintf)
+        overflows once the input passes the fixed buffer; the size ladder finds the threshold;
+      * format-string probes -- `printf(in)` with attacker bytes dereferences `%s`/reads `%n`/leaks
+        `%p`, which these specifier runs trigger directly.
+    These are a fixed handful, not a mutation loop: deterministic, so this is the ladder's FIRST rung."""
+    sizes = sorted({32, 64, 256, 1024, 4096, 16384, 65536, int(input_size), int(input_size) * 2})
+    tpls = [b"A" * s for s in sizes if 1 <= s <= (1 << 20)]
+    tpls += [b"%n" * 32, b"%s" * 64, b"%p" * 128, b"%s%p%n%x" * 32]
+    return tpls
+
+
+def template_confirm(asan_binary, *, lib_dirs=None, templates=None, input_size: int = 4096,
+                     timeout: int = 60) -> dict:
+    """Deterministic TEMPLATE rung (the ladder's smartest/first): replay a small fixed set of
+    known-bad-shape inputs under ASan -- no solver, no fuzzing. The first input that faults, with a
+    passing empty-input negative control, is the proof. Only an ASan/UBSan memory fault counts (a
+    benign reject/abort does not), so this never fabricates a confirmation. Returns the concolic_confirm
+    result shape with rung="template"."""
+    import time as _t
+    out = {"confirmed": False, "input": None, "report": None, "source": None, "class": None,
+           "rung": "template", "reason": None}
+    tpls = templates if templates is not None else _default_templates(input_size)
+    deadline = _t.time() + float(timeout)
+    tried = 0
+    for data in tpls:
+        if _t.time() >= deadline:
+            break
+        tried += 1
+        rep = _asan_replay(asan_binary, data, lib_dirs, timeout=min(15.0, timeout))
+        if not rep["faulted"]:
+            continue
+        neg = _asan_replay(asan_binary, b"", lib_dirs, timeout=min(15.0, timeout))
+        if neg["faulted"]:
+            out["reason"] = "negative control (empty input) also faulted -- not attributable"
+            return out
+        out.update(confirmed=True, input=data, report=rep["report"], source=rep["source"])
+        out["class"] = rep["cls"]
+        return out
+    out["reason"] = f"no template input faulted under ASan ({tried} shapes tried)"
+    return out
+
+
 # ---- the confirmation LADDER ---------------------------------------------------------------------
 # Rungs tried SMARTEST-FIRST per the operator's order: a deterministic template (no solver, no
 # fuzzing), then concolic (solver, no fuzzing), then directed SMART fuzzing (stochastic but steered --
@@ -118,11 +164,15 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
 
 
 def _rung_template(h, *, timeout, ctx):
-    """B2 (deterministic template synthesis): construct the triggering input directly from a
-    recognised bug shape (length-field -> oversized value, OOB index, %n, integer-overflow alloc).
-    Not yet implemented -- an ordered hook so the ladder tries it FIRST when it lands."""
-    return {"confirmed": False, "rung": "template", "skipped": True,
-            "reason": "deterministic template rung not implemented"}
+    """B2 (deterministic template synthesis): replay the known-bad shapes against the ASan harness
+    (the static replay build, or the shared fuzz build). No solver, no fuzzing -- the fastest rung,
+    so it runs FIRST and a directly-triggerable overflow / format-string bug is proven instantly."""
+    asan = h.get("replay_binary") or h.get("fuzz_binary")
+    if not asan:
+        return {"confirmed": False, "rung": "template", "skipped": True,
+                "reason": "no ASan harness build to replay templates against"}
+    return template_confirm(asan, lib_dirs=h.get("lib_dirs"),
+                            input_size=int(h.get("input_size", 4096)), timeout=timeout)
 
 
 def _rung_concolic(h, *, timeout, ctx):
