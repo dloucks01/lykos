@@ -155,6 +155,12 @@ def instrumentation_noise(f: dict) -> dict:
     return {"noise": False}
 
 
+#: How actionable each verdict is (highest wins when folding a distinct issue's copies): a real
+#: on-surface finding (shortlist) beats off-surface beats unclassified beats instrumentation noise.
+VERDICT_RANK = {"prove-out-shortlist": 3, "off-surface": 2, "unclassified": 1,
+                "instrumentation-noise": 0}
+
+
 def finding_verification(f: dict, reachable: Optional[bool] = None) -> dict:
     """The "is this an actual finding?" review verdict -- sound and conservative, it NEVER sets the
     earned `confirmed` state (that is reserved for a fired reproducer / dynamic confirm). It

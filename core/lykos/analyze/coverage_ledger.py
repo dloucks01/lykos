@@ -179,6 +179,23 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
     distinct = {"issues": len(_dk_best),
                 "weaponized": sum(1 for v in _dk_best.values() if v),
                 "raw": total_f}
+    # VERIFICATION triage over DISTINCT issues (the "is this an actual finding?" review): the
+    # de-noised prove-out shortlist, the off-surface remainder, and the instrumentation artifacts.
+    # Same verdict the report + finding cards use (one source: confirm_ladder). The GUI's ledger
+    # line links the shortlist count into the findings board.
+    from .confirm_ladder import VERDICT_RANK, finding_verification
+    _dk_verdict: dict[str, str] = {}
+    for f in all_findings:
+        v = finding_verification({"title": f.title, "cwe": f.cwe,
+                                  "evidence": f.evidence or []}).get("verdict", "unclassified")
+        prev = _dk_verdict.get(f.dedup_key)
+        if prev is None or VERDICT_RANK.get(v, 1) > VERDICT_RANK.get(prev, 1):
+            _dk_verdict[f.dedup_key] = v
+    verification = {
+        "shortlist": sum(1 for v in _dk_verdict.values() if v == "prove-out-shortlist"),
+        "off_surface": sum(1 for v in _dk_verdict.values() if v == "off-surface"),
+        "noise": sum(1 for v in _dk_verdict.values() if v == "instrumentation-noise"),
+    }
 
     # ---- combined GAPS worklist ----
     gaps: list[str] = []
@@ -210,7 +227,7 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         "weaponization": {"findings": total_f, "weaponized": weaponized,
                           "pct": round(100.0 * weaponized / total_f, 1) if total_f else None,
                           "by_state": by_state, "unweaponized": unweaponized[:200],
-                          "distinct": distinct},
+                          "distinct": distinct, "verification": verification},
         "code": code,
         "gaps": gaps,
     }

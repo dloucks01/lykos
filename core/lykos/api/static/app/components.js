@@ -1190,7 +1190,7 @@ function _axisBar(pct) {
     style=${`width:${pct != null ? Math.max(2, Math.min(100, pct)) : 0}%`}></div></div>`;
 }
 
-export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusTarget }) {
+export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusTarget, onShortlist }) {
   const [showChecks, setShowChecks] = useState(false);
   const [showCands, setShowCands] = useState(false);
   if (busy && !ledger) {
@@ -1258,6 +1258,15 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
             ${wpn.distinct.weaponized} weaponized
             <span class="ld-muted">(${wpn.distinct.raw} raw findings — the same source bug is
             counted once per target that compiles the file)</span></div>` : null}
+        ${wpn.verification && (wpn.verification.shortlist || wpn.verification.off_surface || wpn.verification.noise) ? html`
+          <div class="ledger-verify">
+            ${onShortlist && wpn.verification.shortlist ? html`<button class="lv-shortlist clk"
+                title="show the real, on-attack-surface findings worth proving out"
+                onClick=${() => onShortlist("prove-out-shortlist", "prove-out shortlist")}>
+                <b>${wpn.verification.shortlist}</b> prove-out shortlist →</button>`
+              : html`<span class="lv-shortlist"><b>${wpn.verification.shortlist}</b> prove-out shortlist</span>`}
+            <span class="ld-muted">${wpn.verification.off_surface} off-surface · ${wpn.verification.noise} instrumentation artifact(s)</span>
+          </div>` : null}
         ${Object.keys(byState).length ? html`<div class="ledger-chips">
           ${Object.entries(byState).sort().map(([st, n]) => html`<span
             class=${`lchip st-${_STATE_TONE[st] || "lo"}`} key=${st}>${st} · ${n}</span>`)}

@@ -192,6 +192,13 @@ def test_a_finding_links_to_its_discovering_stage():
     assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"
 
 
+def test_the_ledger_links_to_the_prove_out_shortlist():
+    """The coverage ledger's verification line is the case-level entry into the prove-out shortlist:
+    clicking it filters the findings board to the real, on-attack-surface findings."""
+    assert "lv-shortlist" in COMPONENTS and "onShortlist" in COMPONENTS, "no ledger shortlist link"
+    assert "onShortlist=${filterByVerdict}" in APP, "the app never wires the ledger->shortlist hop"
+
+
 def test_timing_panel_is_in_the_gui_and_cross_links_to_stage_findings():
     """The time & yield table (report-only before) now lives in the GUI's ledger tab, and each
     technique row filters the findings board to the stage it discovered."""

@@ -1521,7 +1521,7 @@ function App() {
               <div class="wb-panel">
                 <${LedgerPanel} ledger=${ledger} busy=${ledgerBusy}
                   onOpenFinding=${openFindingById} onFilterCwe=${filterByCwe}
-                  onFocusTarget=${focusTargetByName} />
+                  onFocusTarget=${focusTargetByName} onShortlist=${filterByVerdict} />
                 <${TimingPanel} timing=${timing} busy=${ledgerBusy}
                   onFilterStage=${showStageFindings} />
               </div>

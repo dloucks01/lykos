@@ -61,6 +61,25 @@ def test_ledger_distinct_dedup_across_targets(store, case):
     assert d["weaponized"] == 1                        # only the shared (corroborated) issue
 
 
+def test_ledger_verification_rollup_over_distinct_issues(store, case):
+    """The ledger triages distinct issues into prove-out shortlist / off-surface / noise -- the
+    case-level entry the GUI links into the findings board."""
+    t = TargetDAO(store.conn).upsert(case.id, "x", "e" * 64, arch="source", bits=0)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, {"cwe": "CWE-190", "title": "ovf", "severity": "high",
+              "state": "corroborated", "detector": "source_recipe", "dedup_key": "on",
+              "evidence": [{"channel": "s", "detail": "on the fuzzed attack surface"}]})
+    fd.upsert(t.id, case.id, {"cwe": "CWE-416", "title": "uaf", "severity": "high",
+              "state": "corroborated", "detector": "uaf", "dedup_key": "off",
+              "evidence": [{"channel": "s", "detail": "off the fuzzed attack surface"}]})
+    fd.upsert(t.id, case.id, {"cwe": "CWE-129", "title": "oob _ZN11__sanitizer internal_allocator",
+              "severity": "high", "state": "corroborated", "detector": "oob_index",
+              "dedup_key": "noise",
+              "evidence": [{"channel": "s", "detail": "on the fuzzed attack surface"}]})
+    v = CL.build_ledger(store, case.id)["weaponization"]["verification"]
+    assert v["shortlist"] == 1 and v["off_surface"] == 1 and v["noise"] == 1
+
+
 def test_undriven_reachability_from_harness_entry(store, case):
     """A harness entry's forward call-graph reach vs total recovered functions -- the honest
     'how much code does a harness drive' measure (undriven = the rest)."""
