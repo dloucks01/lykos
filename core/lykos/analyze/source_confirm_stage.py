@@ -232,12 +232,11 @@ def source_confirm_stage(ctx) -> dict:
     # not -- so it is always attempted, and is the floor that covers the projects concolic cannot.
     bslice = max(60, int(budget * 0.25))
     ctx.progress(msg="building in-tree harnesses (static clean+ASan for concolic, shared ASan for fuzz)")
-    explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice,
-                                       build_name="_lykos_build_explore")
-    replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice,
-                                      build_name="_lykos_build_replay")
-    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice,
-                                     build_name="_lykos_build_fuzz")
+    # Config-keyed build dirs (the default): the shared-ASan fuzz build is shared with libfuzzer_stage
+    # (built once, not twice); the static explore/replay builds are distinct configs with their own dirs.
+    explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice)
+    replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice)
+    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice)
     if not (explore["ok"] or fuzzb["ok"]):
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "could not build harnesses for confirmation (neither static nor shared linked)",

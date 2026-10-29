@@ -1695,9 +1695,38 @@ def _cmake_disable_flags(pkg: str) -> list:
     return [f"-DWITH_{P}=OFF", f"-DENABLE_{P}=OFF", f"-DUSE_{P}=OFF", f"-DWITH_{P}=0"]
 
 
+def _collect_cmake_harnesses(bd, intree, names):
+    """The harness ELFs produced under build dir `bd` (match by stem, exclude libraries) plus the
+    shared-lib dirs. Returns (harnesses, lib_dirs)."""
+    bd = Path(bd)
+    if not bd.is_dir():
+        return [], []
+    found: dict = {}
+    for p in bd.rglob("*"):
+        if p.is_file() and p.stem in names and p.suffix == "" and os.access(p, os.X_OK) and _is_elf_exec(p):
+            found.setdefault(p.stem, p)
+    harnesses = [{"name": s.stem, "source": str(s), "binary": str(found[s.stem])}
+                 for s in intree if s.stem in found]
+    lib_dirs = sorted({str(p.parent) for p in bd.rglob("*.so*") if p.is_file()})
+    return harnesses, lib_dirs
+
+
+def _cmake_fresh(bd, root) -> bool:
+    """True when the build under `bd` is newer than the project's CMakeLists.txt -- a cheap staleness
+    guard. The materialized source tree is immutable after ingest, so this is conservative; it only
+    protects against a stale dir left by an earlier, different checkout."""
+    try:
+        cml = (Path(root) / "CMakeLists.txt").stat().st_mtime
+        newest = max((p.stat().st_mtime for p in Path(bd).rglob("*")
+                      if p.is_file() and p.suffix == "" and os.access(p, os.X_OK)), default=0.0)
+        return newest >= cml
+    except OSError:
+        return False
+
+
 def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = None,
                           want=None, shared: bool = True, sanitize: bool = True,
-                          build_name: str = "_lykos_fuzzbuild") -> dict:
+                          build_name: str | None = None) -> dict:
     """Build a CMake project's IN-TREE libFuzzer harnesses (files defining LLVMFuzzerTestOneInput)
     with the project's OWN cmake -- which generates its config headers and resolves its include/link
     graph, neither of which a per-translation-unit compile can do for a large project (FreeRDP's
@@ -1733,7 +1762,24 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
         return res
     if deadline is None:
         deadline = _time.time() + timeout * 4
-    bd = root / build_name              # distinct names let the explore + replay builds coexist
+    # A CONFIG-KEYED build dir (default): the same (shared, sanitize) config lands in the same dir, so
+    # the shared-ASan harness that source_confirm and libfuzzer_stage BOTH want is built once and
+    # shared, instead of twice into two dirs (each configure pass rmtrees its dir, so distinct names
+    # meant a full rebuild). Distinct configs (static-clean explore, static-ASan replay) still get
+    # distinct dirs and coexist.
+    if build_name is None:
+        build_name = f"_lykos_cmake_{'sh' if shared else 'st'}_{'asan' if sanitize else 'clean'}"
+    names = {p.stem for p in intree}
+    if want:
+        names &= set(want)
+    bd = root / build_name
+    # REUSE: if this exact config was already built this run, skip reconfigure+rebuild and re-collect
+    # the ELFs (fresh = newer than CMakeLists.txt). This is what makes the shared build shared.
+    _pre_h, _pre_l = _collect_cmake_harnesses(bd, intree, names)
+    if _pre_h and _cmake_fresh(bd, root):
+        res["harnesses"], res["lib_dirs"], res["ok"] = _pre_h, _pre_l, True
+        res["log"], res["reused"] = f"reused existing cmake build {build_name}", True
+        return res
     confine = _configure_confinement(root)
     env = dict(os.environ)
     if confine:
@@ -1782,9 +1828,6 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
     res["log"] = log
     if rc != 0:
         return res
-    names = {p.stem for p in intree}
-    if want:
-        names &= set(want)
     # Prefer the project's `fuzzers` aggregate target; fall back to building each harness by name.
     br = _run(["cmake", "--build", str(bd), "-j", "--target", "fuzzers"])
     res["log"] = (log + (br.stdout or "") + (br.stderr or ""))[-20000:]
@@ -1793,14 +1836,7 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
             if _time.time() >= deadline:
                 break
             _run(["cmake", "--build", str(bd), "-j", "--target", n])
-    # collect the produced harness ELFs (match by stem; exclude libraries)
-    found: dict = {}
-    for p in bd.rglob("*"):
-        if p.is_file() and p.stem in names and p.suffix == "" and os.access(p, os.X_OK) and _is_elf_exec(p):
-            found.setdefault(p.stem, p)
-    harnesses = [{"name": s.stem, "source": str(s), "binary": str(found[s.stem])}
-                 for s in intree if s.stem in found]
-    lib_dirs = sorted({str(p.parent) for p in bd.rglob("*.so*") if p.is_file()})
+    harnesses, lib_dirs = _collect_cmake_harnesses(bd, intree, names)
     res["harnesses"], res["lib_dirs"], res["ok"] = harnesses, lib_dirs, bool(harnesses)
     return res
 
