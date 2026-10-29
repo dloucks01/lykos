@@ -34,7 +34,7 @@ _CWE = {"stack-buffer-overflow": "CWE-121", "heap-buffer-overflow": "CWE-122",
 #: the STATIC source detectors whose candidates a ladder crash can confirm by co-location (and whose
 #: functions synth_confirm drives). Includes `cpg` (CWE-120/CWE-22 queries) and `source_sink`.
 _STATIC_SOURCE_DETECTORS = ("source_sink", "cpg", "int_overflow", "uaf", "cve_source",
-                            "embedded_config", "assert_guard")
+                            "embedded_config", "assert_guard", "oob_write")
 _SRC_LOC = re.compile(r"([\w./+\-]+):(\d+)")
 
 

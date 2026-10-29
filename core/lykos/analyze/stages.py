@@ -79,6 +79,8 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("int_overflow_scan", "Int-overflow allocs", "target", "..analyze.fingerprint", "enqueue_int_overflow_scan", no_params=True),
     StageSpec("uaf_scan", "Use-after-free scan", "target", "..analyze.fingerprint", "enqueue_uaf_scan", no_params=True),
     StageSpec("assert_guard_scan", "Assert-only bounds checks", "target", "..analyze.fingerprint", "enqueue_assert_guard_scan", no_params=True),
+    StageSpec("oob_write_scan", "Out-of-bounds index writes", "target", "..analyze.fingerprint",
+              "enqueue_oob_write_scan", no_params=True),
     StageSpec("grounding", "Ground findings (precision + peer reachability)", "target",
               "..analyze.grounding_stage", "enqueue_grounding", no_params=True),
     StageSpec("source_sink_scan", "Tainted-sink scan", "target", "..analyze.fingerprint", "enqueue_source_sink_scan", no_params=True),

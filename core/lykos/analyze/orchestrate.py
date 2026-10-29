@@ -29,7 +29,6 @@ from ..db.dao import DynResultDAO, EventDAO, FindingDAO, FunctionDAO, PocDAO
 from ..db.models import STATIC_DETECTORS
 from ..jobs.queue import JobQueue
 from . import budget as budget_mod
-from . import substrate
 
 # ---- Pipeline stages: DERIVED from the single declarative registry (doc 49, Theme 1a) -------
 # These five structures used to be hand-synced literals; a stage present in some and not the
@@ -39,6 +38,7 @@ from . import substrate
 # literals, so every consumer (the API dispatch tables, the plan, the no-params gate) is
 # preserved; see tests/test_stage_registry.py for the pin.
 from . import stages as _stages
+from . import substrate
 
 _stages.check_consistency()  # fail LOUD at import if any descriptor is internally inconsistent
 
@@ -1497,7 +1497,7 @@ _EVENT_STAGE = {
     "source_cve": "source_cve_scan", "source_sink": "source_sink_scan",
     "synth": "synthesize_poc", "system": "whole_system", "taint": "dynamic_taint",
     "triage": "ingest_triage", "uaf": "uaf_scan", "assert_guard": "assert_guard_scan",
-    "grounding": "grounding",
+    "oob_write": "oob_write_scan", "grounding": "grounding",
 }
 
 #: Stages the autopilot is not expected to schedule per target, so their absence is not a gap:
@@ -2091,6 +2091,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # A copy whose only length bound is an assertion: unchecked in release builds (an
                 # out-of-bounds write) or a remote abort where kept (CWE-787/CWE-617).
                 _staged(bud, store, t, "assert_guard_scan", status, stop)
+                # An attacker-controlled / monotonic-unbounded index written into an array with no
+                # bounds check -- an out-of-bounds write (CWE-787).
+                _staged(bud, store, t, "oob_write_scan", status, stop)
                 # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
                 _staged(bud, store, t, "source_sink_scan", status, stop)
                 # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
