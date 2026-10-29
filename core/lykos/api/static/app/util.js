@@ -334,6 +334,9 @@ export function filterByViz(findings, viz) {
   if (viz.severity) return findings.filter((f) => (f.severity || "").toLowerCase() === viz.severity);
   if (viz.cwe) return findings.filter((f) => f.cwe === viz.cwe);
   if (viz.stage) return findings.filter((f) => f.stage === viz.stage);
+  // Verification verdict (doc 49 spine): the prove-out shortlist / off-surface / noise triage, so
+  // a verdict badge or the ledger's shortlist line filters the board to exactly those findings.
+  if (viz.verdict) return findings.filter((f) => (f.verification || {}).verdict === viz.verdict);
   return findings;
 }
 

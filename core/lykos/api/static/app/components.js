@@ -696,7 +696,7 @@ export function CurationFilter({ mode, onChange, counts }) {
     </div>`;
 }
 
-export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph, onStage }) {
+export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph, onStage, onVerdict }) {
   const inspect = (ch) => onInspect && onInspect(finding, ch);
   const demo = isDemonstrated(finding);
   const evRaw = finding.evidence;
@@ -737,9 +737,14 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
         <${CurationChip} curation=${finding.curation} />
         <${Badge} state=${finding.state} />
         ${finding.verification && VERIFY_BADGE[finding.verification.verdict]
-          ? html`<span class=${`verify-badge vb-${finding.verification.verdict}`}
-              title=${finding.verification.noise_reason || VERIFY_BADGE[finding.verification.verdict].tip}>
-              ${VERIFY_BADGE[finding.verification.verdict].label}</span>` : null}
+          ? (onVerdict
+            ? html`<button class=${`verify-badge vb-${finding.verification.verdict} clk`}
+                title=${`show every finding with this verdict${finding.verification.noise_reason ? " — " + finding.verification.noise_reason : ""}`}
+                onClick=${() => onVerdict(finding.verification.verdict, VERIFY_BADGE[finding.verification.verdict].label)}>
+                ${VERIFY_BADGE[finding.verification.verdict].label}</button>`
+            : html`<span class=${`verify-badge vb-${finding.verification.verdict}`}
+                title=${finding.verification.noise_reason || VERIFY_BADGE[finding.verification.verdict].tip}>
+                ${VERIFY_BADGE[finding.verification.verdict].label}</span>`) : null}
       </div>
       <div class="find-gloss">${STATE_GLOSS[finding.state] || ""}</div>
 
@@ -2326,7 +2331,7 @@ export function CaseOverview({ findings, pocs, filter, onFilter }) {
   const barMax = Math.max(1, ...cwes.map((c) => c.count));
   return html`<div class="ov" aria-label="case overview">
     ${filter ? html`<button class="ov-clear btn small ghost" onClick=${() => onFilter && onFilter(null)}>
-      ✕ clear ${filter.severity || filter.cwe || filter.stageLabel || filter.stage} filter</button>` : null}
+      ✕ clear ${filter.severity || filter.cwe || filter.stageLabel || filter.stage || filter.verdictLabel || filter.verdict} filter</button>` : null}
     <div class="ov-grid">
       <div class="ov-card">
         <div class="ov-h">Severity</div>

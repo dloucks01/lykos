@@ -163,6 +163,16 @@ function renderInfo(vnode) {
   }));
   ck("FindingCard renders the prove-out-shortlist verdict badge",
     /prove-out shortlist/.test(shortlist.all) && shortlist.classes.some((c) => /vb-prove-out-shortlist/.test(c)));
+  // The verdict badge is an inert span by default, and a clickable cross-link button with onVerdict
+  // (the spine link: "show every finding with this verdict").
+  ck("FindingCard verdict badge is NOT a button without onVerdict",
+    !shortlist.classes.some((c) => /verify-badge .*clk|verify-badge clk/.test(c)));
+  const verdictClick = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, verification: { verdict: "prove-out-shortlist", shortlist: true } },
+    onVerdict() {}, pocs: [], reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard verdict badge becomes a clickable button with onVerdict",
+    verdictClick.threw.length === 0 && verdictClick.classes.some((c) => /vb-prove-out-shortlist clk/.test(c)));
   ck("FindingCard renders the directed prove-out plan for a shortlisted finding",
     /Prove it out/.test(shortlist.all) && /synthesize a driver/.test(shortlist.all)
     && shortlist.classes.some((c) => /find-proveout/.test(c)));

@@ -989,6 +989,12 @@ function App() {
     setTab("findings");
     setViz({ cwe });
   }, []);
+  // A verification verdict -> the findings filtered to that triage bucket (the prove-out shortlist,
+  // off-surface, or instrumentation noise) -- the spine's link from the verification surface.
+  const filterByVerdict = useCallback((verdict, label) => {
+    setTab("findings");
+    setViz({ verdict, verdictLabel: label });
+  }, []);
   const focusTargetByName = useCallback((filename) => {
     const t = targetsRef.current.find((x) => x.filename === filename);
     if (!t) return;
@@ -1130,7 +1136,8 @@ function App() {
     pocs=${pocsFor(f)} mitigations=${mitOf(f)}
     reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
     onInspect=${(finding, focus) => setEvidence({ finding, focus })}
-    onCurate=${curate} onShowInGraph=${showInGraph} onStage=${showStageFindings} />`;
+    onCurate=${curate} onShowInGraph=${showInGraph} onStage=${showStageFindings}
+    onVerdict=${filterByVerdict} />`;
   const multi = targets.length > 1;
   // finding -> its false-positive review (via the PoC that carries the crashing input's sha)
   const verByFinding = {};

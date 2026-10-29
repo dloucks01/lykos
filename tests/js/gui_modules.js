@@ -357,6 +357,13 @@ const ck = (n, cond) => { pass = pass && !!cond; console.log(`${cond ? "PASS" : 
     util.filterByViz([
       { id: "a", stage: "cpg_scan" }, { id: "b", stage: "uaf_scan" }, { id: "c", stage: "cpg_scan" },
     ], { stage: "cpg_scan" }).map((f) => f.id).join("") === "ac");
+  ck("filterByViz narrows to a verification verdict (the prove-out-shortlist cross-link)",
+    util.filterByViz([
+      { id: "a", verification: { verdict: "prove-out-shortlist" } },
+      { id: "b", verification: { verdict: "off-surface" } },
+      { id: "c", verification: { verdict: "prove-out-shortlist" } },
+      { id: "d" },
+    ], { verdict: "prove-out-shortlist" }).map((f) => f.id).join("") === "ac");
   ck("histogram counts a field, most-frequent first",
     JSON.stringify(util.histogram(ov, "cwe")) ===
       JSON.stringify([{ key: "CWE-787", count: 2 }, { key: "CWE-121", count: 1 }, { key: "CWE-78", count: 1 }]));

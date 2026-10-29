@@ -190,3 +190,13 @@ def test_a_finding_links_to_its_discovering_stage():
     assert "onStage=${showStageFindings}" in APP, "the app never wires the finding->stage hop"
     # the filter understands the stage dimension the chip sets
     assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"
+
+
+def test_a_finding_links_to_its_verification_verdict():
+    """Spine extension (doc 49): the verification-verdict badge filters the board to that verdict
+    (the prove-out shortlist), so the new verification surface is navigable, not a dead end."""
+    assert "onVerdict" in COMPONENTS, "FindingCard has no verdict cross-link"
+    assert "onVerdict=${filterByVerdict}" in APP, "the app never wires the finding->verdict hop"
+    assert "setViz({ verdict" in APP, "filterByVerdict does not set a verdict viz filter"
+    assert "viz.verdict" in (STATIC / "app" / "util.js").read_text(), \
+        "filterByViz ignores a verdict filter"
