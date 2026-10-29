@@ -223,3 +223,81 @@ def test_empty_case(store, case):
     assert to_html(r).startswith("<!doctype html>")
     assert to_pdf(r)[:5] == b"%PDF-"
     assert to_sarif(r)["runs"][0]["results"] == []
+
+
+def _seed_timing(store, case):
+    """Runs across three techniques: one that spent the MOST time and produced nothing (the honest
+    zero-yield case the timing table exists to surface), and two that produced findings / a crash."""
+    content = b"\x7fELFtiming-sample"
+    sha = hash_bytes(content)
+    t = store.targets.upsert(case.id, filename="t", sha256=sha, size=len(content),
+                             arch="x86_64", bits=64, endianness="little", stripped=False,
+                             file_type="ELF", linking="dynamic")
+    rd = store.runs
+    # fuzz: 300s wall, ZERO findings, ZERO crashes -- the "no yield" row
+    rf = rd.create(case.id, "fuzz", target_id=t.id, status="done")
+    rd.set_status(rf.id, "done", started_at=1000, ended_at=1300)
+    # int_overflow_scan: 10s, two findings
+    ri = rd.create(case.id, "int_overflow_scan", target_id=t.id, status="done")
+    rd.set_status(ri.id, "done", started_at=1000, ended_at=1010)
+    # concolic: 50s, one finding AND one reproduced crash tied to this run
+    rc = rd.create(case.id, "concolic", target_id=t.id, status="done")
+    rd.set_status(rc.id, "done", started_at=1010, ended_at=1060)
+    fd = FindingDAO(store.conn)
+    for k in ("io1", "io2"):
+        fd.upsert(t.id, case.id, {
+            "dedup_key": k, "cwe": "CWE-190", "title": f"int overflow {k}",
+            "severity": "high", "state": "candidate", "detector": "int_overflow",
+            "stage": "int_overflow_scan", "evidence": [{"channel": "static", "detail": "x"}]})
+    fd.upsert(t.id, case.id, {
+        "dedup_key": "cc1", "cwe": "CWE-787", "title": "concolic bug", "severity": "high",
+        "state": "corroborated", "detector": "concolic", "stage": "concolic",
+        "evidence": [{"channel": "dynamic", "detail": "x"}]})
+    DynResultDAO(store.conn).insert(t.id, case.id, run_id=rc.id, input_sha=hash_bytes(b"c"),
+                                    input_mode="arg", signal=11, signal_name="SIGSEGV",
+                                    crashed=True, isolation="bwrap")
+    return t
+
+
+def test_timing_per_technique_and_overall(store, case):
+    _seed_timing(store, case)
+    tm = build_report(store, case.id)["timing"]
+    ov = tm["overall"]
+    # wall-clock is the SPAN (1000..1300 = 300s); compute is the SUM (300+10+50 = 360s), larger
+    # because techniques overlap in wall-clock -- both reported so the gap is explained.
+    assert ov["wall_seconds"] == 300
+    assert ov["compute_seconds"] == 360
+    assert ov["wall_human"] == "5m 0s"
+    assert ov["started_at"].endswith("Z") and ov["ended_at"].endswith("Z")
+    # dearest-first ordering
+    assert tm["techniques"][0]["stage"] == "fuzz"
+    by = {d["stage"]: d for d in tm["techniques"]}
+    # the honest no-yield case: most time, nothing produced
+    assert by["fuzz"]["seconds"] == 300
+    assert by["fuzz"]["findings"] == 0 and by["fuzz"]["crashes"] == 0
+    # yield sits beside the cost
+    assert by["int_overflow_scan"]["findings"] == 2
+    assert by["concolic"]["findings"] == 1 and by["concolic"]["crashes"] == 1
+
+
+def test_html_shows_time_and_yield(store, case):
+    _seed_timing(store, case)
+    html = to_html(build_report(store, case.id))
+    assert "Time &amp; yield per technique" in html
+    assert "5m 0s" in html            # overall wall-clock tile
+    assert "no yield" in html         # the fuzz row is flagged
+
+
+def test_sarif_carries_timing(store, case):
+    _seed_timing(store, case)
+    s = to_sarif(build_report(store, case.id))
+    inv = s["runs"][0]["invocations"][0]
+    assert inv["startTimeUtc"].endswith("Z") and inv["endTimeUtc"].endswith("Z")
+    tm = s["runs"][0]["properties"]["timing"]
+    assert tm["overall"]["compute_seconds"] == 360
+    assert any(d["stage"] == "fuzz" and d["findings"] == 0 for d in tm["techniques"])
+
+
+def test_pdf_with_timing_is_valid(store, case):
+    _seed_timing(store, case)
+    assert to_pdf(build_report(store, case.id))[:5] == b"%PDF-"

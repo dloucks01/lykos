@@ -162,6 +162,13 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
         "executionSuccessful": not any_failure,
         "toolExecutionNotifications": notifications,
     }
+    # When the analysis ran (SARIF's canonical fields), distinct from when the report was rendered.
+    _tm = report.get("timing") or {}
+    _ov = _tm.get("overall") or {}
+    if _ov.get("started_at"):
+        invocation["startTimeUtc"] = _ov["started_at"]
+    if _ov.get("ended_at"):
+        invocation["endTimeUtc"] = _ov["ended_at"]
     run: dict[str, Any] = {
         "tool": {"driver": driver},
         "invocations": [invocation],
@@ -174,6 +181,9 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
             "highest_level": summ.get("highest_level") or None,
             "engine_health": summ.get("engine_health"),
             "curation": summ.get("curation") or {},
+            # Per-technique time + yield, machine-readable: a consumer can see which technique
+            # spent the budget and what it returned without parsing the HTML.
+            "timing": _tm or None,
         },
     }
     return {"$schema": SARIF_SCHEMA, "version": "2.1.0", "runs": [run]}

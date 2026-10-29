@@ -324,6 +324,31 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
         L.append(_Line("Fuzzing coverage", "HB", 10, 0, 16, (0.2, 0.2, 0.25)))
         L += _fig_block(_cov)
 
+    # Time & yield per technique -- the same measurement the HTML report carries, so a reader of
+    # the PDF sees which technique spent the budget and what it returned (a stage that took the
+    # most clock for zero findings/crashes is marked).
+    tm = report.get("timing") or {}
+    techs = tm.get("techniques") or []
+    ov = tm.get("overall") or {}
+    if techs:
+        L.append(_Line("Time & yield per technique", "HB", 13, 0, 16))
+        L.append(_Line("", "H", 1, 0, 3, rule=True))
+        L += _flow(
+            f'Wall-clock {ov.get("wall_human", "-")}  ·  total compute '
+            f'{ov.get("compute_human", "-")} across {len(techs)} techniques '
+            f'({ov.get("runs", 0)} runs; compute exceeds wall-clock because the worker pool runs '
+            f'targets in parallel).', "H", 9, 0, 4)
+        _compute = ov.get("compute_seconds") or 0
+        for tq in techs:
+            secs = tq.get("seconds") or 0
+            pct = (100.0 * secs / _compute) if _compute else 0.0
+            yld, cr = tq.get("findings") or 0, tq.get("crashes") or 0
+            zero = secs > 0 and yld == 0 and cr == 0
+            line = (f'- {tq.get("label") or tq.get("stage")}: {tq.get("human")} '
+                    f'({pct:.0f}% of compute) -- {yld} findings, {cr} crashes'
+                    + ("  [no yield]" if zero else ""))
+            L.append(_Line(line, "H", 9, 8, 1, (0.72, 0.42, 0.18) if zero else None))
+
     # targets + findings
     for t in report.get("targets", []):
         L.append(_Line("Target", "HB", 8, 0, 20, (0.6, 0.6, 0.65)))

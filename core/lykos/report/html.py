@@ -247,6 +247,52 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
     return "".join(p)
 
 
+def _timing_html(tm: dict[str, Any]) -> str:
+    """How long each technique took + the overall analysis time, with YIELD (findings/reproduced
+    crashes) beside the cost -- so a technique that ate the clock for nothing is visible at a glance
+    (the question the FreeRDP fuzzers raised: 44% of compute, zero findings, zero crashes)."""
+    ov = tm.get("overall") or {}
+    techs = tm.get("techniques") or []
+    p = ['<section class="card timing"><h2>Time &amp; yield per technique</h2>',
+         '<p class="muted">How long each analysis technique took and what it produced. Wall-clock is '
+         'the real elapsed span; total compute is the sum across techniques, larger because the '
+         'worker pool runs targets in parallel. Yield counts are unfiltered (what the technique '
+         'actually produced), so a technique that spent time and produced nothing reads honestly.</p>']
+    p.append('<div class="stats">')
+    p.append(_stat(ov.get("wall_human") or "—", "wall-clock"))
+    p.append(_stat(ov.get("compute_human") or "—", "total compute"))
+    p.append(_stat(ov.get("runs", 0), "analysis runs"))
+    p.append(_stat(len(techs), "techniques"))
+    p.append('</div>')
+    if techs:
+        compute = ov.get("compute_seconds") or 0
+        p.append('<table class="htab timing-tab"><thead><tr><th>technique</th><th>time</th>'
+                 '<th>share of compute</th><th>runs</th><th>findings</th><th>crashes</th>'
+                 '</tr></thead><tbody>')
+        for t in techs:
+            secs = t.get("seconds") or 0
+            pct = (100.0 * secs / compute) if compute else 0.0
+            yld = t.get("findings") or 0
+            cr = t.get("crashes") or 0
+            # The honest flag: time spent, nothing produced -- the slice the reader is hunting for.
+            zero = secs > 0 and yld == 0 and cr == 0
+            name = esc(t.get("label") or t.get("stage"))
+            if zero:
+                name += ' <span class="muted">(no yield)</span>'
+            bar = (f'<div class="tbar"><span style="width:{pct:.1f}%"></span></div>'
+                   f'<span class="tbar-pct">{pct:.0f}%</span>')
+            p.append('<tr class="noyield">' if zero else '<tr>')
+            p.append(f'<td class="mono">{name}</td>'
+                     f'<td class="num">{esc(t.get("human"))}</td>'
+                     f'<td class="tbar-cell">{bar}</td>'
+                     f'<td class="num">{esc(t.get("runs"))}</td>'
+                     f'<td class="num">{esc(yld)}</td>'
+                     f'<td class="num">{esc(cr)}</td></tr>')
+        p.append('</tbody></table>')
+    p.append('</section>')
+    return "".join(p)
+
+
 def _methodology_html(report: dict[str, Any]) -> str:
     """The approach, the confirmation ladder, and the evidence standard -- so the findings below are
     read against a stated method and a defined confidence scale, not taken on faith."""
@@ -406,6 +452,11 @@ def to_html(report: dict[str, Any]) -> str:
     led = report.get("coverage_ledger")
     if led:
         parts.append(_coverage_ledger_html(led))
+
+    # ---- time & yield per technique ----
+    tm = report.get("timing")
+    if tm and (tm.get("techniques") or tm.get("overall")):
+        parts.append(_timing_html(tm))
 
     # ---- reproducibility ----
     eng = report.get("engines", [])
@@ -944,6 +995,14 @@ a.dl:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
 .htab th{text-align:left;color:var(--faint);font-weight:600;font-size:11px;padding:3px 6px}
 .htab td{padding:4px 6px;border-top:1px solid var(--border);vertical-align:top;word-break:break-word}
 .htab td.num{text-align:right;white-space:nowrap}
+.timing-tab td.tbar-cell{width:38%;white-space:nowrap}
+.tbar{display:inline-block;width:calc(100% - 44px);height:8px;border-radius:4px;
+  background:var(--surface-2);border:1px solid var(--border);overflow:hidden;vertical-align:middle}
+.tbar>span{display:block;height:100%;background:var(--accent,#539bf5)}
+.tbar-pct{display:inline-block;width:36px;text-align:right;font-size:11px;color:var(--muted);
+  margin-left:4px;vertical-align:middle}
+.timing-tab tr.noyield td{color:var(--muted)}
+.timing-tab tr.noyield .tbar>span{background:#8b8d98}
 .hdec ul{margin:2px 0 0;padding-left:16px}
 .fcur{margin:6px 0 2px;padding:6px 10px;border-left:3px solid #d29922;font-size:12.5px;
   background:color-mix(in srgb,#d29922 7%,transparent);word-break:break-word}
