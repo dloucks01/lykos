@@ -192,6 +192,17 @@ def test_a_finding_links_to_its_discovering_stage():
     assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"
 
 
+def test_the_evidence_modal_walks_the_reachability_path_into_the_graph():
+    """Spine: the EvidenceModal renders the source->sink reachability path, and each hop focuses
+    that function in the call graph -- walking the path from the finding to the sink."""
+    assert "ev-reach" in COMPONENTS, "the modal has no reachability chain"
+    assert "finding.reachability.path" in COMPONENTS, "the modal never reads the path"
+    # a hop focuses its function in the call graph by address
+    assert "function_addr: hop.addr" in COMPONENTS, "a path hop does not focus its function"
+    # the modal is fed the single-finding detail (which carries the path), not only the list row
+    assert "api.getFinding" in APP
+
+
 def test_a_finding_links_to_its_verification_verdict():
     """Spine extension (doc 49): the verification-verdict badge filters the board to that verdict
     (the prove-out shortlist), so the new verification surface is navigable, not a dead end."""

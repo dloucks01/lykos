@@ -962,7 +962,11 @@ function App() {
 
   // Crash triage -> the finding a crash group belongs to, in the evidence inspector.
   const openFindingById = useCallback(async (fid) => {
-    const f = findings.find((x) => x.id === fid) || await api.getFinding(fid).catch(() => null);
+    // Prefer the single-finding detail (it carries the reachability PATH + per-finding analysis the
+    // list omits), merged over the list row so target_name etc. survive.
+    const base = findings.find((x) => x.id === fid);
+    const full = await api.getFinding(fid).catch(() => null);
+    const f = full ? { ...base, ...full } : base;
     if (f) setEvidence({ finding: f, focus: null });
     else setError("Could not load that finding.");
   }, [findings]);
@@ -1135,7 +1139,10 @@ function App() {
     finding=${verByFinding[f.id] ? { ...f, verification: verByFinding[f.id] } : f}
     pocs=${pocsFor(f)} mitigations=${mitOf(f)}
     reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
-    onInspect=${(finding, focus) => setEvidence({ finding, focus })}
+    onInspect=${async (finding, focus) => {
+      const full = await api.getFinding(finding.id).catch(() => null);
+      setEvidence({ finding: full ? { ...finding, ...full } : finding, focus });
+    }}
     onCurate=${curate} onShowInGraph=${showInGraph} onStage=${showStageFindings}
     onVerdict=${filterByVerdict} />`;
   const multi = targets.length > 1;

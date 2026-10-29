@@ -28,6 +28,7 @@ from ..analyze.confirm_ladder import finding_analysis as _finding_analysis
 from ..analyze.confirm_ladder import finding_exploitability as _finding_exploitability
 from ..analyze.confirm_ladder import finding_verification as _finding_verification
 from ..analyze.confirm_ladder import prove_out_plan as _prove_out_plan
+from ..analyze.reachability import reachability_steps as _reachability_steps
 from ..analyze.stages import label_for as _stage_label_report
 from . import figures as _figures
 from ..db.models import FINDING_STATES, SEVERITIES
@@ -475,67 +476,6 @@ def _provenance_chain_svg(f: dict) -> Optional[str]:
     except Exception:                               # noqa: BLE001
         observe.absorbed(_log, "provenance figure skipped")
         return None
-
-
-def _bare_sym(n) -> str:
-    n = str(n or "")
-    for p in ("sym.imp.", "sym.", "imp.", "_"):
-        if n.startswith(p):
-            n = n[len(p):]
-    return n.split("@")[0]
-
-
-def _reachability_steps(call_edges, f: dict) -> Optional[list]:
-    """The shortest call path from a function that reads EXTERNAL INPUT to this finding's function,
-    as a list of {label, sub, tone} hops. Control-flow reachability from an input source -- NOT a
-    verified byte-level dataflow taint. None when the finding has no function or no such path exists
-    (a path is never fabricated). Shared by the SVG figure and the structured per-finding field, so
-    the drawing and the data can never disagree."""
-    fa = f.get("function_addr")
-    if not fa:
-        return None
-    try:
-        from ..analyze.detect.taint import SOURCES
-    except Exception:                               # noqa: BLE001
-        return None
-    succ: dict[str, set] = {}
-    name: dict[str, str] = {}
-    source_callers: set[str] = set()
-    for e in call_edges:
-        if e.src_addr is None or e.dst_addr is None:
-            continue
-        s, d = str(e.src_addr), str(e.dst_addr)
-        succ.setdefault(s, set()).add(d)
-        if e.dst_name:
-            name.setdefault(d, str(e.dst_name))
-        if _bare_sym(e.dst_name) in SOURCES:
-            source_callers.add(s)
-    target = str(fa)
-    if not source_callers or target in source_callers:
-        return None
-    from collections import deque
-    seen = set(source_callers)
-    q = deque((s, [s]) for s in sorted(source_callers))
-    path = None
-    while q:
-        node, p = q.popleft()
-        if node == target:
-            path = p
-            break
-        if len(p) >= 8:                             # bound the drawn path; shortest paths are short
-            continue
-        for nxt in sorted(succ.get(node, ())):
-            if nxt not in seen:
-                seen.add(nxt)
-                q.append((nxt, p + [nxt]))
-    if not path or len(path) < 2:
-        return None
-    steps = []
-    for i, a in enumerate(path):
-        tone = "source" if i == 0 else ("sink" if i == len(path) - 1 else "")
-        sub = "reads input" if i == 0 else ("the finding" if i == len(path) - 1 else None)
-        steps.append({"label": name.get(a) or a, "sub": sub, "tone": tone})
-    return steps
 
 
 def _reachability_path_svg(call_edges, f: dict) -> Optional[str]:

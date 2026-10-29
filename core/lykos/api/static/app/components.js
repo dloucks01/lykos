@@ -919,6 +919,23 @@ export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose,
           </ol>
         </div>
 
+        ${finding.reachability && (finding.reachability.path || []).length ? html`
+          <div class="ev-sec">
+            <div class="ev-sec-h">Reachability <span class="ev-count">path from an input source</span></div>
+            <ol class="ev-reach" title="control-flow reachability, not verified dataflow">
+              ${finding.reachability.path.map((hop, i) => html`
+                <li class=${`evr-hop evr-${hop.tone || "mid"}`} key=${hop.addr + ":" + i}>
+                  ${onShowInGraph && hop.addr ? html`<button class="evr-fn clk"
+                      title="focus this function in the call graph"
+                      onClick=${() => { onClose(); onShowInGraph({ target_id: finding.target_id, function_addr: hop.addr, title: hop.label }); }}>
+                      ${hop.label}</button>`
+                    : html`<span class="evr-fn">${hop.label}</span>`}
+                  ${hop.sub ? html`<span class="evr-sub">${hop.sub}</span>` : null}
+                  ${i < finding.reachability.path.length - 1 ? html`<span class="evr-arrow">→</span>` : null}
+                </li>`)}
+            </ol>
+          </div>` : null}
+
         <div class="ev-sec ev-artifacts">
           ${bundle && bundle.bundle_sha ? html`<a class="btn small" href=${artifactUrl(bundle.bundle_sha)} download>⬇ PoC bundle${bundle.verified ? " (verified)" : ""}</a>` : null}
           ${inputPoc && inputPoc.input_sha ? html`<a class="btn small ghost" href=${artifactUrl(inputPoc.input_sha)} download>⬇ Crashing input</a>` : null}

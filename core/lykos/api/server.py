@@ -556,10 +556,24 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                     if not f:
                         return self._json({"error": "no finding"}, 404)
                     _tgt = s.targets.get(f.target_id)
-                    return self._json(self._with_curation(
+                    d = self._with_curation(
                         _finding(f, sites=fd.sites(f.id),
                                  mitigations=(_tgt.mitigations if _tgt else None)),
-                        self._curation_map(s, f.case_id)))
+                        self._curation_map(s, f.case_id))
+                    # The source->sink reachability PATH (doc 49 spine): affordable here -- this is
+                    # ONE finding, so the call-graph BFS runs on one target's edges (never in the
+                    # list view, where it would be per-finding). Each hop carries its function addr
+                    # so the GUI can walk the path into the call graph. Best-effort.
+                    try:
+                        from ..analyze.reachability import reachability_steps
+                        steps = reachability_steps(CallEdgeDAO(s.conn).list_by_target(f.target_id), d)
+                        if steps:
+                            d.setdefault("reachability", {})["path"] = [
+                                {"label": st["label"], "addr": st["addr"], "tone": st["tone"]}
+                                for st in steps]
+                    except Exception:                                # noqa: BLE001 -- advisory only
+                        pass
+                    return self._json(d)
                 finally:
                     s.close()
             m = _TARGET_DYN.match(path)
