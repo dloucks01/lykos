@@ -20,6 +20,7 @@ from .ingest import register as _register_ingest
 from .libfuzzer_stage import register as _register_libfuzzer
 from .link import register as _register_link
 from .source_confirm_stage import register as _register_source_confirm
+from .symbolic.uc_stage import register as _register_uc_symbolic
 from .patch_diff_stage import register as _register_patch_diff
 from .poc import register as _register_poc
 from .scan_stages import register as _register_scans
@@ -36,6 +37,7 @@ def register() -> None:
     _register_harness()
     _register_libfuzzer()
     _register_source_confirm()
+    _register_uc_symbolic()
     _register_poc()
     _register_patch_diff()
     _register_scans()

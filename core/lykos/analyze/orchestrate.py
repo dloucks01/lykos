@@ -2105,6 +2105,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # cheaply (no build) for a binary-only target or a source tree with no in-tree
                 # harness -- so scheduling it unconditionally costs those nothing.
                 _staged(bud, store, t, "source_confirm", status, stop, want=240.0)
+                # UNDER-CONSTRAINED symbolic execution of the UNDRIVEN functions -- discovery for code
+                # no harness reaches (the ladder above and the campaigns below only exercise what a
+                # harness drives). It files CANDIDATE control-hijack leads with an under-constrained
+                # caveat -- never a proven bug -- so it widens discovery coverage without claiming
+                # confirmation. Self-gates: unsupported without angr, recovered functions, and a
+                # harness entry (so 'undriven' is defined), costing those targets nothing.
+                _staged(bud, store, t, "uc_symbolic", status, stop, want=180.0)
                 # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
                 # strongest crash finder available -- thousands of executions a second with a
                 # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its

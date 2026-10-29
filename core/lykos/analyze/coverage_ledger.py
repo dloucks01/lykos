@@ -72,6 +72,8 @@ _CHECKS: list[dict] = [
     {"stage": "concolic", "label": "Concolic / symbolic execution", "classes": ["*"],
      "kind": "dynamic"},
     {"stage": "dynamic_taint", "label": "Dynamic taint tracking", "classes": ["*"], "kind": "dynamic"},
+    {"stage": "uc_symbolic", "label": "Under-constrained symbolic exec (undriven code)",
+     "classes": ["CWE-94"], "kind": "dynamic"},
     # ---- confirmation ----
     {"stage": "source_confirm", "label": "Source confirmation ladder (template/concolic/smart-fuzz)",
      "classes": [], "kind": "confirm"},
