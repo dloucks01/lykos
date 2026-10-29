@@ -89,6 +89,7 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
     except Exception as e:                                   # noqa: BLE001 -- a stuck/failed explore
         out["reason"] = f"concolic exploration failed: {e}"
         return out
+    out["entry"] = res.get("harness_entry")                  # which entry angr used (parser vs wrapper)
     cands = [base64.b64decode(g["input_b64"]) for g in res.get("generated", []) if g.get("input_b64")]
     if not cands:
         out["reason"] = "concolic generated no inputs" + (" (cutoff)" if res.get("cutoff") else "")
@@ -307,6 +308,8 @@ def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=
                        "reason": r.get("reason")}
                 if r.get("execs") is not None:
                     rec["execs"] = r.get("execs")
+                if r.get("entry"):
+                    rec["entry"] = r.get("entry")
                 attempts_out.append(rec)
             if r.get("confirmed"):
                 key = (r.get("source"), r.get("class"))
