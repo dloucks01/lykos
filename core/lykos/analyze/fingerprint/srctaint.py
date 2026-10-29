@@ -155,6 +155,18 @@ def is_parser_name(name) -> bool:
     return bool(name and _PARSER_ROLE.search(name))
 
 
+#: a wire/stream parameter TYPE -- a function that takes one receives peer bytes to parse, so its
+#: parameters are attacker-controlled regardless of the function's name (audin_process_formats(...,
+#: wStream* s) is a parser even though "process" is too generic a name to rely on). A precise,
+#: low-false-positive signal: these types exist to carry untrusted wire data.
+_WIRE_PARAM = re.compile(r"\b(?:wStream|p?Stream|STREAM|BIO|wMessage)\s*\*")
+
+
+def is_parser_sig(sig: str) -> bool:
+    """True when the function SIGNATURE takes a wire/stream buffer -- its parameters are wire data."""
+    return bool(sig and _WIRE_PARAM.search(sig))
+
+
 def untrusted_strength(lines: list, idx: int, expr: str):
     """(strength, link) where strength is 'strong' | 'weak' | None. This is the PRECISION layer over
     untrusted_link: a value is STRONGLY untrusted when it comes from a real input reader, is argv, or
@@ -168,8 +180,12 @@ def untrusted_strength(lines: list, idx: int, expr: str):
         return None, None
     if link["via"] == "input-reader" or "argv" in (link.get("source") or ""):
         return "strong", link
-    fn = enclosing_name(lines, idx)                          # link["via"] == "parameter" here
-    if fn == "main" or is_parser_name(fn):
+    # link["via"] == "parameter": strong only in an entry point (main), a role-named parser, or a
+    # function whose signature takes a wire/stream buffer (its parameters ARE wire data).
+    start, _ = enclosing(lines, idx)
+    fn = enclosing_name(lines, idx)
+    sig = lines[start] if 0 <= start < len(lines) else ""
+    if fn == "main" or is_parser_name(fn) or is_parser_sig(sig):
         return "strong", link
     return "weak", link
 

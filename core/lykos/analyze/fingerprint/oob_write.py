@@ -27,6 +27,7 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
+from . import srctaint
 from .assert_guard import _call_args, _guard_kind, _idents, discover_assert_macros, functions, strip_code
 from .srcwalk import source_files
 
@@ -37,6 +38,10 @@ TOOL = "oob_write"
 TOOL_VERSION = "oob_write-1"
 
 _IDENT = r"[A-Za-z_]\w*"
+#: a wire-read call -- a function that reads from a peer stream IS a parser, so its parameters and
+#: their fields carry attacker-controlled data (FreeRDP's Stream_Read*/Stream_Get*, plus generic
+#: recv/read-into). A precise, body-based parser signal that does not depend on the function's name.
+_WIRE_READ = re.compile(r"\b(?:Stream_(?:Read|Get|Peek|Check)\w*|recv|recvfrom)\s*\(")
 # an indexed WRITE: arr[idx] =/+=/-=/++/-- , or &arr[idx] (address taken to write through). The
 # array base may be a member chain (state->keys, x.buf). Captures (base, index-expr).
 _IDX_WRITE = re.compile(
@@ -52,14 +57,36 @@ def _base_leaf(base: str) -> str:
     return re.split(r"->|\.", base)[-1].strip()
 
 
-def _external_index(blines, upto: int, idx_expr: str, params: set) -> bool:
-    """True when the index is attacker-influenced: an identifier that is a parameter, assigned from
-    a reader/parser, or a field of such. Conservative."""
+#: a capacity-ensuring helper -- a call that grows/reserves/reallocs the array before the write, so
+#: the index that follows is bounded by it (Queue_EnsureCapacity(q,..), Stream_EnsureCapacity(s,..),
+#: *_resize(buf,..), realloc(arr,..)). The write after such a call is not an unbounded append.
+_ENSURE = re.compile(r"(?i)\b(\w*(?:ensure|reserve|resize|realloc|expand|reallocarray)\w*)\s*\(")
+
+
+def _capacity_ensured(blines, upto: int, base: str) -> bool:
+    """True when a capacity-ensuring helper for the array's base OBJECT is called before the write."""
+    obj = re.split(r"->|\.", base)[0].strip()
+    if not obj:
+        return False
+    pre = "\n".join(blines[:upto])
+    oe = re.escape(obj)
+    for m in _ENSURE.finditer(pre):
+        got = _call_args(pre, m.end() - 1)
+        if got and any(re.search(rf"\b{oe}\b", a) for a in got[0]):
+            return True
+    return False
+
+
+def _external_index(blines, upto: int, idx_expr: str, params: set, parser: bool) -> bool:
+    """True when the index is attacker-influenced. A reader/parser-filled index counts anywhere; a
+    bare PARAMETER or a field of one counts only when the enclosing function is itself a wire/peer
+    parser (or main) -- otherwise a parameter is just an internal value a caller passed (the queue,
+    the pool, the pixel count), not attacker-controlled. Conservative."""
     ids = _idents(idx_expr)
     mb = re.match(rf"\s*[&*]?\s*({_IDENT})\s*(?:->|\.)", idx_expr)
     if mb:
         ids.add(mb.group(1))
-    if ids & params:
+    if parser and (ids & params):
         return True
     pre = "\n".join(blines[:upto])
     for b in ids:
@@ -86,6 +113,7 @@ def _fixed_arrays(code: str) -> set:
 def _scan_function(lbl, name, b0, body, params, asserts) -> list:
     blines = body.split("\n")
     fixed = _fixed_arrays(body)
+    parser = srctaint.is_parser_name(name) or name == "main" or bool(_WIRE_READ.search(body))
     findings, seen = [], set()
     for li, line in enumerate(blines):
         for m in _IDX_WRITE.finditer(line):
@@ -103,13 +131,17 @@ def _scan_function(lbl, name, b0, body, params, asserts) -> list:
             # a single comparison of the index is taken as a bound).
             if _index_compared(body, idx_ids):
                 continue
+            # a capacity-ensuring helper for this array before the write bounds the index (the safe
+            # dynamic-container pattern: Queue_EnsureCapacity(q,1); q->array[q->tail] = ...).
+            if _capacity_ensured(blines, li, base):
+                continue
             leaf = _base_leaf(base)
             monotonic = _is_monotonic(body, idx)
-            # PRECISION FLOOR: the index must be attacker-influenced -- a parameter, a field of one,
-            # or a reader/parser output. A purely-local counter walking a static table or filling a
-            # sized scratch array (the dominant safe pattern) is NOT flagged. This is what separates
-            # an unbounded append driven by peer data (a counter field of a parsed object) from a safe loop.
-            attacker = _external_index(blines, li, idx, params)
+            # PRECISION FLOOR: the index must be attacker-influenced -- a reader/parser output, or a
+            # parameter/field WHEN the enclosing function is a wire parser (not a generic helper
+            # whose parameter is just an internal object a caller passed). A purely-local counter, a
+            # static-table walk, or an internal container index is NOT flagged.
+            attacker = _external_index(blines, li, idx, params, parser)
             if not attacker:
                 continue
             key = (lbl, b0 + li + 1, base, idx[:24])
