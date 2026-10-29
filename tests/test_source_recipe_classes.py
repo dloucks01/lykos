@@ -25,17 +25,27 @@ def _tree(tmp_path, src: str) -> Path:
 
 # ---- int_overflow (CWE-190) taint-lite --------------------------------------------------------
 
-def test_intovf_size_operand_from_parameter_is_linked(tmp_path):
-    src = "void f(int n, int sz)\n{\n    char *p = malloc(n * sz);\n    (void)p;\n}\n"
+def test_intovf_size_operand_from_a_parser_parameter_is_strong(tmp_path):
+    # a parser's parameters carry attacker wire data, so a size computed from them is a STRONG
+    # (exploitable, high) integer-overflow finding.
+    src = "void decode_frame(int n, int sz)\n{\n    char *p = malloc(n * sz);\n    (void)p;\n}\n"
     f = IO.scan_source(_tree(tmp_path, src))[0]
-    assert f["cwe"] == "CWE-190" and f["taint"] and f["taint"]["via"] == "parameter"
+    assert f["cwe"] == "CWE-190" and f["strong"] and f["severity"] == "high" and f["taint"]
 
 
-def test_intovf_size_variable_operand_from_parameter_is_linked(tmp_path):
-    src = ("void g(int a, int b)\n{\n    unsigned long sz = a * b;\n"
+def test_intovf_size_variable_operand_from_a_parser_parameter_is_strong(tmp_path):
+    src = ("void parse_hdr(int a, int b)\n{\n    unsigned long sz = a * b;\n"
            "    char *p = malloc(sz);\n    (void)p;\n}\n")
     f = IO.scan_source(_tree(tmp_path, src))[0]
-    assert f["taint"] and "a" in f["taint"]["source"]
+    assert f["strong"] and f["taint"] and "a" in f["taint"]["source"]
+
+
+def test_intovf_generic_function_parameter_is_weak_hygiene(tmp_path):
+    # the precision fix: a size from a GENERIC function's parameter is not established
+    # attacker-controlled (the caller decides) -> a low hygiene note, not a high finding.
+    src = "void f(int n, int sz)\n{\n    char *p = malloc(n * sz);\n    (void)p;\n}\n"
+    f = IO.scan_source(_tree(tmp_path, src))[0]
+    assert f["cwe"] == "CWE-190" and not f["strong"] and f["severity"] == "low" and f["taint"] is None
 
 
 def test_intovf_local_operands_are_not_linked(tmp_path):

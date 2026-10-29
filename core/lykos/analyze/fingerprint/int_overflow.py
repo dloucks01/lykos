@@ -128,19 +128,30 @@ def scan_source(root: Path) -> list:
             # the operands live in its assignment; for inline arithmetic they are in `frag` itself.
             expr = lines[size_vars[via]] if (via and via in size_vars) else frag
             operands = [o for o in re.findall(_IDENT, expr) if not _MACRO.match(o)]
-            taint = srctaint.any_untrusted(lines, i, operands)
+            # PRECISION: the size is an EXPLOITABLE overflow only when a size operand is genuinely
+            # attacker-controlled (a reader / argv / a parser's or main's parameter). An internal
+            # count grown by a small step -- `(mapSize + 1) * sizeof(T)`, `nargc * sizeof(char*)`,
+            # `pixelWidth * pixelHeight` -- is the safe dynamic-array / geometry idiom, not a remote
+            # bug; it becomes a LOW hygiene note (unchecked arithmetic, attacker control not
+            # established), never a high finding or a recipe.
+            strength, taint = srctaint.any_untrusted_strength(lines, i, operands)
+            strong = strength == "strong"
             detail = (f"{label}:{i + 1}: {alloc}() size is overflow-prone arithmetic "
-                      f"({frag}) with no nearby overflow check")
+                      f"({frag}) with no nearby overflow check"
+                      + ("" if strong else " -- attacker control of the size NOT established (hygiene)"))
             ev = [{"channel": "source", "detail": detail}]
-            if taint:
+            if strong:
                 ev.append({"channel": "source-flow",
                            "detail": f"a size operand flows from {taint['source']} ({taint['via']})"})
             findings.append({
-                "cwe": "CWE-190", "severity": "medium",
-                "title": f"Unchecked size arithmetic into {alloc}() (integer-overflow allocation)",
+                "cwe": "CWE-190", "severity": "high" if strong else "low",
+                "title": (f"Unchecked size arithmetic into {alloc}() (integer-overflow allocation)"
+                          if strong else
+                          f"Non-literal size arithmetic into {alloc}() (CWE-190, hygiene)"),
                 "dedup_key": f"intovf:{label}:{i + 1}:{alloc}",
-                "evidence": ev, "via": via,
-                "fn": alloc, "arg": frag, "file": label, "line": i + 1, "taint": taint})
+                "evidence": ev, "via": via, "strong": strong,
+                "fn": alloc, "arg": frag, "file": label, "line": i + 1,
+                "taint": taint if strong else None})
     return findings
 
 

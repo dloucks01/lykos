@@ -46,12 +46,24 @@ _SINKS = {**{k: ("CWE-120", v, "copy") for k, v in _COPY.items()},
 _CALL = re.compile(rf"\b({'|'.join(sorted(_SINKS, key=len, reverse=True))})\s*\(")
 #: tokens that mean the path was normalised / traversal-checked in the enclosing function.
 _PATH_SANITIZERS = ("realpath", "canonicaliz", "PathCanon", "basename", '".."', "'..'", "secure_path")
+#: an allowlist / prefix check compares the path against a string LITERAL (e.g.
+#: `strncmp(deviceId, "/dev/video", 10)`, `if (path == "...")`) -- the caller restricts the path to a
+#: known-safe set, so an open() guarded by one is not an uncontrolled traversal.
+_ALLOWLIST_CMP = re.compile(
+    r'\b(?:strncmp|strncasecmp|strcmp|strcasecmp|memcmp|_strnicmp|_stricmp|wcscmp|wcsncmp|'
+    r'CompareString\w*)\s*\([^;]*"')
 
 
-def _sanitized(lines: list, idx: int) -> bool:
+def _sanitized(lines: list, idx: int, base: str | None = None) -> bool:
     start, _ = srctaint.enclosing(lines, idx)
     body = "\n".join(lines[start:idx + 1])
-    return any(s in body for s in _PATH_SANITIZERS)
+    if any(s in body for s in _PATH_SANITIZERS):
+        return True
+    # an allowlist comparison of the path base against a string literal anywhere before the sink
+    for m in _ALLOWLIST_CMP.finditer(body):
+        if base is None or re.search(rf"\b{re.escape(base)}\b", body[m.start():m.start() + 120]):
+            return True
+    return False
 
 
 def _mk(name, line, fn, arg, cwe, label, taint) -> dict:
@@ -93,11 +105,14 @@ def scan_source(root: Path) -> list:
                 arg = args[pos]
                 if _is_literal(arg) or re.fullmatch(r"(?:NULL|0|nullptr)", arg.strip()):
                     continue
-                taint = srctaint.untrusted_link(lines, i, arg)
-                if not taint:
+                # PRECISION: require a STRONG untrusted source (input reader / argv / a parser's or
+                # main's parameter), not a generic parameter -- a path/buffer arg that is merely a
+                # forwarded parameter of a helper is not established attacker-controlled.
+                strength, taint = srctaint.untrusted_strength(lines, i, arg)
+                if strength != "strong":
                     continue
                 if mode == "path":
-                    if _sanitized(lines, i):
+                    if _sanitized(lines, i, srctaint.base_ident(arg)):
                         continue
                     findings.append(_mk(label, i, fn, arg, "CWE-22",
                                         f"{fn}() opens a path from untrusted input ('{arg}') with "

@@ -19,8 +19,16 @@ def _cwes(rows):
 
 
 def test_unbounded_copy_of_tainted_data_is_cwe120(tmp_path):
-    f = _scan(tmp_path, "void f(char *u){ char b[16]; strcpy(b, u); }")[0]
+    # the untrusted value is a parameter of a PARSER (its parameters are attacker wire data).
+    f = _scan(tmp_path, "void parse_pdu(char *u){ char b[16]; strcpy(b, u); }")[0]
     assert f["cwe"] == "CWE-120" and f["fn"] == "strcpy" and f["taint"]
+
+
+def test_generic_function_parameter_is_not_flagged(tmp_path):
+    """Precision: a strcpy/fopen of a plain parameter of a GENERIC function is a forwarding wrapper
+    (the caller decides), not an established untrusted flow -- not flagged."""
+    assert _scan(tmp_path, "void copy_name(char *dst, char *u){ strcpy(dst, u); }") == []
+    assert _scan(tmp_path, 'void open_cfg(char *u){ FILE *fp = fopen(u, "r"); (void)fp; }') == []
 
 
 def test_bounded_variant_and_literal_and_untainted_are_not_flagged(tmp_path):
@@ -35,8 +43,16 @@ def test_gets_is_flagged_universally(tmp_path):
 
 
 def test_path_from_input_is_cwe22(tmp_path):
-    f = _scan(tmp_path, 'void f(char *u){ FILE *fp = fopen(u, "r"); (void)fp; }')[0]
+    f = _scan(tmp_path, 'void parse_pdu(char *u){ FILE *fp = fopen(u, "r"); (void)fp; }')[0]
     assert f["cwe"] == "CWE-22" and f["fn"] == "fopen" and f["taint"]
+
+
+def test_path_with_an_allowlist_prefix_check_is_not_flagged(tmp_path):
+    """An allowlist (a strncmp of the path against a literal prefix) restricts it to a known-safe
+    set -- not an uncontrolled traversal."""
+    src = ('int parse_pdu(char *u){ if (strncmp(u, "/dev/video", 10) != 0) return -1; '
+           'FILE *fp = fopen(u, "r"); (void)fp; return 0; }')
+    assert _scan(tmp_path, src) == []
 
 
 def test_path_with_a_normalising_guard_is_not_flagged(tmp_path):
@@ -46,7 +62,8 @@ def test_path_with_a_normalising_guard_is_not_flagged(tmp_path):
 
 
 def test_strcat_and_openat_positions(tmp_path):
-    rows = _scan(tmp_path, "void f(int fd, char *u){ char b[8]; strcat(b, u); openat(fd, u, 0); }")
+    rows = _scan(tmp_path,
+                 "void parse_pdu(int fd, char *u){ char b[8]; strcat(b, u); openat(fd, u, 0); }")
     assert _cwes(rows) == ["CWE-120", "CWE-22"]  # strcat src arg + openat path arg (2nd)
 
 
@@ -65,7 +82,8 @@ class _FakeCtx:
 
 def test_file_findings_files_candidates_and_recipes(store, case, tmp_path):
     t = TargetDAO(store.conn).upsert(case.id, "t", "a" * 64, arch="source", bits=0)
-    rows = _scan(tmp_path, "void f(char *u){ char b[16]; strcpy(b, u); FILE*x=fopen(u,\"r\"); (void)x; }")
+    rows = _scan(tmp_path,
+                 "void parse_pdu(char *u){ char b[16]; strcpy(b, u); FILE*x=fopen(u,\"r\"); (void)x; }")
     n = CP._file_findings(_FakeCtx(store.conn), t, rows)
     assert n == 2                                 # both taint-linked -> both get recipes
     recs = [f for f in FindingDAO(store.conn).list_by_target(t.id)
