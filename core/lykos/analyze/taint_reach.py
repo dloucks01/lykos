@@ -56,6 +56,49 @@ def _is_entry(name: Optional[str]) -> bool:
     return low in ("recv", "recvfrom", "read", "bio_read", "ssl_read", "gnutls_record_recv")
 
 
+# ---- the MALICIOUS-PEER attack surface ---------------------------------------------------------
+# For a network protocol target (RDP, TLS, a parser daemon) the attacker is not a fuzz harness --
+# it is the PEER on the wire. Reachability measured only from a fuzz entry misses the entire
+# protocol/codec/channel surface (the common, wrong result). These recognise the peer-data entry
+# points so reachability can seed from the real attack surface.
+
+#: byte-source reads from a remote peer (whole-ish names / imports).
+_PEER_READ = frozenset({
+    "recv", "recvfrom", "recvmsg", "read", "pread", "readv", "bio_read", "ssl_read", "sslread",
+    "gnutls_record_recv", "tls_read", "transport_read", "stream_read", "wsarecv"})
+
+#: name roles of a function that PARSES peer/wire data: a receive/PDU/order handler, a codec
+#: decoder, a channel data-received callback. Substring/suffix patterns, case-insensitive. Tight
+#: enough to mean "wire parser", not any helper -- the basis is stated when it promotes a finding.
+_PEER_PARSE_RE = re.compile(
+    r"(?i)(?:^|_)(?:recv|read)_(?:pdu|order|message|msg|header|capability|caps|packet|data)"
+    r"|_recv$|_recv_pdu|_recv_callback|on_?data_?received|_process_(?:message|pdu|packet|data)"
+    r"|_decompress(?:$|_)|_decode(?:$|_)|_read_(?:pdu|order|server|client|message)"
+    r"|_parse_(?:pdu|packet|message|header|server|client)")
+
+
+def is_peer_entry(name: Optional[str]) -> bool:
+    """True when `name` is itself a malicious-peer data entry: a network read, or a function whose
+    role is parsing wire data (PDU/order/codec/channel). Such a function is attacker-reachable by
+    definition -- a peer drives it -- even when the static call graph (indirect PDU/channel dispatch
+    via function-pointer tables) cannot connect it upward to a read."""
+    if not name:
+        return False
+    low = name.lower()
+    base = re.split(r"[.:]", low)[-1]
+    if base in _PEER_READ or low in _PEER_READ:
+        return True
+    return bool(_PEER_PARSE_RE.search(base))
+
+
+def peer_entry_basis(name: str) -> str:
+    """Human basis for why `name` is a peer entry (for the grounding evidence trail)."""
+    base = re.split(r"[.:]", (name or "").lower())[-1]
+    if base in _PEER_READ or (name or "").lower() in _PEER_READ:
+        return "a network read from the peer"
+    return "a wire-data parser (PDU/order/codec/channel handler) a malicious peer drives"
+
+
 def reachable_names_for_target(functions: list, call_edges: list, *, entry_substr=None) -> set:
     """Set of function NAMES reachable from the target's attacker entries over its call graph.
 
@@ -129,14 +172,9 @@ def unified_name_graph(conn, case_id: str):
     return adj, entries
 
 
-def harness_reachable_names(conn, case_id: str) -> set:
-    """Function names reachable from any attacker entry (fuzz harness / network read) over the
-    UNIFIED cross-binary name graph. A function on a live path from attacker input is here."""
-    adj, entries = unified_name_graph(conn, case_id)
-    if not entries:
-        return set()
-    seen = set(entries)
-    stack = list(entries)
+def _bfs(adj: dict, seeds: set) -> set:
+    seen = set(seeds)
+    stack = list(seeds)
     while stack:
         cur = stack.pop()
         for nxt in adj.get(cur, ()):
@@ -144,6 +182,28 @@ def harness_reachable_names(conn, case_id: str) -> set:
                 seen.add(nxt)
                 stack.append(nxt)
     return seen
+
+
+def harness_reachable_names(conn, case_id: str) -> set:
+    """Function names reachable from a FUZZ-HARNESS / network-read entry over the unified
+    cross-binary name graph. The harnessed slice -- kept for back-compat and for distinguishing the
+    harnessed surface from the full peer surface."""
+    adj, entries = unified_name_graph(conn, case_id)
+    return _bfs(adj, entries) if entries else set()
+
+
+def attacker_reachable_names(conn, case_id: str) -> set:
+    """Function names on the MALICIOUS-PEER attack surface: everything reachable from a fuzz/network
+    entry PLUS every wire-data parser (PDU/order/codec/channel handler) and everything they reach.
+
+    For a network protocol target the peer drives the parsers directly, and the static call graph
+    cannot follow the indirect PDU/channel dispatch -- so a fuzz-harness-only reachability (the old
+    behaviour) dismisses the real attack surface. Seeding BFS from the peer-parser roles themselves
+    fixes that: the parsers are attacker-reachable by definition, and their callees come along."""
+    adj, entries = unified_name_graph(conn, case_id)
+    names = set(adj) | {d for cs in adj.values() for d in cs} | set(entries)
+    seeds = set(entries) | {n for n in names if is_peer_entry(n)}
+    return _bfs(adj, seeds) if seeds else set()
 
 
 _SIG_RE = re.compile(r'^[A-Za-z_][\w \t\*&]*\b([A-Za-z_]\w+)\s*\(')
@@ -208,14 +268,19 @@ def ground_reach(finding: dict, reachable: set, *, conn=None, source_lookup=None
     if not name:
         return {"reachable": None, "name": None,
                 "reason": "no function could be resolved for the finding -- reachability undecided"}
+    # A function that IS itself a peer-data parser is attacker-reachable by definition, even if the
+    # graph could not connect it upward (indirect PDU/channel dispatch) -- state that basis.
+    if is_peer_entry(name):
+        return {"reachable": True, "name": name, "basis": "peer-entry",
+                "reason": f"'{name}' is {peer_entry_basis(name)} -- attacker-reachable by role"}
     # match on the bare name and on a symbol tail (method.foo.bar -> bar; C++ a::b -> b)
     tail = re.split(r'[.:]', name)[-1]
     hit = name in reachable or tail in reachable \
         or any(r == name or r.endswith("." + name) or r.split("::")[-1] == tail for r in reachable)
     if hit:
-        return {"reachable": True, "name": name,
-                "reason": f"'{name}' is reachable from an attacker entry (fuzz harness / network "
-                          "read) in the recovered call graph -- attacker input reaches this code"}
-    return {"reachable": False, "name": name,
+        return {"reachable": True, "name": name, "basis": "reached",
+                "reason": f"'{name}' is reachable from an attacker entry (peer parser / network "
+                          "read / fuzz harness) in the recovered call graph -- attacker input reaches it"}
+    return {"reachable": False, "name": name, "basis": "unreached",
             "reason": f"'{name}' was not reached from any attacker entry in the recovered call graph "
                       "(indirect/plugin dispatch may hide a path) -- deprioritised, not dismissed"}

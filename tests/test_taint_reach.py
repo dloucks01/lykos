@@ -79,3 +79,37 @@ def test_mangled_symbol_tail_matches():
     reach = {"parse_cs2"}
     f = {"cwe": "CWE-787", "evidence": [{"channel": "source", "detail": "in method.libx.parse_cs2 at 0x10"}]}
     assert TR.ground_reach(f, reach)["reachable"] is True
+
+
+def test_is_peer_entry_recognizes_wire_parsers_and_reads():
+    # role-y names the regex catches (the rest -- e.g. vendor_SurfaceCommand_Handler -- are caught
+    # by reachability from these, or by source-path role, not by name).
+    for n in ("recv", "SSL_read", "proto_recv_pdu", "codec_process_message", "lz_decompress",
+              "tile_decode", "channel_recv", "read_order_header"):
+        assert TR.is_peer_entry(n), n
+    for n in ("spread_value", "readable", "main", "config_settings_new", "compute_crc"):
+        assert not TR.is_peer_entry(n), n
+
+
+def test_attacker_reachable_seeds_from_peer_parsers_even_without_a_read_edge(store, case):
+    """A codec decoder reached only via indirect PDU dispatch (no edge from a read) is still on the
+    attacker surface by role, and its callees come along -- the fix for protocol targets."""
+    conn = store.conn
+    lib = TargetDAO(conn).upsert(case.id, "lib.so", "a" * 64, arch="x86-64", bits=64)
+    FunctionDAO(conn).replace_for_target(lib.id, [
+        {"addr": "0x1000", "name": "codec_process_message"},   # peer parser (role), no caller edge
+        {"addr": "0x1100", "name": "codec_rle_decode"}, {"addr": "0x1200", "name": "write_pixel"},
+        {"addr": "0x9000", "name": "config_load_local"}])    # unrelated local helper
+    CallEdgeDAO(conn).replace_for_target(lib.id, [
+        {"src_addr": "0x1000", "dst_addr": "0x1100"}, {"src_addr": "0x1100", "dst_addr": "0x1200"}])
+    reach = TR.attacker_reachable_names(conn, case.id)
+    assert {"codec_process_message", "codec_rle_decode", "write_pixel"} <= reach
+    assert "config_load_local" not in reach
+    # and the old fuzz-only view does NOT see it (no fuzz/read entry present)
+    assert "codec_process_message" not in TR.harness_reachable_names(conn, case.id)
+
+
+def test_ground_reach_marks_peer_parser_reachable_with_basis():
+    f = {"cwe": "CWE-122", "evidence": [{"channel": "source", "detail": "x.c:9: oob in tile_decode"}]}
+    g = TR.ground_reach(f, set())            # empty graph set; role alone suffices
+    assert g["reachable"] is True and g["basis"] == "peer-entry"
