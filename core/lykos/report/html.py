@@ -782,6 +782,17 @@ def _finding_html(f: dict) -> str:
                  f'{" — " + esc(cur.get("label") or cur.get("status")) if cur.get("status") else ""}'
                  f'</b>{" · " + esc(cur.get("updated_at")) if cur.get("updated_at") else ""}'
                  f'{"<br>" + esc(cur.get("note")) if cur.get("note") else ""}</div>')
+    # Confirmation ladder: where this finding sits, WHY, and what it would take to climb a rung.
+    # This is the "verify it's a real finding" account, beside (never instead of) the evidence.
+    an = f.get("analysis") or {}
+    if an.get("why_state") or an.get("to_promote"):
+        p.append('<div class="fanalysis">')
+        p.append(f'<div class="fa-why"><b>Status — {esc(an.get("state") or "")}:</b> '
+                 f'{esc(an.get("why_state") or "")}</div>')
+        if an.get("to_promote"):
+            p.append(f'<div class="fa-next"><b>To reach {esc(an.get("next_state") or "")}:</b> '
+                     f'{esc(an.get("to_promote"))}</div>')
+        p.append('</div>')
     # Concrete EFFECTS (what the defect actually does — a leak, a write-what-where, a hijacked call):
     # the model parses them but the report used to drop them, understating impact.
     effects = f.get("effects") or []
@@ -1021,6 +1032,10 @@ a.dl:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
   margin-left:4px;vertical-align:middle}
 .timing-tab tr.noyield td{color:var(--muted)}
 .timing-tab tr.noyield .tbar>span{background:#8b8d98}
+.fanalysis{margin:6px 0 2px;padding:6px 10px;border-left:3px solid var(--accent,#539bf5);
+  background:color-mix(in srgb,var(--accent,#539bf5) 6%,transparent);font-size:12.5px;
+  border-radius:0 6px 6px 0}
+.fanalysis .fa-next{margin-top:3px;color:var(--muted)}
 .hdec ul{margin:2px 0 0;padding-left:16px}
 .fcur{margin:6px 0 2px;padding:6px 10px;border-left:3px solid #d29922;font-size:12.5px;
   background:color-mix(in srgb,#d29922 7%,transparent);word-break:break-word}

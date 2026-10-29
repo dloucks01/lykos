@@ -636,6 +636,54 @@ def _attach_source_snippets(store, target, findings_out: list, *, ctx: int = 4, 
         tf.close()
 
 
+#: The confirmation ladder's next rung up from each state (None at the top).
+_NEXT_STATE = {"candidate": "corroborated", "corroborated": "confirmed",
+               "confirmed": "poc-backed", "poc-backed": None}
+
+
+def _finding_analysis(f: dict) -> dict:
+    """The confirmation ladder, per finding: where it sits, WHY, and what it would take to climb.
+
+    Faithful to the finding's own record -- it states the rung's meaning and the generic promotion
+    criterion for the next rung, enriched only with signals that are actually present (the
+    corroborating evidence channels, the verified PoC level). It never asserts a per-finding
+    specific it has not established (a proven reachable path, a recovered leak); those specifics
+    already sit in the evidence list this analysis sits beside, so the two never disagree.
+    """
+    state = f.get("state") or "candidate"
+    channels = sorted({(e.get("channel") or "").strip() for e in (f.get("evidence") or [])
+                       if (e.get("channel") or "").strip()})
+    verified = [p.get("level") for p in (f.get("pocs") or [])
+                if p.get("verified") and p.get("level")]
+    why = {
+        "candidate": "A single detector flagged this pattern; no independent signal has "
+                     "corroborated it yet.",
+        "corroborated": "A second independent signal supports the initial detection"
+                        + (f" ({', '.join(channels)})" if channels else "") + ".",
+        "confirmed": "Verified by analysis as a real, reachable defect.",
+        "poc-backed": "A reproducer ran and the fault fired"
+                      + (f" (verified {max(verified)})" if verified else "")
+                      + " -- demonstrated, not suspected.",
+    }.get(state, "")
+    to_promote = {
+        "candidate": "To corroborate: a second signal agreeing with the detector -- a synthesized "
+                     "exploitation recipe, a dataflow/reachability check, or dynamic corroboration.",
+        "corroborated": "To confirm: prove the sink is reachable from an attacker-controlled input "
+                        "(a call-path from an input source, its guards satisfiable). Reachability "
+                        "is not yet demonstrated here.",
+        "confirmed": "To PoC-back: a reproducer that fires -- a synthesized driver that reaches the "
+                     "sink on a runnable (uninstrumented) build, or delivery to the live target.",
+        "poc-backed": None,
+    }.get(state)
+    return {
+        "state": state,
+        "next_state": _NEXT_STATE.get(state),
+        "why_state": why,
+        "to_promote": to_promote,
+        "signals": channels,
+    }
+
+
 def build_report(
     store,
     case_id: str,
@@ -840,6 +888,9 @@ def build_report(
                 "curation": _cur,
                 "created_at": _iso(f.created_at), "updated_at": _iso(f.updated_at),
             })
+            # The confirmation ladder for this finding (why this rung, what climbs it) -- derived
+            # from the finding dict just built, so report and GUI share one account.
+            findings_out[-1]["analysis"] = _finding_analysis(findings_out[-1])
             tot_findings += 1
             by_state[f.state] = by_state.get(f.state, 0) + 1
             by_severity[f.severity] = by_severity.get(f.severity, 0) + 1

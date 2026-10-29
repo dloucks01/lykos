@@ -303,6 +303,25 @@ def test_pdf_with_timing_is_valid(store, case):
     assert to_pdf(build_report(store, case.id))[:5] == b"%PDF-"
 
 
+def test_finding_confirmation_ladder(store, case):
+    """Each finding carries WHERE it sits on the ladder, WHY, and what would climb it."""
+    _seed(store, case)
+    r = build_report(store, case.id)
+    fs = {f["cwe"]: f for t in r["targets"] for f in t["findings"]}
+    cand = fs["CWE-134"]["analysis"]          # the low candidate
+    assert cand["state"] == "candidate"
+    assert cand["next_state"] == "corroborated"
+    assert "corroborate" in cand["to_promote"].lower()
+    poc = fs["CWE-121"]["analysis"]           # the poc-backed finding
+    assert poc["state"] == "poc-backed"
+    assert poc["next_state"] is None
+    assert poc["to_promote"] is None
+    assert "fired" in poc["why_state"]
+    html = to_html(r)
+    assert "To reach corroborated" in html
+    assert "no independent signal has corroborated" in html
+
+
 def test_distinct_issues_dedup_across_targets(store, case):
     """One source bug compiled into two targets is ONE distinct issue spanning two, not two."""
     fd = FindingDAO(store.conn)
