@@ -469,3 +469,48 @@ def test_ingest_registers_built_shared_libraries_as_targets(store, case, tmp_pat
     names = {t.filename for t in store.targets.list_by_case(case.id)}
     assert "proj" in names                                   # the primary (named by the ingest name)
     assert "libcore.so" in names and "libutil.so" in names, names
+
+
+def test_partial_build_salvages_compiled_objects(tmp_path, gcc_or_skip):
+    """A build that COMPILES objects but then fails (a missing link library, or a unit that only
+    the project's own build can compile) must not lose everything: the compiled objects are merged
+    into one relocatable ELF so binary/symbolic analysis covers the compiled subset. The loose
+    builder cannot recompile these raw (they need -DNEEDED), so salvage is what recovers them."""
+    # foo.c compiles ONLY with -DNEEDED (which only the Makefile rule passes); the link then fails
+    # on a library that does not exist -> objects exist, no binary, loose cannot rebuild them.
+    (tmp_path / "foo.c").write_text(
+        "#ifndef NEEDED\n#error needs NEEDED\n#endif\n"
+        "int helper(int x){ return x + 1; }\n")
+    (tmp_path / "Makefile").write_text(
+        "all: prog\n"
+        "foo.o: foo.c\n\t$(CC) -DNEEDED $(CFLAGS) -c foo.c -o foo.o\n"
+        "prog: foo.o\n\t$(CC) foo.o -o prog $(LDFLAGS) -lxyz_definitely_missing_zzz\n")
+    built = build_source_project(tmp_path, timeout=120, total=180)
+    assert built["ok"] is True and built.get("partial") is True
+    assert built["system"] == "salvage" and built["salvaged_objects"] >= 1
+    prim = Path(built["primary"])
+    assert prim.exists() and prim.stat().st_size > 0
+    with open(prim, "rb") as f:
+        head = f.read(18)
+    assert head[:4] == b"\x7fELF"
+    et = int.from_bytes(head[16:18], "little" if head[5] == 1 else "big")
+    assert et == 1                                        # ET_REL -- a merged relocatable object
+    assert "partial-build salvage" in built["log"]
+
+
+def test_elf_objects_finds_relocatables_and_skips_scaffold(tmp_path, gcc_or_skip):
+    import shutil
+    import time as _t
+
+    from lykos.analyze.source_project import _elf_objects
+    cc = shutil.which("gcc") or shutil.which("clang")
+    (tmp_path / "a.c").write_text("int f(void){return 3;}\n")
+    since = _t.time()
+    subprocess.run([cc, "-c", str(tmp_path / "a.c"), "-o", str(tmp_path / "a.o")], check=True)
+    # autoconf scaffolding and CMake probe objects must NOT be salvaged
+    (tmp_path / "conftest.o").write_bytes((tmp_path / "a.o").read_bytes())
+    cmf = tmp_path / "CMakeFiles"; cmf.mkdir()
+    (cmf / "probe.o").write_bytes((tmp_path / "a.o").read_bytes())
+    found = {p.name for p in _elf_objects(tmp_path, since)}
+    assert "a.o" in found
+    assert "conftest.o" not in found and "probe.o" not in found

@@ -1194,6 +1194,16 @@ function _axisBar(pct) {
     style=${`width:${pct != null ? Math.max(2, Math.min(100, pct)) : 0}%`}></div></div>`;
 }
 
+// The pre-flight's actionable checklist for a failed/partial build: the exact deps + build tools
+// to stage before re-ingesting. Shared by the build-caveat banner's fail and partial branches.
+function _stageChecklist(bld) {
+  if (!bld || !bld.stage || !bld.stage.length) return null;
+  return html`
+    <div class="lb-stage-label">Stage these before re-ingesting
+      <span class="muted">— <span class="mono">lykos deps &lt;dir&gt;</span> for detail</span></div>
+    <div class="lb-stage">${bld.stage.map(t => html`<span class="lb-tok mono">${t}</span>`)}</div>`;
+}
+
 export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusTarget, onShortlist }) {
   const [showChecks, setShowChecks] = useState(false);
   const [showCands, setShowCands] = useState(false);
@@ -1225,12 +1235,14 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
           <div class="lb-head">⚠ Build produced no binaries — static-source analysis only</div>
           ${bld.reason ? html`<div class="lb-reason mono">${bld.reason}</div>` : null}
           <div class="lb-caveat">${bld.caveat}</div>
-          ${(bld.stage && bld.stage.length) ? html`
-            <div class="lb-stage-label">Stage these before re-ingesting
-              <span class="muted">— <span class="mono">lykos deps &lt;dir&gt;</span> for detail</span></div>
-            <div class="lb-stage">${bld.stage.map(t => html`<span class="lb-tok mono">${t}</span>`)}</div>`
-            : null}
+          ${_stageChecklist(bld)}
         </div>`
+        : bld && bld.partial ? html`
+          <div class="ledger-build partial">
+            <div class="lb-head">⚠ Partial build — binary analysis covers the compiled subset only</div>
+            <div class="lb-caveat">${bld.caveat}</div>
+            ${_stageChecklist(bld)}
+          </div>`
         : bld && bld.caveat ? html`<div class="ledger-build note">Build: ${bld.caveat}</div>` : null}
 
       <!-- Axis B: analysis checks / weakness classes -->

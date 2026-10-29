@@ -503,13 +503,20 @@ def _ingest_built_project(store, case_id, root, built, filename):
         raise NotAnalysable(f"{filename}: project built an empty binary")
     # archive the source tree (skip build outputs and VCS/build dirs) for the code view + provenance
     buf_bytes = _source_tree_tgz(root, skip_binary=primary)
-    store.put_artifact(case_id, "source-project", data=buf_bytes,
-                       meta={"binary_sha": info["sha256"], "filename": filename,
-                             "build_system": built.get("system"), "compiler": built.get("compiler"),
-                             # shared-linked harness targets (cmake fuzz build) need these on
-                             # LD_LIBRARY_PATH to run; a stage that executes the target reads them.
-                             "lib_dirs": built.get("lib_dirs") or [],
-                             "other_binaries": [b.name for b in built.get("binaries", [])[1:8]]})
+    meta = {"binary_sha": info["sha256"], "filename": filename,
+            "build_system": built.get("system"), "compiler": built.get("compiler"),
+            # shared-linked harness targets (cmake fuzz build) need these on
+            # LD_LIBRARY_PATH to run; a stage that executes the target reads them.
+            "lib_dirs": built.get("lib_dirs") or [],
+            "other_binaries": [b.name for b in built.get("binaries", [])[1:8]]}
+    if built.get("partial"):
+        # A PARTIAL build (link failed / some TUs failed): the target is a salvage of what compiled,
+        # so the binary/dynamic/symbolic capability covers only that subset -- a coverage caveat,
+        # with the same stage-these pre-flight a full failure gets so the operator can complete it.
+        meta["build_partial"] = True
+        meta["salvaged_objects"] = built.get("salvaged_objects")
+        meta["preflight"] = _safe_preflight(root)
+    store.put_artifact(case_id, "source-project", data=buf_bytes, meta=meta)
     store.put_artifact(case_id, "target-blob", src=primary)
     main = store.targets.upsert(case_id, filename, info["sha256"],
                                 md5=info["md5"], sha1=info["sha1"], size=info["size"])

@@ -229,6 +229,17 @@ def test_the_build_caveat_shows_the_dependency_stage_checklist():
     assert ".lb-stage" in (STATIC / "index.html").read_text(), "no CSS for the stage chips"
 
 
+def test_the_build_caveat_distinguishes_a_partial_salvage_build():
+    """A partial build (the full build failed but compiled objects were salvaged) is a distinct,
+    less-total caveat than no binaries at all -- the GUI shows it as its own banner with the
+    stage checklist, so the operator sees the capability is partial, not absent."""
+    assert "bld.partial" in COMPONENTS, "the panel never distinguishes a partial build"
+    assert "Partial build" in COMPONENTS, "no partial-build caveat text"
+    assert "ledger-build partial" in COMPONENTS, "partial build has no banner class"
+    assert "_stageChecklist" in COMPONENTS, "the stage checklist is not shared by fail + partial"
+    assert ".ledger-build.partial" in (STATIC / "index.html").read_text(), "no CSS for partial"
+
+
 def test_the_ledger_links_to_the_prove_out_shortlist():
     """The coverage ledger's verification line is the case-level entry into the prove-out shortlist:
     clicking it filters the findings board to the real, on-attack-surface findings."""

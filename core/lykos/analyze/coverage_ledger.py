@@ -165,6 +165,24 @@ def _build_status(store, case_id: str) -> Optional[dict]:
         if pf.get("toolchain_missing"):
             out["toolchain_missing"] = pf["toolchain_missing"]
         return out
+    partial = next((m for m in metas if m.get("build_partial")), None)
+    if partial:
+        pf = partial.get("preflight") or {}
+        nobj = partial.get("salvaged_objects")
+        out: dict[str, Any] = {
+            "built": True, "partial": True, "system": partial.get("build_system") or "salvage",
+            "salvaged_objects": nobj,
+            "caveat": "the full build FAILED, but the compiled object files were salvaged into one "
+                      f"relocatable binary ({nobj} object(s)): binary / symbolic analysis covers "
+                      "that compiled subset, the rest is static-source only. Stage the missing "
+                      "build dependencies and re-ingest for a complete build."}
+        if pf.get("tokens"):
+            out["stage"] = pf["tokens"]
+        if pf.get("missing"):
+            out["missing_deps"] = pf["missing"]
+        if pf.get("toolchain_missing"):
+            out["toolchain_missing"] = pf["toolchain_missing"]
+        return out
     system = next((m.get("build_system") for m in metas if m.get("build_system")), None)
     out: dict[str, Any] = {"built": True, "system": system}
     if system == "cmake-fuzzers":

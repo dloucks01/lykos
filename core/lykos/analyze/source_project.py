@@ -142,6 +142,33 @@ def _elf_libraries(root: Path, since: float):
     return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
 
 
+_SALVAGE_MAX_OBJS = 4000              # bound the relocatable merge against a pathological tree
+
+
+def _elf_objects(root: Path, since: float):
+    """Newly-produced ELF RELOCATABLE objects (ET_REL `.o`) under `root` -- the instrumented output
+    of every translation unit that COMPILED, even in a build that then failed at link. These are
+    what partial-build salvage merges. CMake's compiler-probe objects (under CMakeFiles/) and
+    autoconf's `conftest.o` are excluded -- they are build scaffolding, not the project's code."""
+    out = []
+    for p in root.rglob("*"):
+        if not p.is_file() or p.suffix not in (".o", ".obj") or _is_build_scaffold(p):
+            continue
+        if p.name.startswith("conftest"):
+            continue
+        try:
+            if p.stat().st_mtime < since - 1:
+                continue
+            with open(p, "rb") as f:
+                head = f.read(18)
+        except OSError:
+            continue
+        if head[:4] == b"\x7fELF" and len(head) >= 18 and \
+                int.from_bytes(head[16:18], "little" if head[5] == 1 else "big") == 1:  # ET_REL
+            out.append(p)
+    return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
+
+
 def _build_confinement(root: Path, wrapdir: Path) -> list:
     """bwrap prefix for running a project's build commands, or [] when bwrap is unusable (the
     build then runs unconfined, as before; the build log says so). Opt out with
@@ -434,6 +461,30 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
         builders.append(_b_make)
     builders.append(_b_loose)
 
+    def _b_salvage(since: float):
+        """Last-resort PARTIAL-build salvage: a build can fail at LINK (a missing library) or on
+        ONE translation unit while most of the tree compiled cleanly. Rather than discard all of
+        that instrumented code, merge every ELF object that DID compile into one relocatable ELF
+        with `ld -r` (via the real compiler driver). `-r` is an incremental link: it tolerates
+        undefined symbols and non-PIC objects -- exactly the two things that make a normal
+        `-shared`/executable link of a half-built tree fail -- so a tree that produced objects but
+        no binary still yields a single analysable ELF. It is not runnable (ET_REL), so it is
+        registered like a library: the binary static detectors, CVE fingerprinting and symbolic
+        execution read it, reaching the code the failed link would have thrown away.
+
+        Returns (path, n_objects) or None. Uses the REAL compiler (the objects are already
+        instrumented; re-adding sanitizer flags at an `-r` merge only risks the merge)."""
+        objs = _elf_objects(root, since)
+        if not objs:
+            return None
+        objs = objs[:_SALVAGE_MAX_OBJS]
+        out = root / "a.lykos-partial.o"
+        rc, _ = _run([cc, "-r", "-nostdlib", "-o", str(out)] + [str(o) for o in objs])
+        if rc == 0 and out.exists() and out.stat().st_size:
+            return out, len(objs)
+        return None
+
+    overall_start = time.time()
     full_log, system = "", None
     try:
         for build in builders:
@@ -460,6 +511,19 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
                 return {"ok": True, "system": system, "kind": kind, "binaries": bins,
                         "libraries": libs, "primary": bins[0], "compiler": Path(cc).name,
                         "log": full_log[-4000:]}
+        # No builder produced a binary. Before giving up to static-source only, salvage whatever
+        # compiled: a single relocatable ELF of every object the failed build left behind, so the
+        # binary/symbolic capability covers the compiled subset instead of nothing.
+        salv = _b_salvage(overall_start) if _left() > 1.0 else None
+        if salv:
+            out, nobj = salv
+            full_log += (f"\n== partial-build salvage: {system or 'build'} produced no binary; "
+                         f"merged {nobj} compiled object(s) into {out.name} (ld -r) so binary and "
+                         "symbolic analysis cover the compiled subset -- the rest is static-source "
+                         "only ==\n")
+            return {"ok": True, "system": "salvage", "kind": "library", "partial": True,
+                    "salvaged_objects": nobj, "binaries": [out], "libraries": [out],
+                    "primary": out, "compiler": Path(cc).name, "log": full_log[-4000:]}
         if not confine:
             full_log += ("\n== note: build ran UNCONFINED (bwrap unavailable) -- the project's "
                          "build scripts executed with this user's full privileges ==\n")

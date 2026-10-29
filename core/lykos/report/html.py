@@ -202,20 +202,32 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
     # The build outcome, up top: a source case whose build produced no binaries is static-source
     # ONLY -- the loudest coverage caveat, because the whole binary/dynamic capability did not run.
     bld = led.get("build") or {}
+
+    def _stage_list():
+        # The pre-flight's actionable checklist: the exact deps / build tools to stage so the
+        # binary/dynamic/symbolic capability runs (or completes) on the next ingest.
+        stage = bld.get("stage") or []
+        if not stage:
+            return
+        p.append('<div class="evlabel ledger-stage-label">Stage these before re-ingesting '
+                 '<span class="muted">— run <span class="mono">lykos deps &lt;dir&gt;</span> '
+                 'for detail</span></div><ul class="ev ledger-stage">')
+        for tok in stage:
+            p.append(f'<li class="mono">{esc(tok)}</li>')
+        p.append('</ul>')
+
     if bld and not bld.get("built"):
         rr = f' <span class="mono">{esc(bld["reason"])}</span>' if bld.get("reason") else ""
         p.append('<p class="headline tone-high">Build produced no binaries — static-source analysis '
                  f'only.{rr}</p><p class="muted">{esc(bld.get("caveat") or "")}</p>')
-        # The pre-flight's actionable checklist: the exact deps / build tools to stage so the
-        # binary/dynamic/symbolic capability runs on the next ingest.
-        stage = bld.get("stage") or []
-        if stage:
-            p.append('<div class="evlabel ledger-stage-label">Stage these before re-ingesting '
-                     '<span class="muted">— run <span class="mono">lykos deps &lt;dir&gt;</span> '
-                     'for detail</span></div><ul class="ev ledger-stage">')
-            for tok in stage:
-                p.append(f'<li class="mono">{esc(tok)}</li>')
-            p.append('</ul>')
+        _stage_list()
+    elif bld.get("partial"):
+        # A partial build salvaged the compiled subset: a real coverage caveat, but not the total
+        # loss a no-binary build is -- tone it a notch below, and still list what to stage.
+        p.append('<p class="headline tone-medium">Partial build — binary analysis covers the compiled '
+                 'subset only.</p>'
+                 f'<p class="muted">{esc(bld.get("caveat") or "")}</p>')
+        _stage_list()
     elif bld.get("caveat"):
         p.append(f'<p class="muted ledger-build-note">Build: {esc(bld["caveat"])}</p>')
     p.append('<div class="stats">')

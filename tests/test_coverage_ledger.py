@@ -171,6 +171,39 @@ def test_failed_build_stage_list_renders_in_html():
     assert "OpenSSL (libssl-dev)" in h and "lykos deps" in h
 
 
+def test_ledger_surfaces_a_partial_build_with_its_stage_list(store, case):
+    """A PARTIAL build (the full build failed but the compiled objects were salvaged) is built=True
+    but flagged partial, with the salvage count and the same stage-these checklist as a full
+    failure -- binary analysis covers the compiled subset, the rest is static-source only."""
+    store.put_artifact(case.id, "source-project", data=b"tree",
+                       meta={"filename": "proj", "build_system": "salvage", "build_partial": True,
+                             "salvaged_objects": 42,
+                             "preflight": {"build_system": "make", "toolchain_missing": [],
+                                           "missing": [{"kind": "library", "name": "ssl",
+                                                        "hint": {"apt": "libssl-dev",
+                                                                 "dnf": "openssl-devel"}}],
+                                           "tokens": ["ssl (libssl-dev)"],
+                                           "summary": {"missing": 1}}})
+    b = CL.build_ledger(store, case.id)["build"]
+    assert b["built"] is True and b["partial"] is True
+    assert b["salvaged_objects"] == 42
+    assert b["stage"] == ["ssl (libssl-dev)"]
+    assert "salvaged" in b["caveat"]
+
+
+def test_partial_build_renders_in_html():
+    from lykos.report.html import _coverage_ledger_html
+    led = {"checks": {"total": 5, "ran": 2, "classes_checked": ["CWE-190"], "not_run": []},
+           "weaponization": {"findings": 1, "weaponized": 0, "pct": 0.0, "unweaponized": []},
+           "code": [], "gaps": [],
+           "build": {"built": True, "partial": True, "system": "salvage", "salvaged_objects": 42,
+                     "caveat": "the full build FAILED, but the compiled objects were salvaged",
+                     "stage": ["ssl (libssl-dev)"]}}
+    h = _coverage_ledger_html(led)
+    assert "Partial build" in h and "Stage these before re-ingesting" in h
+    assert "ssl (libssl-dev)" in h
+
+
 def test_ledger_notes_a_harness_only_build(store, case):
     store.put_artifact(case.id, "source-project", data=b"tree",
                        meta={"filename": "proj", "build_system": "cmake-fuzzers"})
