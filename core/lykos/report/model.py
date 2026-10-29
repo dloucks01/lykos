@@ -684,6 +684,83 @@ def _finding_analysis(f: dict) -> dict:
     }
 
 
+#: The PRIMITIVE a CWE class yields, by definition of the class -- not a claim that this instance
+#: was demonstrated (that is what `demonstrated_level`/`ceiling` below carry). Labelled "class
+#: primitive" in the UI so the distinction is explicit.
+_CLASS_PRIMITIVE = {
+    "CWE-120": "unbounded copy -> buffer overflow (out-of-bounds write)",
+    "CWE-121": "stack buffer overflow -> saved-return / local overwrite",
+    "CWE-122": "heap buffer overflow (out-of-bounds write)",
+    "CWE-125": "out-of-bounds read (information disclosure)",
+    "CWE-129": "unchecked array index -> out-of-bounds read/write primitive",
+    "CWE-134": "format string -> %n write-what-where + %s/%p disclosure",
+    "CWE-190": "integer overflow -> undersized allocation -> heap overflow (out-of-bounds write)",
+    "CWE-191": "integer underflow -> oversized length -> out-of-bounds access",
+    "CWE-415": "double free -> allocator metadata corruption",
+    "CWE-416": "use-after-free -> controlled reclaimed object (read/write via a dangling pointer)",
+    "CWE-457": "uninitialised memory use -> disclosure / control-flow influence",
+    "CWE-476": "null-pointer dereference -> denial of service",
+    "CWE-787": "out-of-bounds write",
+    "CWE-78": "OS command injection -> arbitrary command execution",
+    "CWE-94": "code injection -> arbitrary code execution",
+    "CWE-798": "hard-coded credential -> authentication bypass / credential disclosure",
+}
+
+#: How an ENABLED target mitigation stands between the primitive and a full exploit.
+_MIT_GLOSS = {
+    "nx": "NX — no executable stack/heap, so a code-reuse chain (ROP/ret2libc) is needed, not shellcode",
+    "pie": "PIE — ASLR, so an address leak is needed before any code-reuse chain",
+    "canary": "stack canary — a linear stack overflow must leak or avoid it",
+}
+
+
+def _finding_exploitability(f: dict, mitigations: dict) -> Optional[dict]:
+    """What the finding's class yields, what stands in the way, and the honest ceiling.
+
+    Faithful: the primitive is the CWE class's definition (not a claim this instance was proven);
+    the mitigations-in-the-way are the TARGET's own enabled protections (metadata); the ceiling is
+    the tool's OWN "weaponization reached L_n and stopped: <why>" statement, lifted verbatim from
+    the evidence -- never a level this finding has not reached.
+    """
+    import re
+    cwe = f.get("cwe")
+    prim = _CLASS_PRIMITIVE.get(cwe)
+    m = mitigations or {}
+    mi: list[str] = []
+    for k in ("nx", "pie", "canary"):
+        if m.get(k):
+            mi.append(_MIT_GLOSS[k])
+    relro = m.get("relro")
+    if relro in ("full", True) or m.get("bind_now"):
+        mi.append("full RELRO/BIND_NOW — the GOT is read-only at runtime")
+    elif relro == "partial":
+        mi.append("partial RELRO — the GOT is still writable at runtime")
+    ceiling = reason = targets_live = None
+    for e in f.get("evidence") or []:
+        d = e.get("detail") or ""
+        mo = re.search(r"weaponization reached (L\d)\b.*?stopped(?: here)?[:]?\s*(.+)", d)
+        if mo:
+            ceiling, reason = mo.group(1), mo.group(2).strip().rstrip(".")[:240]
+        to = re.search(r"[Tt]argets (L\d) if run against the live target", d)
+        if to:
+            targets_live = to.group(1)
+    verified = [p.get("level") for p in (f.get("pocs") or [])
+                if p.get("verified") and p.get("level")]
+    out: dict[str, Any] = {}
+    if prim:
+        out["class_primitive"] = prim
+    if mi:
+        out["mitigations_in_way"] = mi
+    if verified:
+        out["demonstrated_level"] = max(verified)
+    if ceiling:
+        out["ceiling"] = ceiling
+        out["ceiling_reason"] = reason
+    if targets_live:
+        out["targets_live"] = targets_live
+    return out or None
+
+
 def build_report(
     store,
     case_id: str,
@@ -891,6 +968,11 @@ def build_report(
             # The confirmation ladder for this finding (why this rung, what climbs it) -- derived
             # from the finding dict just built, so report and GUI share one account.
             findings_out[-1]["analysis"] = _finding_analysis(findings_out[-1])
+            # Exploitability: class primitive, the target's mitigations in the way, the honest
+            # ceiling (doc 49 per-finding detail).
+            _expl = _finding_exploitability(findings_out[-1], t.mitigations)
+            if _expl:
+                findings_out[-1]["exploitability"] = _expl
             tot_findings += 1
             by_state[f.state] = by_state.get(f.state, 0) + 1
             by_severity[f.severity] = by_severity.get(f.severity, 0) + 1

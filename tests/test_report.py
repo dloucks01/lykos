@@ -322,6 +322,32 @@ def test_finding_confirmation_ladder(store, case):
     assert "no independent signal has corroborated" in html
 
 
+def test_finding_exploitability_and_ceiling(store, case):
+    """Each finding carries the class primitive, the target's mitigations in the way, and the
+    tool's own honest ceiling lifted from the evidence."""
+    tt = store.targets.upsert(
+        case.id, filename="svc", sha256=hash_bytes(b"svc"), size=8, arch="x86_64", bits=64,
+        endianness="little", stripped=False, file_type="ELF", linking="dynamic",
+        mitigations={"nx": True, "pie": True, "canary": False, "relro": "partial"})
+    FindingDAO(store.conn).upsert(tt.id, case.id, {
+        "dedup_key": "e1", "cwe": "CWE-134", "title": "format string", "severity": "high",
+        "state": "corroborated", "detector": "source_recipe", "evidence": [
+            {"channel": "static", "detail": "vsnprintf uses a non-literal format"},
+            {"channel": "weaponization", "detail": "weaponization reached L2 and stopped: PIE: "
+                                                   "no in-band leak recovered the image base"},
+            {"channel": "recipe", "detail": "... Targets L3 if run against the live target."}]})
+    r = build_report(store, case.id)
+    ex = next(ff for t in r["targets"] for ff in t["findings"])["exploitability"]
+    assert "format string" in ex["class_primitive"]
+    assert ex["ceiling"] == "L2" and "PIE" in ex["ceiling_reason"]
+    assert ex["targets_live"] == "L3"
+    joined = " ".join(ex["mitigations_in_way"])
+    assert "NX" in joined and "PIE" in joined and "partial RELRO" in joined
+    html = to_html(r)
+    assert "Exploitability" in html
+    assert "weaponization reached L2 and stopped" in html
+
+
 def test_distinct_issues_dedup_across_targets(store, case):
     """One source bug compiled into two targets is ONE distinct issue spanning two, not two."""
     fd = FindingDAO(store.conn)

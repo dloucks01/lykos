@@ -793,6 +793,26 @@ def _finding_html(f: dict) -> str:
             p.append(f'<div class="fa-next"><b>To reach {esc(an.get("next_state") or "")}:</b> '
                      f'{esc(an.get("to_promote"))}</div>')
         p.append('</div>')
+    # Exploitability: the class primitive, the target mitigations in the way, and the honest
+    # ceiling (how far weaponization got and why it stopped).
+    ex = f.get("exploitability") or {}
+    if ex:
+        p.append('<div class="fexploit"><div class="evlabel">Exploitability</div><ul class="ev">')
+        if ex.get("class_primitive"):
+            p.append(f'<li><b>Primitive (class):</b> {esc(ex["class_primitive"])}</li>')
+        dl = ex.get("demonstrated_level")
+        if dl:
+            p.append(f'<li><b>Demonstrated:</b> a verified PoC reached {esc(dl)}</li>')
+        if ex.get("ceiling"):
+            rr = f' — {esc(ex.get("ceiling_reason"))}' if ex.get("ceiling_reason") else ""
+            p.append(f'<li><b>Ceiling:</b> weaponization reached {esc(ex["ceiling"])} and stopped'
+                     f'{rr}</li>')
+        if ex.get("targets_live"):
+            p.append(f'<li><b>Against the live target:</b> this recipe targets '
+                     f'{esc(ex["targets_live"])}</li>')
+        for mit in ex.get("mitigations_in_way") or []:
+            p.append(f'<li><b>In the way:</b> {esc(mit)}</li>')
+        p.append('</ul></div>')
     # Concrete EFFECTS (what the defect actually does — a leak, a write-what-where, a hijacked call):
     # the model parses them but the report used to drop them, understating impact.
     effects = f.get("effects") or []
