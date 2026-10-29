@@ -27,6 +27,7 @@ from ..analyze.confirm_ladder import attack_surface as _attack_surface
 from ..analyze.confirm_ladder import finding_analysis as _finding_analysis
 from ..analyze.confirm_ladder import finding_exploitability as _finding_exploitability
 from ..analyze.confirm_ladder import finding_verification as _finding_verification
+from ..analyze.confirm_ladder import prove_out_plan as _prove_out_plan
 from ..analyze.stages import label_for as _stage_label_report
 from . import figures as _figures
 from ..db.models import FINDING_STATES, SEVERITIES
@@ -910,6 +911,11 @@ def build_report(
                 # The verification verdict (de-noise + prove-out shortlist), with the call-graph
                 # path as the bonus `reachable` signal when one was found (doc 49 #3).
                 _f["verification"] = _finding_verification(_f, reachable=bool(_steps))
+                # The directed prove-out plan for a shortlisted finding (doc 49 #5): how lykos would
+                # raise it to poc-backed. A plan, not a demonstrated exploit; None off the shortlist.
+                _pp = _prove_out_plan(_f, _f["verification"])
+                if _pp:
+                    _f["prove_out"] = _pp
             tout["execution"]["has_gaps"] = has_execution_gaps(tout)
             tout["verdict"] = target_verdict(tout)
             targets_out.append(tout)

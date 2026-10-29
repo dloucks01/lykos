@@ -775,6 +775,12 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
           </ul>
         </div>` : null}
 
+      ${finding.prove_out && finding.prove_out.steps ? html`
+        <div class="find-proveout">
+          <div class="fp-head">Prove it out <span class="fp-sub">— directed plan to reach poc-backed</span></div>
+          <ol>${finding.prove_out.steps.map((s) => html`<li>${s}</li>`)}</ol>
+        </div>` : null}
+
       ${effects.length ? html`
         <div class="effects-block">
           <div class="effects">

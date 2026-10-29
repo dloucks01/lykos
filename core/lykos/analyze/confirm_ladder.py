@@ -188,3 +188,55 @@ def finding_verification(f: dict, reachable: Optional[bool] = None) -> dict:
         "reachable": reachable,
         "shortlist": verdict == "prove-out-shortlist",
     }
+
+
+#: Per CWE class, the (solver lykos would run, oracle that would confirm it) once a driver reaches
+#: the sink -- the directed path from a corroborated finding to a fired reproducer (poc-backed).
+_CWE_SOLVER = {
+    "CWE-190": ("the integer-overflow -> undersized-alloc -> heap-overflow detonator",
+                "an ASan heap-buffer-overflow abort"),
+    "CWE-122": ("the heap-overflow detonator", "an ASan heap-buffer-overflow abort"),
+    "CWE-121": ("the stack-overflow detonator built from the recovered frame, then the ROP solver",
+                "a controlled saved-return (and, past the leak, a spawned shell)"),
+    "CWE-787": ("the out-of-bounds-write detonator", "an ASan out-of-bounds-write abort"),
+    "CWE-125": ("the out-of-bounds-read detonator", "an ASan out-of-bounds-read report"),
+    "CWE-129": ("the unchecked-index detonator (the computed array/GOT write)",
+                "an ASan out-of-bounds abort / the overwritten slot's effect"),
+    "CWE-134": ("the format-string %hhn write-what-where solver",
+                "a win-address write (and, on non/partial-RELRO, a spawned shell)"),
+    "CWE-416": ("the use-after-free reclaim detonator (groom the freed chunk)",
+                "an ASan use-after-free abort"),
+    "CWE-415": ("the double-free detonator", "an ASan double-free / allocator abort"),
+    "CWE-78": ("the command-injection payload over the reaching channel",
+               "the injected command's runtime marker"),
+    "CWE-22": ("the path-traversal payload over the reaching channel",
+               "a read/write resolved outside the intended directory"),
+}
+
+
+def prove_out_plan(f: dict, verification: Optional[dict] = None) -> Optional[dict]:
+    """For a PROVE-OUT-SHORTLIST finding, the directed plan lykos would run to raise it to
+    poc-backed: synthesize a driver that reaches the sink, drive the attacker-controlled source,
+    run the CWE-specific solver against the uninstrumented build, confirm with its oracle. This is
+    a PLAN (what to run next), never a demonstrated exploit -- it is emitted only for findings the
+    verification step put on the shortlist, and names the finding's own site/function, so it cannot
+    overstate. None for anything not on the shortlist."""
+    v = verification or f.get("verification") or finding_verification(f)
+    if not v.get("shortlist"):
+        return None
+    solver, oracle = _CWE_SOLVER.get(f.get("cwe"), ("the matching weaponizer for this class",
+                                                     "its sanitizer / runtime-marker oracle"))
+    where = f.get("function_addr") or "the finding's function"
+    site = f.get("site_addr")
+    reach_note = (" (seed it with the gate-passing inputs the harness recovered)"
+                  if v.get("reachable") else
+                  " (synthesize a driver / harness; the recovered call graph showed no path, so "
+                  "reachability must be established)")
+    steps = [
+        f"synthesize a driver that reaches {where}" + reach_note,
+        "drive the attacker-controlled input named in the dataflow to the sink"
+        + (f" at {site}" if site else ""),
+        f"run {solver} against the uninstrumented build",
+        f"confirm with {oracle} — this raises the finding to poc-backed",
+    ]
+    return {"solver": solver, "oracle": oracle, "steps": steps}

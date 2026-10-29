@@ -10,6 +10,7 @@ from lykos.analyze.confirm_ladder import (
     finding_exploitability,
     finding_verification,
     instrumentation_noise,
+    prove_out_plan,
 )
 from lykos.api.serializers import _finding
 
@@ -86,6 +87,22 @@ def test_finding_verification_verdicts():
     v = finding_verification({"title": "x", "evidence": [
         {"channel": "s", "detail": "on the fuzzed attack surface"}]}, reachable=True)
     assert v["reachable"] is True
+
+
+def test_prove_out_plan_only_for_shortlist():
+    on = {"cwe": "CWE-190", "function_addr": "0x401000", "site_addr": "0x401100",
+          "evidence": [{"channel": "s", "detail": "on the fuzzed attack surface"}]}
+    plan = prove_out_plan(on)
+    assert plan and len(plan["steps"]) >= 3
+    assert "heap-overflow" in plan["solver"]
+    assert any("poc-backed" in s for s in plan["steps"])
+    assert any("0x401000" in s for s in plan["steps"])          # names the finding's own function
+    # off-surface and instrumentation-noise get NO plan
+    assert prove_out_plan({"cwe": "CWE-190", "evidence": [
+        {"channel": "s", "detail": "off the fuzzed attack surface"}]}) is None
+    assert prove_out_plan({"cwe": "CWE-190", "title": "__sanitizer internal_allocator",
+                           "evidence": [{"channel": "s", "detail": "on the fuzzed attack surface"}]}) \
+        is None
 
 
 def test_serializer_attaches_per_finding_detail():

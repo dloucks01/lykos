@@ -833,6 +833,14 @@ def _finding_html(f: dict) -> str:
         for mit in ex.get("mitigations_in_way") or []:
             p.append(f'<li><b>In the way:</b> {esc(mit)}</li>')
         p.append('</ul></div>')
+    # The directed prove-out plan (shortlisted findings only): how to raise this to poc-backed.
+    pp = f.get("prove_out") or {}
+    if pp.get("steps"):
+        p.append('<div class="fproveout"><div class="evlabel">Prove it out '
+                 '<span class="muted">— directed plan to reach poc-backed</span></div><ol class="ev">')
+        for stp in pp["steps"]:
+            p.append(f'<li>{esc(stp)}</li>')
+        p.append('</ol></div>')
     # Reachability: attack surface + the shortest call path from an input source (control-flow
     # reachability, not a verified byte-level dataflow -- said so explicitly).
     rch = f.get("reachability") or {}

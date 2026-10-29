@@ -377,6 +377,11 @@ def test_verification_shortlist_and_noise(store, case):
     assert verdicts["oob _ZN11__sanitizer internal_allocator"] == "instrumentation-noise"
     html = to_html(r)
     assert "prove-out shortlist" in html and "instrumentation artifact" in html
+    # the shortlisted finding carries a directed prove-out plan; off-surface/noise do not
+    byt = {f["title"]: f for t in r["targets"] for f in t["findings"]}
+    assert byt["ovf"].get("prove_out") and byt["ovf"]["prove_out"]["steps"]
+    assert "prove_out" not in byt["uaf"] and "prove_out" not in byt["oob _ZN11__sanitizer internal_allocator"]
+    assert "Prove it out" in html
 
 
 def test_finding_exploitability_and_ceiling(store, case):

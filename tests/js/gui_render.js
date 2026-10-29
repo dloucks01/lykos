@@ -155,11 +155,17 @@ function renderInfo(vnode) {
 
   // Verification verdict badge (doc 49 #3): the de-noise / prove-out-shortlist review.
   const shortlist = renderInfo(h(C.FindingCard, {
-    finding: { ...finding, verification: { verdict: "prove-out-shortlist", shortlist: true, noise: false } },
+    finding: { ...finding, verification: { verdict: "prove-out-shortlist", shortlist: true, noise: false },
+      prove_out: { solver: "the heap-overflow detonator", oracle: "an ASan abort",
+        steps: ["synthesize a driver that reaches 0x401000", "drive the input to the sink",
+                "run the heap-overflow detonator", "confirm with an ASan abort — reaches poc-backed"] } },
     pocs: [], reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
   }));
   ck("FindingCard renders the prove-out-shortlist verdict badge",
     /prove-out shortlist/.test(shortlist.all) && shortlist.classes.some((c) => /vb-prove-out-shortlist/.test(c)));
+  ck("FindingCard renders the directed prove-out plan for a shortlisted finding",
+    /Prove it out/.test(shortlist.all) && /synthesize a driver/.test(shortlist.all)
+    && shortlist.classes.some((c) => /find-proveout/.test(c)));
   const noise = renderInfo(h(C.FindingCard, {
     finding: { ...finding, verification: { verdict: "instrumentation-noise", noise: true,
       noise_reason: "anchored in instrumentation/runtime symbol (__sanitizer)" } },

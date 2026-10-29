@@ -102,6 +102,7 @@ def _finding(f, sites=None, site_count=None, proven=0, mitigations=None):
         finding_analysis,
         finding_exploitability,
         finding_verification,
+        prove_out_plan,
     )
     d["analysis"] = finding_analysis(d)
     _ex = finding_exploitability(d, mitigations)
@@ -111,6 +112,10 @@ def _finding(f, sites=None, site_count=None, proven=0, mitigations=None):
     # conservative -- it never sets the earned `confirmed` state. `reachable` is left None in the
     # list view (the call-graph path is a report/detail-view computation).
     d["verification"] = finding_verification(d)
+    # The directed prove-out plan for a shortlisted finding (how to raise it to poc-backed).
+    _pp = prove_out_plan(d, d["verification"])
+    if _pp:
+        d["prove_out"] = _pp
     _surf = attack_surface(d)
     if _surf:
         d["reachability"] = {"attack_surface": _surf}
