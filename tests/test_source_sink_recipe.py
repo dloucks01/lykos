@@ -32,9 +32,14 @@ def _scan(tmp_path, src: str):
 
 # ---- taint-lite: which sinks get a proven source link ----------------------------------------
 
-def test_parameter_argument_is_linked(tmp_path):
+def test_bare_parameter_is_NOT_a_strong_link(tmp_path):
+    """A generic parameter is NOT an established untrusted source -- `void run(char *cmd){
+    system(cmd); }` is a forwarding WRAPPER (the caller decides cmd). Flagging it as exploitable
+    was the false-positive class that lit up every printf/exec wrapper in real code. It stays a
+    low-severity hygiene note with no proven flow (precision is paramount)."""
     f = _scan(tmp_path, "void run(char *cmd){ system(cmd); }")[0]
-    assert f["cwe"] == "CWE-78" and f["taint"] and f["taint"]["via"] == "parameter"
+    assert f["cwe"] == "CWE-78" and not f["strong"] and f["taint"] is None
+    assert f["severity"] == "low" and "hygiene" in f["title"]
 
 
 def test_getenv_return_is_linked(tmp_path):
@@ -52,9 +57,12 @@ def test_fgets_into_buffer_is_linked(tmp_path):
     assert f["taint"] and "fgets" in f["taint"]["source"]
 
 
-def test_argv_subscript_is_linked_as_parameter(tmp_path):
+def test_argv_subscript_is_a_strong_untrusted_source(tmp_path):
+    """argv is genuinely attacker-controlled even though it arrives as main()'s parameter -- it is
+    STRONG (an exploitable finding worth a PoC), unlike a generic parameter."""
     f = _scan(tmp_path, "int main(int argc, char **argv){ system(argv[1]); return 0; }")[0]
-    assert f["taint"] and f["taint"]["via"] == "parameter" and "argv" in f["taint"]["source"]
+    assert f["strong"] and f["taint"] and "argv" in f["taint"]["source"]
+    assert f["severity"] == "high"
 
 
 def test_a_computed_value_is_not_linked(tmp_path):
@@ -65,12 +73,13 @@ def test_a_computed_value_is_not_linked(tmp_path):
 
 
 def test_the_count_argument_of_read_is_not_mistaken_for_the_buffer(tmp_path):
-    """`read(fd, other, n)` fills `other`, not `n`; a sink on `n` must not be called reader-linked."""
+    """`read(fd, other, n)` fills `other`, not `n`; a sink on `n` must not be called reader-linked.
+    `n` is a bare parameter, so after the precision fix it is weak (no input reader fills it) --
+    crucially NOT misattributed to read() as a strong source."""
     src = ("void f(int fd, char *n){ char other[64]; read(fd, other, (unsigned long)n); "
            "system(n); }")
     f = _scan(tmp_path, src)[0]
-    # n IS a parameter here, so it is linked -- but as a parameter, not misattributed to read().
-    assert f["taint"] and f["taint"]["via"] == "parameter"
+    assert not f["strong"] and f["taint"] is None          # not strong, and NOT read()-attributed
 
 
 # ---- the recipe floor ------------------------------------------------------------------------
@@ -95,13 +104,16 @@ def _recipes(conn, tid):
             if (f.title or "").startswith("Exploitation recipe")]
 
 
-def test_file_findings_files_candidate_and_recipe_for_linked_sinks(store, case, tmp_path):
+def test_file_findings_files_candidate_and_recipe_for_strongly_linked_sinks(store, case, tmp_path):
     t = _target(store, case)
     ctx = _FakeCtx(store.conn)
-    findings = _scan(tmp_path, "void run(char *cmd){ system(cmd); }\n"
-                               "void logit(const char *fmt){ syslog(3, fmt); }\n")
+    # STRONG sources only: argv -> system, and a read() buffer -> printf. Both are genuinely
+    # attacker-controlled, so both earn a recipe.
+    findings = _scan(tmp_path,
+                     "int main(int c, char**v){ if(c>1) system(v[1]); return 0; }\n"
+                     "void logit(int fd){ char b[64]; read(fd,b,64); printf(b); }\n")
     n = ss._file_findings(ctx, t, findings)
-    assert n == 2                                            # both are parameter-linked
+    assert n == 2                                            # both are strongly linked
     recs = _recipes(store.conn, t.id)
     cwes = sorted(r.cwe for r in recs)
     assert cwes == ["CWE-134", "CWE-78"]
@@ -116,6 +128,20 @@ def test_file_findings_files_candidate_and_recipe_for_linked_sinks(store, case, 
     assert cands and all(abs((c.confidence or 0) - 0.6) < 1e-6 for c in cands)
     ev = " ".join(str(e.get("detail", "")) for c in cands for e in (c.evidence or []))
     assert "flows from" in ev
+
+
+def test_parameter_forwarding_wrapper_gets_no_recipe(store, case, tmp_path):
+    """The precision fix: a bare-parameter sink (a forwarding wrapper) is a low hygiene note, not a
+    recipe-worthy exploitable finding."""
+    t = _target(store, case)
+    ctx = _FakeCtx(store.conn)
+    findings = _scan(tmp_path, "void run(char *cmd){ system(cmd); }\n"
+                               "void logit(const char *fmt){ syslog(3, fmt); }\n")
+    n = ss._file_findings(ctx, t, findings)
+    assert n == 0                                            # no recipe for parameter-forwarded sinks
+    assert not _recipes(store.conn, t.id)
+    cands = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "source_sink"]
+    assert cands and all(c.severity == "low" for c in cands)
 
 
 def test_an_unlinked_sink_gets_no_recipe(store, case, tmp_path):

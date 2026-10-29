@@ -24,8 +24,8 @@ from pathlib import Path
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
-from .srcwalk import source_files
 from . import srctaint
+from .srcwalk import source_files
 
 _log = logging.getLogger(__name__)
 
@@ -145,6 +145,12 @@ def scan_source(root: Path) -> list:
                 if pos is None or pos >= len(args):
                     continue
                 arg = args[pos]
+                # PARSER ROBUSTNESS: a multi-line call spills the format/command arg onto the next
+                # line, so the single-line split yields an empty or non-identifier arg. A finding
+                # with no real argument is never valid -- skip it rather than file garbage (this was
+                # a false-positive source: tsmf_codec.c:259 and others came through with arg='').
+                if not arg.strip() or not re.search(r"[A-Za-z_]", arg):
+                    continue
                 if _is_literal(arg) or arg in lit_vars:
                     continue
                 # the v* family takes a va_list: `vfprintf(stderr, fmt, ap)` is the body of a
@@ -157,27 +163,52 @@ def scan_source(root: Path) -> list:
                 if re.fullmatch(r"(?:NULL|0|nullptr)", arg):
                     continue
                 taint = srctaint.untrusted_link(lines, i, arg)
-                if fn in _CMDI:
-                    findings.append(_mk(label, i, fn, arg, "CWE-78",
-                                        f"{fn}() runs a non-literal command ('{arg}')",
-                                        "OS command injection", taint))
-                else:
-                    findings.append(_mk(label, i, fn, arg, "CWE-134",
-                                        f"{fn}() uses a non-literal format string ('{arg}')",
-                                        "format string", taint))
+                # PRECISION FLOOR (precision is paramount): a non-literal format/command is an
+                # EXPLOITABLE finding only when attacker-controlled input demonstrably reaches it IN
+                # THIS FUNCTION -- a real input reader (read/recv/fgets/fread/getenv/argv), not a
+                # forwarded parameter. Treating a parameter as untrusted flags every printf/exec
+                # WRAPPER (sfreerdp.c fprintf(fmt), wlog vsnprintf(cmessage->FormatString)) and every
+                # local-config popen (xfreerdp action scripts, passphrase askpass) as a remote bug:
+                # a parameter is untrusted only if an attacker-reachable caller passes untrusted data
+                # to it, which source-alone cannot prove. So: input-reader taint -> a real,
+                # PoC-worthy finding (high); anything else -> a LOW hygiene note (non-literal sink,
+                # untrusted source not established here), never weaponized, never a false alarm.
+                # A PARAMETER counts as untrusted only when the enclosing function is an ENTRY POINT
+                # whose parameters ARE program input -- main() (argv/argc) -- or when it is argv
+                # itself. A generic function's parameter is a forwarding wrapper (the caller
+                # decides), so it stays weak.
+                fn_name = srctaint.enclosing_name(lines, i)
+                param_untrusted = bool(taint and taint.get("via") == "parameter"
+                                       and (fn_name == "main"
+                                            or "argv" in (taint.get("source") or "")))
+                strong = bool(taint and (taint.get("via") == "input-reader" or param_untrusted))
+                cwe = "CWE-78" if fn in _CMDI else "CWE-134"
+                kind = "OS command injection" if fn in _CMDI else "format string"
+                findings.append(_mk(label, i, fn, arg, cwe, kind, taint, strong))
     return findings
 
 
-def _mk(name, line, fn, arg, cwe, detail_tail, label, taint=None) -> dict:
+def _mk(name, line, fn, arg, cwe, kind, taint, strong) -> dict:
+    if strong:
+        detail_tail = (f"{fn}() {'runs' if cwe == 'CWE-78' else 'uses'} attacker-controlled "
+                       f"{'command' if cwe == 'CWE-78' else 'format string'} ('{arg}')")
+        title = f"{kind} via {fn}() ({cwe})"
+        sev = "high"
+    else:
+        detail_tail = (f"{fn}() takes a non-literal {'command' if cwe == 'CWE-78' else 'format'} "
+                       f"('{arg}') -- untrusted source NOT established in this function (hygiene)")
+        title = f"non-literal {'command' if cwe == 'CWE-78' else 'format'} to {fn}() ({cwe}, hygiene)"
+        sev = "low"
     ev = [{"channel": "source", "detail": f"{name}:{line + 1}: {detail_tail}"}]
-    if taint:                                              # a proven source->sink link raises the row
+    if strong:                                             # a proven untrusted source->sink link
         ev.append({"channel": "source-flow",
                    "detail": f"the sink argument flows from {taint['source']} ({taint['via']})"})
     return {
-        "cwe": cwe, "severity": "high",
-        "title": f"{label} via {fn}() ({cwe})",
+        "cwe": cwe, "severity": sev,
+        "title": title,
         "dedup_key": f"srcsink:{cwe}:{name}:{line + 1}:{fn}",
-        "fn": fn, "arg": arg, "file": name, "line": line + 1, "taint": taint,
+        "fn": fn, "arg": arg, "file": name, "line": line + 1,
+        "taint": taint if strong else None, "strong": strong,
         "evidence": ev}
 
 
