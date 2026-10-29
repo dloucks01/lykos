@@ -1711,6 +1711,44 @@ def _collect_cmake_harnesses(bd, intree, names):
     return harnesses, lib_dirs
 
 
+#: Core shared libraries to register as analysis targets from a harness build. Bounded because a
+#: large project builds dozens of plugin .so's and each target costs a full per-target budget; the
+#: biggest few are the core libs that hold the code (the rest are thin channel/codec plugins).
+_LIB_TARGET_MAX = 4
+
+
+def _collect_cmake_libraries(bd):
+    """The largest few distinct SHARED LIBRARIES built under `bd` -- the core libs that hold the
+    project's code, not the many small plugins. Real ELF .so files only (no symlinks, no sanitizer
+    runtimes), deduped by version-stripped name, largest first, bounded by `_LIB_TARGET_MAX`. These
+    are not runnable, but the binary static detectors / CVE fingerprint / symbolic execution read a
+    .so, so registering them reaches the library code the harnesses only link."""
+    import re as _re
+    bd = Path(bd)
+    if not bd.is_dir():
+        return []
+    best: dict = {}
+    for p in bd.rglob("*.so*"):
+        try:
+            if not p.is_file() or p.is_symlink():
+                continue
+            n = p.name
+            if not (n.endswith(".so") or ".so." in n):
+                continue
+            if any(x in n for x in ("libasan", "libubsan", "liblsan", "libclang_rt")):
+                continue
+            with open(p, "rb") as fh:
+                if fh.read(4) != b"\x7fELF":
+                    continue
+            sz = p.stat().st_size
+        except OSError:
+            continue
+        stem = _re.sub(r"\.so.*$", "", n)                 # libfreerdp3.so.3.20 -> libfreerdp3
+        if stem not in best or sz > best[stem][0]:
+            best[stem] = (sz, str(p))
+    return [path for _sz, path in sorted(best.values(), key=lambda t: -t[0])][:_LIB_TARGET_MAX]
+
+
 def _cmake_fresh(bd, root) -> bool:
     """True when the build under `bd` is newer than the project's CMakeLists.txt -- a cheap staleness
     guard. The materialized source tree is immutable after ingest, so this is conservative; it only
@@ -1778,6 +1816,7 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
     _pre_h, _pre_l = _collect_cmake_harnesses(bd, intree, names)
     if _pre_h and _cmake_fresh(bd, root):
         res["harnesses"], res["lib_dirs"], res["ok"] = _pre_h, _pre_l, True
+        res["libraries"] = _collect_cmake_libraries(bd)
         res["log"], res["reused"] = f"reused existing cmake build {build_name}", True
         return res
     confine = _configure_confinement(root)
@@ -1838,6 +1877,7 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
             _run(["cmake", "--build", str(bd), "-j", "--target", n])
     harnesses, lib_dirs = _collect_cmake_harnesses(bd, intree, names)
     res["harnesses"], res["lib_dirs"], res["ok"] = harnesses, lib_dirs, bool(harnesses)
+    res["libraries"] = _collect_cmake_libraries(bd)
     return res
 
 

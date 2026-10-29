@@ -174,3 +174,32 @@ def test_ingest_registers_cmake_harnesses(store, tmp_path):
         f"harness path did not fire (build_system): {[(a.meta or {}).get('build_system') for a in arts]}"
     assert any((a.meta or {}).get("lib_dirs") for a in arts), \
         f"lib_dirs not recorded: {[a.meta for a in arts]}"
+
+
+def test_collect_cmake_libraries_picks_bounded_core_libs(tmp_path):
+    """The library collector returns the largest few REAL shared libraries (the core libs that
+    hold the code), skipping symlinks, sanitizer runtimes and the long tail of small plugins --
+    bounded so a project that builds dozens of .so's does not explode into dozens of targets."""
+    from lykos.analyze.libfuzzer import _LIB_TARGET_MAX, _collect_cmake_libraries
+    bd = tmp_path / "build"
+    bd.mkdir()
+
+    def mk(rel, body):
+        p = bd / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x7fELF" + body)
+        return p
+
+    mk("libfreerdp/libcore3.so.3.20", b"A" * 5000)          # largest core lib (versioned real file)
+    (bd / "libfreerdp" / "libcore3.so").symlink_to(bd / "libfreerdp" / "libcore3.so.3.20")  # skipped
+    mk("winpr/libsupport3.so.3", b"B" * 3000)               # second core lib
+    mk("lib/libclang_rt.asan.so", b"D" * 9000)              # sanitizer runtime -> excluded
+    for i, nm in enumerate(("liba", "libb", "libc", "libd")):  # small plugins
+        mk(f"ch/{nm}.so", bytes([65 + i]) * (50 + i))
+    libs = _collect_cmake_libraries(bd)
+    names = [os.path.basename(p) for p in libs]
+    assert len(libs) <= _LIB_TARGET_MAX
+    assert "libcore3.so.3.20" in names and "libsupport3.so.3" in names
+    assert not any("clang_rt" in n for n in names)          # sanitizer runtime never a target
+    assert not any(p.endswith("/libcore3.so") for p in libs)  # the symlink is not picked
+    assert names[0] == "libcore3.so.3.20"                   # largest first

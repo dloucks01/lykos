@@ -583,7 +583,11 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 return _ingest_built_project(
                     store, case_id, path,
                     {"ok": True, "primary": bins[0], "binaries": bins, "system": "cmake-fuzzers",
-                     "compiler": "clang", "lib_dirs": hb.get("lib_dirs") or []},
+                     "compiler": "clang", "lib_dirs": hb.get("lib_dirs") or [],
+                     # the core shared libraries this build produced -- registered as (non-runnable)
+                     # targets so binary static / CVE / symbolic analysis reaches the library code
+                     # the harnesses only link (captured now, while the build dir still exists).
+                     "libraries": hb.get("libraries") or []},
                     filename or path.name)
             # No harnesses either, but the build DID produce something (a library) -- keep the old
             # behaviour: register it so the source detectors still have an archived tree to read.
