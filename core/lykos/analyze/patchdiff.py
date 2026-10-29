@@ -179,3 +179,88 @@ def is_patched(target_funcs: list, vulnerable_fn: dict, patched_fn: dict):
     if cand["hash"] == vf["hash"]:
         return "vulnerable"
     return None
+
+
+# ---- patch-signature classification: turn a changed function into a typed N-day candidate --------
+
+#: callee-name signatures (substring, case-insensitive) that a fix ADDS, grouped by what they mean.
+_FIX_ADDS = {
+    "bounds-check": ("checkandlog", "ensurecapacity", "ensureremaining", "safeseek", "validate",
+                     "_valid", "boundcheck", "checklen", "check_len", "_min", "clamp", "_cap",
+                     "require"),
+    "size-arith-guard": ("mul_overflow", "add_overflow", "umul", "uadd", "safe_mul", "safe_add",
+                         "ckd_", "_overflow"),
+    "null-check": ("assert", "_check_null", "isnull"),
+}
+#: callee swaps: an UNSAFE call the vuln used, dropped in favour of a bounded one.
+_UNSAFE_DROPPED = ("strcpy", "strcat", "sprintf", "gets", "memcpy", "stpcpy", "lstrcpy", "wcscpy")
+_SAFE_ADDED = ("strncpy", "strlcpy", "snprintf", "strncat", "strlcat", "memcpy_s", "memmove")
+_FREE_NAMES = ("free", "cfree", "kfree", "g_free", "release", "destroy", "_free", "unref")
+
+
+def classify_change(c: dict) -> dict:
+    """Infer the LIKELY vulnerability a fix addressed, from the shape of the change `c` (one entry
+    of `diff()['changed']`). Returns {cwe, exploit_class, why, confidence}. A labelled HYPOTHESIS
+    from the patch signature -- never an assertion -- used to rank changed functions into an
+    exploit-loop worklist (memory-corruption fixes first). `confidence` is the ranking weight."""
+    new_cl = [x.lower() for x in (c.get("new_callees") or [])]
+    drop_cl = [x.lower() for x in (c.get("dropped_callees") or [])]
+    new_consts = c.get("new_consts") or []
+    # a comparison immediate that appeared -- the classic "added a bounds/length check" silent fix.
+    added_cmp = [k for k in new_consts if k.split(":")[0] in ("cmp", "sub", "test", "and", "jae",
+                                                              "jbe", "ja", "jb", "jg", "jl")]
+
+    def has(cls_key):
+        sigs = _FIX_ADDS[cls_key]
+        return any(s in n for n in new_cl for s in sigs)
+
+    # 1) unsafe -> bounded copy swap: a textbook overflow fix.
+    if any(u in n for n in drop_cl for u in _UNSAFE_DROPPED) and \
+            any(s in n for n in new_cl for s in _SAFE_ADDED):
+        return _c("CWE-787", "overflow", 0.8,
+                  "the fix replaced an unbounded copy with a bounded one "
+                  f"({', '.join(sorted({u for n in drop_cl for u in _UNSAFE_DROPPED if u in n}))}"
+                  f" -> {', '.join(sorted({s for n in new_cl for s in _SAFE_ADDED if s in n}))})")
+    # 2) size-arithmetic overflow guard added -> integer-overflow-to-heap-overflow.
+    if has("size-arith-guard"):
+        return _c("CWE-190", "overflow", 0.75,
+                  "the fix added checked size arithmetic (overflow-guarded multiply/add) before an "
+                  "allocation or copy -- the unguarded arithmetic is the vulnerability")
+    # 3) a bounds/length/capacity validator added, or a length comparison constant appeared.
+    if has("bounds-check") or added_cmp:
+        why = "the fix added a bounds/length check"
+        if has("bounds-check"):
+            got = sorted({s for n in new_cl for s in _FIX_ADDS["bounds-check"] if s in n})
+            why += f" (new call to {', '.join(got[:4])})"
+        if added_cmp:
+            why += f"; new comparison immediate(s) {', '.join(added_cmp[:4])}"
+        why += " -- its absence let an attacker-controlled length run past the buffer"
+        return _c("CWE-787", "overflow", 0.65, why)
+    # 4) a free/release appeared or moved -> lifetime fix (use-after-free / double-free).
+    if any(f in n for n in new_cl for f in _FREE_NAMES) or \
+            any(f in n for n in drop_cl for f in _FREE_NAMES):
+        return _c("CWE-416", "uaf", 0.5,
+                  "the fix changed where memory is freed/released -- a use-after-free or double-free "
+                  "lifetime bug")
+    # 5) body changed but no memory-safety signature -> unknown (still a lead, low rank).
+    return _c("NVD-CWE-noinfo", "unknown", 0.3,
+              "the function body changed but the patch shows no clear memory-safety signature; "
+              "the weakness class is unknown until the engines reach it")
+
+
+def _c(cwe, cls, conf, why):
+    return {"cwe": cwe, "exploit_class": cls, "confidence": conf, "why": why}
+
+
+def exploit_worklist(diff_result: dict, *, top: int = 25) -> list:
+    """Rank a diff()'s changed functions into a typed exploit-loop worklist: each entry is the
+    change plus its classification, memory-corruption fixes first (by class weight x how much the
+    body moved). This is the hand-off from patch-diff to the exploit loop."""
+    out = []
+    for c in diff_result.get("changed") or []:
+        cls = classify_change(c)
+        out.append({**c, **{"classification": cls}})
+    order = {"overflow": 0, "uaf": 1, "unknown": 2}
+    out.sort(key=lambda e: (order.get(e["classification"]["exploit_class"], 3),
+                            -e["classification"]["confidence"], -e.get("moved", 0)))
+    return out[:top]

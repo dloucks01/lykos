@@ -964,13 +964,16 @@ def _cmd_bindiff(args: argparse.Namespace) -> int:
         return 0
     print(f"unchanged: {d['unchanged']}   added: {len(d['added'])}   removed: {len(d['removed'])}")
     if d["changed"]:
-        print(f"\nCHANGED functions ({len(d['changed'])}) -- a security fix lives in the top ones:")
-        for c in d["changed"][:25]:
-            extra = ""
-            if c["new_callees"]:
-                extra += f"  +calls {', '.join(c['new_callees'][:4])}"
-            print(f"  {c['name']:<32} blocks {c['blocks'][0]}->{c['blocks'][1]}  "
-                  f"insns {c['insns'][0]}->{c['insns'][1]}  (moved {c['moved']}){extra}")
+        wl = patchdiff.exploit_worklist(d, top=25)
+        n_mem = sum(1 for e in wl if e["classification"]["exploit_class"] in ("overflow", "uaf"))
+        print(f"\nEXPLOIT-LOOP WORKLIST ({len(d['changed'])} changed; {n_mem} look memory-corrupting) "
+              "-- typed N-day candidates, memory-corruption first:")
+        for e in wl:
+            cls = e["classification"]
+            tag = {"overflow": "OVERFLOW", "uaf": "UAF", "unknown": "unknown"}[cls["exploit_class"]]
+            print(f"  [{tag:<8}] {e['name']:<30} {cls['cwe']:<16} moved {e['moved']:<4} "
+                  f"conf {cls['confidence']:.2f}")
+            print(f"             {cls['why'][:100]}")
     else:
         print("\nno named function changed -- the two builds are identical where symbols match.")
     return 0

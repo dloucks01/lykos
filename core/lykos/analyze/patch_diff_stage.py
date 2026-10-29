@@ -80,10 +80,15 @@ def patch_diff_stage(ctx) -> dict:
     fd = FindingDAO(ctx.conn)
     top = int(p.get("max_leads", 12))
     filed = 0
-    for c in changed[:top]:
+    # Rank changed functions into a typed exploit-loop worklist (memory-corruption first) so the
+    # leads carry the LIKELY vuln class from the patch signature, not a blind unknown -- and the
+    # directed/concolic/synth stages that steer here know what they are hunting.
+    worklist = patchdiff.exploit_worklist(result, top=top)
+    for c in worklist:
         addr = _addr_str(c.get("new_addr"))
         if addr is None:
             continue
+        cls = c["classification"]
         nc = c.get("new_callees") or []
         kc, dc = c.get("new_consts") or [], c.get("dropped_consts") or []
         detail = (f"function '{c['name']}' changed between the baseline '{a.filename}' and this "
@@ -93,13 +98,16 @@ def patch_diff_stage(ctx) -> dict:
                   # an immediate-only edit (a bounds constant) is the classic silent fix: name it
                   + (f", immediates {', '.join(dc[:6]) or '-'} -> {', '.join(kc[:6]) or '-'}"
                      if (kc or dc) else "")
+                  + f". LIKELY VULNERABILITY ({cls['exploit_class']}): {cls['why']}"
                   + ". A security patch -- and the vulnerability it fixes -- lives in the code that "
                     "changed between builds, so analysis is STEERED here (directed fuzzing / concolic "
                     "drive at this function). This is a LEAD, not a proven weakness.")
+        mem = cls["exploit_class"] in ("overflow", "uaf")
         fd.upsert(b.id, b.case_id, {
-            "cwe": "NVD-CWE-noinfo", "severity": "medium",
-            "title": f"Patch-diff lead: '{c['name']}' changed vs baseline"[:200],
-            "detector": "patch_diff", "state": "candidate", "confidence": 0.4,
+            "cwe": cls["cwe"], "severity": "high" if mem else "medium",
+            "title": f"Patch-diff lead ({cls['exploit_class']}): '{c['name']}' changed vs baseline"[:200],
+            "detector": "patch_diff", "state": "candidate",
+            "confidence": round(0.3 + 0.2 * cls["confidence"], 2),
             "function_addr": addr,
             "dedup_key": f"patch_diff:{c['name']}:{addr}",
             # The prose line for the evidence trail, plus the SAME facts as structured data (a JSON
@@ -111,12 +119,16 @@ def patch_diff_stage(ctx) -> dict:
                              "blocks": c["blocks"], "insns": c["insns"],
                              "new_callees": nc[:8],
                              "dropped_callees": (c.get("dropped_callees") or [])[:8],
+                             "exploit_class": cls["exploit_class"], "likely_cwe": cls["cwe"],
                              "baseline": a.filename}, sort_keys=True)}]})
         filed += 1
 
+    mem_leads = sum(1 for c in worklist
+                    if c["classification"]["exploit_class"] in ("overflow", "uaf"))
     ctx.emit("patch_diff.done", payload={
         "applicable": True, "baseline": a.filename, "target": b.filename,
-        "changed": len(changed), "leads": filed, "added": len(result.get("added") or []),
+        "changed": len(changed), "leads": filed, "memory_corruption_leads": mem_leads,
+        "added": len(result.get("added") or []),
         "removed": len(result.get("removed") or []), "symbols": bool(result.get("symbols"))})
     tail = (f"patch_diff: {filed} changed-function lead(s) from {len(changed)} changed "
             f"(vs {a.filename}); analysis steers at them")
