@@ -161,6 +161,13 @@ def synthesize_stage(ctx) -> dict:
                  f"return address"),
         why_not_executed=why,
         lead=lead, input_bytes=rec_payload, input_mode=(modes or ["stdin"])[0], argv=argv_base or None)
+    # Emit the standalone exploit SCRIPT (RIP-control PoC) from the computed offset -- the
+    # analyst-loop deliverable, static-derived (not run here), honest about its assumptions.
+    _src = (f"{getattr(target, 'filename', 'target')} ({exact['func']}() at {exact['site']:#x})"
+            if exact else getattr(target, "filename", "target"))
+    _emit_exploit_script(ctx, target, offset=rec_off, delivery=(modes or ["stdin"])[0],
+                         argv=argv_base, target_addr=None, proven=None, exact=exact,
+                         target_bytes=target_bytes, source=_src)
     # One rung further when the image allows it: a win function, no PIE, no canary in the frame ->
     # the return slot gets &win instead of a sentinel. A candidate L3, the payload carried over.
     if exact is not None:
@@ -173,6 +180,34 @@ def synthesize_stage(ctx) -> dict:
                      "directly (menu/protocol navigation) or the target could not be executed"})
     ctx.progress(pct=100, msg=f"no crash from {tried} inputs -- filed overflow recipe for {top['buffer']}")
     return {}
+
+
+def _emit_exploit_script(ctx, target, *, offset, delivery, argv, target_addr, proven,
+                         exact=None, target_bytes=b"", win_desc=None, source=None):
+    """Render a simple standalone exploit SCRIPT from the computed overflow facts and store it as an
+    `exploit-script` artifact (+ its review notes). This is the analyst-loop deliverable: the actual
+    exploit code, emitted whether or not a crash was observed (static-derived vs run-proven, stated
+    honestly in the script). Best-effort -- never fails the stage."""
+    try:
+        from . import elfstatic, exploit_script
+        mode = delivery if delivery in ("stdin", "arg", "file") else "stdin"
+        mit = {"canary": bool(exact and exact.get("canary")),
+               "pie": bool(target_bytes and elfstatic.is_pie(target_bytes)), "nx": True}
+        nul = exact.get("nul_terminated", True) if exact else True
+        facts = {"offset": int(offset), "target_addr": target_addr, "bits": target.bits or 64,
+                 "endian": "big" if target.endianness == "big" else "little", "delivery": mode,
+                 "argv": [str(a) for a in (argv or [])], "nul_terminated": nul, "cwe": "CWE-121",
+                 "source": source or getattr(target, "filename", "the target"),
+                 "target_desc": win_desc or "", "exec_name": getattr(target, "filename", "./target"),
+                 "mitigations": mit}
+        script = exploit_script.render_overflow_exploit(facts)
+        kind = "ret2win" if target_addr is not None else "rip-control"
+        sha = ctx.put_artifact("exploit-script", data=script.encode(),
+                               meta={"proven": bool(proven), "kind": kind, "offset": int(offset),
+                                     "review": exploit_script.review_notes(facts, proven)})
+        return sha
+    except Exception:                                    # noqa: BLE001 -- the recipe/poc still stands
+        return None
 
 
 #: Detectors whose CWE-121/120 finding names an unbounded copy SITE (function + call address).
@@ -244,6 +279,12 @@ def _file_ret2win_recipe(ctx, target, target_bytes, exact, lead, why, word, endi
                   + list(exact.get("notes") or []),
             why_not_executed=why, lead=lead, input_bytes=payload, input_mode=mode,
             argv=argv_base or None)
+        # The ret2win exploit SCRIPT: return address -> &win, the real redirect (L3 candidate).
+        _emit_exploit_script(ctx, target, offset=int(exact["payload_offset"]), delivery=mode,
+                             argv=argv_base, target_addr=int(win[1]), proven=None, exact=exact,
+                             target_bytes=target_bytes, win_desc=f"redirect into {win[0]}",
+                             source=f"{getattr(target, 'filename', 'target')} "
+                                    f"({exact['func']}() at {exact['site']:#x})")
     except Exception:                                    # noqa: BLE001 -- the L1 recipe stands
         pass
 
@@ -294,6 +335,10 @@ def _finalize(ctx, target, target_bytes, payload, mode, argv_base, res, cand, of
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
 
+    # The exploit SCRIPT, now PROVEN: the overflow detonated at this offset in the sandbox.
+    _emit_exploit_script(ctx, target, offset=off, delivery=mode, argv=argv_base,
+                         target_addr=None, proven=True, target_bytes=target_bytes,
+                         source=f"{getattr(target, 'filename', 'target')} (synthesized crash)")
     ctx.emit("synth.done", payload={"ok": True, "crashed": True, "offset": off,
              "buffer": cand["buffer"], "buffer_size": cand["size"], "mode": mode,
              "signal": res.signal_name, "level": "L1", "bundle": bundle_sha, "tried": tried,
