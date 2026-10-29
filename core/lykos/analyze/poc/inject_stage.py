@@ -221,6 +221,24 @@ _INJECT_RECIPE_LEVEL = {"CWE-78": "L3", "CWE-94": "L3", "CWE-89": "L2", "CWE-918
                         "CWE-611": "L2", "CWE-22": "L2", "CWE-134": "L2"}
 
 
+def _emit_injection_script(ctx, target, spec, mode, nav, *, proven: bool):
+    """Store a standalone command-injection exploit script as an `exploit-script` artifact.
+    Best-effort -- never raises, never blocks the stage."""
+    try:
+        from . import exploit_script
+        facts = {"cwe": "CWE-78", "sink": spec.get("title", "system/popen"),
+                 "source": f"{getattr(target, 'filename', 'target')} (command sink)",
+                 "delivery": mode if mode in ("stdin", "arg", "file") else "stdin",
+                 "argv": [], "exec_name": getattr(target, "filename", "./target"),
+                 "nav": (nav.decode("latin-1") if isinstance(nav, (bytes, bytearray)) and nav else "")}
+        script = exploit_script.render_injection_exploit(facts)
+        return ctx.put_artifact("exploit-script", data=script.encode(),
+                                meta={"proven": bool(proven), "kind": "command-injection",
+                                      "cwe": "CWE-78"})
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
 def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
     """For each applicable injection probe that did not confirm, file a corroborated recipe carrying
     the concrete marked payload + delivery channel. Honest: state via recipe.file_recipe (never
@@ -228,6 +246,8 @@ def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
     leads = _recipe_leads(ctx, target)
     chan = (channels or ["stdin"])[0]
     for name, spec in applicable.items():
+        if spec.get("cwe") == "CWE-78":                  # a runnable injection script for the operator
+            _emit_injection_script(ctx, target, spec, chan, b"", proven=False)
         cwe = spec.get("cwe", "")
         if cwe not in leads:
             # An IMPORT is not a weakness: nearly every C binary imports printf, many call
@@ -492,6 +512,10 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     fid = fd.id_for_dedup(target.id, f"{spec['cwe']}:inject:{mode}")
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
+    # The operator-runnable deliverable: a standalone command-injection script (proven -- the marker
+    # ran in the sandbox). Best-effort, alongside the bundle.
+    if spec.get("cwe") == "CWE-78":
+        _emit_injection_script(ctx, target, spec, mode, nav, proven=True)
     return {"cwe": spec["cwe"], "mode": mode, "bundle": bundle_sha, "input_sha": input_sha,
             "level": level, "bases": {k: v for k, v in bases.items()
                                       if k in ("pie_base", "libc_base", "canary", "rule")}}
