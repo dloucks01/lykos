@@ -121,14 +121,16 @@ def _rung_template(h, *, timeout, ctx):
     """B2 (deterministic template synthesis): construct the triggering input directly from a
     recognised bug shape (length-field -> oversized value, OOB index, %n, integer-overflow alloc).
     Not yet implemented -- an ordered hook so the ladder tries it FIRST when it lands."""
-    return None
+    return {"confirmed": False, "rung": "template", "skipped": True,
+            "reason": "deterministic template rung not implemented"}
 
 
 def _rung_concolic(h, *, timeout, ctx):
     # needs the STATIC clean build (angr must see the parser in the ELF). Absent (e.g. a project whose
     # static link does not resolve) -> skip this rung; the smart-fuzz floor covers it.
     if not h.get("explore_binary"):
-        return None
+        return {"confirmed": False, "rung": "concolic", "skipped": True,
+                "reason": "no static explore build (static link unavailable for this project)"}
     return concolic_confirm(
         h["explore_binary"], h.get("replay_binary") or h["explore_binary"],
         harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
@@ -145,13 +147,14 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
     empty-input negative control. Returns the concolic_confirm result shape with rung="smart-fuzz"."""
     from ..libfuzzer import run_libfuzzer
     out = {"confirmed": False, "input": None, "report": None, "source": None, "class": None,
-           "rung": "smart-fuzz", "reason": None}
+           "rung": "smart-fuzz", "reason": None, "execs": 0}
     own_wd = workdir is None
     wd = Path(tempfile.mkdtemp(prefix="lykos-sf-")) if own_wd else Path(workdir)
     try:
         corpus = list(seeds or []) + [b"A" * n for n in (16, 64, 256, 1024)]
         res = run_libfuzzer(fuzz_binary, wd, seconds=int(timeout), max_len=int(input_size),
                             corpus=corpus, lib_dirs=lib_dirs)
+        out["execs"] = int(res.get("execs") or 0)            # honest telemetry: did the harness run?
         from ..debug.rootcause import parse_asan_report
         for cr in res.get("crashes", []):
             rep = cr.get("report") or ""
@@ -165,7 +168,13 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
             out.update(confirmed=True, input=cr.get("input"), report=rep, source=cls.get("source"))
             out["class"] = cls.get("class") or cls.get("cwe")
             return out
-        out["reason"] = f"no crash in {int(timeout)}s of smart fuzzing"
+        # Distinguish "ran and found nothing" from "could not launch the harness" -- 0 executions
+        # means the binary never fuzzed (a run/link problem), which must NOT read as a clean no-find.
+        if out["execs"] <= 1:
+            out["reason"] = (f"smart-fuzz produced {out['execs']} executions -- the harness did not run "
+                             f"(check the shared-lib link); not a clean no-find")
+        else:
+            out["reason"] = f"no crash in {int(timeout)}s of smart fuzzing ({out['execs']} executions)"
         return out
     finally:
         if own_wd:
@@ -176,7 +185,8 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
 def _rung_smartfuzz(h, *, timeout, ctx):
     # needs the SHARED ASan build (coverage-guided libFuzzer); the floor rung below concolic.
     if not h.get("fuzz_binary"):
-        return None
+        return {"confirmed": False, "rung": "smart-fuzz", "skipped": True,
+                "reason": "no shared fuzz build"}
     return smartfuzz_confirm(h["fuzz_binary"], lib_dirs=h.get("lib_dirs"), seeds=h.get("seeds"),
                              input_size=int(h.get("input_size", 4096)), timeout=timeout,
                              workdir=(ctx.scratch() / f"sf-{h.get('name', 'h')}") if ctx else None)
@@ -185,13 +195,17 @@ def _rung_smartfuzz(h, *, timeout, ctx):
 _LADDER = (_rung_template, _rung_concolic, _rung_smartfuzz)
 
 
-def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None) -> list:
+def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=None) -> list:
     """Run the non-fuzzing confirmation ladder over a set of harness descriptors and return the
     CONFIRMED bugs. Each harness is {name, explore_binary, replay_binary?, lib_dirs?, input_size?,
     harness_fn?, targets?}. For each harness the rungs are tried smartest-first; the first that
     confirms wins. Returns [{harness, confirmed:True, input, report, source, class, rung}] -- the
     proven PoCs, each tagged with the rung that proved it. Deduped by (source, class) so the same
-    defect reached through two harnesses is reported once (the first harness that proved it)."""
+    defect reached through two harnesses is reported once (the first harness that proved it).
+
+    If `attempts_out` is a list, every rung attempt is appended to it as
+    {harness, rung, outcome: confirmed|no-confirm|skipped|error, reason, execs?} -- the honest account
+    of what ran, what was skipped and why, so a '0 confirmed' is never silent about its cause."""
     out: list = []
     seen: set = set()
     for h in harnesses:
@@ -199,8 +213,19 @@ def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None) -> list:
             try:
                 r = rung(h, timeout=timeout_per, ctx=ctx)
             except Exception as e:                           # noqa: BLE001 -- a rung must never abort
-                r = {"confirmed": False, "reason": f"{rung.__name__} error: {e}"}
-            if r and r.get("confirmed"):
+                r = {"confirmed": False, "rung": getattr(rung, "__name__", "?").replace("_rung_", ""),
+                     "reason": f"error: {e}", "error": True}
+            r = r or {"confirmed": False, "rung": "?", "skipped": True, "reason": "no result"}
+            if attempts_out is not None:
+                outcome = ("confirmed" if r.get("confirmed") else
+                           "error" if r.get("error") else
+                           "skipped" if r.get("skipped") else "no-confirm")
+                rec = {"harness": h.get("name"), "rung": r.get("rung", "?"), "outcome": outcome,
+                       "reason": r.get("reason")}
+                if r.get("execs") is not None:
+                    rec["execs"] = r.get("execs")
+                attempts_out.append(rec)
+            if r.get("confirmed"):
                 key = (r.get("source"), r.get("class"))
                 if key in seen:
                     break

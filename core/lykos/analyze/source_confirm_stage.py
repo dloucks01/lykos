@@ -214,18 +214,39 @@ def source_confirm_stage(ctx) -> dict:
                  "note": "no usable harness binaries after building"})
         return {"metrics": {"supported": False}}
 
+    # Honest build account: which harness variants linked. A failed build is WHY a rung is skipped
+    # (concolic needs explore+replay; smart-fuzz needs fuzz), so report it rather than leave the skip
+    # silent. A short log tail backs a failure.
+    builds = {"explore": {"ok": bool(explore["ok"]), "harnesses": len(ex_by)},
+              "replay": {"ok": bool(replay["ok"]), "harnesses": len(rp_by)},
+              "fuzz": {"ok": bool(fuzzb["ok"]), "harnesses": len(fz_by)}}
+    for name, b in (("explore", explore), ("replay", replay), ("fuzz", fuzzb)):
+        if not b["ok"]:
+            builds[name]["error"] = (b.get("log") or "")[-300:]
+
     per = max(30, int((budget * 0.6) / max(1, len(harnesses))))
-    proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx)
+    attempts: list = []
+    proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
     upgraded = 0
     for r in proven:
         upgraded += _file_confirmed(ctx, target, r)
         ctx.progress(msg=f"CONFIRMED (non-fuzzing {r.get('rung')}): {r.get('class')} "
                          f"via {r.get('harness')}")
+    # Surface the honest no-confirm account too: each rung that RAN and did not confirm, and each one
+    # skipped and why -- so '0 confirmed' explains itself (concolic skipped: static link failed;
+    # smart-fuzz ran N execs, no crash; or 0 execs = the harness never ran).
+    for a in attempts:
+        if a["outcome"] in ("no-confirm", "error"):
+            ex = f", {a['execs']} execs" if a.get("execs") is not None else ""
+            ctx.progress(msg=f"{a['rung']} on {a['harness']}: {a['outcome']} "
+                             f"({a.get('reason') or ''}{ex})")
+    ran = sum(1 for a in attempts if a["outcome"] in ("no-confirm", "confirmed", "error"))
     ctx.emit("source_confirm.done", payload={"supported": True, "harnesses": len(harnesses),
              "confirmed": len(proven), "upgraded": upgraded,
-             "rungs": sorted({r.get("rung") for r in proven})})
+             "rungs": sorted({r.get("rung") for r in proven}),
+             "builds": builds, "rungs_ran": ran, "attempts": attempts})
     return {"metrics": {"supported": True, "harnesses": len(harnesses), "confirmed": len(proven),
-                        "upgraded": upgraded}}
+                        "upgraded": upgraded, "rungs_ran": ran}}
 
 
 def register() -> None:

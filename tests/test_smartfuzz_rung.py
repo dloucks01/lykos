@@ -61,3 +61,4 @@ def test_smartfuzz_rung_confirms_shared_harness(tmp_path):
     assert res["confirmed"], f"smart-fuzz did not confirm the overflow: {res['reason']}"
     assert res["rung"] == "smart-fuzz"
     assert "overflow" in (res["report"] or ""), f"class={res['class']}"
+    assert res.get("execs", 0) > 1, "smart-fuzz telemetry should record the executions it ran"
