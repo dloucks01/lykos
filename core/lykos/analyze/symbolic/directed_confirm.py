@@ -198,16 +198,25 @@ def _rung_template(h, *, timeout, ctx):
                             input_size=int(h.get("input_size", 4096)), timeout=timeout)
 
 
+#: cap on the concolic SYMBOLIC-input size. A parser's gates (magic/length/type fields) sit in the
+#: first bytes, and every symbolic byte multiplies angr's per-step solver cost, so a 2 KB symbolic
+#: buffer makes a large target (FreeRDP) cut off before it reaches the parser. A bounded symbolic
+#: PREFIX lets concolic get DEEP and solve the gates; the template/smart-fuzz rungs cover the
+#: large-input overflows a short prefix cannot express.
+_CONCOLIC_MAX_INPUT = 256
+
+
 def _rung_concolic(h, *, timeout, ctx):
-    # needs the STATIC clean build (angr must see the parser in the ELF). Absent (e.g. a project whose
-    # static link does not resolve) -> skip this rung; the smart-fuzz floor covers it.
+    # needs a CLEAN build with the parser visible: the STATIC clean harness (parser in the ELF), or a
+    # SHARED clean harness with the project's .so force-loaded (load_libs). Absent -> skip; the
+    # smart-fuzz floor covers it.
     if not h.get("explore_binary"):
         return {"confirmed": False, "rung": "concolic", "skipped": True,
-                "reason": "no static explore build (static link unavailable for this project)"}
+                "reason": "no clean explore build (neither static nor shared-clean linked)"}
     return concolic_confirm(
         h["explore_binary"], h.get("replay_binary") or h["explore_binary"],
         harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
-        input_size=int(h.get("input_size", 256)), lib_dirs=h.get("lib_dirs"),
+        input_size=min(int(h.get("input_size", 256)), _CONCOLIC_MAX_INPUT), lib_dirs=h.get("lib_dirs"),
         targets=h.get("targets"), target_syms=h.get("target_syms"),
         load_libs=h.get("load_libs"), timeout=timeout, ctx=ctx)
 

@@ -304,6 +304,16 @@ def main(spec_path, out_path):
             except Exception:                                # noqa: BLE001
                 return None
 
+        def _depth(st):
+            """How far this state got -- for ranking the cut-off frontier deepest-first."""
+            try:
+                return int(st.history.block_count)
+            except Exception:                                # noqa: BLE001
+                try:
+                    return len(list(st.history.bbl_addrs))
+                except Exception:                            # noqa: BLE001
+                    return 0
+
         reached = set()
         for st in simgr.stashes.get("found", []):
             g = dump_input(st, False)
@@ -323,6 +333,23 @@ def main(spec_path, out_path):
             if g:
                 g["reached"] = None
                 result["generated"].append(g)
+        # FRONTIER DUMP: on a CUT-OFF search the deepest states sit in deferred/active/spilled, not
+        # deadended -- so a big target (FreeRDP's parsers, which do not drain in the budget) yields
+        # NOTHING above and the rung reported "generated no inputs (cutoff)". Concretise the DEEPEST
+        # frontier states too: each is an input that drove a long way into the parser (often past the
+        # gates), the likeliest to trip a bug on ASan replay. Sound -- every input is still replay-
+        # gated with a negative control downstream, and this adds no reachability claim (reached_targets
+        # is untouched). Deepest-first so the most-explored paths win the cap.
+        if len(result["generated"]) < num_find:
+            frontier = []
+            for _stash in ("deferred", "active", "spilled"):
+                frontier += list(simgr.stashes.get(_stash, []))
+            frontier.sort(key=_depth, reverse=True)
+            for st in frontier[:max(0, num_find - len(result["generated"]))]:
+                g = dump_input(st, False)
+                if g:
+                    g["reached"] = "frontier"
+                    result["generated"].append(g)
 
         result["reached_targets"] = sorted(reached)
         # Reachability-certificate soundness (T3): distinguish a search that reached a NATURAL
