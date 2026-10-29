@@ -102,6 +102,25 @@ def test_html_self_contained(store, case):
     # no ext assets in css
     assert "http://" not in html.split("</style>")[0].replace("http://www.w3", "")
     assert "SIGSEGV reproduced" in html
+    # methodology section + the confidence/level legends (defines the states the findings use)
+    assert "Methodology &amp; evidence standard" in html
+    assert "confirmation ladder" in html and "negative control" in html
+    assert "Confidence states" in html and "Impact levels" in html
+
+
+def test_html_headline_tolerates_a_non_escalation_verdict_level(store):
+    """A tag-only verdict level such as `L0-secret` (a hardcoded-secret finding) must not crash the
+    headline, which only escalates on the dynamic rungs L1/L2/L3."""
+    rep = {
+        "case": {"name": "c"}, "tool": {"version": "t"}, "generated_at": "now",
+        "summary": {"targets": 1, "findings": 1, "by_state": {"candidate": 1}},
+        "engines": [],
+        "targets": [{"filename": "libx.so", "verdict": {"level": "L0-secret",
+                     "label": "Secret exposed", "tone": "info"}, "findings": [], "execution": {}}],
+    }
+    html = to_html(rep)                               # must not raise KeyError('L0-secret')
+    assert html.startswith("<!doctype html>")
+    assert "Static findings reported" in html or "No defects were demonstrated" in html
 
 
 def test_sarif_valid(store, case):

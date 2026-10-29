@@ -171,6 +171,69 @@ def _kv(rows: list[tuple[str, Any]]) -> str:
     return f'<div class="kv">{cells}</div>' if cells else ""
 
 
+#: Confidence states, weakest -> strongest, with what each MEANS. The report uses these labels on
+#: every finding; the methodology section defines them so a reader can weigh the evidence.
+_STATE_LEGEND = [
+    ("candidate", "A static or semantic pattern match — the shape of a defect, not yet proven "
+                  "reachable or exploitable."),
+    ("corroborated", "A weaponization computed from the recovered program (e.g. an exploitation "
+                     "recipe with a concrete candidate payload), derived but not executed in this "
+                     "run."),
+    ("confirmed", "A sanitizer fault (AddressSanitizer / UBSan) reproduced by a concrete input at "
+                  "the predicted site, with a passing negative control — the fault is attributable "
+                  "to those bytes, not to the harness."),
+    ("poc-backed", "A packaged proof-of-concept that re-runs and verifies — a demonstrated exploit, "
+                   "not an asserted one."),
+]
+#: state order for the summary chips (weakest -> strongest).
+_STATE_ORDER = [k for k, _ in _STATE_LEGEND]
+
+
+def _methodology_html(report: dict[str, Any]) -> str:
+    """The approach, the confirmation ladder, and the evidence standard -- so the findings below are
+    read against a stated method and a defined confidence scale, not taken on faith."""
+    summ = report.get("summary", {})
+    bystate = summ.get("by_state", {}) or {}
+    p = ['<section class="card method"><h2>Methodology &amp; evidence standard</h2>']
+    p.append('<p>Discovery is <b>static and semantic first</b>. The source tree and any recovered '
+             'binaries are scanned for weakness patterns — dangerous sinks (command and format-string '
+             'injection), integer-overflow allocations, use-after-free and double-free, tainted '
+             'dereferences, hardcoded secrets, and dependencies pinned to known-vulnerable versions — '
+             'without executing anything. Each candidate is then driven through a <b>confirmation '
+             'ladder, smartest-first</b>: a deterministic input <i>template</i> (known bad shapes), '
+             'then <i>concolic / symbolic</i> solving (which solves the parser gates a blind search '
+             'cannot), then <i>directed, coverage-guided</i> smart-fuzzing. Fuzzing is used here to '
+             '<b>confirm</b> a statically-discovered defect, not to discover it.</p>')
+    p.append('<p>Where a candidate cannot be driven to a fault in this run, the engagement still '
+             'emits a <b>corroborated exploitation recipe</b> — the technique, a concrete candidate '
+             'payload, and exactly what remains unproven — so a finding is never left as a bare '
+             'detection.</p>')
+    p.append('<p class="method-std"><b>Evidence standard.</b> A finding is marked <b>confirmed</b> '
+             'only when a concrete input reproduces the fault at the predicted site under a '
+             'sanitizer, with a <b>passing negative control</b> (a benign input that does not fault), '
+             'so the fault is attributable to the specific bytes rather than to the test harness. It '
+             'is <b>poc-backed</b> only when a packaged exploit bundle re-runs and verifies. Nothing '
+             'is claimed as demonstrated on the strength of a static match alone, and every gap in '
+             'execution — an engine that could not run, a stage that timed out — is reported in the '
+             'per-target scorecards rather than hidden behind an empty result.</p>')
+    p.append('<div class="legend"><div class="lg-title">Confidence states '
+             '<span class="muted">— weakest to strongest; the count is this report\'s findings at '
+             'each</span></div>')
+    for key, desc in _STATE_LEGEND:
+        n = bystate.get(key)
+        cnt = f'<span class="lg-n">{n}</span>' if n else '<span class="lg-n lg-0">0</span>'
+        p.append(f'<div class="lg-row">{_badge(key, _STATE_COLOR.get(key, "#8b8d98"))}{cnt}'
+                 f'<span class="lg-d">{esc(desc)}</span></div>')
+    p.append('</div>')
+    p.append('<div class="legend"><div class="lg-title">Impact levels '
+             '<span class="muted">— how far an exploit was carried</span></div>')
+    for lv in ("L0", "L1", "L2", "L3"):
+        p.append(f'<div class="lg-row">{_badge(lv, _LEVEL_COLOR[lv])}'
+                 f'<span class="lg-d">{esc(_LEVEL_GLOSS[lv])}</span></div>')
+    p.append('</div></section>')
+    return "".join(p)
+
+
 def to_html(report: dict[str, Any]) -> str:
     case = report.get("case", {})
     summ = report.get("summary", {})
@@ -197,7 +260,10 @@ def to_html(report: dict[str, Any]) -> str:
     targets = report.get("targets", [])
     verdicts = [(t, _target_verdict(t)) for t in targets]
     # Impact FIRST: the strongest outcome across the whole case, in one sentence, before any count.
-    levels_seen = [v["level"] for _t, v in verdicts if v["level"]]
+    # Only the dynamic escalation rungs L1/L2/L3 drive the headline; a tag-only level such as
+    # `L0-secret` (a hardcoded-secret finding) is NOT a demonstrated impact, so it falls through to
+    # the "static findings reported" branch instead of crashing the headline lookup.
+    levels_seen = [v["level"] for _t, v in verdicts if v["level"] in ("L1", "L2", "L3")]
     top_level = max(levels_seen) if levels_seen else ""
     n_exploited = sum(1 for _t, v in verdicts if v["level"] == "L3")
     n_prim = sum(1 for _t, v in verdicts if v["level"] == "L2")
@@ -240,6 +306,7 @@ def to_html(report: dict[str, Any]) -> str:
     parts.append(_stat(summ.get("targets", 0), "targets"))
     parts.append(_stat(summ.get("findings", 0), "findings"))
     parts.append(_stat(top_level or "—", "highest impact"))
+    parts.append(_stat(summ.get("confirmed", 0), "confirmed"))
     parts.append(_stat(summ.get("poc_backed", 0), "PoC-backed"))
     parts.append('</div>')
     bysev = summ.get("by_severity", {})
@@ -247,6 +314,13 @@ def to_html(report: dict[str, Any]) -> str:
         parts.append('<div class="chips">' + "".join(
             _badge(f"{k} · {v}", _SEV_COLOR.get(k, "#8b8d98")) for k, v in bysev.items())
             + '</div>')
+    # The proof breakdown beside severity: how many findings reached each confidence state, so the
+    # headline count is immediately qualified by how much of it is demonstrated vs suspected.
+    bystate = summ.get("by_state", {}) or {}
+    if bystate:
+        parts.append('<div class="chips">' + "".join(
+            _badge(f"{k} · {bystate[k]}", _STATE_COLOR.get(k, "#8b8d98"))
+            for k in _STATE_ORDER if bystate.get(k)) + '</div>')
     cur = summ.get("curation") or {}
     if cur:
         # The operator's triage, stated beside the tool's counts (which it never changes).
@@ -264,6 +338,11 @@ def to_html(report: dict[str, Any]) -> str:
                 f'{esc(v["label"])} {lvlb}</td></tr>')
         parts.append('</tbody></table>')
     parts.append('</section>')
+
+    # ---- methodology & evidence standard ----
+    # Before any finding: the approach, the confirmation ladder, and what each confidence state and
+    # impact level MEANS -- so the reader weighs the findings against a stated method, not on faith.
+    parts.append(_methodology_html(report))
 
     # ---- reproducibility ----
     eng = report.get("engines", [])
@@ -698,6 +777,18 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
 .fimpact{font-size:12.5px;color:var(--muted);margin:2px 0 6px}
 .repro{margin:2px 0;padding:8px 10px;border-radius:7px;background:var(--surface-2);
   font-size:12px;line-height:1.5;word-break:break-word}
+/* methodology section: prose + the confidence/level legend */
+.method p{margin:0 0 10px;line-height:1.55}
+.method .method-std{padding:9px 11px;border-left:3px solid var(--accent);border-radius:0 6px 6px 0;
+  background:color-mix(in srgb,var(--accent) 6%,transparent)}
+.legend{margin:12px 0 0}
+.lg-title{font-size:12px;font-weight:600;color:var(--muted);margin:0 0 6px}
+.lg-row{display:grid;grid-template-columns:96px 34px 1fr;align-items:baseline;gap:8px;
+  padding:5px 0;border-top:1px solid var(--border);font-size:12.5px}
+.lg-n{font-family:var(--mono);font-size:12px;color:var(--text);text-align:right}
+.lg-0{color:var(--faint)}
+.lg-d{line-height:1.5}
+@media (max-width:560px){.lg-row{grid-template-columns:96px 1fr;}.lg-n{display:none}}
 .remed{margin:2px 0;padding:8px 10px;border-left:3px solid #46a758;
   background:color-mix(in srgb,#46a758 8%,transparent);font-size:12.5px;line-height:1.5}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
