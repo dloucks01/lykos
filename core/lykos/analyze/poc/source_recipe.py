@@ -34,6 +34,9 @@ _WEAPON = {
                 "the controlled size input"),
     "CWE-416": (None, "use-after-free with heap grooming -> controlled reclaimed contents", "L2",
                 "the controlled free/use path"),
+    "CWE-120": (b"A" * 512, "unbounded copy -> buffer overflow", "L2",
+                "the controlled source string"),
+    "CWE-22": (b"../../../../../../etc/passwd", "path traversal", "L1", "the controlled path"),
 }
 
 
@@ -73,6 +76,29 @@ def _prose(cwe: str, fn: str, arg_s: str, file: str, line: int, src: str) -> tup
              "the allocation then returns a buffer smaller than the data about to be written",
              "the subsequent copy overflows it (heap-buffer-overflow, CWE-122)",
              "widths and the copy length need the compiled binary -- run the memory tools on it"])
+    if cwe == "CWE-120":
+        return (
+            f"{fn}() at {file}:{line} copies '{arg_s}' into a buffer with no length bound, and "
+            f"'{arg_s}' flows from {src}; a source longer than the destination overflows it",
+            "static source analysis: the source->sink flow is a syntactic link; the destination "
+            "buffer's size and the overflow offset need the compiled binary, and nothing ran here",
+            [f"drive {src} with a string longer than the destination buffer",
+             f"{fn}() copies it with no bound, overflowing the destination (stack or heap)",
+             "a stack destination overwrites the saved return address (CWE-121); a heap one "
+             "corrupts adjacent chunk metadata (CWE-122)",
+             "the destination size and the exact offset need the compiled binary -- run the "
+             "overflow tools on it"])
+    if cwe == "CWE-22":
+        return (
+            f"{fn}() at {file}:{line} opens the path '{arg_s}', which flows from {src} with no "
+            f"traversal sanitisation; `../` sequences escape the intended directory",
+            "static source analysis: the input->path flow is a syntactic link and no normalising "
+            "check (realpath / a `..` reject) was seen on the path; attacker-reachability is not "
+            "dynamically proven",
+            [f"set {src} to a path with `../` sequences, e.g. `../../../../etc/passwd`",
+             f"{fn}() resolves it outside the intended directory",
+             "read or write a file the application never meant to expose",
+             "confirm against the running service; a normalising check on the path closes it"])
     # CWE-416 (use-after-free) / CWE-415 is routed here too
     return (
         f"{fn} at {file}:{line} uses '{arg_s}' after it is freed, and '{arg_s}' flows from {src}; "

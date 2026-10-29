@@ -79,6 +79,7 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("int_overflow_scan", "Int-overflow allocs", "target", "..analyze.fingerprint", "enqueue_int_overflow_scan", no_params=True),
     StageSpec("uaf_scan", "Use-after-free scan", "target", "..analyze.fingerprint", "enqueue_uaf_scan", no_params=True),
     StageSpec("source_sink_scan", "Tainted-sink scan", "target", "..analyze.fingerprint", "enqueue_source_sink_scan", no_params=True),
+    StageSpec("cpg_scan", "Per-CWE source/sink queries", "target", "..analyze.fingerprint", "enqueue_cpg_scan", no_params=True),
     # extract_secrets feeds itself a probe input when given none; synthesize_secret reads static
     # findings and never executes -- both take no params.
     StageSpec("extract_secrets", "Recover gate values", "target", "..analyze.debug", "enqueue_extract", no_params=True),

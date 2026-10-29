@@ -5,6 +5,8 @@ and `source_cve_scan` (dependency manifests + vendored headers in a built-from-s
 """
 from .corroborate import CORROBORATE_STAGE, enqueue_cve_corroborate  # noqa: F401
 from .corroborate import register as _register_corroborate
+from .cpg_scan import CPG_STAGE, enqueue_cpg_scan  # noqa: F401
+from .cpg_scan import register as _register_cpg
 from .embedded_config import EMBEDDED_AUDIT_STAGE, enqueue_embedded_audit  # noqa: F401
 from .embedded_config import register as _register_embedded
 from .int_overflow import INT_OVERFLOW_STAGE, enqueue_int_overflow_scan  # noqa: F401
@@ -26,4 +28,5 @@ def register() -> None:
     _register_intovf()
     _register_uaf()
     _register_sinks()
+    _register_cpg()
     _register_corroborate()

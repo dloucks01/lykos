@@ -1953,6 +1953,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "uaf_scan", status, stop)
                 # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
                 _staged(bud, store, t, "source_sink_scan", status, stop)
+                # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
+                # (CWE-120: strcpy/strcat/gets of untrusted data) and path traversal (CWE-22).
+                _staged(bud, store, t, "cpg_scan", status, stop)
                 # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
                 # an expected token, a menu command -- by breaking on its comparison functions. Those
                 # are the values every later stage needs in order to get PAST a gate, so this belongs

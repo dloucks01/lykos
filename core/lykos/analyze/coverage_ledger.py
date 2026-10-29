@@ -32,6 +32,8 @@ _CHECKS: list[dict] = [
     # ---- static discovery (source) ----
     {"stage": "source_sink_scan", "label": "Tainted sinks (command / format-string injection)",
      "classes": ["CWE-78", "CWE-134"], "kind": "static"},
+    {"stage": "cpg_scan", "label": "Per-CWE source/sink queries (buffer-copy, path-traversal)",
+     "classes": ["CWE-120", "CWE-22"], "kind": "static"},
     {"stage": "int_overflow_scan", "label": "Integer-overflow allocations",
      "classes": ["CWE-190"], "kind": "static"},
     {"stage": "uaf_scan", "label": "Use-after-free / double-free (source)",
