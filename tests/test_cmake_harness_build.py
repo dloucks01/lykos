@@ -190,9 +190,9 @@ def test_collect_cmake_libraries_picks_bounded_core_libs(tmp_path):
         p.write_bytes(b"\x7fELF" + body)
         return p
 
-    mk("libfreerdp/libcore3.so.3.20", b"A" * 5000)          # largest core lib (versioned real file)
-    (bd / "libfreerdp" / "libcore3.so").symlink_to(bd / "libfreerdp" / "libcore3.so.3.20")  # skipped
-    mk("winpr/libsupport3.so.3", b"B" * 3000)               # second core lib
+    mk("libcore/libcore3.so.3.20", b"A" * 5000)             # largest core lib (versioned real file)
+    (bd / "libcore" / "libcore3.so").symlink_to(bd / "libcore" / "libcore3.so.3.20")  # skipped
+    mk("libsup/libsupport3.so.3", b"B" * 3000)              # second core lib
     mk("lib/libclang_rt.asan.so", b"D" * 9000)              # sanitizer runtime -> excluded
     for i, nm in enumerate(("liba", "libb", "libc", "libd")):  # small plugins
         mk(f"ch/{nm}.so", bytes([65 + i]) * (50 + i))

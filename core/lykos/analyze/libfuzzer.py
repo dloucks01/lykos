@@ -1743,7 +1743,7 @@ def _collect_cmake_libraries(bd):
             sz = p.stat().st_size
         except OSError:
             continue
-        stem = _re.sub(r"\.so.*$", "", n)                 # libfreerdp3.so.3.20 -> libfreerdp3
+        stem = _re.sub(r"\.so.*$", "", n)                 # libcore3.so.3.20 -> libcore3
         if stem not in best or sz > best[stem][0]:
             best[stem] = (sz, str(p))
     return [path for _sz, path in sorted(best.values(), key=lambda t: -t[0])][:_LIB_TARGET_MAX]
