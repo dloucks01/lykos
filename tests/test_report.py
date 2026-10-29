@@ -348,6 +348,37 @@ def test_finding_reachability_path_and_attack_surface(store, case):
     assert "Path from an input source" in html
 
 
+def test_verification_shortlist_and_noise(store, case):
+    """The report triages distinct issues into prove-out shortlist / off-surface / noise, and each
+    finding carries its verdict -- the de-noise step, without touching the earned `confirmed` state."""
+    t = store.targets.upsert(case.id, filename="svc3", sha256=hash_bytes(b"svc3"), size=8,
+                             arch="x86_64", bits=64, endianness="little", stripped=False,
+                             file_type="ELF", linking="dynamic")
+    fd = FindingDAO(store.conn)
+    # a real on-surface finding (shortlist)
+    fd.upsert(t.id, case.id, {"dedup_key": "on1", "cwe": "CWE-190", "title": "ovf", "severity": "high",
+              "state": "corroborated", "detector": "source_recipe", "evidence": [
+                  {"channel": "surface", "detail": "on the fuzzed attack surface (in-tree harness)"}]})
+    # an off-surface finding
+    fd.upsert(t.id, case.id, {"dedup_key": "off1", "cwe": "CWE-416", "title": "uaf", "severity": "high",
+              "state": "corroborated", "detector": "uaf", "evidence": [
+                  {"channel": "surface", "detail": "off the fuzzed attack surface (a build tool)"}]})
+    # an instrumentation artifact (noise)
+    fd.upsert(t.id, case.id, {"dedup_key": "noise1", "cwe": "CWE-129",
+              "title": "oob _ZN11__sanitizer internal_allocator", "severity": "high",
+              "state": "corroborated", "detector": "oob_index", "evidence": [
+                  {"channel": "surface", "detail": "on the fuzzed attack surface"}]})
+    r = build_report(store, case.id)
+    vz = r["summary"]["verification"]
+    assert vz["shortlist"] == 1 and vz["off_surface"] == 1 and vz["noise"] == 1
+    verdicts = {f["title"]: f["verification"]["verdict"] for t in r["targets"] for f in t["findings"]}
+    assert verdicts["ovf"] == "prove-out-shortlist"
+    assert verdicts["uaf"] == "off-surface"
+    assert verdicts["oob _ZN11__sanitizer internal_allocator"] == "instrumentation-noise"
+    html = to_html(r)
+    assert "prove-out shortlist" in html and "instrumentation artifact" in html
+
+
 def test_finding_exploitability_and_ceiling(store, case):
     """Each finding carries the class primitive, the target's mitigations in the way, and the
     tool's own honest ceiling lifted from the evidence."""

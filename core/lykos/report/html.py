@@ -426,6 +426,17 @@ def to_html(report: dict[str, Any]) -> str:
             f'{summ.get("findings", 0)} raw findings — {dist["multi_target"]} appear in more than '
             f'one target (the same source bug is reported once per target that compiles the file). '
             f'Counts below are raw findings unless labelled “distinct”.</p>')
+    # Verification triage (distinct issues): the de-noised prove-out shortlist vs off-surface vs
+    # instrumentation artifacts -- "which of these are actual findings worth proving out".
+    vz = summ.get("verification") or {}
+    if vz and (vz.get("shortlist") or vz.get("off_surface") or vz.get("noise")):
+        bits = [f'<b>{vz.get("shortlist", 0)}</b> on the fuzzed attack surface (prove-out shortlist)']
+        if vz.get("off_surface"):
+            bits.append(f'{vz["off_surface"]} off-surface (lower priority)')
+        if vz.get("noise"):
+            bits.append(f'{vz["noise"]} instrumentation artifact(s)')
+        parts.append('<p class="muted verify-note">Verification (distinct issues): '
+                     + ' · '.join(bits) + '.</p>')
     bysev = summ.get("by_severity", {})
     if bysev:
         parts.append('<div class="chips">' + "".join(
@@ -755,6 +766,15 @@ def _finding_html(f: dict) -> str:
         p.append(_badge(f'{lvl}{"" if lvl_ver else " (unverified)"}',
                         _LEVEL_COLOR.get(lvl, "#8b8d98")))
     p.append(_badge(state, _STATE_COLOR.get(state, "#8b8d98")))
+    # Verification verdict: the de-noise / prove-out-shortlist review. A clear badge so a reader
+    # sees at a glance whether this is a real on-surface finding, off-surface, or an artifact.
+    vf = f.get("verification") or {}
+    _VERDICT_BADGE = {"prove-out-shortlist": ("prove-out shortlist", "#2ea043"),
+                      "off-surface": ("off-surface", "#6e7681"),
+                      "instrumentation-noise": ("instrumentation artifact", "#d29922")}
+    if vf.get("verdict") in _VERDICT_BADGE:
+        _lbl, _col = _VERDICT_BADGE[vf["verdict"]]
+        p.append(_badge(_lbl, _col))
     # One bug, filed per target that compiles the file: say so, so a reader does not read N copies
     # as N bugs. Only when it genuinely spans more than one target.
     span = f.get("target_span") or 1

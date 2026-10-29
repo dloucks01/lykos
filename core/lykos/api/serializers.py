@@ -101,11 +101,16 @@ def _finding(f, sites=None, site_count=None, proven=0, mitigations=None):
         attack_surface,
         finding_analysis,
         finding_exploitability,
+        finding_verification,
     )
     d["analysis"] = finding_analysis(d)
     _ex = finding_exploitability(d, mitigations)
     if _ex:
         d["exploitability"] = _ex
+    # The "is this an actual finding?" review verdict (de-noise + prove-out shortlist). Sound and
+    # conservative -- it never sets the earned `confirmed` state. `reachable` is left None in the
+    # list view (the call-graph path is a report/detail-view computation).
+    d["verification"] = finding_verification(d)
     _surf = attack_surface(d)
     if _surf:
         d["reachability"] = {"attack_surface": _surf}

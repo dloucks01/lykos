@@ -132,3 +132,59 @@ def attack_surface(f: dict) -> Optional[str]:
         if "off the fuzzed attack surface" in d:
             return "off"
     return None
+
+
+#: Symbols that mark a finding as anchored in INSTRUMENTATION / sanitizer / fuzzer RUNTIME code
+#: rather than the target's own code -- an artifact of analysing the instrumented build, not a real
+#: target defect. Conservative: only unambiguous runtime symbols, so de-noising never hides a real
+#: finding (a false "noise" flag would be worse than none).
+_NOISE_MARKERS = ("__sanitizer", "internal_allocator", "_zn6fuzzer", "fuzzer::executecommand",
+                  "__asan", "__ubsan", "__lsan", "asan_report", "sanitizer_cov")
+
+
+def instrumentation_noise(f: dict) -> dict:
+    """{noise: bool, reason?} -- True when the finding is anchored in sanitizer/fuzzer runtime code.
+    Scans the title + evidence prose for unambiguous runtime symbols (addresses alone never match)."""
+    hay = (f.get("title") or "").lower()
+    for e in f.get("evidence") or []:
+        if isinstance(e, dict):
+            hay += " " + (e.get("detail") or "").lower()
+    for m in _NOISE_MARKERS:
+        if m in hay:
+            return {"noise": True, "reason": f"anchored in instrumentation/runtime symbol ({m})"}
+    return {"noise": False}
+
+
+def finding_verification(f: dict, reachable: Optional[bool] = None) -> dict:
+    """The "is this an actual finding?" review verdict -- sound and conservative, it NEVER sets the
+    earned `confirmed` state (that is reserved for a fired reproducer / dynamic confirm). It
+    separates the pile into:
+
+      * noise             -- an instrumentation/runtime artifact, not a target defect (de-prioritise)
+      * prove-out shortlist -- a real finding on the fuzzed attack surface (attacker-reachable
+                               surface): the slice worth synthesizing a driver for and proving out
+      * off-surface       -- a real finding not compiled into any harness (lower remote priority)
+
+    `reachable` (optional, from the call-graph path) is a BONUS signal noted when present; its
+    absence is not held against a finding (the recovered call graph is incomplete, so a missing
+    path is usually graph incompleteness, not proof of unreachability). `shortlist` is the
+    actionable flag #5 consumes.
+    """
+    noise = instrumentation_noise(f)
+    surf = attack_surface(f)
+    if noise["noise"]:
+        verdict = "instrumentation-noise"
+    elif surf == "on":
+        verdict = "prove-out-shortlist"
+    elif surf == "off":
+        verdict = "off-surface"
+    else:
+        verdict = "unclassified"
+    return {
+        "verdict": verdict,
+        "noise": noise["noise"],
+        "noise_reason": noise.get("reason"),
+        "attack_surface": surf,
+        "reachable": reachable,
+        "shortlist": verdict == "prove-out-shortlist",
+    }

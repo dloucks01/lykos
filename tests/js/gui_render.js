@@ -153,6 +153,21 @@ function renderInfo(vnode) {
   ck("FindingCard renders the attack surface with its tone class",
     /On the fuzzed attack surface/.test(detail.all) && detail.classes.some((c) => /surf-on/.test(c)));
 
+  // Verification verdict badge (doc 49 #3): the de-noise / prove-out-shortlist review.
+  const shortlist = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, verification: { verdict: "prove-out-shortlist", shortlist: true, noise: false } },
+    pocs: [], reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard renders the prove-out-shortlist verdict badge",
+    /prove-out shortlist/.test(shortlist.all) && shortlist.classes.some((c) => /vb-prove-out-shortlist/.test(c)));
+  const noise = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, verification: { verdict: "instrumentation-noise", noise: true,
+      noise_reason: "anchored in instrumentation/runtime symbol (__sanitizer)" } },
+    pocs: [], reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard renders the instrumentation-artifact verdict badge",
+    /instrumentation artifact/.test(noise.all) && noise.classes.some((c) => /vb-instrumentation-noise/.test(c)));
+
   // A candidate must NOT be styled as demonstrated.
   const cand = renderInfo(h(C.FindingCard, {
     finding: { id: "F2", cwe: "CWE-120", title: "strcpy", severity: "high", state: "candidate" },

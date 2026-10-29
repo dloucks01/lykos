@@ -8,6 +8,8 @@ from lykos.analyze.confirm_ladder import (
     attack_surface,
     finding_analysis,
     finding_exploitability,
+    finding_verification,
+    instrumentation_noise,
 )
 from lykos.api.serializers import _finding
 
@@ -56,6 +58,36 @@ def test_attack_surface_from_evidence():
     assert attack_surface({"evidence": []}) is None
 
 
+def test_instrumentation_noise_is_conservative():
+    # a sanitizer-runtime artifact is flagged
+    n = instrumentation_noise({"title": "oob write _ZN11__sanitizerL24internal_allocator_cacheE[-9]",
+                               "evidence": []})
+    assert n["noise"] and "instrumentation" in n["reason"]
+    # a real target finding is NOT flagged (no false "noise")
+    assert instrumentation_noise({"title": "integer overflow in rdpsnd", "evidence": [
+        {"channel": "static", "detail": "realloc sizes from overflow-prone arithmetic"}]})["noise"] \
+        is False
+
+
+def test_finding_verification_verdicts():
+    # on attack surface + real -> prove-out shortlist
+    v = finding_verification({"title": "ovf", "evidence": [
+        {"channel": "s", "detail": "on the fuzzed attack surface (in an in-tree harness)"}]})
+    assert v["verdict"] == "prove-out-shortlist" and v["shortlist"] is True and v["noise"] is False
+    # off attack surface -> off-surface, not shortlist
+    v = finding_verification({"title": "ovf", "evidence": [
+        {"channel": "s", "detail": "off the fuzzed attack surface (a build tool)"}]})
+    assert v["verdict"] == "off-surface" and v["shortlist"] is False
+    # instrumentation artifact -> noise, regardless of surface
+    v = finding_verification({"title": "oob _ZN11__sanitizer internal_allocator", "evidence": [
+        {"channel": "s", "detail": "on the fuzzed attack surface"}]})
+    assert v["verdict"] == "instrumentation-noise" and v["noise"] is True and v["shortlist"] is False
+    # bonus reachable signal is carried through
+    v = finding_verification({"title": "x", "evidence": [
+        {"channel": "s", "detail": "on the fuzzed attack surface"}]}, reachable=True)
+    assert v["reachable"] is True
+
+
 def test_serializer_attaches_per_finding_detail():
     f = _f(cwe="CWE-134", state="corroborated", evidence=[
         {"channel": "w", "detail": "weaponization reached L2 and stopped: PIE no leak"},
@@ -65,3 +97,5 @@ def test_serializer_attaches_per_finding_detail():
     assert d["analysis"]["next_state"] == "confirmed"
     assert d["exploitability"]["ceiling"] == "L2"
     assert d["reachability"]["attack_surface"] == "on"
+    assert d["verification"]["verdict"] == "prove-out-shortlist"
+    assert d["verification"]["shortlist"] is True

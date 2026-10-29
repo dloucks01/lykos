@@ -26,6 +26,7 @@ from ..db.dao import (
 from ..analyze.confirm_ladder import attack_surface as _attack_surface
 from ..analyze.confirm_ladder import finding_analysis as _finding_analysis
 from ..analyze.confirm_ladder import finding_exploitability as _finding_exploitability
+from ..analyze.confirm_ladder import finding_verification as _finding_verification
 from ..analyze.stages import label_for as _stage_label_report
 from . import figures as _figures
 from ..db.models import FINDING_STATES, SEVERITIES
@@ -906,6 +907,9 @@ def build_report(
                 if _steps or _surface:
                     _f["reachability"] = {"attack_surface": _surface,
                                           "path": [s["label"] for s in (_steps or [])]}
+                # The verification verdict (de-noise + prove-out shortlist), with the call-graph
+                # path as the bonus `reachable` signal when one was found (doc 49 #3).
+                _f["verification"] = _finding_verification(_f, reachable=bool(_steps))
             tout["execution"]["has_gaps"] = has_execution_gaps(tout)
             tout["verdict"] = target_verdict(tout)
             targets_out.append(tout)
@@ -915,19 +919,25 @@ def build_report(
     # the distinct issues (a multi-target source case can inflate it several-fold). A "distinct
     # issue" is one dedup_key; each finding also learns how many targets it spans (`target_span`),
     # which the report/GUI show as "N targets" so a reader is never misled by the inflated total.
+    # best verification verdict per distinct issue (shortlist beats off-surface beats noise)
+    _VERDICT_RANK = {"prove-out-shortlist": 3, "off-surface": 2, "unclassified": 1,
+                     "instrumentation-noise": 0}
     _clusters: dict[str, dict] = {}
     for _t in targets_out:
         for _f in _t["findings"]:
             dk = _f.get("dedup_key")
             if not dk:
                 continue
+            _v = (_f.get("verification") or {}).get("verdict") or "unclassified"
             c = _clusters.setdefault(dk, {"targets": set(), "severity": _f["severity"],
-                                          "state": _f["state"]})
+                                          "state": _f["state"], "verdict": _v})
             c["targets"].add(_t["id"])
             if _rank(FINDING_STATES, _f["state"]) > _rank(FINDING_STATES, c["state"]):
                 c["state"] = _f["state"]
             if _rank(SEVERITIES, _f["severity"]) > _rank(SEVERITIES, c["severity"]):
                 c["severity"] = _f["severity"]
+            if _VERDICT_RANK.get(_v, 1) > _VERDICT_RANK.get(c["verdict"], 1):
+                c["verdict"] = _v
     _span = {dk: len(c["targets"]) for dk, c in _clusters.items()}
     for _t in targets_out:
         for _f in _t["findings"]:
@@ -943,6 +953,14 @@ def build_report(
         "multi_target": sum(1 for c in _clusters.values() if len(c["targets"]) > 1),
         "by_severity": {s: _d_sev.get(s, 0) for s in reversed(SEVERITIES) if _d_sev.get(s)},
         "by_state": {s: _d_state.get(s, 0) for s in FINDING_STATES if _d_state.get(s)},
+    }
+    # Verification rollup over DISTINCT issues: the de-noised prove-out shortlist (real + on the
+    # fuzzed attack surface), the off-surface remainder, and the instrumentation artifacts. This is
+    # the "verify it's an actual finding" triage -- it never sets the earned `confirmed` state.
+    verification = {
+        "shortlist": sum(1 for c in _clusters.values() if c["verdict"] == "prove-out-shortlist"),
+        "off_surface": sum(1 for c in _clusters.values() if c["verdict"] == "off-surface"),
+        "noise": sum(1 for c in _clusters.values() if c["verdict"] == "instrumentation-noise"),
     }
 
     engines = _engines(rdao, case_id)
@@ -972,6 +990,8 @@ def build_report(
             # Deduped headline: how many DISTINCT issues the raw findings represent, so a
             # source case built into N targets is not read as N x the bugs.
             "distinct": distinct,
+            # The verification triage over distinct issues: prove-out shortlist / off-surface / noise.
+            "verification": verification,
             "by_state": {s: by_state.get(s, 0) for s in FINDING_STATES if by_state.get(s)},
             "by_severity": {s: by_severity.get(s, 0)
                             for s in reversed(SEVERITIES) if by_severity.get(s)},

@@ -574,6 +574,16 @@ const RATING_CLASS = {
   EXPLOITABLE: "exp-hi", PROBABLY_EXPLOITABLE: "exp-hi",
   UNKNOWN: "exp-mid", PROBABLY_NOT_EXPLOITABLE: "exp-lo", NOT_EXPLOITABLE: "exp-lo",
 };
+// Verification verdict badge: the "is this an actual finding?" review (de-noise + prove-out
+// shortlist). Never implies the earned `confirmed` state -- it is a triage signal.
+const VERIFY_BADGE = {
+  "prove-out-shortlist": { label: "prove-out shortlist",
+    tip: "a real finding on the fuzzed attack surface — the slice worth proving out" },
+  "off-surface": { label: "off-surface",
+    tip: "not compiled into any in-tree harness — lower remote-reachability priority, not dismissed" },
+  "instrumentation-noise": { label: "instrumentation artifact",
+    tip: "anchored in sanitizer/fuzzer runtime code, not the target's own — de-prioritised" },
+};
 function fmtAddr(a) {
   if (a == null) return null;
   if (typeof a === "string") return a;
@@ -726,6 +736,10 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
         </div>
         <${CurationChip} curation=${finding.curation} />
         <${Badge} state=${finding.state} />
+        ${finding.verification && VERIFY_BADGE[finding.verification.verdict]
+          ? html`<span class=${`verify-badge vb-${finding.verification.verdict}`}
+              title=${finding.verification.noise_reason || VERIFY_BADGE[finding.verification.verdict].tip}>
+              ${VERIFY_BADGE[finding.verification.verdict].label}</span>` : null}
       </div>
       <div class="find-gloss">${STATE_GLOSS[finding.state] || ""}</div>
 
