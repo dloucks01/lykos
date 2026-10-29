@@ -56,3 +56,24 @@ def resolve_sites(binary, sites, *, timeout: float = 30.0) -> dict:
 def site_addrs(binary, sites, *, timeout: float = 30.0) -> list:
     """The de-duplicated list of addresses for `sites` found in `binary`'s DWARF line table."""
     return sorted(set(resolve_sites(binary, sites, timeout=timeout).values()))
+
+
+def source_files(binary, *, timeout: float = 60.0) -> set:
+    """The set of source-file BASENAMES that contributed code to `binary`, from its DWARF line table.
+    A file appears here iff code compiled from it was linked in -- a sound, conservative signal that
+    the file is on the attack surface a fuzz harness (or the shared libs it links) actually exercises.
+    Empty when objdump is missing or the binary has no line info (caller then ranks nothing)."""
+    objdump = shutil.which("objdump")
+    if objdump is None:
+        return set()
+    try:
+        r = subprocess.run([objdump, "--dwarf=decodedline", str(binary)],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    files: set = set()
+    for line in (r.stdout or "").splitlines():
+        m = _ROW.match(line)
+        if m:
+            files.add(os.path.basename(m.group(1)))
+    return files

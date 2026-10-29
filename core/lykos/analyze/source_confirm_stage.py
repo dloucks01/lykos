@@ -76,6 +76,65 @@ def _steer_sites(ctx, target) -> list:
     return sites
 
 
+#: detectors whose findings are ranked by attack-surface proximity (static source + the recipe floor).
+_RANKABLE_DETECTORS = _STATIC_SOURCE_DETECTORS + ("source_recipe",)
+
+
+def _attack_surface(harness_bins, lib_dirs) -> set:
+    """The set of source-file basenames compiled into the fuzz target -- the harness ELFs plus the
+    shared objects they link (where a shared build keeps the parser). Bounded so a huge project cannot
+    make this run away; empty when no DWARF/objdump, in which case the caller ranks nothing."""
+    from pathlib import Path as _P
+    objs = list(harness_bins)
+    for d in (lib_dirs or []):
+        try:
+            objs += [str(p) for p in sorted(_P(d).glob("*.so*"))][:40]
+        except OSError:
+            pass
+    files: set = set()
+    for o in objs[:60]:
+        files |= dwarfline.source_files(o)
+    return files
+
+
+def _rank_by_surface(ctx, target, surface) -> dict:
+    """Annotate the static source findings + recipes by whether their file is on the fuzzed attack
+    surface. IN-surface findings are boosted (more actionable: the fuzzer actually exercises that
+    file) and annotated; OUT-of-surface ones are annotated only -- never hidden or penalised, so a
+    real bug off the fuzzed path is still reported, just lower in the ranking. Returns counts."""
+    fd = FindingDAO(ctx.conn)
+    inc = outc = 0
+    for f in fd.list_by_target(target.id):
+        if f.detector not in _RANKABLE_DETECTORS:
+            continue
+        base = None
+        for e in (f.evidence or []):
+            if e.get("channel") in ("source", "recipe-source"):
+                fp, _ = _parse_loc(e.get("detail"))
+                if fp:
+                    base = os.path.basename(fp)
+                    break
+        if not base:
+            continue
+        on = base in surface
+        if on:
+            inc += 1
+            detail = "on the fuzzed attack surface (its file is compiled into an in-tree fuzz harness)"
+            newconf = min(0.9, (f.confidence or 0.0) + 0.15)
+        else:
+            outc += 1
+            detail = ("off the fuzzed attack surface (its file is not compiled into any in-tree fuzz "
+                      "harness -- e.g. a build tool, example, or platform-specific client); lower "
+                      "remote-reachability priority, not dismissed")
+            newconf = f.confidence or 0.0
+        fd.upsert(target.id, target.case_id, {
+            "cwe": f.cwe, "title": f.title, "severity": f.severity or "medium",
+            "detector": f.detector, "dedup_key": f.dedup_key, "state": f.state,
+            "confidence": newconf, "channel": "attack-surface",
+            "evidence": [{"channel": "attack-surface", "detail": detail}]})
+    return {"in_surface": inc, "off_surface": outc}
+
+
 def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> int:
     """Upgrade a co-located STATIC source candidate to `confirmed` when this ladder crash proves it:
     the crash's file:line matches the candidate's AND the CWE agrees. Sound -- an ASan fault at the
@@ -224,6 +283,14 @@ def source_confirm_stage(ctx) -> dict:
         if not b["ok"]:
             builds[name]["error"] = (b.get("log") or "")[-300:]
 
+    # Attack-surface ranking: a static finding whose file is compiled into a fuzz harness (or the libs
+    # it links) is on the surface the fuzzers exercise -> boost it over build tools / platform clients.
+    ctx.progress(msg="ranking source findings by attack-surface proximity")
+    surf_bins = [h["binary"] for h in (fuzzb["harnesses"] if fuzzb["ok"] else [])]
+    surf_bins += [h["binary"] for h in (explore["harnesses"] if explore["ok"] else [])]
+    surface = _attack_surface(surf_bins, fuzzb.get("lib_dirs") if fuzzb["ok"] else None) if surf_bins else set()
+    ranked = _rank_by_surface(ctx, target, surface) if surface else {"in_surface": 0, "off_surface": 0}
+
     per = max(30, int((budget * 0.6) / max(1, len(harnesses))))
     attempts: list = []
     proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
@@ -244,9 +311,11 @@ def source_confirm_stage(ctx) -> dict:
     ctx.emit("source_confirm.done", payload={"supported": True, "harnesses": len(harnesses),
              "confirmed": len(proven), "upgraded": upgraded,
              "rungs": sorted({r.get("rung") for r in proven}),
-             "builds": builds, "rungs_ran": ran, "attempts": attempts})
+             "builds": builds, "rungs_ran": ran, "attempts": attempts,
+             "surface_files": len(surface), "ranked": ranked})
     return {"metrics": {"supported": True, "harnesses": len(harnesses), "confirmed": len(proven),
-                        "upgraded": upgraded, "rungs_ran": ran}}
+                        "upgraded": upgraded, "rungs_ran": ran,
+                        "in_surface": ranked["in_surface"], "off_surface": ranked["off_surface"]}}
 
 
 def register() -> None:
