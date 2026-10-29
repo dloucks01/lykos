@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Optional
 
@@ -556,6 +557,85 @@ def _coverage_figure(targets_out: list[dict]) -> Optional[str]:
         return None
 
 
+#: a source location `path.ext:line` inside a finding's evidence detail.
+_SRC_LOC_RE = re.compile(r"([\w./+\-]+\.(?:c|cc|cpp|cxx|h|hpp|hh|cs|go|rs|py|java|js|ts)):(\d+)")
+
+
+def _finding_src_loc(f: dict):
+    """(relpath, line) for a finding whose evidence carries a source location; else None."""
+    for e in f.get("evidence") or []:
+        m = _SRC_LOC_RE.search(str(e.get("detail") or ""))
+        if m:
+            return m.group(1), int(m.group(2))
+    return None
+
+
+def _match_src_member(members: list, path: str):
+    """A tar member whose name is, or ends with, `path` (the tree is archived under a top dir)."""
+    if path in members:
+        return path
+    suf = "/" + path
+    return next((m for m in members if m.endswith(suf)), None)
+
+
+def _snippet(lines: list, ln: int, path: str, ctx: int) -> Optional[dict]:
+    n = len(lines)
+    if ln < 1 or ln > n:
+        return None
+    lo, hi = max(1, ln - ctx), min(n, ln + ctx)
+    return {"file": path, "line": ln,
+            "rows": [{"n": i, "text": lines[i - 1], "hit": i == ln} for i in range(lo, hi + 1)]}
+
+
+def _attach_source_snippets(store, target, findings_out: list, *, ctx: int = 4, cap: int = 120):
+    """Attach the vulnerable SOURCE lines around each finding's site, read ONCE from the archived
+    source tree, so the report shows the code -- not just a file:line. Best-effort: a tree that
+    cannot be read, or a file/line that cannot be located, simply yields no snippet (never raised)."""
+    want: dict = {}
+    for f in findings_out:
+        loc = _finding_src_loc(f)
+        if loc:
+            want.setdefault(loc[0], []).append((f, loc[1]))
+    if not want:
+        return
+    try:
+        from ..analyze.source_lookup import source_project_for
+        proj = source_project_for(store.conn, target)
+        if proj is None:
+            return
+        import io
+        import tarfile
+        raw = store.content.path(proj.sha256).read_bytes()
+        tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+    except Exception:                                    # noqa: BLE001 -- snippets are advisory
+        observe.absorbed(_log, "source tree unavailable for snippets")
+        return
+    try:
+        infos = {m.name: m for m in tf.getmembers() if m.isfile()}
+        names = list(infos)
+        done = 0
+        for path, flist in want.items():
+            if done >= cap:
+                break
+            mem = _match_src_member(names, path)
+            if not mem:
+                continue
+            try:
+                text = tf.extractfile(infos[mem]).read().decode("utf-8", "replace")
+            except Exception:                            # noqa: BLE001
+                continue
+            lines = text.splitlines()
+            for f, ln in flist:
+                if done >= cap:
+                    break
+                snip = _snippet(lines, ln, path, ctx)
+                if snip:
+                    f["source_snippet"] = snip
+                    done += 1
+    finally:
+        tf.close()
+
+
 def build_report(
     store,
     case_id: str,
@@ -788,6 +868,9 @@ def build_report(
                 _edges = []
             tout["figures"] = {"call_graph": _call_graph_svg(_edges, findings_out),
                                "patch_diff": _patch_diff_map_svg(findings_out)}
+            # The vulnerable SOURCE lines around each finding's site -- read once from the archived
+            # tree so the report shows the code, not just a file:line.
+            _attach_source_snippets(store, t, findings_out)
             for _f in findings_out:
                 _f["figures"] = {"provenance": _provenance_chain_svg(_f),
                                  "reachability": _reachability_path_svg(_edges, _f)}

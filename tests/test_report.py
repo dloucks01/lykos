@@ -108,6 +108,34 @@ def test_html_self_contained(store, case):
     assert "Confidence states" in html and "Impact levels" in html
 
 
+def test_source_snippet_helpers():
+    from lykos.report.model import _finding_src_loc, _match_src_member, _snippet
+    assert _finding_src_loc({"evidence": [{"channel": "source", "detail": "a/b.c:42: x"}]}) == ("a/b.c", 42)
+    assert _finding_src_loc({"evidence": [{"detail": "no source location here"}]}) is None
+    snip = _snippet(["l1", "l2", "l3", "l4", "l5"], 3, "x.c", ctx=1)
+    assert snip["line"] == 3 and [r["n"] for r in snip["rows"]] == [2, 3, 4]
+    assert [r["hit"] for r in snip["rows"]] == [False, True, False]
+    # the tree is archived under a top dir -> suffix match on the relative path
+    assert _match_src_member(["freerdp-3.20.0/winpr/wlog.c", "x"], "winpr/wlog.c") \
+        == "freerdp-3.20.0/winpr/wlog.c"
+    assert _match_src_member(["a/foo.c"], "bar.c") is None
+
+
+def test_html_renders_vulnerable_code_snippet_and_cwe_reference():
+    from lykos.report.html import _finding_html
+    f = {"title": "format string", "severity": "high", "state": "corroborated", "cwe": "CWE-134",
+         "cwe_name": "Uncontrolled Format String", "detector": "source_sink",
+         "evidence": [{"channel": "source", "detail": "winpr/wlog.c:362: non-literal format"}],
+         "source_snippet": {"file": "winpr/wlog.c", "line": 362, "rows": [
+             {"n": 361, "text": "  PRAGMA_IGNORE", "hit": False},
+             {"n": 362, "text": "  vsnprintf(buf, n, cmessage->FormatString, args);", "hit": True},
+             {"n": 363, "text": "    return FALSE;", "hit": False}]}}
+    h = _finding_html(f)
+    assert "Vulnerable code" in h and "winpr/wlog.c:362" in h
+    assert 'class="cline hit"' in h and "vsnprintf" in h           # the finding line, highlighted
+    assert "cwe.mitre.org/data/definitions/134.html" in h          # the CWE reference link
+
+
 def test_html_headline_tolerates_a_non_escalation_verdict_level(store):
     """A tag-only verdict level such as `L0-secret` (a hardcoded-secret finding) must not crash the
     headline, which only escalates on the dynamic rungs L1/L2/L3."""

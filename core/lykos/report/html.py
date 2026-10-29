@@ -658,6 +658,23 @@ def _finding_html(f: dict) -> str:
         ("Function", f.get("function_addr")),
         ("Site", f.get("site_addr")),
     ]))
+    # CWE reference: the authoritative definition, so the class is not just an opaque code.
+    if cwe and cwe.startswith("CWE-") and cwe.split("-")[-1].isdigit():
+        num = esc(cwe.split("-")[-1])
+        p.append(f'<div class="cweref muted">Reference: <a href="https://cwe.mitre.org/data/'
+                 f'definitions/{num}.html">{esc(cwe)} — {esc(f.get("cwe_name") or "")}</a> '
+                 '(MITRE CWE)</div>')
+    # The vulnerable SOURCE, with the finding's line marked -- the code, not just a file:line.
+    snip = f.get("source_snippet")
+    if snip and snip.get("rows"):
+        p.append('<div class="evlabel">Vulnerable code '
+                 f'<span class="muted">— {esc(snip.get("file"))}:{esc(snip.get("line"))}</span></div>')
+        code = []
+        for r in snip["rows"]:
+            cls = "cline hit" if r.get("hit") else "cline"
+            code.append(f'<span class="{cls}"><span class="ln">{esc(r.get("n"))}</span>'
+                        f'<span class="src">{esc(r.get("text"))}</span></span>')
+        p.append('<pre class="code">' + "".join(code) + '</pre>')
     # Provenance + source-reachability figures (doc 49 Theme 4) -- trusted, internally-escaped SVG
     # from report.figures, inserted raw. Each is None when there is nothing honest to draw.
     figs = f.get("figures") or {}
@@ -789,6 +806,17 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
 .lg-0{color:var(--faint)}
 .lg-d{line-height:1.5}
 @media (max-width:560px){.lg-row{grid-template-columns:96px 1fr;}.lg-n{display:none}}
+/* vulnerable-code snippet: line-numbered, with the finding's line highlighted */
+.cweref{font-size:12px;margin:2px 0 6px}
+.code{margin:4px 0 2px;padding:8px 0;background:var(--surface-2);border:1px solid var(--border);
+  border-radius:7px;overflow-x:auto;font-family:var(--mono);font-size:12px;line-height:1.5}
+.cline{display:block;white-space:pre;padding:0 10px}
+.cline .ln{display:inline-block;width:3.2em;margin-right:12px;text-align:right;color:var(--faint);
+  user-select:none}
+.cline .src{color:var(--text)}
+.cline.hit{background:color-mix(in srgb,#e5484d 14%,transparent)}
+.cline.hit .ln{color:#e5484d;font-weight:700}
+.cline.hit .src{font-weight:600}
 .remed{margin:2px 0;padding:8px 10px;border-left:3px solid #46a758;
   background:color-mix(in srgb,#46a758 8%,transparent);font-size:12.5px;line-height:1.5}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
