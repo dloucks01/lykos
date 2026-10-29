@@ -192,6 +192,18 @@ def test_a_finding_links_to_its_discovering_stage():
     assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"
 
 
+def test_the_home_view_is_the_engagement_map_that_drives_the_tabs():
+    """A case lands on a Home view whose engagement map (recover->detect->search->prove) drives the
+    tabs: each reached phase navigates to the tab where its work lives."""
+    assert 'useState("home")' in APP, "the workbench does not default to the Home view"
+    assert "home:" in APP and '"home"' in APP, "no Home tab is registered"
+    # Home renders the engagement map, wired to navigate tabs
+    assert "<${EngagementMap} phases=${engPhases} onNav=${setTab} home=${true}" in APP, \
+        "the Home view does not render the tab-driving engagement map"
+    # the phase nodes carry the tab each navigates to
+    assert 'nav: "functions"' in APP and 'nav: "findings"' in APP and 'nav: "exploits"' in APP
+
+
 def test_the_prove_out_plan_and_exploitability_walk_into_the_spine():
     """A shortlisted finding's prove-out plan links its sink function into the call graph, and a
     demonstrated exploitability links into the Exploits tab."""

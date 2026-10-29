@@ -383,6 +383,25 @@ function renderInfo(vnode) {
     /clear/i.test(renderInfo(h(C.CaseOverview,
       { findings: ovFindings, pocs: ovPocs, filter: { severity: "critical" }, onFilter() {} })).all));
 
+  // ---- EngagementMap: the Home landing's path that drives the tabs ----
+  const eng = renderInfo(h(C.EngagementMap, {
+    phases: [
+      { label: "Recover", detail: "12 functions", reached: true, nav: "functions" },
+      { label: "Detect", detail: "3 findings", reached: true, nav: "findings" },
+      { label: "Search", detail: "not executed", reached: false, nav: null },
+      { label: "Prove", detail: "no PoC", reached: false, nav: null },
+    ],
+    onNav() {}, home: true,
+  }));
+  ck("EngagementMap (home) renders the recover->prove path",
+    eng.threw.length === 0 && /Recover/.test(eng.all) && /Detect/.test(eng.all) && /Prove/.test(eng.all)
+    && eng.classes.some((c) => /engmap-home/.test(c)));
+  ck("EngagementMap reached phases are navigable, unreached are muted",
+    eng.classes.some((c) => /engmap-node reached clk/.test(c))
+    && eng.classes.some((c) => /engmap-node muted/.test(c)));
+  ck("EngagementMap (home) shows the open affordance on navigable phases", /open/.test(eng.all));
+  ck("EngagementMap is empty-safe", renderInfo(h(C.EngagementMap, { phases: [] })).threw.length === 0);
+
   // ---------- RunScorecard: what the run DID ----------
   // The workbench showed findings with no account of the work behind them: no executions, no
   // declines, no never-scheduled list, no absorbed count. There was no endpoint to ask, so of

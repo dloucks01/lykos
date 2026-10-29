@@ -839,6 +839,21 @@
   .engmap-lbl { font-weight: 600; font-size: .9rem; color: var(--ink); }
   .engmap-sub { font-size: .74rem; color: var(--muted); margin-top: 2px; }
   .engmap-arrow { display: flex; align-items: center; color: var(--faint); padding: 0 7px; }
+  /* Home landing: a larger, card-like engagement map that leads the case view. */
+  .wb-panel.home { max-width: 920px; }
+  .home-verdict { font-size: 1.05rem; font-weight: 600; padding: 10px 14px; border-radius: 10px; margin: 2px 0 16px; border-left: 4px solid var(--line); }
+  .home-verdict.tone-crit { border-left-color: var(--crit, #f85149); background: color-mix(in srgb, var(--crit, #f85149) 9%, transparent); }
+  .home-verdict.tone-high { border-left-color: var(--high, #db6d28); background: color-mix(in srgb, var(--high, #db6d28) 9%, transparent); }
+  .home-verdict.tone-med { border-left-color: var(--med, #d29922); background: color-mix(in srgb, var(--med, #d29922) 8%, transparent); }
+  .home-verdict.tone-info { border-left-color: var(--line); background: var(--panel-2); color: var(--muted); }
+  .engmap-home { gap: 0; }
+  .engmap-home .engmap-node { min-width: 140px; padding: 16px 14px; gap: 2px; }
+  .engmap-home .engmap-lbl { font-size: 1.05rem; }
+  .engmap-home .engmap-sub { font-size: .82rem; }
+  .engmap-home .engmap-go { margin-top: 8px; font-size: .72rem; color: var(--accent-2); opacity: 0; transition: opacity .12s; }
+  .engmap-home .engmap-node.clk:hover .engmap-go { opacity: 1; }
+  .engmap-home .engmap-arrow { font-size: 1.1rem; }
+  .home-hint { font-size: .78rem; color: var(--faint); margin-top: 12px; }
   /* compact target strip (2-pane: replaces the right drawer) */
   .wb-metabar { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
     padding: 8px 12px; margin-bottom: 12px; }

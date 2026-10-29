@@ -2354,9 +2354,9 @@ const _sameSeg = (a, b) => !!(a && b && _segKey(a) && _segKey(a) === _segKey(b))
 // The engagement map (doc 49 Theme 2a): the analysis path recover -> detect -> search -> prove,
 // each phase a clickable node that jumps to the tab where that phase's work lives. A reached phase
 // is solid; an unreached one is muted and inert -- so the map shows honestly how far this run got.
-export function EngagementMap({ phases, onNav }) {
+export function EngagementMap({ phases, onNav, home }) {
   if (!phases || !phases.length) return null;
-  return html`<div class="engmap">
+  return html`<div class=${`engmap${home ? " engmap-home" : ""}`}>
     ${phases.map((p, i) => html`
       ${i ? html`<span class="engmap-arrow" key=${"a" + i}>▸</span>` : null}
       <div key=${p.label}
@@ -2365,6 +2365,7 @@ export function EngagementMap({ phases, onNav }) {
         title=${p.reached ? (p.nav ? `Go to ${p.nav}` : "") : "not reached in this run"}>
         <span class="engmap-lbl">${p.label}</span>
         <span class="engmap-sub">${p.detail}</span>
+        ${home && p.reached && p.nav ? html`<span class="engmap-go">open ▸</span>` : null}
       </div>`)}
   </div>`;
 }

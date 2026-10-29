@@ -16,6 +16,7 @@ import {
 let _conSeq = 0;
 
 const stageLabelSafe = (s) => (s ? stageLabel(s) : "");
+const _LADDER_NAME = { 1: "crash reproduced", 2: "primitive established", 3: "working exploit" };
 
 // Match a finding's function address against a function row's address (hex or int, PIE-shifted
 // forms compared loosely on the low bits).
@@ -170,7 +171,7 @@ function App() {
   const [funcBrowse, setFuncBrowse] = useState(null); // {targetId, name, functions} for the function browser
   const [showCandidates, setShowCandidates] = useState(false); // triage: reveal speculative candidates
   const [activeTid, setActiveTid] = useState(null);   // the target focused in the workbench shell
-  const [tab, setTab] = useState("findings");         // active workbench tab
+  const [tab, setTab] = useState("home");              // active workbench tab (case lands on Home)
   const [viz, setViz] = useState(null);               // Case Overview click-filter ({severity}/{cwe})
   const [funcsByT, setFuncsByT] = useState({});       // lazy per-target caches for the tab views
   const [cgByT, setCgByT] = useState({});             // call-graph edges per target
@@ -266,7 +267,7 @@ function App() {
     setCoverage({}); setLedger(null); setTiming(null); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]);
     setOpenLog(null); setFuzzLive(null); setFuzzState(null); setInvChosen(null); setBgActivity(null);
     setConsoleLines([]); consoleSeen.current = new Set();
-    setActiveTid(null); setTab("findings"); setViz(null); setCgFocus(null);
+    setActiveTid(null); setTab("home"); setViz(null); setCgFocus(null);
     setRunSignals(null); setTriageByT({}); setSeeds([]);
     setCodeFn(null); setEvidence(null); setFuncBrowse(null);
     setDisasmFn(null); setDisasmSel({}); setDiffVerify(null); setPatchDiff(null); setScans({}); setHarnessRun(null);
@@ -1327,7 +1328,16 @@ function App() {
         : "no PoC",
       reached: !!(activeVerdict && activeVerdict.level), nav: "exploits" },
   ] : [];
+  // The Home landing's one-line verdict for the active target: impact first, else the honest
+  // static-only / nothing-demonstrated line (mirrors the report's executive headline).
+  const homeHeadline = !activeTarget ? ""
+    : (activeVerdict && activeVerdict.level) ? `Demonstrated impact: L${activeVerdict.level} — ${_LADDER_NAME[activeVerdict.level] || "reached"}`
+    : activeRanked.length ? `${activeRanked.length} finding${activeRanked.length === 1 ? "" : "s"} reported; none demonstrated dynamically in this run`
+    : "No defects demonstrated on this target in this run";
+  const homeTone = (activeVerdict && activeVerdict.level) ? (activeVerdict.level >= 3 ? "crit" : "high")
+    : activeRanked.length ? "med" : "info";
   const tabMeta = {
+    home: { label: "Home" },
     findings: { label: "Findings", n: activeRanked.length },
     ledger: { label: "Coverage ledger" },
     exploits: { label: "Exploits", n: activePocs.length },
@@ -1344,6 +1354,7 @@ function App() {
     console: { label: "Console", n: consoleLines.length },
   };
   const groupDefs = [
+    { id: "home", label: "Home", tabs: ["home"] },
     { id: "overview", label: "Overview", tabs: ["findings", "ledger"], n: activeRanked.length },
     { id: "exploits", label: "Exploits", tabs: ["exploits"], n: activePocs.length },
     { id: "code", label: "Code", tabs: ["functions", "disasm", "strings"] },
@@ -1492,14 +1503,23 @@ function App() {
                 </button>`)}
               </div>` : null}
 
-            ${tab === "findings" ? html`
+            ${tab === "home" ? html`
+              <div class="wb-panel home">
+                <!-- The case landing: the engagement path recover -> detect -> search -> prove, each
+                     phase a card that drives the tab where its work lives. The spine's entry point. -->
+                <${DynamicCoverageBanner} health=${fuzzHealth} ran=${ran} />
+                ${activeTarget ? html`<div class=${`home-verdict tone-${homeTone}`}>${homeHeadline}</div>` : null}
+                ${engPhases.length ? html`<${EngagementMap} phases=${engPhases} onNav=${setTab} home=${true} />`
+                  : html`<${EmptyResults} ran=${ran} />`}
+                <p class="home-hint">Click a phase to open its tab — or use the tabs above.</p>
+              </div>
+            ` : tab === "findings" ? html`
               <div class="wb-panel">
                 <!-- When NO dynamic engine could execute the target, say so HERE, next to the
                      findings -- a static-only (L0) result is a setup outcome, not a clean binary,
                      and the remedy (supply the target's libraries) belongs where the operator reads
                      the results, not only in the Console tab. -->
                 <${DynamicCoverageBanner} health=${fuzzHealth} ran=${ran} />
-                ${engPhases.length ? html`<${EngagementMap} phases=${engPhases} onNav=${setTab} />` : null}
                 ${activeRanked.length ? html`<${CaseOverview} findings=${activeRanked}
                   pocs=${activePocs} filter=${viz} onFilter=${setViz} />` : null}
                 ${activeRanked.length ? html`<${CurationFilter} mode=${curFilter} onChange=${setCurFilter} counts=${curCounts} />` : null}
