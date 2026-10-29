@@ -94,6 +94,35 @@ def _check_bundle_budget(sizes, what: str) -> None:
                                  "refusing to extract it", 413)
 
 
+#: files that mark a directory as a SOURCE-PROJECT root (so a lone wrapper dir is worth descending).
+_PROJECT_MARKERS = ("CMakeLists.txt", "configure", "configure.ac", "configure.in", "Makefile",
+                    "Makefile.am", "GNUmakefile", "meson.build", "autogen.sh", "setup.py",
+                    "pyproject.toml", "Cargo.toml", "go.mod", "package.json")
+
+
+def _descend_single_dir(d: Path) -> Path:
+    """A SOURCE tarball/zip usually wraps the tree in ONE top-level directory (`project/...`), so the
+    tree lands one level too deep and reads as "not a cmake project": the harnesses never build and
+    source_confirm declines (measured on a FreeRDP source tarball through the web GUI). Descend
+    through a lone wrapper directory ONLY when it is a recognisable project root (it holds a build
+    marker), matching `tar x && cd project`. A flat binary bundle (chal + libc + flag), and a lone
+    directory with no build marker, are left untouched -- binary-bundle ingest is unchanged. Dotfiles
+    and __MACOSX are ignored."""
+    cur = d
+    for _ in range(8):                                   # a few nested wrappers at most; bounded
+        try:
+            entries = [p for p in cur.iterdir()
+                       if not p.name.startswith(".") and p.name != "__MACOSX"]
+        except OSError:
+            break
+        if (len(entries) == 1 and entries[0].is_dir()
+                and any((entries[0] / m).exists() for m in _PROJECT_MARKERS)):
+            cur = entries[0]
+        else:
+            break
+    return cur
+
+
 def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
     """If `upload` is a zip/tar archive (a zipped challenge bundle), extract it SAFELY to a temp
     directory and return that dir for ingest() to treat as a bundle; otherwise return None. Path
@@ -115,7 +144,7 @@ def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
                     if m.endswith("/") or mp.is_absolute() or ".." in mp.parts:
                         continue
                     z.extract(info, dest)
-            return dest if any(dest.rglob("*")) else None
+            return _descend_single_dir(dest) if any(dest.rglob("*")) else None
         if tarfile.is_tarfile(upload):
             with tarfile.open(upload) as tf:
                 # getmembers() reads headers only (a compressed tar is streamed through, never
@@ -124,7 +153,7 @@ def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
                 _check_bundle_budget((m.size if m.isfile() else 0 for m in members),
                                      "the tar archive")
                 tf.extractall(dest, filter="data")   # 'data' filter blocks traversal/special files
-            return dest if any(dest.rglob("*")) else None
+            return _descend_single_dir(dest) if any(dest.rglob("*")) else None
     except BundleRejected:
         raise                                        # an over-ceiling archive is refused, not
                                                      # silently ingested as one opaque file

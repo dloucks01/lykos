@@ -500,8 +500,40 @@ def test_a_normal_bundle_still_extracts(tmp_path):
         zf.writestr("chal/bin", b"\x7fELF" + b"\0" * 60)
         zf.writestr("../evil", b"x")
     dest = endpoints._maybe_extract_bundle(z, tmp_path, "ok.zip")
+    # a flat binary bundle wrapped in one dir is NOT a project -> not descended (behaviour unchanged)
     assert dest is not None and (dest / "chal" / "bin").is_file()
     assert not (tmp_path / "evil").exists()
+
+
+def test_a_source_tarball_descends_to_the_project_root(tmp_path):
+    """A source tarball wraps the tree in a top-level dir (`project/CMakeLists.txt`). The bundle must
+    descend to the project ROOT so ingest/cmake see CMakeLists.txt -- otherwise the tree is one level
+    too deep and reads as 'not a cmake project' (the FreeRDP-through-the-GUI parity bug)."""
+    import tarfile
+    src = tmp_path / "proj"
+    (src / "freerdp-x").mkdir(parents=True)
+    (src / "freerdp-x" / "CMakeLists.txt").write_text("project(x)\n")
+    (src / "freerdp-x" / "vuln.c").write_text("int f(void){return 0;}\n")
+    tgz = tmp_path / "src.tgz"
+    with tarfile.open(tgz, "w:gz") as tf:
+        tf.add(src / "freerdp-x", arcname="freerdp-x")
+    from lykos.api import endpoints
+    dest = endpoints._maybe_extract_bundle(tgz, tmp_path / "td", "src.tgz")
+    # descended INTO freerdp-x/, so CMakeLists.txt is at the returned root (ingest will see it)
+    assert dest is not None and (dest / "CMakeLists.txt").is_file() and (dest / "vuln.c").is_file()
+
+
+def test_a_lone_dir_without_a_build_marker_is_not_descended(tmp_path):
+    import tarfile
+    src = tmp_path / "s"
+    (src / "wrap").mkdir(parents=True)
+    (src / "wrap" / "data.bin").write_text("x")      # no project marker
+    tgz = tmp_path / "d.tgz"
+    with tarfile.open(tgz, "w:gz") as tf:
+        tf.add(src / "wrap", arcname="wrap")
+    from lykos.api import endpoints
+    dest = endpoints._maybe_extract_bundle(tgz, tmp_path / "td2", "d.tgz")
+    assert dest is not None and (dest / "wrap" / "data.bin").is_file()   # stayed at the wrapper
 
 
 def test_a_zip_bomb_upload_is_a_413(api, monkeypatch):
