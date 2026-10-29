@@ -226,8 +226,15 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
                   else "not measured (no coverage-instrumented run reached it)")
             fns = c.get("functions_recovered")
             fx = f' · {fns} functions recovered' if fns else ""
+            und = c.get("undriven") or {}
+            ux = ""
+            if und.get("total"):
+                ux = (f'<br><span class="muted">a harness statically reaches '
+                      f'<b>{esc(und["reachable"])} of {esc(und["total"])}</b> recovered functions '
+                      f'({esc(und.get("pct"))}%); the undriven remainder (incl. linked libraries) '
+                      f'needs additional drivers</span>')
             p.append(f'<tr><td class="mono vt-name">{esc(c.get("target"))}</td>'
-                     f'<td class="vt-verdict">{esc(cv)}{esc(fx)}</td></tr>')
+                     f'<td class="vt-verdict">{esc(cv)}{esc(fx)}{ux}</td></tr>')
         p.append('</tbody></table>')
     # the combined gaps worklist
     gaps = led.get("gaps") or []

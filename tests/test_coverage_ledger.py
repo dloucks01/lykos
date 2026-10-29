@@ -42,6 +42,26 @@ def test_ledger_class_and_weaponization_accounting(store, case):
     assert any("weaponization worklist" in g for g in led["gaps"])
 
 
+def test_undriven_reachability_from_harness_entry(store, case):
+    """A harness entry's forward call-graph reach vs total recovered functions -- the honest
+    'how much code does a harness drive' measure (undriven = the rest)."""
+    from lykos.db.dao import CallEdgeDAO, FunctionDAO
+    t = TargetDAO(store.conn).upsert(case.id, "h.bin", "c" * 64, arch="x86-64", bits=64)
+    FunctionDAO(store.conn).replace_for_target(t.id, [
+        {"addr": "0x1000", "name": "LLVMFuzzerTestOneInput"},
+        {"addr": "0x1100", "name": "parse"},
+        {"addr": "0x1200", "name": "helper"},
+        {"addr": "0x9000", "name": "orphan_never_called"},   # undriven
+    ])
+    CallEdgeDAO(store.conn).replace_for_target(t.id, [
+        {"src_addr": "0x1000", "dst_addr": "0x1100"},        # entry -> parse
+        {"src_addr": "0x1100", "dst_addr": "0x1200"},        # parse -> helper
+    ])
+    und = CL._undriven_functions(store.conn, t.id)
+    assert und["total"] == 4 and und["reachable"] == 3 and und["count"] == 1
+    assert und["pct"] == 75.0
+
+
 def test_ledger_renders_in_html():
     from lykos.report.html import _coverage_ledger_html
     led = {"checks": {"total": 10, "ran": 4, "classes_checked": ["CWE-190", "CWE-416"],

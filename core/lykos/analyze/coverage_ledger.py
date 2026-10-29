@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..db.dao import AnalysisRunDAO, FindingDAO, FunctionDAO, TargetDAO
+from ..db.dao import AnalysisRunDAO, CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 
 #: The analysis CHECKS lykos can perform, each tagged with the weakness classes it covers and its
 #: kind. The stage NAMES are the registry's (a test pins that every name here still exists), so the
@@ -145,10 +145,16 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         except Exception:                                    # noqa: BLE001
             nfns = 0
         cov = _target_block_coverage(store, case_id, t.id)
-        code.append({"target": t.filename, "functions_recovered": nfns,
-                     "block_pct": cov.get("pct") if cov else None,
-                     "blocks_hit": cov.get("blocks_hit") if cov else None,
-                     "blocks_known": cov.get("blocks_known") if cov else None})
+        entry = {"target": t.filename, "functions_recovered": nfns,
+                 "block_pct": cov.get("pct") if cov else None,
+                 "blocks_hit": cov.get("blocks_hit") if cov else None,
+                 "blocks_known": cov.get("blocks_known") if cov else None}
+        # the UNDRIVEN-function worklist (axis A): recovered functions with no static call path from a
+        # harness entry -- code no driver reaches, the worklist for harness synthesis.
+        und = _undriven_functions(conn, t.id)
+        if und:
+            entry["undriven"] = und
+        code.append(entry)
 
     by_state: dict[str, int] = {}
     for f in all_findings:
@@ -172,6 +178,14 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
     if dark:
         gaps.append(f"{len(dark)} target(s) have little or no measured code coverage — much of their "
                     f"code was not exercised")
+    # the worst-driven target: a harness that statically reaches only a small fraction of recovered
+    # functions is exercising a sliver of the code -- the "reach all code" gap, directional.
+    driven = [(c.get("undriven") or {}).get("pct") for c in code if (c.get("undriven") or {}).get("total")]
+    driven = [p for p in driven if p is not None]
+    if driven and min(driven) < 50:
+        gaps.append(f"a harness statically reaches as little as {min(driven):g}% of a target's "
+                    f"recovered functions — most code is undriven and needs additional drivers "
+                    f"(harness-synthesis worklist)")
 
     return {
         "schema": "lykos.coverage-ledger/1",
@@ -183,6 +197,42 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         "code": code,
         "gaps": gaps,
     }
+
+
+def _undriven_functions(conn, target_id: str) -> Optional[dict]:
+    """How much of the recovered code a harness statically DRIVES: the count of functions reachable
+    from a harness entry (LLVMFuzzer* / main) over the call graph, vs the total recovered. The
+    remainder is undriven -- code no harness exercises, which fuzzing that harness can never reach.
+    Sound and directional: the recovered call graph does not model indirect/virtual calls (so it may
+    under-count reachable), and `total` includes statically-linked libraries, so the figure is the
+    HONEST 'fraction of recovered functions a harness reaches', not a clean project worklist -- the
+    precise, source-attributed worklist is the harness-synthesis step's job. None when there is no
+    identifiable harness entry or no call graph."""
+    fns = FunctionDAO(conn).list_by_target(target_id)
+    if not fns:
+        return None
+    by_addr = {f.addr: f for f in fns if f.addr}
+    entries = {f.addr for f in fns if (f.name or "").startswith("LLVMFuzzer") and f.addr}
+    if not entries:
+        entries = {f.addr for f in fns if (f.name or "") == "main" and f.addr}
+    if not entries:
+        return None
+    adj: dict = {}
+    for e in CallEdgeDAO(conn).list_by_target(target_id):
+        if e.src_addr and e.dst_addr:
+            adj.setdefault(e.src_addr, set()).add(e.dst_addr)
+    seen: set = set()
+    stack = list(entries)
+    while stack:
+        a = stack.pop()
+        if a in seen:
+            continue
+        seen.add(a)
+        stack.extend(d for d in adj.get(a, ()) if d not in seen)
+    reachable = len(seen & set(by_addr))
+    total = len(by_addr)
+    return {"total": total, "reachable": reachable, "count": max(0, total - reachable),
+            "pct": round(100.0 * reachable / total, 1) if total else None}
 
 
 def _target_block_coverage(store, case_id: str, target_id: str) -> Optional[dict]:
