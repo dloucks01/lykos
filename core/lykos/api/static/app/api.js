@@ -114,6 +114,9 @@ export const api = {
 
   // ---- case-level findings + report ----
   caseFindings: (caseId) => _req("GET", `/cases/${caseId}/findings`),
+  // The coverage ledger: the three axes (checks/classes run, findings weaponized, code exercised)
+  // + the gaps worklist -- the "how close to 100%" dashboard.
+  coverage: (caseId) => _req("GET", `/cases/${caseId}/coverage`),
   systemmap: (caseId) => _req("GET", `/cases/${caseId}/systemmap`),
   // The false-positive review verdicts for a case: { input_sha: {runs, crashed, signal,
   // deterministic} }. Lets a reopened case restore its VerifyBadges (the live run gets them from

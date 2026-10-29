@@ -1096,6 +1096,126 @@ export function CoveragePanel({ coverage, targets, onDrill }) {
     </div>`;
 }
 
+// ── The coverage ledger ─────────────────────────────────────────────────────────────────────
+// The "how close to 100%?" dashboard. Full coverage is an asymptote, so this is the honest
+// substitute: the gap along three axes -- which analysis CHECKS ran (which vuln classes were
+// looked for), how many findings are WEAPONIZED (a verified PoC or a corroborated recipe), and
+// how much CODE the search exercised -- plus the combined gaps worklist that is the to-do list to
+// close it. Fed by GET /cases/{id}/coverage (analyze/coverage_ledger.py build_ledger); read-only.
+
+// Tone for a finding-state chip: proven states green, corroborated amber, bare candidates muted.
+const _STATE_TONE = { "poc-backed": "hi", confirmed: "hi", corroborated: "mid",
+  candidate: "lo", "false-positive": "lo" };
+
+// One axis progress bar, reusing the coverage-bar visuals (one source of truth for the tones).
+function _axisBar(pct) {
+  return html`<div class="cov-bar"><div class=${`cov-fill cov-${covTone(pct)}`}
+    style=${`width:${pct != null ? Math.max(2, Math.min(100, pct)) : 0}%`}></div></div>`;
+}
+
+export function LedgerPanel({ ledger, busy }) {
+  const [showChecks, setShowChecks] = useState(false);
+  const [showCands, setShowCands] = useState(false);
+  if (busy && !ledger) {
+    return html`<div class="card ledger"><${Spinner} label="building the coverage ledger…" /></div>`;
+  }
+  if (!ledger || !ledger.checks) {
+    return html`<div class="card empty">No coverage ledger yet — run an analysis first.</div>`;
+  }
+  const chk = ledger.checks, wpn = ledger.weaponization || {}, code = ledger.code || [],
+    gaps = ledger.gaps || [];
+  const chkPct = chk.total ? Math.round((100 * chk.ran) / chk.total) : 0;
+  const classes = chk.classes_checked || [];
+  const notRun = chk.not_run || [];
+  const cands = wpn.unweaponized || [];
+  // The true count of bare candidates -- the endpoint caps the listed sample (unweaponized[:200]),
+  // so label the worklist with findings − weaponized, not the length of the capped list.
+  const candTotal = Math.max(cands.length, (wpn.findings || 0) - (wpn.weaponized || 0));
+  const byState = wpn.by_state || {};
+  return html`
+    <div class="card ledger">
+      <div class="ledger-head">Coverage ledger</div>
+      <div class="ledger-sub">Full coverage is an asymptote, so this is the honest account of the gap
+        along three axes — which checks ran, which findings are weaponized, and how much code the
+        search exercised — with the worklist to close it.</div>
+
+      <!-- Axis B: analysis checks / weakness classes -->
+      <div class="ledger-axis">
+        <div class="ax-top">
+          <span class="ax-name">Checks run <span class="ax-tag">vuln classes</span></span>
+          <span class="ax-val">${chk.ran}/${chk.total} checks</span>
+        </div>
+        ${_axisBar(chkPct)}
+        <div class="ax-note">${classes.length} weakness class${classes.length === 1 ? "" : "es"} looked for${
+          notRun.length ? ` · ${notRun.length} check${notRun.length === 1 ? "" : "s"} did not run` : ""}</div>
+        ${classes.length ? html`<div class="ledger-chips">
+          ${classes.map((c) => html`<span class="lchip cwe" key=${c}>${c}</span>`)}
+        </div>` : null}
+        ${notRun.length ? html`
+          <button class="btn small ghost ledger-toggle" onClick=${() => setShowChecks((s) => !s)}>
+            ${showChecks ? "▾" : "▸"} ${notRun.length} check${notRun.length === 1 ? "" : "s"} did not run
+          </button>
+          ${showChecks ? html`<div class="ledger-list">
+            ${notRun.map((c) => html`<div class="ll-row" key=${c.stage}>
+              <span class=${`ll-status s-${c.status}`}>${c.status === "not_run" ? "not run" : c.status}</span>
+              <span class="ll-label">${c.label}</span>
+              ${(c.classes || []).filter((x) => x !== "*").length ? html`<span class="ll-classes">${
+                c.classes.filter((x) => x !== "*").join(", ")}</span>` : null}
+            </div>`)}
+          </div>` : null}
+        ` : null}
+      </div>
+
+      <!-- Axis C: weaponization -->
+      <div class="ledger-axis">
+        <div class="ax-top">
+          <span class="ax-name">Findings weaponized <span class="ax-tag">verified PoC or recipe</span></span>
+          <span class="ax-val">${wpn.weaponized || 0}/${wpn.findings || 0}${wpn.pct != null ? ` · ${wpn.pct}%` : ""}</span>
+        </div>
+        ${_axisBar(wpn.pct)}
+        ${Object.keys(byState).length ? html`<div class="ledger-chips">
+          ${Object.entries(byState).sort().map(([st, n]) => html`<span
+            class=${`lchip st-${_STATE_TONE[st] || "lo"}`} key=${st}>${st} · ${n}</span>`)}
+        </div>` : null}
+        ${candTotal ? html`
+          <button class="btn small ghost ledger-toggle" onClick=${() => setShowCands((s) => !s)}>
+            ${showCands ? "▾" : "▸"} ${candTotal} bare candidate${candTotal === 1 ? "" : "s"} — weaponization worklist
+          </button>
+          ${showCands ? html`<div class="ledger-list">
+            ${cands.map((f) => html`<div class="ll-row" key=${f.id}>
+              <span class="ll-cwe">${f.cwe || "—"}</span>
+              <span class="ll-label">${f.title || "(untitled)"}</span>
+              ${f.detector ? html`<span class="ll-classes">${f.detector}</span>` : null}
+            </div>`)}
+            ${candTotal > cands.length ? html`<div class="ll-row ll-more">…and ${candTotal - cands.length} more not listed</div>` : null}
+          </div>` : null}
+        ` : null}
+      </div>
+
+      <!-- Axis A: code exercised, per target -->
+      <div class="ledger-axis">
+        <div class="ax-top"><span class="ax-name">Code exercised <span class="ax-tag">per target</span></span></div>
+        ${code.length ? code.map((c) => html`<div class="ledger-code-row" key=${c.target}>
+          <span class="lc-name" title=${c.target}>${c.target}</span>
+          ${_axisBar(c.block_pct)}
+          <span class="lc-val">${c.block_pct != null ? `${c.block_pct}%` : "—"}
+            <span class="lc-detail">${c.blocks_hit != null
+              ? `${c.blocks_hit}/${c.blocks_known} blocks`
+              : "no coverage measured"}${c.undriven && c.undriven.pct != null
+                ? ` · harness reaches ${c.undriven.pct}% of ${c.functions_recovered} fns`
+                : ""}</span>
+          </span>
+        </div>`) : html`<div class="ax-note">No targets analysed.</div>`}
+      </div>
+
+      <!-- The combined gaps worklist -->
+      ${gaps.length ? html`<div class="ledger-gaps">
+        <div class="lg-head">Gaps worklist</div>
+        <ul>${gaps.map((g, i) => html`<li key=${i}>${g}</li>`)}</ul>
+      </div>` : html`<div class="ledger-gaps clean"><div class="lg-head">No gaps flagged — every check ran, every finding weaponized.</div></div>`}
+    </div>`;
+}
+
 // ── Verdict layer ───────────────────────────────────────────────────────────────────────────
 // The answer, up top. Everything below (target facts, findings, the analysis drawer) is the
 // working; these components are the verdict: per binary, the worst effect an attacker can drive it

@@ -46,7 +46,12 @@ const DYNAMIC_BACKENDS = new Set([
 // not-in-tab: ingest_triage, unpack
 //
 // source-only: they need an archived source tree, which the workbench does not upload:
-// not-in-tab: embedded_audit, int_overflow_scan, libfuzzer, source_cve_scan, source_sink_scan, uaf_scan
+// not-in-tab: cpg_scan, embedded_audit, int_overflow_scan, libfuzzer, source_cve_scan, source_sink_scan, uaf_scan
+//
+// the source confirmation + under-constrained-symbolic stages: the server schedules them after the
+// source scans, and they run on source-built harnesses / materialized binaries (the confirmation
+// ladder, a synthesized driver, undriven-function symbolic exec) that an in-tab run does not build:
+// not-in-tab: source_confirm, synth_confirm, uc_symbolic
 //
 // the heap / out-of-bounds chain. Each one consumes the previous one's artifact -- a menu crawl,
 // an op model, a primitive -- and that cross-stage threading is what the server autopilot does:

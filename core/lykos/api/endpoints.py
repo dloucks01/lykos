@@ -525,6 +525,18 @@ class EndpointsMixin:
             out["invocation"] = found
         return out
 
+    def _get_coverage(self, cid):
+        """The coverage ledger for a case: the three axes (checks/classes run, findings weaponized,
+        code exercised) + the gaps worklist -- the GUI's 'how close to 100%' dashboard."""
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            from ..analyze.coverage_ledger import build_ledger
+            return self._json(build_ledger(s, cid))
+        finally:
+            s.close()
+
     def _get_case_findings(self, cid):
         """All findings in a case, enriched with target filename/arch and the target's best
         PoC level -- the data the case findings board aggregates."""

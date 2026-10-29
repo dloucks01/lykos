@@ -143,3 +143,30 @@ def test_the_scorecard_survives_a_case_reset():
     """A stale card from the previous case is worse than none: it describes work on a different
     binary."""
     assert "setScorecard([])" in APP, "the scorecard is not cleared when the case is reset"
+
+
+def test_the_ui_can_fetch_the_coverage_ledger():
+    """The "how close to 100%?" dashboard: a route, an api.js call, and an endpoint handler."""
+    from lykos.api import routes
+    assert hasattr(routes, "_CASE_COVERAGE"), "no coverage-ledger route"
+    assert routes._CASE_COVERAGE.match("/cases/abc/coverage")
+    assert "coverage:" in APIJS, "api.js cannot fetch the coverage ledger"
+    from lykos.api.endpoints import EndpointsMixin
+    assert hasattr(EndpointsMixin, "_get_coverage"), "no coverage endpoint"
+    # a bad case id must be a 404, not a 200 with an empty ledger
+    assert "404" in _code(EndpointsMixin._get_coverage), \
+        "the coverage endpoint must 404 an unknown case"
+
+
+def test_the_ui_renders_the_coverage_ledger():
+    assert "export function LedgerPanel" in COMPONENTS, "no coverage-ledger component"
+    assert "LedgerPanel" in APP and "api.coverage(" in APP, \
+        "the component exists but the app never fetches or renders it"
+    # the three axes + the worklist the panel must surface
+    for token in ("Checks run", "weaponized", "Code exercised", "Gaps worklist"):
+        assert token in COMPONENTS, f"the ledger panel does not show {token!r}"
+
+
+def test_the_coverage_ledger_survives_a_case_reset():
+    """A stale ledger from the previous case describes a different engagement."""
+    assert "setLedger(null)" in APP, "the coverage ledger is not cleared when the case is reset"

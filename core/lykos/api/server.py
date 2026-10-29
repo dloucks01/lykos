@@ -147,6 +147,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_AUTOPILOT_CANCEL,
     _CASE_AUTOPILOT_PAUSE,
     _CASE_AUTOPILOT_RESUME,
+    _CASE_COVERAGE,
     _CASE_CURATION,
     _CASE_EVENTS,
     _CASE_EXPORT,
@@ -516,6 +517,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_FIND.match(path)
             if m:
                 return self._get_case_findings(m.group(1))
+            m = _CASE_COVERAGE.match(path)
+            if m:
+                return self._get_coverage(m.group(1))
             m = _CASE_CURATION.match(path)
             if m:
                 return self._get_case_curation(m.group(1))

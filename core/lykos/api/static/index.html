@@ -467,6 +467,46 @@
   .cov-row.clk:hover { background: var(--panel-2); }
   .cov-row.clk:hover .cov-name { color: var(--accent-2); }
 
+  /* The coverage ledger ("how close to 100%?" dashboard): three axes + a gaps worklist. */
+  .ledger-head { font-weight: 600; font-size: .95rem; }
+  .ledger-sub { color: var(--muted); font-size: .82rem; margin: 4px 0 14px; line-height: 1.45; }
+  .ledger-axis { padding: 11px 0; border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
+  .ledger-axis:first-of-type { border-top: none; }
+  .ax-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+  .ax-name { font-size: .86rem; font-weight: 600; }
+  .ax-tag { color: var(--faint); font-weight: 400; font-size: .74rem; margin-left: 6px; }
+  .ax-val { font-size: .82rem; font-weight: 600; white-space: nowrap; }
+  .ax-note { color: var(--muted); font-size: .76rem; margin-top: 6px; }
+  .ledger-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .lchip { border-radius: 999px; padding: 2px 9px; font-size: 11px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--ink); font-family: var(--mono); }
+  .lchip.cwe { color: var(--accent-2); }
+  .lchip.st-hi { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); color: var(--ok); font-family: inherit; }
+  .lchip.st-mid { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); color: var(--warn); font-family: inherit; }
+  .lchip.st-lo { color: var(--muted); font-family: inherit; }
+  .ledger-toggle { margin-top: 9px; }
+  .ledger-list { margin-top: 7px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .ll-row { display: flex; align-items: baseline; gap: 10px; padding: 5px 10px; font-size: .78rem;
+    border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+  .ll-row:first-child { border-top: none; }
+  .ll-status { flex: 0 0 64px; font-size: .7rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+  .ll-status.s-errored { color: var(--bad); }
+  .ll-status.s-pending { color: var(--warn); }
+  .ll-cwe { flex: 0 0 74px; font-family: var(--mono); font-size: .74rem; color: var(--accent-2); }
+  .ll-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ll-classes { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: .72rem; }
+  .ll-more { color: var(--muted); font-style: italic; justify-content: center; }
+  .ledger-code-row { display: flex; align-items: center; gap: 12px; margin: 7px 0; }
+  .lc-name { flex: 0 0 150px; font-family: var(--mono); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lc-val { flex: 0 0 auto; font-size: .8rem; font-weight: 600; text-align: right; }
+  .lc-detail { color: var(--faint); font-weight: 400; font-size: .72rem; display: block; }
+  .ledger-gaps { margin-top: 12px; padding: 11px 13px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 9px; }
+  .ledger-gaps.clean { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+  .lg-head { font-weight: 600; font-size: .84rem; margin-bottom: 6px; }
+  .ledger-gaps ul { margin: 0; padding-left: 18px; }
+  .ledger-gaps li { font-size: .8rem; color: var(--ink); margin: 5px 0; line-height: 1.45; }
+
   /* Disassembly drill-in button on a target summary */
   .disasm-drill { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 12px;
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px;

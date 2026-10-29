@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction, failedTargets, operatorSettings } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, EngagementMap, CurationFilter,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, LedgerPanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, EngagementMap, CurationFilter,
   RunSignalsStrip, DoctorPanel, SeedsField, BuildFoot,
 } from "./components.js";
 
@@ -161,6 +161,8 @@ function App() {
   const [recentCases, setRecentCases] = useState([]);
   const [sysmap, setSysmap] = useState(null);
   const [coverage, setCoverage] = useState({});
+  const [ledger, setLedger] = useState(null);         // coverage ledger (3-axis "how close to 100%?" dashboard)
+  const [ledgerBusy, setLedgerBusy] = useState(false);
   const [verifications, setVerifications] = useState({});  // input_sha -> replay review result
   const [codeFn, setCodeFn] = useState(null);       // {fn, finding} for the open code view
   const [evidence, setEvidence] = useState(null);   // {finding, focus} for the evidence inspector
@@ -260,7 +262,7 @@ function App() {
   // scorecard, console and open modals used to survive into the next case and read as its own.
   const resetCaseView = useCallback(() => {
     setLog([]); setFindings([]); setPocs([]); setAdvice(null); setUnavailable([]); setSysmap(null);
-    setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]);
+    setCoverage({}); setLedger(null); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]);
     setOpenLog(null); setFuzzLive(null); setFuzzState(null); setInvChosen(null); setBgActivity(null);
     setConsoleLines([]); consoleSeen.current = new Set();
     setActiveTid(null); setTab("findings"); setViz(null); setCgFocus(null);
@@ -862,7 +864,7 @@ function App() {
     setRunning(true);
     setRan(true);
     setUnavailable([]);
-    setCoverage({}); setVerifications({});
+    setCoverage({}); setLedger(null); setVerifications({});
     const ctrl = newController();
     ctrlRef.current = ctrl;
     const ids = targets.map((t) => t.id);
@@ -1075,6 +1077,20 @@ function App() {
   }, [tab, _at, funcsByT, cgByT, stringsByT, dynByT, triageByT]);
   activeTidRef.current = _at || null;
 
+  // The coverage ledger (the "how close to 100%?" dashboard) is built server-side from the whole
+  // case's runs + findings, so it is fetched lazily when its tab opens -- and refetched when the
+  // finding count changes while it is open, so a run that lands new findings updates the ledger.
+  useEffect(() => {
+    if (tab !== "ledger" || !caseId) return;
+    let live = true;
+    setLedgerBusy(true);
+    api.coverage(caseId)
+      .then((led) => { if (live) setLedger(led || null); })
+      .catch(() => { if (live) setLedger(null); })
+      .finally(() => { if (live) setLedgerBusy(false); });
+    return () => { live = false; };
+  }, [tab, caseId, findings.length]);
+
   const ranked = dedupeFindings(rankFindings(findings));
   const topDemoId = ranked.find((f) => f.state === "poc-backed")?.id;
   const pocsFor = (f) => pocsForFinding(pocs, f.id, topDemoId);
@@ -1274,6 +1290,7 @@ function App() {
   ] : [];
   const tabMeta = {
     findings: { label: "Findings", n: activeRanked.length },
+    ledger: { label: "Coverage ledger" },
     exploits: { label: "Exploits", n: activePocs.length },
     functions: { label: "Functions & call graph", n: activeFuncs ? activeFuncs.length : undefined },
     disasm: { label: "Disassembly" },
@@ -1288,7 +1305,7 @@ function App() {
     console: { label: "Console", n: consoleLines.length },
   };
   const groupDefs = [
-    { id: "overview", label: "Overview", tabs: ["findings"], n: activeRanked.length },
+    { id: "overview", label: "Overview", tabs: ["findings", "ledger"], n: activeRanked.length },
     { id: "exploits", label: "Exploits", tabs: ["exploits"], n: activePocs.length },
     { id: "code", label: "Code", tabs: ["functions", "disasm", "strings"] },
     { id: "dynamic", label: "Dynamic", tabs: [
@@ -1460,6 +1477,10 @@ function App() {
                     ${candidatesVisible ? activeCandidates.map(cardFor) : null}
                   ` : null}
                 ` : html`<${EmptyResults} ran=${ran} />`}
+              </div>
+            ` : tab === "ledger" ? html`
+              <div class="wb-panel">
+                <${LedgerPanel} ledger=${ledger} busy=${ledgerBusy} />
               </div>
             ` : tab === "exploits" ? html`
               <div class="wb-panel">
