@@ -194,3 +194,25 @@ def test_no_probe_shells_out_without_a_timeout():
     for line in src.splitlines():
         if "subprocess.run(" in line and "timeout" not in line:
             assert "timeout=timeout" in src, f"unbounded subprocess call: {line.strip()}"
+
+
+def test_dev_library_base_feeds_the_offline_bundle():
+    """The broad C/C++ -dev base must flow into the deb list the collector pulls, so the common
+    source project BUILDS offline instead of failing for a missing header -- a build failure on an
+    air-gapped box costs the whole binary/dynamic capability for that target."""
+    base = tc.dev_dependency_base()
+    assert len(base) >= 40, "the dev base is too thin to cover the common case"
+    assert "libssl-dev" in base and "zlib1g-dev" in base and "libxml2-dev" in base
+    pkgs = set(tc.apt_packages())
+    assert set(base) <= pkgs, "dev base packages the collector would not pull: " \
+        + str(set(base) - pkgs)
+    # the Tool entry exists at the recommended tier (prominent in doctor, not a hard fail)
+    dev = next(t for t in tc.TOOLS if t.key == "devbase")
+    assert dev.tier == "recommended" and dev.apt == base
+
+
+def test_dev_base_is_deduplicated_and_sorted_into_apt_packages():
+    """apt_packages() is the one list the collector reads; a package named twice (base + a
+    cross/engine entry) must appear once."""
+    pkgs = tc.apt_packages()
+    assert pkgs == sorted(set(pkgs))

@@ -431,6 +431,74 @@ def _probe_weggli():
     return f"{ver} ({w})" if ver else None
 
 
+# A broad base of C/C++ development libraries (-dev packages) to carry in the air-gap bundle, so
+# that the common source project BUILDS offline instead of failing for a missing header. The build
+# sandbox cannot fetch anything, so a dependency that is not on the box is a dependency the project
+# cannot use -- and a failed build costs the entire binary/dynamic/symbolic capability for that
+# target. This cannot cover every possible dependency (nothing offline can); it covers the
+# libraries real targets -- network services, parsers, codecs, crypto, system daemons -- pull in
+# most often. `lykos deps <dir>` reports what a SPECIFIC project still needs beyond this base so an
+# operator stages it before going offline. Heavy desktop-GUI stacks (GTK/Qt/pango/cairo) are left
+# out deliberately: they are rarely the target and multiply the bundle size.
+#
+# Debian/Kali names. The collector's apt-cache guard skips any package the target distro lacks, so
+# a name missing on one distro is harmless rather than fatal.
+_DEV_LIB_BASE: tuple = (
+    # compression
+    "zlib1g-dev", "libbz2-dev", "liblzma-dev", "libzstd-dev", "liblz4-dev", "libbrotli-dev",
+    "libsnappy-dev",
+    # crypto / TLS / auth
+    "libssl-dev", "libgnutls28-dev", "libnettle-dev", "libgcrypt20-dev", "libsodium-dev",
+    "libkrb5-dev", "libldap2-dev", "libsasl2-dev",
+    # text / parsing / data formats
+    "libxml2-dev", "libexpat1-dev", "libpcre2-dev", "libpcre3-dev", "libjansson-dev",
+    "libjson-c-dev", "libyaml-dev", "libffi-dev", "libgmp-dev", "libmpfr-dev",
+    # databases / transfer
+    "libsqlite3-dev", "libcurl4-openssl-dev",
+    # networking / capture
+    "libpcap-dev", "libnl-3-dev", "libssh2-1-dev", "libssh-dev", "libusb-1.0-0-dev",
+    "libevent-dev", "libuv1-dev",
+    # system / security
+    "libcap-dev", "libcap-ng-dev", "libseccomp-dev", "libselinux1-dev", "libdbus-1-dev",
+    "libsystemd-dev", "libudev-dev", "uuid-dev", "libmnl-dev", "libmagic-dev", "libarchive-dev",
+    # terminal / line editing
+    "libncurses-dev", "libreadline-dev", "libedit-dev",
+    # image / media codecs (common fuzz targets)
+    "libpng-dev", "libjpeg-dev", "libtiff-dev", "libgif-dev", "libwebp-dev", "libfreetype-dev",
+    "libfontconfig-dev", "libsndfile1-dev", "libogg-dev", "libvorbis-dev", "libflac-dev",
+    "libasound2-dev",
+    # base windowing header set a surprising number of libraries probe for (lightweight subset)
+    "libx11-dev",
+)
+
+# A handful of representative headers from the base, to report presence without asking apt.
+_DEV_LIB_PROBE_HEADERS = (
+    "openssl/ssl.h", "zlib.h", "bzlib.h", "lzma.h", "zstd.h", "curl/curl.h", "libxml/parser.h",
+    "sqlite3.h", "pcre2.h", "ncurses.h", "ffi.h", "expat.h", "gmp.h", "readline/readline.h",
+)
+
+
+def dev_dependency_base() -> tuple:
+    """The broad C/C++ -dev library base the offline bundle carries so common source projects build
+    without network. One place, so the collector and doctor cannot drift."""
+    return _DEV_LIB_BASE
+
+
+def _probe_devbase():
+    """How much of the dev-library base is present on THIS host, by checking a representative set of
+    headers with the same search a build uses. Not all-or-nothing: reports N/M so an operator sees
+    partial coverage, and None only when none are present."""
+    try:
+        from .analyze.dep_preflight import _header_present
+    except Exception:                                   # noqa: BLE001
+        return None
+    have = [h for h in _DEV_LIB_PROBE_HEADERS if _header_present(h)]
+    if not have:
+        return None
+    return f"{len(have)}/{len(_DEV_LIB_PROBE_HEADERS)} common dev headers (e.g. " \
+           + ", ".join(have[:4]) + ")"
+
+
 TOOLS: tuple = (
     Tool("python", "Python 3", "the platform itself", "nothing runs",
          "already present (the runtime is stdlib-based; no pip packages)",
@@ -542,6 +610,14 @@ TOOLS: tuple = (
     Tool("node", "Node.js", "the GUI test harnesses (make gui)",
          "make gui fails; the UI itself is unaffected",
          "apt-get install nodejs", _probe_node, tier="optional", apt=("nodejs",)),
+    Tool("devbase", "C/C++ dev-library base",
+         "building the COMMON source project offline: the headers/libs (openssl, zlib, xml2, "
+         "curl, sqlite, pcre, codecs, crypto, system daemons) real targets link against",
+         "a source project needing one of these cannot build on the air-gapped box, which costs "
+         "the whole binary/dynamic/symbolic capability for that target -- it degrades to "
+         "static-source only. `lykos deps <dir>` reports what a SPECIFIC project still needs",
+         "apt-get install " + " ".join(_DEV_LIB_BASE), _probe_devbase, tier="recommended",
+         apt=_DEV_LIB_BASE),
 )
 
 
