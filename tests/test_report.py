@@ -322,6 +322,32 @@ def test_finding_confirmation_ladder(store, case):
     assert "no independent signal has corroborated" in html
 
 
+def test_finding_reachability_path_and_attack_surface(store, case):
+    """Each finding exposes the structured call path from an input source + its attack surface."""
+    from lykos.db.dao import CallEdgeDAO
+    t = store.targets.upsert(
+        case.id, filename="svc2", sha256=hash_bytes(b"svc2"), size=8, arch="x86_64", bits=64,
+        endianness="little", stripped=False, file_type="ELF", linking="dynamic")
+    # sink finding at the parser function; its file is on the fuzzed attack surface
+    FindingDAO(store.conn).upsert(t.id, case.id, {
+        "dedup_key": "r1", "cwe": "CWE-787", "title": "oob write in parse", "severity": "high",
+        "state": "corroborated", "detector": "source_recipe", "function_addr": "0x402200",
+        "evidence": [{"channel": "surface",
+                      "detail": "on the fuzzed attack surface (compiled into an in-tree harness)"}]})
+    # entry() reads input (recv) and calls parse() -> the sink function
+    CallEdgeDAO(store.conn).replace_for_target(t.id, [
+        {"src_addr": "0x402000", "dst_addr": "0x402100", "dst_name": "recv"},
+        {"src_addr": "0x402000", "dst_addr": "0x402200", "dst_name": "parse"}])
+    r = build_report(store, case.id)
+    ff = next(x for tt in r["targets"] for x in tt["findings"])
+    rch = ff["reachability"]
+    assert rch["attack_surface"] == "on"
+    assert rch["path"] and rch["path"][-1] == "parse"       # ends at the sink function
+    html = to_html(r)
+    assert "ON the fuzzed attack surface" in html
+    assert "Path from an input source" in html
+
+
 def test_finding_exploitability_and_ceiling(store, case):
     """Each finding carries the class primitive, the target's mitigations in the way, and the
     tool's own honest ceiling lifted from the evidence."""

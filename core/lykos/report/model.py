@@ -480,12 +480,12 @@ def _bare_sym(n) -> str:
     return n.split("@")[0]
 
 
-def _reachability_path_svg(call_edges, f: dict) -> Optional[str]:
-    """A source-reachability path (doc 49 Theme 4, figure 2): the shortest call path from a function
-    that reads EXTERNAL INPUT to this finding's function. This is control-flow reachability from an
-    input source -- NOT a verified byte-level dataflow taint -- and is labelled exactly that, so the
-    figure never overstates what was proven. None when the finding has no function, or no such path
-    exists (a path is never fabricated)."""
+def _reachability_steps(call_edges, f: dict) -> Optional[list]:
+    """The shortest call path from a function that reads EXTERNAL INPUT to this finding's function,
+    as a list of {label, sub, tone} hops. Control-flow reachability from an input source -- NOT a
+    verified byte-level dataflow taint. None when the finding has no function or no such path exists
+    (a path is never fabricated). Shared by the SVG figure and the structured per-finding field, so
+    the drawing and the data can never disagree."""
     fa = f.get("function_addr")
     if not fa:
         return None
@@ -530,6 +530,27 @@ def _reachability_path_svg(call_edges, f: dict) -> Optional[str]:
         tone = "source" if i == 0 else ("sink" if i == len(path) - 1 else "")
         sub = "reads input" if i == 0 else ("the finding" if i == len(path) - 1 else None)
         steps.append({"label": name.get(a) or a, "sub": sub, "tone": tone})
+    return steps
+
+
+def _attack_surface(f: dict) -> Optional[str]:
+    """Whether the finding sits ON or OFF the fuzzed attack surface, lifted from the tool's own
+    evidence prose (it writes "on/off the fuzzed attack surface"). None when it said neither."""
+    for e in f.get("evidence") or []:
+        d = (e.get("detail") or "").lower()
+        if "on the fuzzed attack surface" in d:
+            return "on"
+        if "off the fuzzed attack surface" in d:
+            return "off"
+    return None
+
+
+def _reachability_path_svg(call_edges, f: dict) -> Optional[str]:
+    """The source-reachability path (doc 49 Theme 4, figure 2) as an SVG, labelled "reachability,
+    not verified dataflow" so it never overstates what was proven."""
+    steps = _reachability_steps(call_edges, f)
+    if not steps:
+        return None
     try:
         return _figures.chain_svg(
             steps, title="Reachable from an input source",
@@ -1011,6 +1032,14 @@ def build_report(
             for _f in findings_out:
                 _f["figures"] = {"provenance": _provenance_chain_svg(_f),
                                  "reachability": _reachability_path_svg(_edges, _f)}
+                # Structured per-finding reachability (doc 49 per-finding detail): the same hops the
+                # figure draws, plus whether it is on the fuzzed attack surface -- so the GUI and a
+                # machine reader get the path as data, not only a picture.
+                _steps = _reachability_steps(_edges, _f)
+                _surface = _attack_surface(_f)
+                if _steps or _surface:
+                    _f["reachability"] = {"attack_surface": _surface,
+                                          "path": [s["label"] for s in (_steps or [])]}
             tout["execution"]["has_gaps"] = has_execution_gaps(tout)
             tout["verdict"] = target_verdict(tout)
             targets_out.append(tout)

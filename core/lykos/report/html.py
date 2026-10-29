@@ -813,6 +813,25 @@ def _finding_html(f: dict) -> str:
         for mit in ex.get("mitigations_in_way") or []:
             p.append(f'<li><b>In the way:</b> {esc(mit)}</li>')
         p.append('</ul></div>')
+    # Reachability: attack surface + the shortest call path from an input source (control-flow
+    # reachability, not a verified byte-level dataflow -- said so explicitly).
+    rch = f.get("reachability") or {}
+    if rch.get("attack_surface") or rch.get("path"):
+        p.append('<div class="freach"><div class="evlabel">Reachability</div><ul class="ev">')
+        surf = rch.get("attack_surface")
+        if surf == "on":
+            p.append('<li><b>Attack surface:</b> ON the fuzzed attack surface — its file is '
+                     'compiled into an in-tree fuzz harness (higher remote-reachability priority)</li>')
+        elif surf == "off":
+            p.append('<li><b>Attack surface:</b> OFF the fuzzed attack surface — not in any in-tree '
+                     'harness (e.g. a build tool/example); lower remote-reachability priority, not '
+                     'dismissed</li>')
+        path = rch.get("path") or []
+        if path:
+            arrow = " → ".join(esc(step) for step in path)
+            p.append(f'<li><b>Path from an input source:</b> <span class="mono">{arrow}</span> '
+                     '<span class="muted">(control-flow reachability, not verified dataflow)</span></li>')
+        p.append('</ul></div>')
     # Concrete EFFECTS (what the defect actually does — a leak, a write-what-where, a hijacked call):
     # the model parses them but the report used to drop them, understating impact.
     effects = f.get("effects") or []
