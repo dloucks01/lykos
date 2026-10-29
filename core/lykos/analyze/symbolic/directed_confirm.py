@@ -108,18 +108,39 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
     return out
 
 
+def _length_field_templates(payload_len: int = 64) -> list:
+    """Length-prefix probes (format-aware): a parser that reads a LEADING size field and trusts it --
+    `len = read_u32(in); memcpy(dst, in+4, len)` / `malloc(len)` -- is tripped deterministically when
+    the field names more bytes than the input holds (over-read) or than the destination holds
+    (overflow). A fixed set across the common field widths and byte orders, with the all-ones max, a
+    modest oversize, and the signed-32 boundary -- still no fuzzing. Distinct from the generic blobs,
+    whose own bytes would decode to an absurd length a bounds check rejects."""
+    body = b"A" * payload_len
+    tpls: list = []
+    for width in (2, 4, 8):
+        maxv = (1 << (8 * width)) - 1
+        for v in (maxv, 4096):
+            for endian in ("little", "big"):
+                tpls.append(v.to_bytes(width, endian) + body)
+    for endian in ("little", "big"):
+        tpls.append((0x80000000).to_bytes(4, endian) + body)      # signed 32-bit boundary
+    return tpls
+
+
 def _default_templates(input_size: int = 4096) -> list:
     """The deterministic known-bad shapes, SMALLEST-first so the minimal triggering input wins.
 
-    Two families cover the common directly-triggerable memory-safety bugs without solving or fuzzing:
+    Families, each covering a directly-triggerable memory-safety bug without solving or fuzzing:
       * oversized blobs -- a length-driven copy (`memcpy(buf, in, len)`, unbounded strcpy/sprintf)
         overflows once the input passes the fixed buffer; the size ladder finds the threshold;
       * format-string probes -- `printf(in)` with attacker bytes dereferences `%s`/reads `%n`/leaks
-        `%p`, which these specifier runs trigger directly.
+        `%p`, which these specifier runs trigger directly;
+      * length-prefix probes -- a leading size field the parser trusts over the actual input size.
     These are a fixed handful, not a mutation loop: deterministic, so this is the ladder's FIRST rung."""
     sizes = sorted({32, 64, 256, 1024, 4096, 16384, 65536, int(input_size), int(input_size) * 2})
     tpls = [b"A" * s for s in sizes if 1 <= s <= (1 << 20)]
     tpls += [b"%n" * 32, b"%s" * 64, b"%p" * 128, b"%s%p%n%x" * 32]
+    tpls += _length_field_templates()
     return tpls
 
 

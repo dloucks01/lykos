@@ -62,7 +62,7 @@ def test_default_templates_are_small_and_deterministic():
     from lykos.analyze.symbolic import directed_confirm as DC
     t1 = DC._default_templates(4096)
     t2 = DC._default_templates(4096)
-    assert t1 == t2 and 8 <= len(t1) <= 20          # a fixed handful, not a fuzzing loop
+    assert t1 == t2 and 8 <= len(t1) <= 40          # a fixed handful, not a fuzzing loop
     assert t1[0] == b"A" * 32                        # smallest-first, so the minimal trigger wins
     assert any(b"%n" in x for x in t1)               # format-string probe present
 
