@@ -93,6 +93,68 @@ def _project_libs(lib_dirs, limit: int = 24) -> list:
     return libs[:limit]
 
 
+def _dt_needed(elf) -> set:
+    """DT_NEEDED shared-lib basenames of an ELF (readelf -d, best-effort -> empty on failure)."""
+    import shutil
+    import subprocess
+    rd = shutil.which("readelf")
+    if not rd:
+        return set()
+    try:
+        r = subprocess.run([rd, "-d", str(elf)], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]", r.stdout or ""))
+
+
+def _relevant_libs(harness_bin, project_libs) -> list:
+    """The subset of `project_libs` the harness actually needs (its DT_NEEDED, closed one level over
+    project libs), so angr force-loads ONLY those. Loading every project .so is the main cost that
+    makes a big target cut off before reaching the parser; the harness that drives one parser rarely
+    needs them all. Falls back to all project_libs when the NEEDED list cannot be read."""
+    by_base = {os.path.basename(p): p for p in (project_libs or [])}
+    needed = _dt_needed(harness_bin) & set(by_base)
+    if not needed:
+        return list(project_libs or [])
+    seen, frontier = set(needed), list(needed)
+    while frontier:
+        for dep in _dt_needed(by_base[frontier.pop()]) & set(by_base):
+            if dep not in seen:
+                seen.add(dep)
+                frontier.append(dep)
+    return [by_base[b] for b in sorted(seen)]
+
+
+#: calls that take a (ptr, size) pair but are NOT the parser the harness drives.
+_NOT_PARSER_CALLS = frozenset({
+    "LLVMFuzzerTestOneInput", "memcpy", "memmove", "memcmp", "memset", "bcopy", "fwrite", "fread",
+    "write", "read", "malloc", "calloc", "realloc", "free", "printf", "fprintf", "puts", "strncmp",
+    "strncpy", "strncat", "if", "for", "while", "switch", "return", "sizeof"})
+
+
+def _parser_entry(source_path):
+    """If the harness's LLVMFuzzerTestOneInput calls exactly ONE project function with its
+    (data, size) arguments IN THAT ORDER (`FN(data, size)` / `FN((cast)data, size)`), return FN:
+    angr can then enter directly at FN, skipping the harness wrapper -- SOUND, because that call is
+    identical to what the harness does. None when the shape is not that clean (e.g. a parser taking a
+    context object, `parse(ctx, data, size, ...)`), so concolic falls back to the wrapper rather than
+    enter a function whose other arguments it cannot set up (which would crash spuriously)."""
+    try:
+        with open(source_path, "r", errors="ignore") as f:
+            text = f.read()
+    except (OSError, TypeError):
+        return None
+    m = re.search(r"LLVMFuzzerTestOneInput\s*\(\s*[^,(]*?\b(\w+)\s*,\s*[^,)(]*?\b(\w+)\s*\)", text)
+    if not m:
+        return None
+    data_p, size_p = m.group(1), m.group(2)
+    calls = re.findall(
+        rf"\b([A-Za-z_]\w*)\s*\(\s*(?:\([^()]*\)\s*)?{re.escape(data_p)}\s*,\s*{re.escape(size_p)}\s*\)",
+        text)
+    uniq = sorted({c for c in calls if c not in _NOT_PARSER_CALLS})
+    return uniq[0] if len(uniq) == 1 else None
+
+
 def _attack_surface(harness_bins, lib_dirs) -> set:
     """The set of source-file basenames compiled into the fuzz target -- the harness ELFs plus the
     shared objects they link (where a shared build keeps the parser). Bounded so a huge project cannot
@@ -285,9 +347,15 @@ def source_confirm_stage(ctx) -> dict:
         elif n in exc_by and n in fz_by:                    # concolic: shared clean + shared ASan (.so)
             exp = exc_by[n]["binary"]
             d["replay_binary"] = fz_by[n]["binary"]
-            d["load_libs"] = proj_libs                      # force-load the project's own .so
+            d["load_libs"] = _relevant_libs(exp, proj_libs)  # force-load ONLY the .so this harness needs
         if exp:
             d["explore_binary"] = exp
+            # PARSER-ENTRY: if the harness drives a parser with a clean (data, size) call, enter angr
+            # directly there, skipping the wrapper/context setup that eats the budget (falls back to
+            # LLVMFuzzerTestOneInput otherwise -- see _parser_entry).
+            fn = _parser_entry((ex_by.get(n) or exc_by.get(n) or fz_by.get(n) or {}).get("source"))
+            if fn:
+                d["harness_fn"] = fn
             if sites:
                 addrs = dwarfline.site_addrs(exp, sites)
                 if addrs:

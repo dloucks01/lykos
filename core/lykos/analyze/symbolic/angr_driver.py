@@ -191,9 +191,15 @@ def main(spec_path, out_path):
             harness_fn_addr = _int(fn)
             if harness_fn_addr is None:
                 sym = proj.loader.find_symbol(fn)
+                # A discovered PARSER entry that is not a resolvable symbol (static/inlined/renamed)
+                # falls back to the libFuzzer wrapper rather than aborting the whole explore.
+                if sym is None and fn != "LLVMFuzzerTestOneInput":
+                    fn = "LLVMFuzzerTestOneInput"
+                    sym = proj.loader.find_symbol(fn)
                 if sym is None:
                     raise RuntimeError("harness function %r not found in %s" % (fn, binary))
                 harness_fn_addr = sym.rebased_addr
+            result["harness_entry"] = fn
         # The operator's flags must reach the explored program too: exploring `prog <input>` and
         # certifying `prog -c <input>` would be a certificate for an invocation never explored.
         argv_tail, result["argv"] = build_args(spec.get("argv") or [], mode, symbytes)
