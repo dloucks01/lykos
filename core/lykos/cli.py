@@ -749,6 +749,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit non-zero if any declared dependency or build tool is missing")
     dp.set_defaults(func=_cmd_deps)
 
+    cc = sub.add_parser("cwe-coverage",
+                        help="coverage across ALL weakness classes: what we detect + the honest exploit ceiling")
+    cc.add_argument("--case-store", default=None,
+                    help="also show how far each class was carried on a kept run")
+    cc.add_argument("--case", default=None, help="case id/name (if the store holds several)")
+    cc.add_argument("--json", action="store_true", help="machine-readable output")
+    cc.set_defaults(func=_cmd_cwe_coverage)
+
     db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
     db2.add_argument("--history", default=None,
                      help="history file to read (default: eval-history.jsonl)")
@@ -1223,6 +1231,45 @@ def _cmd_deps(args: argparse.Namespace) -> int:
         print(dep_preflight.format_report(pf))
     if args.strict:
         return 1 if (pf["missing"] or pf["toolchain_missing"]) else 0
+    return 0
+
+
+def _cmd_cwe_coverage(args: argparse.Namespace) -> int:
+    """Coverage across ALL weakness classes: the static capability (which CWEs the platform detects
+    and how far a sound exploit of each can honestly be carried), and -- with --case-store -- how
+    far each class that actually appeared on a kept run was carried up the confidence ladder. The
+    honest answer to "consider all CWEs": breadth is wide; the leverage is depth + weaponization."""
+    import json
+
+    from .analyze import cwe_coverage as cc
+    run = None
+    if args.case_store:
+        case_dir = Path(args.case_store)
+        if not (case_dir / "case.db").is_file():
+            print(f"no case store at {case_dir}", file=sys.stderr)
+            return 2
+        store = CaseStore.open(case_dir)
+        try:
+            from .db.dao import FindingDAO
+            cases = list(store.cases.list())
+            if args.case:
+                hit = [c for c in cases if c.id == args.case or c.id.startswith(args.case)
+                       or c.name == args.case]
+            else:
+                hit = cases if len(cases) == 1 else []
+            if len(hit) != 1:
+                print("pass --case <id>; store holds: " + ", ".join(c.id for c in cases[:20]),
+                      file=sys.stderr)
+                return 2
+            findings = FindingDAO(store.conn).list_by_case(hit[0].id)
+            run = cc.run_matrix(findings)
+        finally:
+            store.close()
+    if args.json:
+        print(json.dumps({"capability": cc.capability_matrix(), "summary": cc.summary(),
+                          "run": run}, indent=2))
+    else:
+        print(cc.format_report(run))
     return 0
 
 
