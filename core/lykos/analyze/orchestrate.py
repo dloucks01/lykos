@@ -1186,6 +1186,94 @@ def _has_unproven_harness_leads(store, target_id) -> bool:
     return False
 
 
+#: The iterative concolic<->fuzz hybrid loop (doc 6) runs at most this many rounds. Each round is
+#: one concolic pass plus a directed-fuzz pass seeded by concolic's solved inputs (directed's
+#: `_prior_corpus` ranks the concolic-generated DynResults first). Three rounds walks a nested guard
+#: chain -- a magic header gating a length field gating the vulnerable copy -- while bounding the
+#: cost; the loop stops earlier the instant a full round adds no new crash, coverage or corpus input.
+_MAX_HYBRID_ROUNDS = 3
+#: A follow-on hybrid round needs at least this many seconds of the SEARCH phase to be worth
+#: starting; below it a concolic + refuzz pair cannot do useful work, so the loop ends on budget
+#: rather than queueing a round both stages would decline. The FIRST round is never gated on this --
+#: it reproduces the prior one-shot handoff exactly, so the loop never does less than before.
+_HYBRID_ROUND_FLOOR = 25.0
+
+
+def _hybrid_progress(store, target_id) -> tuple:
+    """A monotonic progress tuple for the hybrid loop: (distinct crashes, best block-coverage pct,
+    distinct corpus inputs). Each component is non-decreasing over a run, so a round that moves none
+    of them unlocked nothing -- no new crash, no new code reached, no new solved input to mutate
+    around -- and the loop has STALLED. Read-only."""
+    crashes = len(_distinct_crashes(store, target_id))
+    cov = _best_block_pct(store, target_id)
+    try:
+        corpus = len({r.input_sha for r in DynResultDAO(store.conn).list_by_target(target_id)
+                      if getattr(r, "input_sha", None)})
+    except Exception:                                        # noqa: BLE001 -- corpus count is advisory
+        corpus = 0
+    return (crashes, cov if cov is not None else -1.0, corpus)
+
+
+def _hybrid_advanced(before: tuple, after: tuple) -> bool:
+    """True when a round strictly increased ANY progress component (crash / coverage / corpus)."""
+    return any(a > b for a, b in zip(after, before))
+
+
+def _hybrid_coverage_loop(bud, store, target, target_id, dyn, status, stop, *, size_mb) -> list:
+    """The iterative concolic<->fuzz hybrid loop (doc 6). Repeats, while it keeps paying off:
+
+        concolic (solve the guarded branches the fuzzer stalled on)
+          -> directed_fuzz seeded by concolic's solved inputs (explore AROUND the unlocked branches)
+
+    The one-shot handoff ended the run at the first branch concolic unlocked; a nested guard chain
+    (magic header -> length field -> vulnerable copy) needs the fuzzer to reach the SECOND guard
+    before concolic can see and solve it. Each round re-seeds concolic from the corpus the previous
+    round grew (`_gather_seeds` is newest-first), so the pair walks the chain one guard at a time.
+
+    The loop stops on the first STALLED round (`_hybrid_progress` unchanged), when the search phase
+    has no room for another round, at `_MAX_HYBRID_ROUNDS`, or on `stop`. The first round always
+    runs when called, so this is never less than the prior one-shot concolic+refuzz. Emits one
+    `autopilot.hybrid_round` per round and a final `autopilot.hybrid_loop` with why it ended.
+    Returns the distinct crashes after the loop."""
+    concolic_want = 240.0 if size_mb >= _LARGE_BINARY_MB else 120.0
+    prev = _hybrid_progress(store, target_id)
+    rounds = 0
+    reason = "max_rounds"
+    for i in range(_MAX_HYBRID_ROUNDS):
+        if stop.is_set():
+            reason = "stopped"
+            break
+        # Only a FOLLOW-ON round is gated on budget: the first reproduces the old one-shot handoff.
+        if i > 0 and bud.available() < _HYBRID_ROUND_FLOOR:
+            reason = "budget"
+            break
+        rounds = i + 1
+        _staged(bud, store, target, "concolic", status, stop, dyn, want=concolic_want)
+        if stop.is_set():
+            reason = "stopped"
+            break
+        # The refuzz reuses concolic's solved inputs as seeds (directed._prior_corpus); a fresh seed
+        # per round so repeated campaigns diverge rather than re-walk the same mutation sequence.
+        _staged(bud, store, target, "directed_fuzz", status, stop,
+                {**dyn, "seed": 4242 + i}, want=120.0)
+        after = _hybrid_progress(store, target_id)
+        advanced = _hybrid_advanced(prev, after)
+        store.events.append("autopilot.hybrid_round", case_id=target.case_id,
+                            payload={"target_id": target_id, "round": rounds, "crashes": after[0],
+                                     "block_pct": (after[1] if after[1] >= 0 else None),
+                                     "corpus": after[2], "advanced": advanced})
+        prev = after
+        if not advanced:
+            reason = "stall"
+            break
+    store.events.append("autopilot.hybrid_loop", case_id=target.case_id,
+                        payload={"target_id": target_id, "rounds": rounds, "ended": reason,
+                                 "crashes": prev[0],
+                                 "block_pct": (prev[1] if prev[1] >= 0 else None),
+                                 "corpus": prev[2]})
+    return _distinct_crashes(store, target_id)
+
+
 #: Channels the native ptrace capture (`poc.capture.make_capture`) can deliver an input over, so a
 #: crash on one of them can have its fault PC re-captured. "socket" has no exec-time carrier.
 _RECAPTURE_MODES = ("stdin", "file", "arg", "env", "prompt")
@@ -2248,14 +2336,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # (see concolic's own large-binary handling). A longer slice on a large binary so the
                 # scoped exploration has room.
                 if want_concolic:
-                    _concolic_want = 240.0 if size_mb >= _LARGE_BINARY_MB else 120.0
-                    _staged(bud, store, t, "concolic", status, stop, dyn, want=_concolic_want)
-                    # Close the coverage loop: re-fuzz once more, now that directed_fuzz automatically
-                    # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
-                    # guarded branches concolic just unlocked, instead of the run ending at them.
-                    _staged(bud, store, t, "directed_fuzz", status, stop,
-                            {**dyn, "seed": 4242}, want=120.0)
-                    crashes = _distinct_crashes(store, tid)
+                    # Close the coverage loop ITERATIVELY (doc 6): concolic solves the guarded
+                    # branches the fuzzer stalled on, directed_fuzz (seeded by concolic's solved
+                    # inputs) explores AROUND them, and the pair repeats while each round keeps
+                    # unlocking new crashes / coverage / corpus -- walking a nested guard chain one
+                    # guard at a time -- stopping the instant a round stalls or the budget runs low.
+                    crashes = _hybrid_coverage_loop(bud, store, t, tid, dyn, status, stop,
+                                                    size_mb=size_mb)
                 # Static-overflow synthesis: an unbounded stack overflow (gets(), a size-less strcpy,
                 # scanf("%s")) needs a long, NEWLINE-FREE payload that blind mutation almost never
                 # generates -- a stray 0x0a ends gets() before the frame is smashed -- so the fuzzer
