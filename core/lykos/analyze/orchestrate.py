@@ -2108,6 +2108,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # cheaply (no build) for a binary-only target or a source tree with no in-tree
                 # harness -- so scheduling it unconditionally costs those nothing.
                 _staged(bud, store, t, "source_confirm", status, stop, want=240.0)
+                # DRIVER SYNTHESIS FOR PROOF: synthesize a (buf,size) driver for each candidate's
+                # function that no in-tree harness drives, build it with ASan, and run the smart-fuzz
+                # rung -- a concrete fault with a negative control proves it and upgrades the static
+                # candidate. The discovery->proof loop for undriven code. Self-gates without source /
+                # unproven candidates / a synthesisable signature.
+                _staged(bud, store, t, "synth_confirm", status, stop, want=240.0)
                 # UNDER-CONSTRAINED symbolic execution of the UNDRIVEN functions -- discovery for code
                 # no harness reaches (the ladder above and the campaigns below only exercise what a
                 # harness drives). It files CANDIDATE control-hijack leads with an under-constrained

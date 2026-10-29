@@ -79,6 +79,8 @@ _CHECKS: list[dict] = [
     # ---- confirmation ----
     {"stage": "source_confirm", "label": "Source confirmation ladder (template/concolic/smart-fuzz)",
      "classes": [], "kind": "confirm"},
+    {"stage": "synth_confirm", "label": "Synthesized-driver confirmation (proof for undriven code)",
+     "classes": [], "kind": "confirm"},
     {"stage": "root_cause", "label": "Crash root-cause classification", "classes": [],
      "kind": "confirm"},
     # ---- weaponization ----

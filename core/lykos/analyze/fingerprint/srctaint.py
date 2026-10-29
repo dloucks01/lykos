@@ -59,6 +59,18 @@ def enclosing(lines: list, idx: int):
     return start, set()
 
 
+def enclosing_name(lines: list, idx: int):
+    """The NAME of the function enclosing line `idx`, or None -- the identifier right before the
+    enclosing signature's parameter list. Used to pick a candidate function to synthesize a driver
+    for (then prove with the ladder)."""
+    s, _ = enclosing(lines, idx)
+    if s >= len(lines) or not _SIG.match(lines[s]) or "(" not in lines[s]:
+        return None
+    head = lines[s][:lines[s].index("(")]
+    names = re.findall(_IDENT, head)
+    return names[-1] if names else None
+
+
 def reader_source(body: str, base: str):
     """If `base` is filled by a known input reader in `body`, name that reader; else None. Readers
     are matched at the exact destination/return position so a count or fd argument is not mistaken

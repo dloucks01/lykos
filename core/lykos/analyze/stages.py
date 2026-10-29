@@ -94,6 +94,8 @@ STAGES: tuple[StageSpec, ...] = (
               "..analyze.source_confirm_stage", "enqueue_source_confirm"),
     StageSpec("uc_symbolic", "Under-constrained symbolic exec (undriven code)", "target",
               "..analyze.symbolic.uc_stage", "enqueue_uc_symbolic"),
+    StageSpec("synth_confirm", "Synthesized-driver confirmation", "target",
+              "..analyze.synth_confirm_stage", "enqueue_synth_confirm"),
     StageSpec("env_fuzz", "Env-var fuzzing", "target", "..analyze.fuzz", "enqueue_env_fuzz", no_params=True),
     StageSpec("cve_poc", "CVE weaponization", "target", "..analyze.poc", "enqueue_cve_poc", no_params=True),
     StageSpec("cve_corroborate", "CVE corroboration", "target", "..analyze.fingerprint", "enqueue_cve_corroborate", no_params=True),
