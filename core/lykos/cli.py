@@ -765,6 +765,25 @@ def build_parser() -> argparse.ArgumentParser:
     bd.add_argument("--timeout", type=int, default=600, help="per-binary analysis budget (s)")
     bd.set_defaults(func=_cmd_bindiff)
 
+    dx = sub.add_parser("diff-exploit",
+                        help="diff old vs patched, type the changes, and drive the exploit loop (N-day)")
+    dx.add_argument("old", help="the OLD / vulnerable build")
+    dx.add_argument("new", help="the NEW / patched build")
+    dx.add_argument("--timeout", type=int, default=600, help="per-binary disassembly budget (s)")
+    dx.add_argument("--max-leads", type=int, default=25, help="changed functions to type/rank")
+    dx.add_argument("--worklist-only", action="store_true",
+                    help="print the typed worklist and stop (do not drive the exploit loop)")
+    dx.add_argument("--budget", type=float, default=600.0, help="exploit-loop budget on the old build (s)")
+    dx.add_argument("--workers", type=int, default=4, help="worker threads for the exploit loop")
+    dx.add_argument("--case-store", default=None, help="keep the case here (default: a temp dir)")
+    dx.add_argument("--name", default=None, help="case name")
+    dx.add_argument("--argv", default=None, help="argv for the old build, if it needs one (shell-split)")
+    dx.add_argument("--input-mode", choices=("stdin", "arg", "file"), default=None,
+                    help="how the old build takes input")
+    dx.add_argument("--out", default=None, help="write PoCs / exploit scripts here (default: cwd)")
+    dx.add_argument("--quiet", action="store_true", help="do not stream per-stage progress")
+    dx.set_defaults(func=_cmd_diff_exploit)
+
     vs = sub.add_parser("variant-scan",
                         help="hunt a known-vulnerable function across a corpus of binaries (N-day)")
     vs.add_argument("--ref", required=True,
@@ -977,6 +996,146 @@ def _cmd_bindiff(args: argparse.Namespace) -> int:
     else:
         print("\nno named function changed -- the two builds are identical where symbols match.")
     return 0
+
+
+def _export_exploit_scripts(store, case_id, out_dir) -> int:
+    """Write every `exploit-script` artifact (the emitter's standalone PoC scripts) to disk with
+    its review. Returns how many were written."""
+    from .db.dao import ArtifactDAO
+    try:
+        arts = [a for a in ArtifactDAO(store.conn).list_by_case(case_id) if a.kind == "exploit-script"]
+    except Exception:                                    # noqa: BLE001
+        return 0
+    if not arts:
+        return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print("\n-- synthesized exploit scripts " + "-" * 46)
+    n = 0
+    for a in arts:
+        meta = a.meta or {}
+        tag = "proven" if meta.get("proven") else "synthesized"
+        name = f"exploit-{meta.get('kind', 'poc')}-{a.sha256[:8]}.py"
+        dest = out_dir / name
+        try:
+            dest.write_bytes(store.content.get_bytes(a.sha256))
+        except Exception:                                # noqa: BLE001
+            continue
+        n += 1
+        print(f"  [{tag}] {dest}")
+        if meta.get("review"):
+            print("      " + str(meta["review"]).splitlines()[0][:100])
+        print(f"      python3 {name} <target>   # RUN IN A SANDBOX/VM; authorized use only")
+    return n
+
+
+def _cmd_diff_exploit(args) -> int:
+    """One command: diff an OLD build against a PATCHED one, type the changed functions into an
+    exploit-loop worklist, then DRIVE the exploit loop on the old build steered at those functions
+    and export the PoCs / exploit scripts it produces. The N-day path, end to end."""
+    import tempfile
+    import threading
+    import time
+
+    from .analyze import native_re, patchdiff, register
+    from .analyze.ingest import enqueue_triage, ingest
+    from .analyze.orchestrate import run_case_autopilot
+    from .casestore import CaseStore
+    from .db.dao import FindingDAO
+
+    old, new = Path(args.old), Path(args.new)
+    for p in (old, new):
+        if not p.is_file():
+            print(f"no such file: {p}", file=sys.stderr)
+            return 2
+    # 1) DIFF -> typed exploit worklist (cheap; native_re, no case store).
+    print(f"diffing {old.name} (old) vs {new.name} (patched) ...", flush=True)
+    fa = native_re.analyze(old, timeout=args.timeout).get("functions") or []
+    fb = native_re.analyze(new, timeout=args.timeout).get("functions") or []
+    d = patchdiff.diff(fa, fb)
+    if not d.get("symbols"):
+        print("both builds are stripped -- cannot localise changed functions by name; supply "
+              "symbolized builds (the diff still needs names to steer the exploit loop).")
+        return 2
+    wl = patchdiff.exploit_worklist(d, top=args.max_leads)
+    mem = [e for e in wl if e["classification"]["exploit_class"] in ("overflow", "uaf")]
+    print(f"\n{len(d['changed'])} changed function(s); {len(mem)} look memory-corrupting. "
+          "Exploit-loop worklist (memory-corruption first):")
+    for e in wl:
+        c = e["classification"]
+        tag = {"overflow": "OVERFLOW", "uaf": "UAF", "unknown": "unknown"}[c["exploit_class"]]
+        print(f"  [{tag:<8}] {e['name']:<30} {c['cwe']:<16} conf {c['confidence']:.2f}  "
+              f"{c['why'][:68]}")
+    if args.worklist_only or not mem:
+        if not mem:
+            print("\nno memory-corruption leads to drive.")
+        return 0
+
+    # 2) DRIVE the exploit loop on the OLD build, steered at the typed leads.
+    from .jobs import JobConfig, JobQueue, WorkerPool
+    case_dir = Path(args.case_store) if args.case_store else Path(
+        tempfile.mkdtemp(prefix="lykos-diffexp-"))
+    register()
+    store = CaseStore.open(case_dir)
+    case = store.cases.create(args.name or f"{old.name}-vs-{new.name}")
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=args.workers, poll_interval=0.02))
+    pool.start()
+    rc = 1
+    try:
+        t = ingest(store, case.id, old, filename=old.name)
+        enqueue_triage(JobQueue(store.conn), t, force=True)
+        pool.wait_idle(180)
+        fd = FindingDAO(store.conn)
+        filed = 0
+        for e in mem:
+            addr = e.get("old_addr")
+            addr_s = hex(addr) if isinstance(addr, int) else (str(addr) if addr is not None else None)
+            if addr_s is None:
+                continue
+            c = e["classification"]
+            fd.upsert(t.id, case.id, {
+                "cwe": c["cwe"], "severity": "high", "detector": "patch_diff", "state": "candidate",
+                "confidence": round(0.3 + 0.2 * c["confidence"], 2), "function_addr": addr_s,
+                "title": f"Patch-diff lead ({c['exploit_class']}): '{e['name']}' changed vs {new.name}"[:200],
+                "dedup_key": f"patch_diff:{e['name']}:{addr_s}",
+                "evidence": [{"channel": "patch-diff",
+                              "detail": f"'{e['name']}' changed vs the patched build {new.name}; "
+                                        f"LIKELY {c['exploit_class']}: {c['why']}. The exploit loop "
+                                        "is steered at this function."}]})
+            filed += 1
+        print(f"\ndriving the exploit loop on {old.name} at {filed} changed function(s), "
+              f"budget {args.budget:g}s ...", flush=True)
+        over: dict = {}
+        if args.argv:
+            import shlex
+            over["argv"] = shlex.split(args.argv)
+        if args.input_mode:
+            over["input_mode"] = args.input_mode
+        status: dict = {"state": "starting"}
+        stop = threading.Event()
+        th = threading.Thread(target=run_case_autopilot,
+                              args=(case_dir, case.id, [t.id], status, stop, args.budget, over),
+                              daemon=True)
+        th.start()
+        deadline = time.monotonic() + args.budget * 1.5 + 120.0
+        seen: dict = {}
+        while th.is_alive() and time.monotonic() < deadline:
+            th.join(timeout=2.0)
+            if not args.quiet:
+                _tick_plan(status, seen)
+        if th.is_alive():
+            stop.set()
+            th.join(timeout=90)
+            print("\n(stopped: the run outlasted its budget)")
+        findings = FindingDAO(store.conn).list_by_target(t.id)
+        _print_findings(findings)
+        out = Path(args.out or ".").resolve()
+        _export_pocs(store, t, out)
+        n_scripts = _export_exploit_scripts(store, case.id, out)
+        rc = 0 if (any(f.state in ("confirmed", "poc-backed") for f in findings) or n_scripts) else 1
+    finally:
+        pool.stop()
+        store.close()
+    return rc
 
 
 def _cmd_archgate(args: argparse.Namespace) -> int:
