@@ -19,6 +19,8 @@ from .stage import CVE_STAGE, enqueue_cve_scan  # noqa: F401
 from .stage import register as _register_cve
 from .uaf import UAF_STAGE, enqueue_uaf_scan  # noqa: F401
 from .uaf import register as _register_uaf
+from .assert_guard import ASSERT_GUARD_STAGE, enqueue_assert_guard_scan  # noqa: F401
+from .assert_guard import register as _register_assert_guard
 
 
 def register() -> None:
@@ -27,6 +29,7 @@ def register() -> None:
     _register_embedded()
     _register_intovf()
     _register_uaf()
+    _register_assert_guard()
     _register_sinks()
     _register_cpg()
     _register_corroborate()

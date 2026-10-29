@@ -1496,7 +1496,7 @@ _EVENT_STAGE = {
     "rootcause": "root_cause", "secret": "synthesize_secret", "secrets": "extract_secrets",
     "source_cve": "source_cve_scan", "source_sink": "source_sink_scan",
     "synth": "synthesize_poc", "system": "whole_system", "taint": "dynamic_taint",
-    "triage": "ingest_triage", "uaf": "uaf_scan",
+    "triage": "ingest_triage", "uaf": "uaf_scan", "assert_guard": "assert_guard_scan",
 }
 
 #: Stages the autopilot is not expected to schedule per target, so their absence is not a gap:
@@ -2087,6 +2087,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "int_overflow_scan", status, stop)
                 # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
                 _staged(bud, store, t, "uaf_scan", status, stop)
+                # A copy whose only length bound is an assertion: unchecked in release builds (an
+                # out-of-bounds write) or a remote abort where kept (CWE-787/CWE-617).
+                _staged(bud, store, t, "assert_guard_scan", status, stop)
                 # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
                 _staged(bud, store, t, "source_sink_scan", status, stop)
                 # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
