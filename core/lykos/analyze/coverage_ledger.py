@@ -320,8 +320,22 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         # The grounding view: how the raw candidate pile tiers once precision + malicious-peer
         # reachability are applied (the grounded, attacker-reachable shortlist vs set-aside FPs).
         "grounding": _grounding_rollup(conn, case_id),
+        # Coverage across ALL weakness classes: the honest answer to "consider all CWEs" -- the
+        # per-class weaponization ceiling (what CAN be proven) and how far each class present on
+        # this case actually climbed the confidence ladder. Breadth is wide; depth is the lever.
+        "cwe_coverage": _cwe_coverage_rollup(all_findings),
         "gaps": gaps,
     }
+
+
+def _cwe_coverage_rollup(all_findings) -> dict:
+    """The CWE coverage matrix for this case: the static capability summary (classes detected, how
+    many reach RCE) and the per-class run matrix (how far each class present climbed). One source
+    for the CLI (`lykos cwe-coverage`), the report, and the GUI."""
+    from . import cwe_coverage
+    run = cwe_coverage.run_matrix(
+        [{"cwe": f.cwe, "state": f.state, "dedup_key": f.dedup_key} for f in all_findings])
+    return {"summary": cwe_coverage.summary(), "run": run}
 
 
 def _grounding_rollup(conn, case_id: str) -> Optional[dict]:

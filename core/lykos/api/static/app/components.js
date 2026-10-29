@@ -1353,6 +1353,35 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
         }) : html`<div class="ax-note">No targets analysed.</div>`}
       </div>
 
+      <!-- Weakness-class coverage: ALL CWEs -- detection breadth + the honest exploit ceiling -->
+      ${ledger.cwe_coverage && ledger.cwe_coverage.summary ? (() => {
+        const cc = ledger.cwe_coverage, sum = cc.summary || {}, run = cc.run || {};
+        const rows = run.rows || [];
+        return html`<div class="ledger-axis">
+          <div class="ax-top"><span class="ax-name">Weakness-class coverage
+            <span class="ax-tag">all CWEs</span></span>
+            <span class="lc-val">${sum.detected_classes} detected · ${sum.rce_capable} can reach RCE</span>
+          </div>
+          <div class="ld-muted" style="margin:2px 0 6px">Breadth is wide; the lever is DEPTH —
+            how far each class present climbed. ${run.demonstrated_classes || 0} of
+            ${run.classes_present || 0} class(es) present reached confirmed/poc.</div>
+          ${rows.length ? html`<div class="ledger-list">
+            ${rows.map((e) => {
+              const row = html`
+                <span class="ll-cwe">${e.cwe}</span>
+                <span class="ll-label">${e.name}</span>
+                <span class=${`lchip st-${_STATE_TONE[e.best_state] || "lo"}`}>${e.best_state}</span>
+                <span class="ll-classes" title="honest weaponization ceiling for this class">${
+                  e.ceiling || "—"}${e.count ? ` · ${e.count}` : ""}</span>`;
+              return onFilterCwe
+                ? html`<button class="ll-row clk" key=${e.cwe}
+                    title="show this class's findings" onClick=${() => onFilterCwe(e.cwe)}>${row}</button>`
+                : html`<div class="ll-row" key=${e.cwe}>${row}</div>`;
+            })}
+          </div>` : html`<div class="ax-note">No classified findings on this case.</div>`}
+        </div>`;
+      })() : null}
+
       <!-- The combined gaps worklist -->
       ${gaps.length ? html`<div class="ledger-gaps">
         <div class="lg-head">Gaps worklist</div>

@@ -83,6 +83,8 @@ STAGES: tuple[StageSpec, ...] = (
               "enqueue_oob_write_scan", no_params=True),
     StageSpec("grounding", "Ground findings (precision + peer reachability)", "target",
               "..analyze.grounding_stage", "enqueue_grounding", no_params=True),
+    StageSpec("confirm", "Confirm real+reachable findings, then weaponize", "target",
+              "..analyze.verify_stage", "enqueue_verify", no_params=True),
     StageSpec("source_sink_scan", "Tainted-sink scan", "target", "..analyze.fingerprint", "enqueue_source_sink_scan", no_params=True),
     StageSpec("cpg_scan", "Per-CWE source/sink queries", "target", "..analyze.fingerprint", "enqueue_cpg_scan", no_params=True),
     # extract_secrets feeds itself a probe input when given none; synthesize_secret reads static

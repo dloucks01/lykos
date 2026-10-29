@@ -46,7 +46,7 @@ const DYNAMIC_BACKENDS = new Set([
 // not-in-tab: ingest_triage, unpack
 //
 // source-only: they need an archived source tree, which the workbench does not upload:
-// not-in-tab: assert_guard_scan, cpg_scan, grounding, oob_write_scan, embedded_audit, int_overflow_scan, libfuzzer, source_cve_scan, source_sink_scan, uaf_scan
+// not-in-tab: assert_guard_scan, cpg_scan, grounding, confirm, oob_write_scan, embedded_audit, int_overflow_scan, libfuzzer, source_cve_scan, source_sink_scan, uaf_scan
 //
 // the source confirmation + under-constrained-symbolic stages: the server schedules them after the
 // source scans, and they run on source-built harnesses / materialized binaries (the confirmation

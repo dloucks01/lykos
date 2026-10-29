@@ -249,6 +249,24 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
                  f'<b>{gr.get("shortlist", 0)}</b> attacker-reachable of {gr["annotated"]} '
                  f'findings{esc(aside)} <span class="muted">(precision + malicious-peer '
                  'reachability; set-asides carry their reason on each finding)</span></p>')
+    # Weakness-class coverage across ALL CWEs: detection breadth + the honest per-class exploit
+    # ceiling, and how far each class present on this case climbed the ladder. The honest framing:
+    # breadth is wide; depth (reaching confirmed/poc on the RCE-capable classes) is the lever.
+    cc = led.get("cwe_coverage") or {}
+    ccsum, ccrun = cc.get("summary") or {}, cc.get("run") or {}
+    if ccsum and ccrun.get("rows"):
+        p.append('<div class="evlabel">Weakness-class coverage <span class="muted">— all CWEs '
+                 f'({ccsum.get("detected_classes", 0)} classes detected, '
+                 f'{ccsum.get("rce_capable", 0)} can reach RCE; '
+                 f'{ccrun.get("demonstrated_classes", 0)} of {ccrun.get("classes_present", 0)} '
+                 'present reached confirmed/poc)</span></div>')
+        p.append('<table class="verdicts"><thead><tr><th>CWE</th><th>class</th><th>best state</th>'
+                 '<th>exploit ceiling</th><th>count</th></tr></thead><tbody>')
+        for e in ccrun["rows"]:
+            p.append(f'<tr><td class="mono">{esc(e.get("cwe"))}</td><td>{esc(e.get("name"))}</td>'
+                     f'<td>{esc(e.get("best_state"))}</td><td>{esc(e.get("ceiling") or "—")}</td>'
+                     f'<td>{e.get("count", 0)}</td></tr>')
+        p.append('</tbody></table>')
     # which checks did NOT run (classes never looked for) -- the axis-B gap
     nr = ch.get("not_run") or []
     if nr:

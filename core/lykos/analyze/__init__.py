@@ -24,6 +24,7 @@ from .symbolic.uc_stage import register as _register_uc_symbolic
 from .synth_confirm_stage import register as _register_synth_confirm
 from .patch_diff_stage import register as _register_patch_diff
 from .grounding_stage import register as _register_grounding
+from .verify_stage import register as _register_verify
 from .poc import register as _register_poc
 from .scan_stages import register as _register_scans
 from .symbolic import register as _register_symbolic
@@ -44,6 +45,7 @@ def register() -> None:
     _register_poc()
     _register_patch_diff()
     _register_grounding()
+    _register_verify()
     _register_scans()
     _register_symbolic()
     _register_debug()

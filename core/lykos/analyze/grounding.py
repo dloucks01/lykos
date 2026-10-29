@@ -249,6 +249,35 @@ def make_source_lookup(root) -> Callable[[str, int], Optional[str]]:
     return lookup
 
 
+def make_file_text_lookup(root) -> Callable[[str], Optional[str]]:
+    """A `lookup(path)` over a source tree at `root` returning the WHOLE file text for a cited path
+    (full relative path or bare basename), or None. This is the shape taint_reach.ground_reach wants
+    (it parses the enclosing function from the full text), distinct from make_source_lookup's
+    (path, line) context slice. Bounded and cached."""
+    root = Path(root)
+    index: dict = {}
+
+    def _build():
+        if index:
+            return
+        for p in root.rglob("*"):
+            if p.is_file() and p.suffix in (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"):
+                index.setdefault(p.name, []).append(p)
+
+    def lookup(path: str) -> Optional[str]:
+        _build()
+        base = path.split("/")[-1]
+        cands = sorted(index.get(base, []), key=lambda p: 0 if str(p).endswith(path) else 1)
+        for p in cands[:4]:
+            try:
+                return p.read_text("utf-8", "replace")
+            except OSError:
+                continue
+        return None
+
+    return lookup
+
+
 def ground_findings(findings: list, *, source_root=None, bits: int = 64) -> dict:
     """Ground a list of findings. Returns {schema, total, grounded:[...], dropped:[...], by_verdict}
     where each entry is {finding, grounding}. The grounded list is the trustworthy prove-out

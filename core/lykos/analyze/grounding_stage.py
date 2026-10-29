@@ -44,9 +44,9 @@ def _finding_dict(f) -> dict:
             "severity": f.severity, "state": f.state, "confidence": f.confidence}
 
 
-def _source_lookup(ctx, target):
-    """A source_lookup over the case's archived source tree (for grounding's source-text checks),
-    or None when there is no source project."""
+def _source_root(ctx, target):
+    """The extracted root of the case's archived source tree, or None when there is no source
+    project / it could not be unpacked."""
     proj = source_project_for(ctx.conn, target)
     if proj is None:
         return None
@@ -61,7 +61,7 @@ def _source_lookup(ctx, target):
                         tf.extract(mem, root)
         except Exception:                                # noqa: BLE001
             return None
-    return grounding.make_source_lookup(root)
+    return root
 
 
 def grounding_stage(ctx) -> dict:
@@ -76,7 +76,12 @@ def grounding_stage(ctx) -> dict:
         reachable = taint_reach.attacker_reachable_names(ctx.conn, target.case_id)
     except Exception:                                    # noqa: BLE001
         reachable = set()
-    lookup = _source_lookup(ctx, target)   # (path, line) -> source line context, for grounding
+    root = _source_root(ctx, target)
+    # (path, line) -> context slice, for grounding's source checks; path -> whole-file text, for
+    # taint_reach to parse the enclosing function of a source finding (so reachability can be
+    # DECIDED rather than left undecided -- what gates the confirm promoter).
+    lookup = grounding.make_source_lookup(root) if root else None
+    text_lookup = grounding.make_file_text_lookup(root) if root else None
 
     fd = FindingDAO(ctx.conn)
     findings = fd.list_by_target(target.id)
@@ -87,10 +92,10 @@ def grounding_stage(ctx) -> dict:
             continue
         fdict = _finding_dict(f)
         g = grounding.ground_finding(fdict, source_lookup=lookup, bits=bits)
-        # taint_reach resolves the finding's function from its binary addr (via conn) and its
-        # evidence prose; it wants whole-file text, which our line-lookup does not provide, so pass
-        # None and let it fall back (the common path uses function_addr / the "in X" prose).
-        r = taint_reach.ground_reach(fdict, reachable, conn=ctx.conn, source_lookup=None)
+        # taint_reach resolves the finding's function from its binary addr (via conn), the enclosing
+        # function at its cited file:line (via the whole-file text_lookup), or a name in the evidence
+        # prose -- so a source finding's reachability is DECIDED, not left undecided.
+        r = taint_reach.ground_reach(fdict, reachable, conn=ctx.conn, source_lookup=text_lookup)
         is_real = bool(g["grounded"])          # grounding kept it (not a PROVABLE false positive)
         reach = r.get("reachable")             # taint_reach: True / False / None
         # COMBINED verdict: grounding decides real-vs-FP; taint_reach decides attacker-reachability,

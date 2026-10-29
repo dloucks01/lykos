@@ -81,6 +81,29 @@ def test_mangled_symbol_tail_matches():
     assert TR.ground_reach(f, reach)["reachable"] is True
 
 
+def test_source_finding_reachability_decided_via_file_text_lookup(tmp_path):
+    """A source finding that cites only file:line (no function name in prose) is still DECIDED:
+    a whole-file text lookup resolves the enclosing function, which here is a wire parser by role
+    -- so reachability is True, not the undecided it would be without the lookup. This is what lets
+    the confirm promoter populate the rung on a source case."""
+    from lykos.analyze import grounding
+    (tmp_path / "chan.c").write_text(
+        "int helper(int x){ return x; }\n"
+        "void recv_pdu(Stream* s){\n"
+        "    char buf[8];\n"
+        "    memcpy(buf, s->data, s->len);   // line 5: the oob write\n"
+        "}\n")
+    text_lookup = grounding.make_file_text_lookup(tmp_path)
+    assert "recv_pdu" in (text_lookup("chan.c") or "")
+    f = {"cwe": "CWE-787", "function_addr": None,
+         "evidence": [{"channel": "source", "detail": "chan.c:5: out-of-bounds write"}]}
+    # Without the text lookup the name cannot be resolved -> undecided.
+    assert TR.ground_reach(f, set())["reachable"] is None
+    # With it, the enclosing function resolves to recv_pdu, a peer parser by role -> reachable.
+    r = TR.ground_reach(f, set(), source_lookup=text_lookup)
+    assert r["reachable"] is True and r["name"] == "recv_pdu" and r["basis"] == "peer-entry"
+
+
 def test_is_peer_entry_recognizes_wire_parsers_and_reads():
     # role-y names the regex catches (the rest -- e.g. vendor_SurfaceCommand_Handler -- are caught
     # by reachability from these, or by source-path role, not by name).
