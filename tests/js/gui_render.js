@@ -360,6 +360,11 @@ function renderInfo(vnode) {
     // pocs reach L3, so all four rungs (L0..L3) are lit
     && info.classes.filter((c) => /^ov-step reached/.test(c)).length === 4);
   ck("CaseOverview shows the detector mix", /cve_fingerprint/.test(info.all) && /scriptscan/.test(info.all));
+  // Hub cross-links: with onFilter, the ladder rungs and detector chips are clickable filters.
+  ck("CaseOverview ladder rungs are clickable impact-level filters",
+    info.classes.some((c) => /\bov-step\b.*\bclk\b/.test(c)));
+  ck("CaseOverview detector chips are clickable detector filters",
+    info.classes.some((c) => /\bov-chip\b.*\bclk\b/.test(c)));
   ck("CaseOverview is empty-safe with no findings",
     renderInfo(h(C.CaseOverview, { findings: [], pocs: [] })).threw.length === 0);
   // a filtered render exposes the clear affordance

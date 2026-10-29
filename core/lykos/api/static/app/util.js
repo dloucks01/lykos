@@ -337,6 +337,10 @@ export function filterByViz(findings, viz) {
   // Verification verdict (doc 49 spine): the prove-out shortlist / off-surface / noise triage, so
   // a verdict badge or the ledger's shortlist line filters the board to exactly those findings.
   if (viz.verdict) return findings.filter((f) => (f.verification || {}).verdict === viz.verdict);
+  // Detector / impact level (the CaseOverview hub widgets): a detector chip, or a weaponization
+  // ladder rung, filters the board. A finding's level is its verified PoC level, else L0.
+  if (viz.detector) return findings.filter((f) => f.detector === viz.detector);
+  if (viz.level) return findings.filter((f) => (f.poc_level || "L0") === viz.level);
   return findings;
 }
 

@@ -364,6 +364,18 @@ const ck = (n, cond) => { pass = pass && !!cond; console.log(`${cond ? "PASS" : 
       { id: "c", verification: { verdict: "prove-out-shortlist" } },
       { id: "d" },
     ], { verdict: "prove-out-shortlist" }).map((f) => f.id).join("") === "ac");
+  ck("filterByViz narrows to a detector (the CaseOverview detector-chip cross-link)",
+    util.filterByViz([
+      { id: "a", detector: "int_overflow" }, { id: "b", detector: "uaf" },
+      { id: "c", detector: "int_overflow" },
+    ], { detector: "int_overflow" }).map((f) => f.id).join("") === "ac");
+  ck("filterByViz narrows to an impact level (the weaponization-ladder cross-link; L0 = no PoC)",
+    util.filterByViz([
+      { id: "a", poc_level: "L2" }, { id: "b" }, { id: "c", poc_level: "L2" }, { id: "d", poc_level: "L0" },
+    ], { level: "L2" }).map((f) => f.id).join("") === "ac" &&
+    util.filterByViz([
+      { id: "a", poc_level: "L2" }, { id: "b" }, { id: "d", poc_level: "L0" },
+    ], { level: "L0" }).map((f) => f.id).join("") === "bd");
   ck("histogram counts a field, most-frequent first",
     JSON.stringify(util.histogram(ov, "cwe")) ===
       JSON.stringify([{ key: "CWE-787", count: 2 }, { key: "CWE-121", count: 1 }, { key: "CWE-78", count: 1 }]));

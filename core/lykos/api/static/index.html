@@ -302,6 +302,12 @@
   .ov-step-l { display: block; font-size: .6rem; opacity: .75; }
   .ov-det { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
   .ov-chip { font-size: .66rem; padding: 2px 7px; border-radius: 12px; border: 1px solid var(--line); font-family: ui-monospace, monospace; opacity: .85; }
+  .ov-step.clk { cursor: pointer; }
+  .ov-step.clk:hover { border-color: var(--accent, #58a6ff); }
+  .ov-step.on { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #58a6ff) 55%, transparent); opacity: 1; }
+  .ov-chip.clk { cursor: pointer; }
+  .ov-chip.clk:hover { border-color: var(--accent, #58a6ff); opacity: 1; }
+  .ov-chip.on { border-color: var(--accent, #58a6ff); color: var(--accent-2); opacity: 1; font-weight: 700; }
   .badge { font-size: .72rem; padding: 3px 9px; border-radius: 20px; white-space: nowrap; border: 1px solid var(--line); }
   .badge.state-poc-backed { background: var(--ok); color: #0d1117; border-color: var(--ok); font-weight: 700; }
   .badge.state-confirmed { background: color-mix(in srgb, var(--ok) 25%, transparent); color: var(--ok); }

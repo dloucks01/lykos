@@ -2326,7 +2326,11 @@ export function CallGraphCanvas({ functions, edges, onOpen, highlightAddr }) {
 
 // Severity -> CSS color token (matches the --crit..--info / sev-* palette used across the UI).
 const SEVVAR = { critical: "crit", high: "high", medium: "med", low: "low", info: "info" };
-const _sameSeg = (a, b) => a && b && a.severity === b.severity && a.cwe === b.cwe;
+// A click-filter segment is single-key ({severity} | {cwe} | {detector} | {level}); two segments
+// are "the same" (so clicking the active one toggles it off) when that one key matches.
+const _segKey = (s) => !s ? "" : s.severity ? `sev:${s.severity}` : s.cwe ? `cwe:${s.cwe}`
+  : s.detector ? `det:${s.detector}` : s.level ? `lvl:${s.level}` : "";
+const _sameSeg = (a, b) => !!(a && b && _segKey(a) && _segKey(a) === _segKey(b));
 
 // Case Overview: at-a-glance INTERACTIVE analytics for the active target -- a severity donut, a
 // top-CWE bar chart, the L0->L3 weaponization ladder, and a detector mix. Pure inline SVG (the
@@ -2387,7 +2391,7 @@ export function CaseOverview({ findings, pocs, filter, onFilter }) {
   const barMax = Math.max(1, ...cwes.map((c) => c.count));
   return html`<div class="ov" aria-label="case overview">
     ${filter ? html`<button class="ov-clear btn small ghost" onClick=${() => onFilter && onFilter(null)}>
-      ✕ clear ${filter.severity || filter.cwe || filter.stageLabel || filter.stage || filter.verdictLabel || filter.verdict} filter</button>` : null}
+      ✕ clear ${filter.severity || filter.cwe || filter.stageLabel || filter.stage || filter.verdictLabel || filter.verdict || filter.detector || filter.level} filter</button>` : null}
     <div class="ov-grid">
       <div class="ov-card">
         <div class="ov-h">Severity</div>
@@ -2412,10 +2416,14 @@ export function CaseOverview({ findings, pocs, filter, onFilter }) {
       <div class="ov-card">
         <div class="ov-h">Weaponization</div>
         <div class="ov-ladder">${LADDER.map((name, i) => html`<div key=${name}
-          class=${`ov-step${lvl >= i ? " reached" : ""}${lvl === i ? " top" : ""}`}
-          title=${`L${i} ${name}${lvl >= i ? " — reached" : ""}`}>
+          class=${`ov-step${lvl >= i ? " reached" : ""}${lvl === i ? " top" : ""}${onFilter ? " clk" : ""}${filter && filter.level === `L${i}` ? " on" : ""}`}
+          onClick=${() => pick({ level: `L${i}` })}
+          title=${`L${i} ${name}${lvl >= i ? " — reached" : ""}${onFilter ? " — click to filter the list" : ""}`}>
           <span class="ov-step-n">L${i}</span><span class="ov-step-l">${name}</span></div>`)}</div>
-        <div class="ov-det">${dets.map((d) => html`<span key=${d.key} class="ov-chip" title=${`${d.count} finding(s) via ${d.key}`}>${d.key} ·${d.count}</span>`)}</div>
+        <div class="ov-det">${dets.map((d) => html`<span key=${d.key}
+          class=${`ov-chip${onFilter ? " clk" : ""}${filter && filter.detector === d.key ? " on" : ""}`}
+          onClick=${() => pick({ detector: d.key })}
+          title=${`${d.count} finding(s) via ${d.key}${onFilter ? " — click to filter" : ""}`}>${d.key} ·${d.count}</span>`)}</div>
       </div>
     </div>
   </div>`;
