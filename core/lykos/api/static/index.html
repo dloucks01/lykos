@@ -496,6 +496,21 @@
   .ll-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ll-classes { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: .72rem; }
   .ll-more { color: var(--muted); font-style: italic; justify-content: center; }
+  /* ledger cross-links: a worklist row, a code row, a class chip become buttons that navigate the
+     rest of the spine. Reset the button chrome so they read as the row/chip they replace. */
+  button.ll-row { width: 100%; background: none; color: inherit; font: inherit; text-align: left;
+    border-left: 0; border-right: 0; border-bottom: 0; cursor: pointer; }
+  button.ll-row:hover { background: var(--panel-2); }
+  button.ll-row:hover .ll-label { color: var(--accent-2); }
+  button.ledger-code-row { width: 100%; background: none; color: inherit; font: inherit;
+    text-align: left; border: 0; cursor: pointer; border-radius: 6px; padding: 4px 6px; margin: 3px -6px; }
+  button.ledger-code-row:hover { background: var(--panel-2); }
+  button.ledger-code-row:hover .lc-name { color: var(--accent-2); }
+  button.lchip.clk { cursor: pointer; }
+  button.lchip.cwe.clk:hover { border-color: color-mix(in srgb, var(--accent-2) 55%, var(--line)); }
+  .find-meta .stage-prov.clk { background: none; border: 0; padding: 0; font: inherit;
+    color: var(--muted); cursor: pointer; text-decoration: underline dotted; }
+  .find-meta .stage-prov.clk:hover { color: var(--accent-2); }
   .ledger-code-row { display: flex; align-items: center; gap: 12px; margin: 7px 0; }
   .lc-name { flex: 0 0 150px; font-family: var(--mono); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lc-val { flex: 0 0 auto; font-size: .8rem; font-weight: 600; text-align: right; }

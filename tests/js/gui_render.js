@@ -116,6 +116,21 @@ function renderInfo(vnode) {
     info.hrefs.some((hh) => hh === "/artifacts/deadbeef") && info.tags.includes("a"));
   ck("FindingCard marks a demonstrated finding", info.classes.some((c) => /\bdemo\b/.test(c)));
 
+  // The "found by <stage>" provenance chip is a plain label by default, and becomes a clickable
+  // button (the finding->stage cross-link) when onStage + finding.stage are both present.
+  const prov = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, stage: "directed_fuzz", stage_label: "Directed fuzzing" },
+    pocs, reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard shows the discovering stage", /found by\s+Directed fuzzing/.test(prov.all) && prov.threw.length === 0);
+  ck("FindingCard provenance chip is NOT a button without onStage", !prov.classes.some((c) => /stage-prov clk/.test(c)));
+  const provClick = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, stage: "directed_fuzz", stage_label: "Directed fuzzing" },
+    pocs, onStage() {}, reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard provenance chip becomes a clickable button with onStage",
+    provClick.threw.length === 0 && provClick.classes.some((c) => /stage-prov clk/.test(c)));
+
   // A candidate must NOT be styled as demonstrated.
   const cand = renderInfo(h(C.FindingCard, {
     finding: { id: "F2", cwe: "CWE-120", title: "strcpy", severity: "high", state: "candidate" },

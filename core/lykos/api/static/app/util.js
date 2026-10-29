@@ -326,12 +326,14 @@ export function progressText(type, p) {
 
 // --- Case Overview visualization helpers (pure; so the viz interactivity is unit-testable) ---
 
-// Filter findings by a clicked overview segment. `viz` is null (no filter), {severity} or {cwe}.
-// Returns the findings a clicked severity arc / CWE bar should narrow the list to.
+// Filter findings by a clicked overview segment or a cross-link. `viz` is null (no filter),
+// {severity}, {cwe}, or {stage} (the provenance hop: a finding's "found by <stage>" chip, and the
+// coverage ledger's class chips, narrow the list to one dimension). Returns the narrowed findings.
 export function filterByViz(findings, viz) {
   if (!viz) return findings;
   if (viz.severity) return findings.filter((f) => (f.severity || "").toLowerCase() === viz.severity);
   if (viz.cwe) return findings.filter((f) => f.cwe === viz.cwe);
+  if (viz.stage) return findings.filter((f) => f.stage === viz.stage);
   return findings;
 }
 

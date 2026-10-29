@@ -353,6 +353,10 @@ const ck = (n, cond) => { pass = pass && !!cond; console.log(`${cond ? "PASS" : 
     util.filterByViz(ov, { severity: "high" }).map((f) => f.id).join("") === "bc");
   ck("filterByViz narrows to a clicked CWE",
     util.filterByViz(ov, { cwe: "CWE-121" }).map((f) => f.id).join("") === "a");
+  ck("filterByViz narrows to a finding's discovering stage (the provenance cross-link)",
+    util.filterByViz([
+      { id: "a", stage: "cpg_scan" }, { id: "b", stage: "uaf_scan" }, { id: "c", stage: "cpg_scan" },
+    ], { stage: "cpg_scan" }).map((f) => f.id).join("") === "ac");
   ck("histogram counts a field, most-frequent first",
     JSON.stringify(util.histogram(ov, "cwe")) ===
       JSON.stringify([{ key: "CWE-787", count: 2 }, { key: "CWE-121", count: 1 }, { key: "CWE-78", count: 1 }]));

@@ -170,3 +170,23 @@ def test_the_ui_renders_the_coverage_ledger():
 def test_the_coverage_ledger_survives_a_case_reset():
     """A stale ledger from the previous case describes a different engagement."""
     assert "setLedger(null)" in APP, "the coverage ledger is not cleared when the case is reset"
+
+
+def test_the_coverage_ledger_cross_links_into_the_spine():
+    """The ledger is a navigable hub (doc 49 2b): its worklist rows open the finding, its class
+    chips filter the findings, and its code rows focus the target -- not a dead-end display."""
+    # the component accepts and wires the three navigation handlers
+    assert "export function LedgerPanel" in COMPONENTS
+    for prop in ("onOpenFinding", "onFilterCwe", "onFocusTarget"):
+        assert COMPONENTS.count(prop) >= 2, f"LedgerPanel declares but never calls {prop}"
+    # the app passes real handlers to them (open the finding, filter by CWE, focus the target)
+    assert "onOpenFinding=${openFindingById}" in APP
+    assert "onFilterCwe=${filterByCwe}" in APP and "onFocusTarget=${focusTargetByName}" in APP
+
+
+def test_a_finding_links_to_its_discovering_stage():
+    """The deferred 2b spine piece: the 'found by <stage>' chip navigates to that stage's findings."""
+    assert "onStage" in COMPONENTS, "FindingCard has no stage cross-link"
+    assert "onStage=${showStageFindings}" in APP, "the app never wires the finding->stage hop"
+    # the filter understands the stage dimension the chip sets
+    assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"

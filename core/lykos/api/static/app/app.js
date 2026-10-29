@@ -976,6 +976,27 @@ function App() {
                  title: finding.title || finding.cwe || "finding" });
   }, []);
 
+  // Cross-link (doc 49 2b): a finding's "found by <stage>" chip -> every finding that stage found
+  // (the provenance hop, the one spine piece 2b left deferred). Filters the findings list by stage.
+  const showStageFindings = useCallback((stage, label) => {
+    setTab("findings");
+    setViz({ stage, stageLabel: label });
+  }, []);
+
+  // Cross-links FROM the coverage ledger INTO the rest of the spine (doc 49 2b): a class chip ->
+  // that CWE's findings; a code row -> that target's call graph; a worklist row -> openFindingById.
+  const filterByCwe = useCallback((cwe) => {
+    setTab("findings");
+    setViz({ cwe });
+  }, []);
+  const focusTargetByName = useCallback((filename) => {
+    const t = targetsRef.current.find((x) => x.filename === filename);
+    if (!t) return;
+    setActiveTid(t.id);
+    setTab("functions");
+    setFnView("graph");
+  }, []);
+
   // A background-run control (pause/resume/stop) that fails must say so; the bare promise was
   // dropped and a refused click looked exactly like one that worked.
   const bgControl = useCallback((fn) => {
@@ -1109,7 +1130,7 @@ function App() {
     pocs=${pocsFor(f)} mitigations=${mitOf(f)}
     reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
     onInspect=${(finding, focus) => setEvidence({ finding, focus })}
-    onCurate=${curate} onShowInGraph=${showInGraph} />`;
+    onCurate=${curate} onShowInGraph=${showInGraph} onStage=${showStageFindings} />`;
   const multi = targets.length > 1;
   // finding -> its false-positive review (via the PoC that carries the crashing input's sha)
   const verByFinding = {};
@@ -1480,7 +1501,9 @@ function App() {
               </div>
             ` : tab === "ledger" ? html`
               <div class="wb-panel">
-                <${LedgerPanel} ledger=${ledger} busy=${ledgerBusy} />
+                <${LedgerPanel} ledger=${ledger} busy=${ledgerBusy}
+                  onOpenFinding=${openFindingById} onFilterCwe=${filterByCwe}
+                  onFocusTarget=${focusTargetByName} />
               </div>
             ` : tab === "exploits" ? html`
               <div class="wb-panel">

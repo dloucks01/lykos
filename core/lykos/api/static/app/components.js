@@ -686,7 +686,7 @@ export function CurationFilter({ mode, onChange, counts }) {
     </div>`;
 }
 
-export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph }) {
+export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph, onStage }) {
   const inspect = (ch) => onInspect && onInspect(finding, ch);
   const demo = isDemonstrated(finding);
   const evRaw = finding.evidence;
@@ -716,7 +716,10 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
           <div class="find-meta">
             <span class="cwe cwe-info" title=${cweTip(finding)}>${finding.cwe}</span>
             ${finding.detector ? html`<span class="det">via ${finding.detector}</span>` : null}
-            ${finding.stage_label ? html`<span class="det stage-prov" title="the pipeline stage that discovered this finding">found by ${finding.stage_label}</span>` : null}
+            ${finding.stage_label ? (onStage && finding.stage
+              ? html`<button class="det stage-prov clk" title="show every finding this pipeline stage discovered"
+                  onClick=${() => onStage(finding.stage, finding.stage_label)}>found by ${finding.stage_label}</button>`
+              : html`<span class="det stage-prov" title="the pipeline stage that discovered this finding">found by ${finding.stage_label}</span>`) : null}
             ${site ? html`<span class="at">at <code>${site}</code></span>` : null}
             ${finding.group_count > 1 ? html`<span class="sites">${finding.group_count} occurrences</span>` : (finding.site_count ? html`<span class="sites">${finding.site_count} site${finding.site_count === 1 ? "" : "s"}${finding.proven_sites ? ` · ${finding.proven_sites} proven` : ""}</span>` : null)}
           </div>
@@ -1113,7 +1116,7 @@ function _axisBar(pct) {
     style=${`width:${pct != null ? Math.max(2, Math.min(100, pct)) : 0}%`}></div></div>`;
 }
 
-export function LedgerPanel({ ledger, busy }) {
+export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusTarget }) {
   const [showChecks, setShowChecks] = useState(false);
   const [showCands, setShowCands] = useState(false);
   if (busy && !ledger) {
@@ -1149,7 +1152,10 @@ export function LedgerPanel({ ledger, busy }) {
         <div class="ax-note">${classes.length} weakness class${classes.length === 1 ? "" : "es"} looked for${
           notRun.length ? ` · ${notRun.length} check${notRun.length === 1 ? "" : "s"} did not run` : ""}</div>
         ${classes.length ? html`<div class="ledger-chips">
-          ${classes.map((c) => html`<span class="lchip cwe" key=${c}>${c}</span>`)}
+          ${classes.map((c) => (onFilterCwe
+            ? html`<button class="lchip cwe clk" key=${c} title="show this class's findings"
+                onClick=${() => onFilterCwe(c)}>${c}</button>`
+            : html`<span class="lchip cwe" key=${c}>${c}</span>`))}
         </div>` : null}
         ${notRun.length ? html`
           <button class="btn small ghost ledger-toggle" onClick=${() => setShowChecks((s) => !s)}>
@@ -1182,11 +1188,18 @@ export function LedgerPanel({ ledger, busy }) {
             ${showCands ? "▾" : "▸"} ${candTotal} bare candidate${candTotal === 1 ? "" : "s"} — weaponization worklist
           </button>
           ${showCands ? html`<div class="ledger-list">
-            ${cands.map((f) => html`<div class="ll-row" key=${f.id}>
-              <span class="ll-cwe">${f.cwe || "—"}</span>
-              <span class="ll-label">${f.title || "(untitled)"}</span>
-              ${f.detector ? html`<span class="ll-classes">${f.detector}</span>` : null}
-            </div>`)}
+            ${cands.map((f) => (onOpenFinding
+              ? html`<button class="ll-row clk" key=${f.id} title="open this finding's evidence"
+                  onClick=${() => onOpenFinding(f.id)}>
+                  <span class="ll-cwe">${f.cwe || "—"}</span>
+                  <span class="ll-label">${f.title || "(untitled)"}</span>
+                  ${f.detector ? html`<span class="ll-classes">${f.detector}</span>` : null}
+                </button>`
+              : html`<div class="ll-row" key=${f.id}>
+                  <span class="ll-cwe">${f.cwe || "—"}</span>
+                  <span class="ll-label">${f.title || "(untitled)"}</span>
+                  ${f.detector ? html`<span class="ll-classes">${f.detector}</span>` : null}
+                </div>`))}
             ${candTotal > cands.length ? html`<div class="ll-row ll-more">…and ${candTotal - cands.length} more not listed</div>` : null}
           </div>` : null}
         ` : null}
@@ -1195,17 +1208,23 @@ export function LedgerPanel({ ledger, busy }) {
       <!-- Axis A: code exercised, per target -->
       <div class="ledger-axis">
         <div class="ax-top"><span class="ax-name">Code exercised <span class="ax-tag">per target</span></span></div>
-        ${code.length ? code.map((c) => html`<div class="ledger-code-row" key=${c.target}>
-          <span class="lc-name" title=${c.target}>${c.target}</span>
-          ${_axisBar(c.block_pct)}
-          <span class="lc-val">${c.block_pct != null ? `${c.block_pct}%` : "—"}
-            <span class="lc-detail">${c.blocks_hit != null
-              ? `${c.blocks_hit}/${c.blocks_known} blocks`
-              : "no coverage measured"}${c.undriven && c.undriven.pct != null
-                ? ` · harness reaches ${c.undriven.pct}% of ${c.functions_recovered} fns`
-                : ""}</span>
-          </span>
-        </div>`) : html`<div class="ax-note">No targets analysed.</div>`}
+        ${code.length ? code.map((c) => {
+          const detail = html`
+            <span class="lc-name" title=${c.target}>${c.target}</span>
+            ${_axisBar(c.block_pct)}
+            <span class="lc-val">${c.block_pct != null ? `${c.block_pct}%` : "—"}
+              <span class="lc-detail">${c.blocks_hit != null
+                ? `${c.blocks_hit}/${c.blocks_known} blocks`
+                : "no coverage measured"}${c.undriven && c.undriven.pct != null
+                  ? ` · harness reaches ${c.undriven.pct}% of ${c.functions_recovered} fns`
+                  : ""}</span>
+            </span>`;
+          return onFocusTarget
+            ? html`<button class="ledger-code-row clk" key=${c.target}
+                title="browse this target's functions and call graph"
+                onClick=${() => onFocusTarget(c.target)}>${detail}</button>`
+            : html`<div class="ledger-code-row" key=${c.target}>${detail}</div>`;
+        }) : html`<div class="ax-note">No targets analysed.</div>`}
       </div>
 
       <!-- The combined gaps worklist -->
@@ -2250,7 +2269,7 @@ export function CaseOverview({ findings, pocs, filter, onFilter }) {
   const barMax = Math.max(1, ...cwes.map((c) => c.count));
   return html`<div class="ov" aria-label="case overview">
     ${filter ? html`<button class="ov-clear btn small ghost" onClick=${() => onFilter && onFilter(null)}>
-      ✕ clear ${filter.severity || filter.cwe} filter</button>` : null}
+      ✕ clear ${filter.severity || filter.cwe || filter.stageLabel || filter.stage} filter</button>` : null}
     <div class="ov-grid">
       <div class="ov-card">
         <div class="ov-h">Severity</div>
