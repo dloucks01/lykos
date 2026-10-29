@@ -176,6 +176,17 @@ function renderInfo(vnode) {
   ck("FindingCard renders the directed prove-out plan for a shortlisted finding",
     /Prove it out/.test(shortlist.all) && /synthesize a driver/.test(shortlist.all)
     && shortlist.classes.some((c) => /find-proveout/.test(c)));
+  // The prove-out plan and a demonstrated exploitability block walk into the graph / Exploits tab.
+  const walk = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, function_addr: "0x401000",
+      exploitability: { class_primitive: "stack overflow", demonstrated_level: "L2" },
+      prove_out: { steps: ["synthesize a driver that reaches 0x401000", "confirm"] } },
+    onShowInGraph() {}, onExploits() {}, pocs: [], reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard prove-out plan links the sink function into the call graph",
+    /show the sink function/.test(walk.all) && walk.classes.some((c) => /fp-link/.test(c)));
+  ck("FindingCard links a demonstrated exploitability into the Exploits tab",
+    /View in Exploits/.test(walk.all) && walk.classes.some((c) => /fx-link/.test(c)));
   const noise = renderInfo(h(C.FindingCard, {
     finding: { ...finding, verification: { verdict: "instrumentation-noise", noise: true,
       noise_reason: "anchored in instrumentation/runtime symbol (__sanitizer)" } },

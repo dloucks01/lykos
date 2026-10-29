@@ -1148,7 +1148,7 @@ function App() {
       setEvidence({ finding: full ? { ...finding, ...full } : finding, focus });
     }}
     onCurate=${curate} onShowInGraph=${showInGraph} onStage=${showStageFindings}
-    onVerdict=${filterByVerdict} />`;
+    onVerdict=${filterByVerdict} onExploits=${() => setTab("exploits")} />`;
   const multi = targets.length > 1;
   // finding -> its false-positive review (via the PoC that carries the crashing input's sha)
   const verByFinding = {};

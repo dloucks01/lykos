@@ -192,6 +192,14 @@ def test_a_finding_links_to_its_discovering_stage():
     assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"
 
 
+def test_the_prove_out_plan_and_exploitability_walk_into_the_spine():
+    """A shortlisted finding's prove-out plan links its sink function into the call graph, and a
+    demonstrated exploitability links into the Exploits tab."""
+    assert "show the sink function" in COMPONENTS, "the prove-out plan has no graph link"
+    assert "View in Exploits" in COMPONENTS, "a demonstrated exploitability has no Exploits link"
+    assert "onExploits=" in APP, "the app never wires the exploitability->Exploits hop"
+
+
 def test_the_ledger_links_to_the_prove_out_shortlist():
     """The coverage ledger's verification line is the case-level entry into the prove-out shortlist:
     clicking it filters the findings board to the real, on-attack-surface findings."""

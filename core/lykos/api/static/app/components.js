@@ -696,7 +696,7 @@ export function CurationFilter({ mode, onChange, counts }) {
     </div>`;
 }
 
-export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph, onStage, onVerdict }) {
+export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph, onStage, onVerdict, onExploits }) {
   const inspect = (ch) => onInspect && onInspect(finding, ch);
   const demo = isDemonstrated(finding);
   const evRaw = finding.evidence;
@@ -778,12 +778,16 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
             ${(finding.exploitability.mitigations_in_way || []).map((m) => html`<li>
               <span class="fx-k">In the way</span> ${m}</li>`)}
           </ul>
+          ${onExploits && finding.exploitability.demonstrated_level ? html`<button class="btn xsmall ghost fx-link"
+            title="see this in the Exploits tab" onClick=${() => onExploits()}>◎ View in Exploits</button>` : null}
         </div>` : null}
 
       ${finding.prove_out && finding.prove_out.steps ? html`
         <div class="find-proveout">
           <div class="fp-head">Prove it out <span class="fp-sub">— directed plan to reach poc-backed</span></div>
           <ol>${finding.prove_out.steps.map((s) => html`<li>${s}</li>`)}</ol>
+          ${onShowInGraph && (finding.function_addr || finding.site_addr) ? html`<button class="btn xsmall ghost fp-link"
+            title="walk to the sink function in the call graph" onClick=${() => onShowInGraph(finding)}>◎ show the sink function</button>` : null}
         </div>` : null}
 
       ${effects.length ? html`
