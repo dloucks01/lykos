@@ -922,6 +922,9 @@ def build_report(
             "curation": {s: cur_counts[s] for s in CURATION_STATUSES if cur_counts.get(s)},
         },
         "targets": targets_out,
+        # The coverage ledger: what was checked (classes), what was weaponized, how much code was
+        # exercised, and the gaps worklist -- the measurement that makes "how close to 100%" a number.
+        "coverage_ledger": _safe_ledger(store, case_id),
         # Case-level static figures (doc 49 Themes 2a/4). HTML/PDF embed these; SARIF stays
         # machine-faithful and ignores them.
         "figures": {
@@ -933,6 +936,16 @@ def build_report(
                 confirmed=by_state.get("confirmed", 0) + by_state.get("poc-backed", 0)),
         },
     }
+
+
+def _safe_ledger(store, case_id: str) -> Optional[dict]:
+    """The coverage ledger, best-effort -- a ledger failure must never take down the whole report."""
+    try:
+        from ..analyze.coverage_ledger import build_ledger
+        return build_ledger(store, case_id)
+    except Exception:                                        # noqa: BLE001
+        observe.absorbed(_log, "coverage ledger unavailable")
+        return None
 
 
 def _exploited_build(store, case_id: str, target_id: str) -> dict:

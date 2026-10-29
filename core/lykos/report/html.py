@@ -190,6 +190,56 @@ _STATE_LEGEND = [
 _STATE_ORDER = [k for k, _ in _STATE_LEGEND]
 
 
+def _coverage_ledger_html(led: dict[str, Any]) -> str:
+    """The coverage ledger: checks run vs available (classes looked for), weaponization reached, code
+    exercised, and the gaps worklist -- how close this engagement got to full coverage, as numbers."""
+    ch = led.get("checks") or {}
+    wp = led.get("weaponization") or {}
+    p = ['<section class="card ledger"><h2>Coverage ledger</h2>',
+         '<p class="muted">Full coverage is an asymptote; this is the honest account of the gap — '
+         'which classes of check ran, how much was weaponized, how much code was exercised — with the '
+         'gaps as a worklist.</p>']
+    p.append('<div class="stats">')
+    p.append(_stat(f'{ch.get("ran", 0)}/{ch.get("total", 0)}', "checks run"))
+    p.append(_stat(len(ch.get("classes_checked") or []), "CWE classes covered"))
+    wpct = wp.get("pct")
+    p.append(_stat("—" if wpct is None else f'{wpct:g}%', "findings weaponized"))
+    p.append(_stat(len(wp.get("unweaponized") or []), "candidates open"))
+    p.append('</div>')
+    # which checks did NOT run (classes never looked for) -- the axis-B gap
+    nr = ch.get("not_run") or []
+    if nr:
+        p.append('<div class="evlabel">Checks that did not run <span class="muted">— a class not '
+                 'looked for</span></div><ul class="ev">')
+        for c in nr:
+            cls = (" · " + ", ".join(c.get("classes") or [])) if c.get("classes") not in (None, [], ["*"]) else ""
+            p.append(f'<li>{esc(c.get("label"))} <span class="muted mono">({esc(c.get("status"))}'
+                     f'{esc(cls)})</span></li>')
+        p.append('</ul>')
+    # code coverage per target (axis A)
+    code = led.get("code") or []
+    if code:
+        p.append('<div class="evlabel">Code exercised</div><table class="verdicts"><tbody>')
+        for c in code:
+            pct = c.get("block_pct")
+            cv = (f'{pct:g}% of blocks' if pct is not None
+                  else "not measured (no coverage-instrumented run reached it)")
+            fns = c.get("functions_recovered")
+            fx = f' · {fns} functions recovered' if fns else ""
+            p.append(f'<tr><td class="mono vt-name">{esc(c.get("target"))}</td>'
+                     f'<td class="vt-verdict">{esc(cv)}{esc(fx)}</td></tr>')
+        p.append('</tbody></table>')
+    # the combined gaps worklist
+    gaps = led.get("gaps") or []
+    if gaps:
+        p.append('<div class="diags"><b>Gaps — what full coverage would still need</b><ul>')
+        for g in gaps:
+            p.append(f'<li>{esc(g)}</li>')
+        p.append('</ul></div>')
+    p.append('</section>')
+    return "".join(p)
+
+
 def _methodology_html(report: dict[str, Any]) -> str:
     """The approach, the confirmation ladder, and the evidence standard -- so the findings below are
     read against a stated method and a defined confidence scale, not taken on faith."""
@@ -344,6 +394,11 @@ def to_html(report: dict[str, Any]) -> str:
     # Before any finding: the approach, the confirmation ladder, and what each confidence state and
     # impact level MEANS -- so the reader weighs the findings against a stated method, not on faith.
     parts.append(_methodology_html(report))
+
+    # ---- coverage ledger ----
+    led = report.get("coverage_ledger")
+    if led:
+        parts.append(_coverage_ledger_html(led))
 
     # ---- reproducibility ----
     eng = report.get("engines", [])
