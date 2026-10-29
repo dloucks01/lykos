@@ -394,6 +394,11 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             name = _sink_name(ir, lead.site_addr)
             layout = format_layout(ir, lead.site_addr, name or "")
             plan = plan_format_write(target_bytes, layout, win=win) if layout else None
+            # Emit a standalone exploit SCRIPT (the operator-runnable deliverable): a write-what-where
+            # when a plan exists, else a leak-only PoC -- a format string is always at least an info
+            # leak. Best-effort, keyed to the site; never blocks the recipe below.
+            if layout:
+                _emit_format_script(ctx, target, target_bytes, layout, plan, name)
             if not plan:
                 continue
             done += 1
@@ -417,6 +422,49 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
     except Exception:                                    # noqa: BLE001 -- advisory, never fatal
         observe.absorbed(_log, "format-write recipe not filed")
     return fids
+
+
+def _emit_format_script(ctx, target, target_bytes, layout, plan, sink) -> Optional[str]:
+    """Render the standalone format-string exploit script from the recovered layout + write plan and
+    store it as an `exploit-script` artifact (write-capable when a plan exists, else leak-only).
+    Best-effort -- never raises, never blocks the recipe."""
+    try:
+        from . import exploit_script
+        wt = None
+        writes = (plan or {}).get("writes") or {}
+        if writes:
+            addr = next(iter(writes))
+            # name the GOT slot if we can (got_entries maps name->addr)
+            name = "GOT slot"
+            try:
+                from . import rop
+                for n, a in (rop.got_entries(target_bytes) or {}).items():
+                    if a == addr:
+                        name = f"{n}@GOT"
+                        break
+            except Exception:                            # noqa: BLE001
+                pass
+            wt = {"name": name, "addr": int(addr), "value": int(writes[addr])}
+        pie = False
+        try:
+            pie = elfstatic.is_pie(target_bytes)
+        except Exception:                                # noqa: BLE001
+            pass
+        facts = {"cwe": "CWE-134", "sink": sink or "a printf-family function",
+                 "source": f"{getattr(target, 'filename', 'target')} ({sink}() at "
+                           f"{layout.get('site', 0):#x})",
+                 "delivery": "stdin", "argv": [], "bits": target.bits or 64,
+                 "exec_name": getattr(target, "filename", "./target"),
+                 "arg_offset": layout.get("arg_offset"), "write_target": wt,
+                 "mitigations": {"pie": pie, "relro": "partial"}}
+        script = exploit_script.render_format_string_exploit(facts)
+        kind = "format-write" if wt else "format-leak"
+        return ctx.put_artifact("exploit-script", data=script.encode(),
+                                meta={"proven": False, "kind": kind,
+                                      "cwe": "CWE-134", "site": layout.get("site")})
+    except Exception:                                    # noqa: BLE001 -- the recipe stands
+        observe.absorbed(_log, "format exploit script not emitted")
+        return None
 
 
 __all__ = ["FMT_ARG_INDEX", "format_layout", "plan_format_write", "file_format_write_recipes"]
