@@ -406,13 +406,26 @@ def to_html(report: dict[str, Any]) -> str:
     if emap:
         parts.append('<div class="figure engagement"><div class="fig-h">Analysis path</div>'
                      + emap + '</div>')
+    dist = summ.get("distinct") or {}
     parts.append('<div class="stats">')
     parts.append(_stat(summ.get("targets", 0), "targets"))
-    parts.append(_stat(summ.get("findings", 0), "findings"))
+    # Distinct issues lead; the raw finding count rides alongside it so neither is hidden.
+    if dist.get("issues") is not None and dist.get("issues") != summ.get("findings", 0):
+        parts.append(_stat(dist["issues"], "distinct issues"))
+        parts.append(_stat(summ.get("findings", 0), "raw findings"))
+    else:
+        parts.append(_stat(summ.get("findings", 0), "findings"))
     parts.append(_stat(top_level or "—", "highest impact"))
     parts.append(_stat(summ.get("confirmed", 0), "confirmed"))
     parts.append(_stat(summ.get("poc_backed", 0), "PoC-backed"))
     parts.append('</div>')
+    # Explain the gap once: the same source bug is filed per target that compiles the file.
+    if dist.get("multi_target"):
+        parts.append(
+            f'<p class="muted dedup-note">{dist["issues"]} distinct issues across '
+            f'{summ.get("findings", 0)} raw findings — {dist["multi_target"]} appear in more than '
+            f'one target (the same source bug is reported once per target that compiles the file). '
+            f'Counts below are raw findings unless labelled “distinct”.</p>')
     bysev = summ.get("by_severity", {})
     if bysev:
         parts.append('<div class="chips">' + "".join(
@@ -742,6 +755,11 @@ def _finding_html(f: dict) -> str:
         p.append(_badge(f'{lvl}{"" if lvl_ver else " (unverified)"}',
                         _LEVEL_COLOR.get(lvl, "#8b8d98")))
     p.append(_badge(state, _STATE_COLOR.get(state, "#8b8d98")))
+    # One bug, filed per target that compiles the file: say so, so a reader does not read N copies
+    # as N bugs. Only when it genuinely spans more than one target.
+    span = f.get("target_span") or 1
+    if span > 1:
+        p.append(_badge(f"in {span} targets", "#6e7681"))
     cur = f.get("curation") or {}
     if cur.get("status"):
         p.append(_badge(cur.get("label") or _model.CURATION_LABEL.get(cur["status"], cur["status"]),

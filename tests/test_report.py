@@ -301,3 +301,35 @@ def test_sarif_carries_timing(store, case):
 def test_pdf_with_timing_is_valid(store, case):
     _seed_timing(store, case)
     assert to_pdf(build_report(store, case.id))[:5] == b"%PDF-"
+
+
+def test_distinct_issues_dedup_across_targets(store, case):
+    """One source bug compiled into two targets is ONE distinct issue spanning two, not two."""
+    fd = FindingDAO(store.conn)
+    ts = {}
+    for name in ("libA", "libB"):
+        ts[name] = store.targets.upsert(
+            case.id, filename=name, sha256=hash_bytes(name.encode()), size=4, arch="x86_64",
+            bits=64, endianness="little", stripped=False, file_type="ELF", linking="dynamic")
+        fd.upsert(ts[name].id, case.id, {
+            "dedup_key": "shared-bug", "cwe": "CWE-190", "title": "int overflow in common.c",
+            "severity": "high", "state": "corroborated", "detector": "source_recipe",
+            "evidence": [{"channel": "static", "detail": "x"}]})
+    # a second, unique bug present in libA only
+    fd.upsert(ts["libA"].id, case.id, {
+        "dedup_key": "uniq", "cwe": "CWE-22", "title": "path traversal", "severity": "medium",
+        "state": "candidate", "detector": "cpg", "evidence": [{"channel": "static", "detail": "y"}]})
+
+    r = build_report(store, case.id)
+    summ = r["summary"]
+    assert summ["findings"] == 3                 # raw rows: shared x2 + uniq x1
+    assert summ["distinct"]["issues"] == 2       # distinct issues
+    assert summ["distinct"]["raw_findings"] == 3
+    assert summ["distinct"]["multi_target"] == 1
+    spans = {f["dedup_key"]: f["target_span"] for t in r["targets"] for f in t["findings"]}
+    assert spans["shared-bug"] == 2
+    assert spans["uniq"] == 1
+
+    html = to_html(r)
+    assert "distinct issues" in html
+    assert "in 2 targets" in html

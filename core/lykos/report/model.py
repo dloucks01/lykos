@@ -820,6 +820,10 @@ def build_report(
                 "confidence": round(f.confidence or 0.0, 3),
                 "function_addr": f.function_addr, "site_addr": f.site_addr,
                 "detector": f.detector, "evidence": _ev_prose,
+                # The tool's own dedup identity. The SAME logical source bug is filed once per
+                # target that compiles the file, sharing this key -- so it is also the cross-target
+                # cluster key (see `summary.distinct` + `target_span`, set after the target loop).
+                "dedup_key": f.dedup_key,
                 # The pipeline stage that discovered this finding (doc 49 Themes 1a/2b), so the
                 # report's provenance reads the same chain the GUI does. None when unknown.
                 "stage": f.stage, "stage_label": _stage_label_report(f.stage),
@@ -878,6 +882,41 @@ def build_report(
             tout["verdict"] = target_verdict(tout)
             targets_out.append(tout)
 
+    # Cross-target DEDUP. Because the targets in a source case are built from ONE tree, the same
+    # bug is filed once per target that compiles the file -- so the raw finding count overcounts
+    # the distinct issues (measured: 932 rows -> ~110 distinct on FreeRDP). A "distinct issue" is
+    # one dedup_key; each finding also learns how many targets it spans (`target_span`), which the
+    # report/GUI show as "N targets" so a reader is never misled by the inflated raw total.
+    _clusters: dict[str, dict] = {}
+    for _t in targets_out:
+        for _f in _t["findings"]:
+            dk = _f.get("dedup_key")
+            if not dk:
+                continue
+            c = _clusters.setdefault(dk, {"targets": set(), "severity": _f["severity"],
+                                          "state": _f["state"]})
+            c["targets"].add(_t["id"])
+            if _rank(FINDING_STATES, _f["state"]) > _rank(FINDING_STATES, c["state"]):
+                c["state"] = _f["state"]
+            if _rank(SEVERITIES, _f["severity"]) > _rank(SEVERITIES, c["severity"]):
+                c["severity"] = _f["severity"]
+    _span = {dk: len(c["targets"]) for dk, c in _clusters.items()}
+    for _t in targets_out:
+        for _f in _t["findings"]:
+            _f["target_span"] = _span.get(_f.get("dedup_key"), 1)
+    _d_sev: dict[str, int] = {}
+    _d_state: dict[str, int] = {}
+    for c in _clusters.values():
+        _d_sev[c["severity"]] = _d_sev.get(c["severity"], 0) + 1
+        _d_state[c["state"]] = _d_state.get(c["state"], 0) + 1
+    distinct = {
+        "issues": len(_clusters),
+        "raw_findings": tot_findings,
+        "multi_target": sum(1 for c in _clusters.values() if len(c["targets"]) > 1),
+        "by_severity": {s: _d_sev.get(s, 0) for s in reversed(SEVERITIES) if _d_sev.get(s)},
+        "by_state": {s: _d_state.get(s, 0) for s in FINDING_STATES if _d_state.get(s)},
+    }
+
     engines = _engines(rdao, case_id)
     # Case-level rollups the executive summary leads with: the WORST engine-health verdict across
     # targets, and the strongest verified level.
@@ -902,6 +941,9 @@ def build_report(
         "summary": {
             "targets": len(targets_out),
             "findings": tot_findings,
+            # Deduped headline: how many DISTINCT issues the raw findings represent, so a
+            # source case built into N targets is not read as N x the bugs.
+            "distinct": distinct,
             "by_state": {s: by_state.get(s, 0) for s in FINDING_STATES if by_state.get(s)},
             "by_severity": {s: by_severity.get(s, 0)
                             for s in reversed(SEVERITIES) if by_severity.get(s)},
