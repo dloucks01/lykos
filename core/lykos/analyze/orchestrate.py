@@ -1219,6 +1219,54 @@ def _hybrid_advanced(before: tuple, after: tuple) -> bool:
     return any(a > b for a, b in zip(after, before))
 
 
+#: Reach-gated + plateau-bail fuzzing. The broad blind/coverage fuzz campaigns are the dominant
+#: per-target cost, and on a target whose harness reaches almost none of the code they execute a
+#: sliver and find nothing -- pure cost. The gate is conservative and FAIL-OPEN: it only *considers*
+#: demoting when a harness statically reaches under `_REACH_GATE_FRACTION` of recovered functions,
+#: and even then it demotes ONLY after a short probe produces strictly no new coverage and no crash.
+#: Any progress -> the full campaigns run exactly as before. A well-driven target never enters the
+#: demote path, so there is no per-codebase threshold to tune (the bail decision is zero-vs-nonzero
+#: observed progress; reach only limits WHEN the cheap probe-then-maybe-bail path is taken).
+_REACH_GATE_FRACTION = 0.05
+_FUZZ_PROBE_EXECS = 4000.0
+
+
+def _harness_reach_fraction(store, target_id) -> Optional[float]:
+    """Fraction (0..1) of recovered functions a harness entry statically reaches, or None when it
+    cannot be measured (no harness entry / no call graph). Reuses the coverage ledger's own
+    undriven-function reach so the gate and the ledger cannot disagree about reach."""
+    try:
+        from .coverage_ledger import _undriven_functions
+        und = _undriven_functions(store.conn, target_id)
+    except Exception:                                        # noqa: BLE001 -- gate must fail open
+        return None
+    if not und or not und.get("total"):
+        return None
+    return (und.get("reachable") or 0) / und["total"]
+
+
+def _reach_gated_fuzz_demote(bud, store, target, target_id, fz, status, stop) -> bool:
+    """Decide whether to DEMOTE the broad fuzz campaigns for this target, running a short probe
+    first. Returns True only when the harness reaches under the gate fraction AND a probe produced
+    no new coverage and no crash -- otherwise False (run the full campaigns; fail-open). The probe
+    is a real, short `fuzz` slice, so nothing is wasted: its execs count as search either way."""
+    reach = _harness_reach_fraction(store, target_id)
+    if reach is None or reach >= _REACH_GATE_FRACTION:
+        return False
+    before = _hybrid_progress(store, target_id)
+    _staged(bud, store, target, "fuzz", status, stop, fz, want_execs=_FUZZ_PROBE_EXECS)
+    after = _hybrid_progress(store, target_id)
+    if _hybrid_advanced(before, after):
+        return False
+    store.events.append("autopilot.fuzz_demoted", case_id=target.case_id, payload={
+        "target_id": target_id, "reach": round(reach, 4), "probe_execs": int(_FUZZ_PROBE_EXECS),
+        "note": (f"a harness statically reaches {reach * 100:.1f}% of this target's recovered "
+                 f"functions; a {int(_FUZZ_PROBE_EXECS)}-exec probe produced no new coverage and no "
+                 f"crash, so the broad fuzz campaigns were demoted and the budget reallocated to "
+                 f"concolic + directed confirmation (fuzzing of undriven code cannot reach it)")})
+    return True
+
+
 def _hybrid_coverage_loop(bud, store, target, target_id, dyn, status, stop, *, size_mb) -> list:
     """The iterative concolic<->fuzz hybrid loop (doc 6). Repeats, while it keeps paying off:
 
@@ -2267,7 +2315,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # "raising --budget did nothing, directed fuzzing still cut out at 30s" an operator hit.
                 _camp_execs = max(_CAMPAIGN_EXECS, bud.affordable_execs())
                 _dir_execs = max(_DIRECTED_EXECS, bud.affordable_execs())
-                if _nonnative_image(t):
+                # Reach-gated + plateau bail: on a target whose harness reaches almost no code, a
+                # short probe decides whether the broad campaigns are worth their (dominant) cost.
+                # Fail-open -- any probe progress, or a well-driven target, runs everything as before.
+                _fuzz_demoted = _reach_gated_fuzz_demote(bud, store, t, tid, fz, status, stop)
+                if _fuzz_demoted:
+                    pass                                     # broad fuzz skipped; concolic/static carry it
+                elif _nonnative_image(t):
                     _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
                 elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
                              want_execs=_camp_execs) != "done" or \
@@ -2294,19 +2348,22 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # decompressor it carries, which is also where its own CVE list starts (an
                 # out-of-bounds read in unlzma). Taking the next few is the `libfuzzer` breadth pass
                 # again with no build to repeat, so it costs only fuzzing time.
-                _mc = (_payloads_of(store, t, "fuzz.multicall") or [{}])[-1]
-                _rest = [d for d in (_mc.get("doors") or []) if d != _mc.get("chosen")]
-                for _door in _rest[:_MORE_MULTICALL_DOORS]:
-                    if stop.is_set():
-                        break
-                    _staged(bud, store, t, "fuzz", status, stop, dict(fz, multicall_door=_door),
-                            want_execs=_camp_execs)
-                _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_dir_execs)
+                if not _fuzz_demoted:
+                    _mc = (_payloads_of(store, t, "fuzz.multicall") or [{}])[-1]
+                    _rest = [d for d in (_mc.get("doors") or []) if d != _mc.get("chosen")]
+                    for _door in _rest[:_MORE_MULTICALL_DOORS]:
+                        if stop.is_set():
+                            break
+                        _staged(bud, store, t, "fuzz", status, stop, dict(fz, multicall_door=_door),
+                                want_execs=_camp_execs)
+                    _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_dir_execs)
                 crashes = _distinct_crashes(store, tid)
                 # Multi-channel retry: the best-guess channel is not always where the bug is (a file
                 # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
                 # directed fuzzer at each of the OTHER channels before spending concolic's budget.
-                if not crashes and not stop.is_set():
+                # Skipped when the broad campaigns were demoted (the harness reaches ~no code, so
+                # retrying other channels blindly would find the same nothing); concolic still runs.
+                if not _fuzz_demoted and not crashes and not stop.is_set():
                     for j, alt in enumerate([c for c in channels[1:] if c != primary]):
                         if stop.is_set():
                             break
