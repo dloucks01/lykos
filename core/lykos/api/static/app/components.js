@@ -729,6 +729,38 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
       </div>
       <div class="find-gloss">${STATE_GLOSS[finding.state] || ""}</div>
 
+      ${finding.analysis ? html`
+        <div class="find-ladder">
+          <div class="fl-why"><b>${finding.analysis.state}:</b> ${finding.analysis.why_state}</div>
+          ${finding.analysis.to_promote ? html`<div class="fl-next">
+            <b>To reach ${finding.analysis.next_state}:</b> ${finding.analysis.to_promote}</div>` : null}
+        </div>` : null}
+
+      ${finding.reachability && finding.reachability.attack_surface ? html`
+        <div class=${`find-surface ${finding.reachability.attack_surface === "on" ? "surf-on" : "surf-off"}`}
+          title="whether this finding's code is compiled into an in-tree fuzz harness">
+          ${finding.reachability.attack_surface === "on"
+            ? "On the fuzzed attack surface — higher remote-reachability priority"
+            : "Off the fuzzed attack surface — lower remote-reachability priority, not dismissed"}
+        </div>` : null}
+
+      ${finding.exploitability ? html`
+        <div class="find-exploit2">
+          <div class="fx-head">Exploitability</div>
+          <ul>
+            ${finding.exploitability.class_primitive ? html`<li>
+              <span class="fx-k">Primitive (class)</span> ${finding.exploitability.class_primitive}</li>` : null}
+            ${finding.exploitability.demonstrated_level ? html`<li>
+              <span class="fx-k">Demonstrated</span> a verified PoC reached ${finding.exploitability.demonstrated_level}</li>` : null}
+            ${finding.exploitability.ceiling ? html`<li>
+              <span class="fx-k">Ceiling</span> weaponization reached ${finding.exploitability.ceiling} and stopped${finding.exploitability.ceiling_reason ? ` — ${finding.exploitability.ceiling_reason}` : ""}</li>` : null}
+            ${finding.exploitability.targets_live ? html`<li>
+              <span class="fx-k">Live target</span> this recipe targets ${finding.exploitability.targets_live}</li>` : null}
+            ${(finding.exploitability.mitigations_in_way || []).map((m) => html`<li>
+              <span class="fx-k">In the way</span> ${m}</li>`)}
+          </ul>
+        </div>` : null}
+
       ${effects.length ? html`
         <div class="effects-block">
           <div class="effects">

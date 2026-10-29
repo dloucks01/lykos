@@ -131,6 +131,28 @@ function renderInfo(vnode) {
   ck("FindingCard provenance chip becomes a clickable button with onStage",
     provClick.threw.length === 0 && provClick.classes.some((c) => /stage-prov clk/.test(c)));
 
+  // Per-finding detail (doc 49 2d): the confirmation ladder, exploitability and attack surface
+  // render in the card -- GUI parity with the report, from the API's shared analysis fields.
+  const detail = renderInfo(h(C.FindingCard, {
+    finding: { ...finding, state: "corroborated",
+      analysis: { state: "corroborated", next_state: "confirmed",
+        why_state: "A second independent signal supports the initial detection.",
+        to_promote: "To confirm: prove the sink is reachable from an attacker-controlled input." },
+      exploitability: { class_primitive: "format string -> %n write-what-where",
+        ceiling: "L2", ceiling_reason: "PIE: no in-band leak", targets_live: "L3",
+        mitigations_in_way: ["NX — no executable stack/heap"] },
+      reachability: { attack_surface: "on" } },
+    pocs: [], reportUrl: () => "", artifactUrl: (s) => `/artifacts/${s}`,
+  }));
+  ck("FindingCard renders the confirmation ladder (why + what's missing)",
+    detail.threw.length === 0 && /second independent signal/.test(detail.all)
+    && /To reach\s+confirmed/.test(detail.all));
+  ck("FindingCard renders exploitability (primitive + ceiling + mitigations in the way)",
+    /format string/.test(detail.all) && /weaponization reached\s+L2\s+and stopped/.test(detail.all)
+    && /NX/.test(detail.all));
+  ck("FindingCard renders the attack surface with its tone class",
+    /On the fuzzed attack surface/.test(detail.all) && detail.classes.some((c) => /surf-on/.test(c)));
+
   // A candidate must NOT be styled as demonstrated.
   const cand = renderInfo(h(C.FindingCard, {
     finding: { id: "F2", cwe: "CWE-120", title: "strcpy", severity: "high", state: "candidate" },

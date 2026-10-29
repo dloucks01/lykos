@@ -68,9 +68,10 @@ def _dynresult(d):
             "duration_ms": d.duration_ms, "note": d.note, "created_at": d.created_at}
 
 
-def _finding(f, sites=None, site_count=None, proven=0):
+def _finding(f, sites=None, site_count=None, proven=0, mitigations=None):
     """Serialize a finding. `sites` is the list of places the defect occurs; `site_count` is
-    the cheap aggregate for list views. A finding is a DEFECT -- the sites are evidence."""
+    the cheap aggregate for list views. A finding is a DEFECT -- the sites are evidence.
+    `mitigations` (the target's) enriches the exploitability block with what's in the way."""
     # Attach the CWE's name + plain-language description so the workbench can explain the number
     # in place (the hover tooltip), instead of showing a bare "CWE-787" the analyst has to look up.
     from ..cwe import cwe_info
@@ -92,6 +93,22 @@ def _finding(f, sites=None, site_count=None, proven=0):
     # one proven occurrence must not read like one where all 99 are.
     d["proven_sites"] = len([s for s in sites if s.get("state") == "poc-backed"]) \
         if sites is not None else (proven or 0)
+    # Per-finding detail (doc 49), the SAME account the report gives (one shared source): the
+    # confirmation ladder (why this state / what climbs it), exploitability (class primitive +
+    # the target's mitigations in the way + the honest ceiling), and the attack surface. The
+    # full reachability call-path is left to the report / a detail view (it needs the call graph).
+    from ..analyze.confirm_ladder import (
+        attack_surface,
+        finding_analysis,
+        finding_exploitability,
+    )
+    d["analysis"] = finding_analysis(d)
+    _ex = finding_exploitability(d, mitigations)
+    if _ex:
+        d["exploitability"] = _ex
+    _surf = attack_surface(d)
+    if _surf:
+        d["reachability"] = {"attack_surface": _surf}
     return d
 
 

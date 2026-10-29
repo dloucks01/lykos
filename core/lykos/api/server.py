@@ -505,12 +505,15 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 s = self._store()
                 try:
                     fd = FindingDAO(s.conn)
+                    tgt = s.targets.get(m.group(1))
+                    _mit = tgt.mitigations if tgt else None
                     fs = fd.list_by_target(m.group(1))
                     counts = fd.site_counts(m.group(1))
                     prov = fd.proven_sites(m.group(1))
                     cur = self._curation_map(s, fs[0].case_id) if fs else {}
                     return self._json([self._with_curation(
-                        _finding(x, site_count=counts.get(x.id, 0), proven=prov.get(x.id, 0)), cur)
+                        _finding(x, site_count=counts.get(x.id, 0), proven=prov.get(x.id, 0),
+                                 mitigations=_mit), cur)
                         for x in fs])
                 finally:
                     s.close()
@@ -552,8 +555,11 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                     f = fd.get(m.group(1))
                     if not f:
                         return self._json({"error": "no finding"}, 404)
-                    return self._json(self._with_curation(_finding(f, sites=fd.sites(f.id)),
-                                                          self._curation_map(s, f.case_id)))
+                    _tgt = s.targets.get(f.target_id)
+                    return self._json(self._with_curation(
+                        _finding(f, sites=fd.sites(f.id),
+                                 mitigations=(_tgt.mitigations if _tgt else None)),
+                        self._curation_map(s, f.case_id)))
                 finally:
                     s.close()
             m = _TARGET_DYN.match(path)

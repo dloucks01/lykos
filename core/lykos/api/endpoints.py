@@ -562,9 +562,10 @@ class EndpointsMixin:
                 proven.update(fd.proven_sites(tid))
             cur = self._curation_map(s, cid)
             for f in fd.list_by_case(cid):
-                d = self._with_curation(_finding(f, site_count=counts.get(f.id, 0),
-                                                 proven=proven.get(f.id, 0)), cur)
                 t = tmap.get(f.target_id)
+                d = self._with_curation(
+                    _finding(f, site_count=counts.get(f.id, 0), proven=proven.get(f.id, 0),
+                             mitigations=(t.mitigations if t else None)), cur)
                 d["target_name"] = t.filename if t else None
                 d["target_arch"] = t.arch if t else None
                 # Only on a finding that IS PoC-backed. This was the TARGET's best level
