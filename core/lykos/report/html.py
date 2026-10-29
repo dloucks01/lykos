@@ -9,6 +9,7 @@ PDF via the browser's print-to-PDF in addition to the native PDF exporter.
 from __future__ import annotations
 
 import html as _html
+import json as _json
 from typing import Any
 
 from . import model as _model
@@ -650,6 +651,16 @@ def _finding_html(f: dict) -> str:
                  f'{" — " + esc(cur.get("label") or cur.get("status")) if cur.get("status") else ""}'
                  f'</b>{" · " + esc(cur.get("updated_at")) if cur.get("updated_at") else ""}'
                  f'{"<br>" + esc(cur.get("note")) if cur.get("note") else ""}</div>')
+    # Concrete EFFECTS (what the defect actually does — a leak, a write-what-where, a hijacked call):
+    # the model parses them but the report used to drop them, understating impact.
+    effects = f.get("effects") or []
+    if effects:
+        p.append('<div class="evlabel">Demonstrated effects</div><ul class="ev effects">')
+        for ef in effects:
+            txt = ef if isinstance(ef, str) else (
+                ef.get("detail") or ef.get("effect") or ef.get("note") or _json.dumps(ef))
+            p.append(f'<li>{esc(txt)}</li>')
+        p.append('</ul>')
     cwe = f.get("cwe")
     p.append(_kv([
         ("CWE", f'{cwe} — {f.get("cwe_name")}' if cwe else None),

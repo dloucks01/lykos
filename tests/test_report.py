@@ -126,6 +126,7 @@ def test_html_renders_vulnerable_code_snippet_and_cwe_reference():
     f = {"title": "format string", "severity": "high", "state": "corroborated", "cwe": "CWE-134",
          "cwe_name": "Uncontrolled Format String", "detector": "source_sink",
          "evidence": [{"channel": "source", "detail": "winpr/wlog.c:362: non-literal format"}],
+         "effects": ["format-string %n write-what-where", "%s/%p stack disclosure"],
          "source_snippet": {"file": "winpr/wlog.c", "line": 362, "rows": [
              {"n": 361, "text": "  PRAGMA_IGNORE", "hit": False},
              {"n": 362, "text": "  vsnprintf(buf, n, cmessage->FormatString, args);", "hit": True},
@@ -134,6 +135,7 @@ def test_html_renders_vulnerable_code_snippet_and_cwe_reference():
     assert "Vulnerable code" in h and "winpr/wlog.c:362" in h
     assert 'class="cline hit"' in h and "vsnprintf" in h           # the finding line, highlighted
     assert "cwe.mitre.org/data/definitions/134.html" in h          # the CWE reference link
+    assert "Demonstrated effects" in h and "write-what-where" in h  # per-finding effects rendered
 
 
 def test_html_headline_tolerates_a_non_escalation_verdict_level(store):
