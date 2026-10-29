@@ -169,6 +169,16 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
     total_f = len(all_findings)
     unweaponized = [{"id": f.id, "cwe": f.cwe, "title": f.title, "detector": f.detector}
                     for f in all_findings if (f.state or "candidate") not in _WEAPONIZED_STATES]
+    # DEDUP (cross-target): a source case built into N targets files the same bug once per target,
+    # so the raw count overcounts distinct issues. Fold by dedup_key; a distinct issue counts as
+    # weaponized if ANY of its target copies reached a weaponized state.
+    _dk_best: dict[str, bool] = {}
+    for f in all_findings:
+        w = (f.state or "candidate") in _WEAPONIZED_STATES
+        _dk_best[f.dedup_key] = _dk_best.get(f.dedup_key, False) or w
+    distinct = {"issues": len(_dk_best),
+                "weaponized": sum(1 for v in _dk_best.values() if v),
+                "raw": total_f}
 
     # ---- combined GAPS worklist ----
     gaps: list[str] = []
@@ -199,7 +209,8 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
                    "classes_checked": sorted(classes_checked)},
         "weaponization": {"findings": total_f, "weaponized": weaponized,
                           "pct": round(100.0 * weaponized / total_f, 1) if total_f else None,
-                          "by_state": by_state, "unweaponized": unweaponized[:200]},
+                          "by_state": by_state, "unweaponized": unweaponized[:200],
+                          "distinct": distinct},
         "code": code,
         "gaps": gaps,
     }

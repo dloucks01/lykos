@@ -249,8 +249,8 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
 
 def _timing_html(tm: dict[str, Any]) -> str:
     """How long each technique took + the overall analysis time, with YIELD (findings/reproduced
-    crashes) beside the cost -- so a technique that ate the clock for nothing is visible at a glance
-    (the question the FreeRDP fuzzers raised: 44% of compute, zero findings, zero crashes)."""
+    crashes) beside the cost -- so a technique that ate the clock for nothing (e.g. a fuzz campaign
+    that spent a large share of compute for zero findings and zero crashes) is visible at a glance."""
     ov = tm.get("overall") or {}
     techs = tm.get("techniques") or []
     p = ['<section class="card timing"><h2>Time &amp; yield per technique</h2>',

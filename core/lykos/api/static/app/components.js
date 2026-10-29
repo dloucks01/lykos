@@ -1211,6 +1211,11 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
           <span class="ax-val">${wpn.weaponized || 0}/${wpn.findings || 0}${wpn.pct != null ? ` · ${wpn.pct}%` : ""}</span>
         </div>
         ${_axisBar(wpn.pct)}
+        ${wpn.distinct && wpn.distinct.raw && wpn.distinct.issues < wpn.distinct.raw ? html`
+          <div class="ledger-distinct"><b>${wpn.distinct.issues}</b> distinct issues ·
+            ${wpn.distinct.weaponized} weaponized
+            <span class="ld-muted">(${wpn.distinct.raw} raw findings — the same source bug is
+            counted once per target that compiles the file)</span></div>` : null}
         ${Object.keys(byState).length ? html`<div class="ledger-chips">
           ${Object.entries(byState).sort().map(([st, n]) => html`<span
             class=${`lchip st-${_STATE_TONE[st] || "lo"}`} key=${st}>${st} · ${n}</span>`)}

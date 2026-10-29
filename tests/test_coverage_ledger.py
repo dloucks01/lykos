@@ -42,6 +42,25 @@ def test_ledger_class_and_weaponization_accounting(store, case):
     assert any("weaponization worklist" in g for g in led["gaps"])
 
 
+def test_ledger_distinct_dedup_across_targets(store, case):
+    """The same source bug built into two targets is ONE distinct issue in the ledger, not two."""
+    fd = FindingDAO(store.conn)
+    for name, sha in (("libA", "a" * 64), ("libB", "b" * 64)):
+        t = TargetDAO(store.conn).upsert(case.id, name, sha, arch="source", bits=0)
+        fd.upsert(t.id, case.id, {"cwe": "CWE-190", "title": "ovf", "severity": "high",
+                  "detector": "source_recipe", "state": "corroborated", "confidence": 0.5,
+                  "dedup_key": "shared", "evidence": []})
+        fd.upsert(t.id, case.id, {"cwe": "CWE-78", "title": f"cand-{name}", "severity": "high",
+                  "detector": "source_sink", "state": "candidate", "confidence": 0.3,
+                  "dedup_key": f"uniq-{name}", "evidence": []})
+    wp = CL.build_ledger(store, case.id)["weaponization"]
+    assert wp["findings"] == 4                         # raw rows: shared x2 + 2 uniques
+    d = wp["distinct"]
+    assert d["raw"] == 4
+    assert d["issues"] == 3                            # shared + uniq-libA + uniq-libB
+    assert d["weaponized"] == 1                        # only the shared (corroborated) issue
+
+
 def test_undriven_reachability_from_harness_entry(store, case):
     """A harness entry's forward call-graph reach vs total recovered functions -- the honest
     'how much code does a harness drive' measure (undriven = the rest)."""

@@ -912,9 +912,9 @@ def build_report(
 
     # Cross-target DEDUP. Because the targets in a source case are built from ONE tree, the same
     # bug is filed once per target that compiles the file -- so the raw finding count overcounts
-    # the distinct issues (measured: 932 rows -> ~110 distinct on FreeRDP). A "distinct issue" is
-    # one dedup_key; each finding also learns how many targets it spans (`target_span`), which the
-    # report/GUI show as "N targets" so a reader is never misled by the inflated raw total.
+    # the distinct issues (a multi-target source case can inflate it several-fold). A "distinct
+    # issue" is one dedup_key; each finding also learns how many targets it spans (`target_span`),
+    # which the report/GUI show as "N targets" so a reader is never misled by the inflated total.
     _clusters: dict[str, dict] = {}
     for _t in targets_out:
         for _f in _t["findings"]:
@@ -1030,8 +1030,8 @@ def _timing(all_runs, store, case_id: str) -> dict:
     the cost.
 
     The operator's question this answers: which techniques earned their time? A stage that spent
-    the most clock for zero findings and zero reproduced crashes (FreeRDP's fuzzers, measured) is
-    exactly what this table surfaces. Durations come from the DURABLE per-run timestamps
+    the most clock for zero findings and zero reproduced crashes is exactly what this table
+    surfaces. Durations come from the DURABLE per-run timestamps
     (`analysis_run.started_at/ended_at`, set by the queue), grouped by `stage` -- `analyze.budget`
     also records per-stage seconds live, but the run rows survive a server restart and are the one
     source the report and the GUI can both re-derive identically.
