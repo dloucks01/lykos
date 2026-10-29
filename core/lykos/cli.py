@@ -739,6 +739,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit non-zero unless every REQUIRED tool is present")
     dr.set_defaults(func=_cmd_doctor)
 
+    dp = sub.add_parser("deps",
+                        help="build-dependency pre-flight for a source dir: what to stage offline")
+    dp.add_argument("path", help="source project directory to pre-flight")
+    dp.add_argument("--json", action="store_true", help="machine-readable output")
+    dp.add_argument("--no-include-scan", action="store_true",
+                    help="skip the #include scan (declarations in the build system only)")
+    dp.add_argument("--strict", action="store_true",
+                    help="exit non-zero if any declared dependency or build tool is missing")
+    dp.set_defaults(func=_cmd_deps)
+
     db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
     db2.add_argument("--history", default=None,
                      help="history file to read (default: eval-history.jsonl)")
@@ -1033,6 +1043,24 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(toolchain.report(verbose=args.verbose, rows=rows))
     if args.strict:
         return 1 if toolchain.missing("required") else 0
+    return 0
+
+
+def _cmd_deps(args: argparse.Namespace) -> int:
+    """Build-dependency PRE-FLIGHT for a source directory: what it declares it needs vs. what this
+    host has, so the gaps are staged BEFORE the box goes offline. A failed build on an air-gapped
+    host costs the whole binary/dynamic capability for that target; this turns that silent failure
+    into an up-front checklist.  Exit non-zero (with --strict) when anything is MISSING."""
+    import json
+
+    from .analyze import dep_preflight
+    pf = dep_preflight.scan_dependencies(args.path, scan_includes=not args.no_include_scan)
+    if args.json:
+        print(json.dumps(pf, indent=2))
+    else:
+        print(dep_preflight.format_report(pf))
+    if args.strict:
+        return 1 if (pf["missing"] or pf["toolchain_missing"]) else 0
     return 0
 
 
