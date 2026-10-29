@@ -317,8 +317,51 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         "code": code,
         # The source build outcome: did it produce binaries, or is this static-source-only?
         "build": build,
+        # The grounding view: how the raw candidate pile tiers once precision + malicious-peer
+        # reachability are applied (the grounded, attacker-reachable shortlist vs set-aside FPs).
+        "grounding": _grounding_rollup(conn, case_id),
         "gaps": gaps,
     }
+
+
+def _grounding_rollup(conn, case_id: str) -> Optional[dict]:
+    """Read the `grounding` stage's per-finding annotations (the `grounding-map` evidence channel)
+    into a case rollup: the attacker-reachable shortlist, and the set-aside verdicts with counts.
+    None when the grounding stage has not run (no annotation present)."""
+    import json as _json
+
+    from ..db.dao import FindingDAO
+    try:
+        findings = FindingDAO(conn).list_by_case(case_id)
+    except Exception:                                    # noqa: BLE001
+        return None
+    by_verdict: dict = {}
+    shortlist = reachable = annotated = 0
+    seen: set = set()
+    for f in findings:
+        ev = getattr(f, "evidence", None) or []
+        mp = next((e.get("detail") for e in ev
+                   if isinstance(e, dict) and e.get("channel") == "grounding-map"), None)
+        if not mp:
+            continue
+        key = f.dedup_key or f.id
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            m = _json.loads(mp)
+        except Exception:                                # noqa: BLE001
+            continue
+        annotated += 1
+        by_verdict[m.get("verdict")] = by_verdict.get(m.get("verdict"), 0) + 1
+        if m.get("reachable") is True:
+            reachable += 1
+        if m.get("shortlist"):
+            shortlist += 1
+    if not annotated:
+        return None
+    return {"annotated": annotated, "shortlist": shortlist, "attacker_reachable": reachable,
+            "by_verdict": by_verdict}
 
 
 def _undriven_functions(conn, target_id: str) -> Optional[dict]:

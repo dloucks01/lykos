@@ -237,6 +237,18 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
     p.append(_stat("—" if wpct is None else f'{wpct:g}%', "findings weaponized"))
     p.append(_stat(len(wp.get("unweaponized") or []), "candidates open"))
     p.append('</div>')
+    # The grounding view: once precision + malicious-peer reachability are applied, how the raw
+    # candidate pile tiers into an attacker-reachable shortlist vs provable set-asides.
+    gr = led.get("grounding") or {}
+    if gr and gr.get("annotated"):
+        setaside = {k: v for k, v in (gr.get("by_verdict") or {}).items()
+                    if k not in ("exploitable-candidate", "unreached")}
+        aside = (" · set aside: " + ", ".join(f"{esc(k)} {v}" for k, v in sorted(setaside.items()))) \
+            if setaside else ""
+        p.append(f'<p class="muted ledger-grounding">Grounded shortlist — '
+                 f'<b>{gr.get("shortlist", 0)}</b> attacker-reachable of {gr["annotated"]} '
+                 f'findings{esc(aside)} <span class="muted">(precision + malicious-peer '
+                 'reachability; set-asides carry their reason on each finding)</span></p>')
     # which checks did NOT run (classes never looked for) -- the axis-B gap
     nr = ch.get("not_run") or []
     if nr:

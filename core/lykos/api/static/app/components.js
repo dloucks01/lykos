@@ -1296,6 +1296,15 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
               : html`<span class="lv-shortlist"><b>${wpn.verification.shortlist}</b> prove-out shortlist</span>`}
             <span class="ld-muted">${wpn.verification.off_surface} off-surface · ${wpn.verification.noise} instrumentation artifact(s)</span>
           </div>` : null}
+        ${ledger.grounding && ledger.grounding.annotated ? html`
+          <div class="ledger-grounding">
+            <b>${ledger.grounding.shortlist}</b> grounded, attacker-reachable of ${ledger.grounding.annotated}
+            findings
+            <span class="ld-muted">— precision + malicious-peer reachability; set aside: ${
+              Object.entries(ledger.grounding.by_verdict || {})
+                .filter(([k]) => k !== "exploitable-candidate" && k !== "unreached")
+                .map(([k, n]) => `${k} ${n}`).join(", ") || "none"}</span>
+          </div>` : null}
         ${Object.keys(byState).length ? html`<div class="ledger-chips">
           ${Object.entries(byState).sort().map(([st, n]) => html`<span
             class=${`lchip st-${_STATE_TONE[st] || "lo"}`} key=${st}>${st} · ${n}</span>`)}

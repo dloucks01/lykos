@@ -276,3 +276,11 @@ def test_a_finding_links_to_its_verification_verdict():
     assert "setViz({ verdict" in APP, "filterByVerdict does not set a verdict viz filter"
     assert "viz.verdict" in (STATIC / "app" / "util.js").read_text(), \
         "filterByViz ignores a verdict filter"
+
+
+def test_the_ledger_surfaces_the_grounded_shortlist():
+    """The grounding stage's precision + malicious-peer reachability roll up into the ledger as an
+    attacker-reachable shortlist; the GUI shows it so the raw candidate pile is not the headline."""
+    assert "ledger.grounding" in COMPONENTS, "the ledger panel never reads the grounding rollup"
+    assert "grounded, attacker-reachable" in COMPONENTS, "no grounded-shortlist line"
+    assert ".ledger-grounding" in (STATIC / "index.html").read_text(), "no CSS for the grounding line"

@@ -1497,6 +1497,7 @@ _EVENT_STAGE = {
     "source_cve": "source_cve_scan", "source_sink": "source_sink_scan",
     "synth": "synthesize_poc", "system": "whole_system", "taint": "dynamic_taint",
     "triage": "ingest_triage", "uaf": "uaf_scan", "assert_guard": "assert_guard_scan",
+    "grounding": "grounding",
 }
 
 #: Stages the autopilot is not expected to schedule per target, so their absence is not a gap:
@@ -2106,6 +2107,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # can never be starved by the fuzzing budget. It must follow detect_cwe, whose
                 # findings it promotes rather than duplicates.
                 _staged(bud, store, t, "synthesize_secret", status, stop, want=20.0)
+                # GROUND the findings the detectors just filed: annotate each with its precision
+                # verdict (real candidate vs provable false positive) and its malicious-peer
+                # reachability, as a VIEW (never a demotion). The ledger/report read this to present
+                # a grounded, attacker-reachable shortlist instead of the raw candidate pile. Runs
+                # after the static + detect + secret detectors and after disassemble (it needs the
+                # call graph for reachability); cheap and offline.
+                _staged(bud, store, t, "grounding", status, stop, want=15.0)
                 # A SOCKET SERVER has to be fuzzed before anything else touches it. Such a target
                 # blocks in accept() and never reads stdin, so every stage that drives it that way --
                 # the injection prober, the crashless exploit ladder, the OOB-index driver, the generic

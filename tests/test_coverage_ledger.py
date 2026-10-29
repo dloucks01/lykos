@@ -213,3 +213,17 @@ def test_ledger_notes_a_harness_only_build(store, case):
 
 def test_ledger_build_is_none_for_a_non_source_case(store, case):
     assert CL.build_ledger(store, case.id)["build"] is None   # no source-project artifact
+
+
+def test_grounding_shortlist_renders_in_html():
+    from lykos.report.html import _coverage_ledger_html
+    led = {"checks": {"total": 5, "ran": 3, "classes_checked": ["CWE-787"], "not_run": []},
+           "weaponization": {"findings": 10, "weaponized": 2, "pct": 20.0, "unweaponized": []},
+           "code": [], "gaps": [], "build": {},
+           "grounding": {"annotated": 10, "shortlist": 3, "attacker_reachable": 3,
+                         "by_verdict": {"exploitable-candidate": 3, "instrumentation-noise": 4,
+                                        "arch-safe-mul": 2, "unreached": 1}}}
+    h = _coverage_ledger_html(led)
+    assert "Grounded shortlist" in h and "3</b>" in h
+    assert "instrumentation-noise 4" in h and "arch-safe-mul 2" in h
+    assert "exploitable-candidate" not in h.split("set aside")[1][:120]   # not listed as set-aside
