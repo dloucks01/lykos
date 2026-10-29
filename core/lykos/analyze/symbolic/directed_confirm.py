@@ -60,7 +60,7 @@ def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -
 
 def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFuzzerTestOneInput",
                      input_size: int = 256, lib_dirs=None, targets=None, target_syms=None,
-                     timeout: int = 120, ctx=None) -> dict:
+                     load_libs=None, timeout: int = 120, ctx=None) -> dict:
     """Confirm a memory-safety bug via concolic input synthesis + ASan replay. See module docstring.
 
     `explore_binary` is the NON-ASan harness angr explores; `replay_binary` the ASan harness used to
@@ -82,6 +82,8 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
         spec["targets"] = list(targets)
     if target_syms:
         spec["target_syms"] = list(target_syms)
+    if load_libs:                                            # explore a SHARED harness with the
+        spec["load_libs"] = list(load_libs)                  # project's own .so visible (no static link)
     try:
         res = _concolic.run_explore(py, spec, ctx=ctx, timeout=timeout)
     except Exception as e:                                   # noqa: BLE001 -- a stuck/failed explore
@@ -206,7 +208,8 @@ def _rung_concolic(h, *, timeout, ctx):
         h["explore_binary"], h.get("replay_binary") or h["explore_binary"],
         harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
         input_size=int(h.get("input_size", 256)), lib_dirs=h.get("lib_dirs"),
-        targets=h.get("targets"), target_syms=h.get("target_syms"), timeout=timeout, ctx=ctx)
+        targets=h.get("targets"), target_syms=h.get("target_syms"),
+        load_libs=h.get("load_libs"), timeout=timeout, ctx=ctx)
 
 
 def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096, timeout=90,

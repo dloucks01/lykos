@@ -101,9 +101,22 @@ def _load_project(angr, spec, binary):
     """Open the binary with angr, falling back to the raw 'blob' loader when CLE has no backend
     for it (a firmware image or headerless dump). Without this a non-ELF target raised
     CLECompatibilityError and took the whole concolic stage down; the blob backend loads any bytes
-    at a base address for the given architecture so exploration can still proceed."""
+    at a base address for the given architecture so exploration can still proceed.
+
+    `load_libs` (the project's OWN shared objects) are FORCE-loaded while auto_load_libs stays off, so
+    a SHARED harness can be explored with its parser visible -- the concolic rung's path when a static
+    link is unavailable (FreeRDP). Only the named project libs load; system libs (libc/libssl) stay
+    stubbed by SimProcedures, which is what keeps the explore tractable and is all the parser gates
+    need."""
+    import os as _os
+    load_libs = [p for p in (spec.get("load_libs") or []) if _os.path.isfile(p)]
+    kw = {"auto_load_libs": False}
+    if load_libs:
+        kw["force_load_libs"] = load_libs
+        kw["ld_path"] = sorted({_os.path.dirname(p) for p in load_libs})
+        kw["except_missing_libs"] = False
     try:
-        return angr.Project(binary, auto_load_libs=False)
+        return angr.Project(binary, **kw)
     except Exception as first:                               # noqa: BLE001
         arch = _ARCH.get(str(spec.get("arch", "")).lower())
         if not arch:

@@ -80,6 +80,19 @@ def _steer_sites(ctx, target) -> list:
 _RANKABLE_DETECTORS = _STATIC_SOURCE_DETECTORS + ("source_recipe",)
 
 
+def _project_libs(lib_dirs, limit: int = 24) -> list:
+    """The project's OWN shared objects under the build's lib dirs -- the parser libraries angr
+    force-loads to explore a shared harness. Bounded; system libs (/usr/lib) are never here."""
+    from pathlib import Path as _P
+    libs: list = []
+    for d in (lib_dirs or []):
+        try:
+            libs += [str(p) for p in sorted(_P(d).glob("*.so*")) if p.is_file()]
+        except OSError:
+            pass
+    return libs[:limit]
+
+
 def _attack_surface(harness_bins, lib_dirs) -> set:
     """The set of source-file basenames compiled into the fuzz target -- the harness ELFs plus the
     shared objects they link (where a shared build keeps the parser). Bounded so a huge project cannot
@@ -237,6 +250,14 @@ def source_confirm_stage(ctx) -> dict:
     explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice)
     replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice)
     fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice)
+    # When the STATIC explore link fails (FreeRDP's -dev cascade) but the shared build works, build a
+    # SHARED-CLEAN explore so concolic still runs: angr explores it with the project's own .so
+    # force-loaded (auto_load_libs stays off, so system libs stay stubbed). This is the concolic
+    # unblock that needs no `-dev` packages.
+    explore_sh = None
+    if not explore["ok"] and fuzzb["ok"]:
+        ctx.progress(msg="static explore link failed; building shared-clean explore for concolic")
+        explore_sh = LF.cmake_build_harnesses(src, shared=True, sanitize=False, timeout=bslice)
     if not (explore["ok"] or fuzzb["ok"]):
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "could not build harnesses for confirmation (neither static nor shared linked)",
@@ -246,21 +267,29 @@ def source_confirm_stage(ctx) -> dict:
     ex_by = {h["name"]: h for h in explore["harnesses"]} if explore["ok"] else {}
     rp_by = {h["name"]: h for h in replay["harnesses"]} if replay["ok"] else {}
     fz_by = {h["name"]: h for h in fuzzb["harnesses"]} if fuzzb["ok"] else {}
+    exc_by = {h["name"]: h for h in explore_sh["harnesses"]} if (explore_sh and explore_sh["ok"]) else {}
+    proj_libs = _project_libs(explore_sh.get("lib_dirs")) if exc_by else []
     # Finding-directed steering: the LINE sites of the static source candidates, to point the concolic
     # rung at the statically-suspected bug lines (resolved per harness against its own DWARF line
-    # table). Only computed when a concolic (explore) build exists -- the only rung that consumes it --
-    # so a project that builds only the shared harness (FreeRDP) pays nothing. Steering only affects
-    # exploration efficiency, never soundness (the ASan replay + negative control still gate confirms).
-    sites = _steer_sites(ctx, target) if ex_by else []
-    names = sorted(set(ex_by) | set(fz_by))
+    # table). Only computed when a concolic (explore) build exists -- the only rung that consumes it.
+    # Steering only affects exploration efficiency, never soundness (replay + negative control gate it).
+    sites = _steer_sites(ctx, target) if (ex_by or exc_by) else []
+    names = sorted(set(ex_by) | set(exc_by) | set(fz_by))
     harnesses = []
     for n in names:
         d = {"name": n, "input_size": input_size, "lib_dirs": fuzzb.get("lib_dirs") or []}
-        if n in ex_by and n in rp_by:                       # concolic (static clean + ASan)
-            d["explore_binary"] = ex_by[n]["binary"]
+        exp = None
+        if n in ex_by and n in rp_by:                       # concolic: static clean + static ASan
+            exp = ex_by[n]["binary"]
             d["replay_binary"] = rp_by[n]["binary"]
+        elif n in exc_by and n in fz_by:                    # concolic: shared clean + shared ASan (.so)
+            exp = exc_by[n]["binary"]
+            d["replay_binary"] = fz_by[n]["binary"]
+            d["load_libs"] = proj_libs                      # force-load the project's own .so
+        if exp:
+            d["explore_binary"] = exp
             if sites:
-                addrs = dwarfline.site_addrs(ex_by[n]["binary"], sites)
+                addrs = dwarfline.site_addrs(exp, sites)
                 if addrs:
                     d["targets"] = [hex(a) for a in addrs]
         if n in fz_by:                                      # smart-fuzz (shared ASan)
@@ -277,7 +306,9 @@ def source_confirm_stage(ctx) -> dict:
     # silent. A short log tail backs a failure.
     builds = {"explore": {"ok": bool(explore["ok"]), "harnesses": len(ex_by)},
               "replay": {"ok": bool(replay["ok"]), "harnesses": len(rp_by)},
-              "fuzz": {"ok": bool(fuzzb["ok"]), "harnesses": len(fz_by)}}
+              "fuzz": {"ok": bool(fuzzb["ok"]), "harnesses": len(fz_by)},
+              "explore_shared": {"ok": bool(exc_by), "harnesses": len(exc_by),
+                                 "libs": len(proj_libs)}}
     for name, b in (("explore", explore), ("replay", replay), ("fuzz", fuzzb)):
         if not b["ok"]:
             builds[name]["error"] = (b.get("log") or "")[-300:]
@@ -287,6 +318,7 @@ def source_confirm_stage(ctx) -> dict:
     ctx.progress(msg="ranking source findings by attack-surface proximity")
     surf_bins = [h["binary"] for h in (fuzzb["harnesses"] if fuzzb["ok"] else [])]
     surf_bins += [h["binary"] for h in (explore["harnesses"] if explore["ok"] else [])]
+    surf_bins += [h["binary"] for h in exc_by.values()]
     surface = _attack_surface(surf_bins, fuzzb.get("lib_dirs") if fuzzb["ok"] else None) if surf_bins else set()
     ranked = _rank_by_surface(ctx, target, surface) if surface else {"in_surface": 0, "off_surface": 0}
 
