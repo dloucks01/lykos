@@ -147,13 +147,24 @@ def _build_status(store, case_id: str) -> Optional[dict]:
         return None
     failed = next((m for m in metas if m.get("build_failed")), None)
     if failed:
-        return {"built": False, "system": failed.get("build_system"),
-                "reason": _build_failure_reason(failed.get("build_log")),
-                "caveat": "the source build produced NO binaries, so this case is STATIC-SOURCE "
-                          "ONLY -- no disassembly, fuzzing, symbolic execution, sanitizer oracle or "
-                          "CVE fingerprint ran. A setup outcome (a missing build-time dependency on "
-                          "this box), not a clean result: stage the project's build dependencies "
-                          "and re-ingest for the binary / dynamic / symbolic capability."}
+        pf = failed.get("preflight") or {}
+        out = {"built": False, "system": failed.get("build_system"),
+               "reason": _build_failure_reason(failed.get("build_log")),
+               "caveat": "the source build produced NO binaries, so this case is STATIC-SOURCE "
+                         "ONLY -- no disassembly, fuzzing, symbolic execution, sanitizer oracle or "
+                         "CVE fingerprint ran. A setup outcome (a missing build-time dependency on "
+                         "this box), not a clean result: stage the project's build dependencies "
+                         "and re-ingest for the binary / dynamic / symbolic capability."}
+        # The pre-flight computed at ingest turns "a dependency was missing" into the exact
+        # checklist to stage. `stage` is the flat bring-these list (deps + build tools) for the
+        # one-line caveat; `missing`/`toolchain_missing` carry the detail for the report/GUI.
+        if pf.get("tokens"):
+            out["stage"] = pf["tokens"]
+        if pf.get("missing"):
+            out["missing_deps"] = pf["missing"]
+        if pf.get("toolchain_missing"):
+            out["toolchain_missing"] = pf["toolchain_missing"]
+        return out
     system = next((m.get("build_system") for m in metas if m.get("build_system")), None)
     out: dict[str, Any] = {"built": True, "system": system}
     if system == "cmake-fuzzers":

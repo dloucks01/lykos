@@ -1225,6 +1225,11 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
           <div class="lb-head">⚠ Build produced no binaries — static-source analysis only</div>
           ${bld.reason ? html`<div class="lb-reason mono">${bld.reason}</div>` : null}
           <div class="lb-caveat">${bld.caveat}</div>
+          ${(bld.stage && bld.stage.length) ? html`
+            <div class="lb-stage-label">Stage these before re-ingesting
+              <span class="muted">— <span class="mono">lykos deps &lt;dir&gt;</span> for detail</span></div>
+            <div class="lb-stage">${bld.stage.map(t => html`<span class="lb-tok mono">${t}</span>`)}</div>`
+            : null}
         </div>`
         : bld && bld.caveat ? html`<div class="ledger-build note">Build: ${bld.caveat}</div>` : null}
 

@@ -464,6 +464,34 @@ def _is_program_elf(p) -> bool:
         return False
 
 
+def _safe_preflight(path):
+    """A compact, JSON-able build-dependency pre-flight of a source tree for the build-failure
+    caveat: which declared deps / build tools this host lacks, so the operator stages them before
+    going offline. Best-effort -- returns None on any failure; the caveat still names the build
+    log. Only the actionable subset is stored (the full requirement list is reproducible with
+    `lykos deps`)."""
+    try:
+        from . import dep_preflight
+        pf = dep_preflight.scan_dependencies(path)
+        return {"build_system": pf["build_system"],
+                "toolchain_missing": pf["toolchain_missing"],
+                "missing": [{"kind": r["kind"], "name": r["name"], "hint": r["hint"]}
+                            for r in pf["missing"]],
+                "tokens": dep_preflight.missing_tokens(pf),
+                "summary": pf["summary"]}
+    except Exception:                                   # noqa: BLE001 -- enrichment only
+        return None
+
+
+def _preflight_stage_line(preflight) -> str:
+    """One trailing line for the NotAnalysable message naming the deps to stage, or '' when the
+    pre-flight found nothing missing / could not run."""
+    toks = (preflight or {}).get("tokens") or []
+    if not toks:
+        return ""
+    return "\n\nstage these before going offline (lykos deps <dir> for detail): " + ", ".join(toks)
+
+
 def _ingest_built_project(store, case_id, root, built, filename):
     """Ingest the binary produced by building a source PROJECT: store the primary instrumented
     executable as the target, keep the source TREE (tar.gz) keyed to its hash so the code view can
@@ -593,6 +621,9 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
             # behaviour: register it so the source detectors still have an archived tree to read.
             if built.get("ok") and built.get("primary"):
                 return _ingest_built_project(store, case_id, path, built, filename or path.name)
+        # The build failed: pre-flight the tree so we can say WHICH dependencies to stage, not just
+        # that something was missing. Offline-honest (it fetches nothing) and best-effort.
+        preflight = _safe_preflight(path) if build_log is not None else None
         # a challenge BUNDLE (prebuilt binary + loader/libc), or a source project that did not build
         main, dep_files = gather_bundle(path)
         if main is None:
@@ -600,8 +631,9 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
             # (e.g. "cmake: No such file or directory" -> install the tool / run `make doctor`), not
             # the generic bundle message, which reads as "lykos could not understand the input".
             if build_log is not None:
-                raise NotAnalysable(
-                    f"{path.name}: source project did not build:\n{build_log.strip()[-600:]}")
+                msg = f"{path.name}: source project did not build:\n{build_log.strip()[-600:]}"
+                stage = _preflight_stage_line(preflight)
+                raise NotAnalysable(msg + stage)
             raise NotAnalysable(f"{path.name}: no analysable binary found in the bundle")
         tgt = ingest(store, case_id, main, filename=filename or main.name, deps=dep_files)
         if build_log is not None:
@@ -615,7 +647,8 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 store.put_artifact(case_id, "source-project", data=_source_tree_tgz(path),
                                    meta={"binary_sha": tgt.sha256,
                                          "filename": filename or path.name, "build_failed": True,
-                                         "build_log": (build_log or "").strip()[-2000:]})
+                                         "build_log": (build_log or "").strip()[-2000:],
+                                         "preflight": preflight})
             except Exception:                        # noqa: BLE001 -- best-effort source enrichment
                 pass
         return tgt

@@ -206,6 +206,16 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
         rr = f' <span class="mono">{esc(bld["reason"])}</span>' if bld.get("reason") else ""
         p.append('<p class="headline tone-high">Build produced no binaries — static-source analysis '
                  f'only.{rr}</p><p class="muted">{esc(bld.get("caveat") or "")}</p>')
+        # The pre-flight's actionable checklist: the exact deps / build tools to stage so the
+        # binary/dynamic/symbolic capability runs on the next ingest.
+        stage = bld.get("stage") or []
+        if stage:
+            p.append('<div class="evlabel ledger-stage-label">Stage these before re-ingesting '
+                     '<span class="muted">— run <span class="mono">lykos deps &lt;dir&gt;</span> '
+                     'for detail</span></div><ul class="ev ledger-stage">')
+            for tok in stage:
+                p.append(f'<li class="mono">{esc(tok)}</li>')
+            p.append('</ul>')
     elif bld.get("caveat"):
         p.append(f'<p class="muted ledger-build-note">Build: {esc(bld["caveat"])}</p>')
     p.append('<div class="stats">')

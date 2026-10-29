@@ -133,6 +133,25 @@ def test_format_report_is_actionable(tmp_path, monkeypatch):
     assert "libxml2-dev" in txt or "zlib1g-dev" in txt              # a package hint appears
 
 
+def test_ingest_preflight_helpers(tmp_path, monkeypatch):
+    """ingest's build-failure path stores a compact pre-flight and a stage line for the error."""
+    import importlib
+    ingest = importlib.import_module("lykos.analyze.ingest")   # the module, not the re-exported fn
+    root = _cmake_project(tmp_path)
+    monkeypatch.setattr(DP, "_header_present", lambda h: False)
+    monkeypatch.setattr(DP, "_pkgconfig_present", lambda m: False)
+    monkeypatch.setattr(DP, "_library_present", lambda n: False)
+    pf = ingest._safe_preflight(root)
+    assert pf and pf["build_system"] == "cmake"
+    assert any(m["name"] == "ZLIB" for m in pf["missing"])
+    assert "tokens" in pf and pf["tokens"]
+    line = ingest._preflight_stage_line(pf)
+    assert "stage these before going offline" in line and "ZLIB" in line
+    # None/empty pre-flight yields an empty stage line, never an error
+    assert ingest._preflight_stage_line(None) == ""
+    assert ingest._preflight_stage_line({"tokens": []}) == ""
+
+
 def test_build_system_detection(tmp_path):
     assert DP._detect_build_system(tmp_path) == "plain"
     (tmp_path / "configure").write_text("#!/bin/sh\n")

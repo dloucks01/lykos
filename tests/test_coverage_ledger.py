@@ -129,6 +129,48 @@ def test_ledger_surfaces_a_failed_build_as_a_coverage_caveat(store, case):
     assert led["gaps"] and "BUILD PRODUCED NO BINARIES" in led["gaps"][0]   # the top gap
 
 
+def test_ledger_build_caveat_carries_preflight_stage_list(store, case):
+    """A failed build whose ingest pre-flight found missing deps surfaces the exact stage-these
+    checklist in the build caveat -- the actionable half of the coverage caveat."""
+    store.put_artifact(case.id, "source-project", data=b"tree",
+                       meta={"filename": "proj", "build_failed": True,
+                             "build_log": "fatal error: openssl/ssl.h: No such file or directory",
+                             "preflight": {"build_system": "cmake",
+                                           "toolchain_missing": ["cmake"],
+                                           "missing": [{"kind": "cmake-package", "name": "OpenSSL",
+                                                        "hint": {"apt": "libssl-dev",
+                                                                 "dnf": "openssl-devel"}}],
+                                           "tokens": ["cmake", "OpenSSL (libssl-dev)"],
+                                           "summary": {"missing": 1}}})
+    b = CL.build_ledger(store, case.id)["build"]
+    assert b["built"] is False
+    assert b["stage"] == ["cmake", "OpenSSL (libssl-dev)"]
+    assert b["toolchain_missing"] == ["cmake"]
+    assert b["missing_deps"][0]["name"] == "OpenSSL"
+
+
+def test_ledger_failed_build_without_preflight_still_renders(store, case):
+    """The pre-flight is best-effort; a failed build with no preflight meta still yields a caveat
+    (no stage list), never an error."""
+    store.put_artifact(case.id, "source-project", data=b"tree",
+                       meta={"filename": "proj", "build_failed": True, "build_log": "boom"})
+    b = CL.build_ledger(store, case.id)["build"]
+    assert b["built"] is False and "stage" not in b
+
+
+def test_failed_build_stage_list_renders_in_html():
+    from lykos.report.html import _coverage_ledger_html
+    led = {"checks": {"total": 5, "ran": 0, "classes_checked": [], "not_run": []},
+           "weaponization": {"findings": 0, "weaponized": 0, "pct": None, "unweaponized": []},
+           "code": [], "gaps": [],
+           "build": {"built": False, "system": "cmake",
+                     "reason": "fatal error: openssl/ssl.h: No such file or directory",
+                     "caveat": "static-source only", "stage": ["cmake", "OpenSSL (libssl-dev)"]}}
+    h = _coverage_ledger_html(led)
+    assert "Stage these before re-ingesting" in h
+    assert "OpenSSL (libssl-dev)" in h and "lykos deps" in h
+
+
 def test_ledger_notes_a_harness_only_build(store, case):
     store.put_artifact(case.id, "source-project", data=b"tree",
                        meta={"filename": "proj", "build_system": "cmake-fuzzers"})

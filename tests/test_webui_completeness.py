@@ -220,6 +220,15 @@ def test_the_ledger_surfaces_the_build_outcome_caveat():
     assert "ledger.build" in COMPONENTS, "the panel never reads the build outcome"
 
 
+def test_the_build_caveat_shows_the_dependency_stage_checklist():
+    """The pre-flight's actionable half: when a build failed for missing deps, the banner lists the
+    exact deps/tools to stage before re-ingesting -- not just that the build failed."""
+    assert "bld.stage" in COMPONENTS, "the build caveat never reads the pre-flight stage list"
+    assert "lb-tok" in COMPONENTS, "the stage checklist has no chips"
+    assert "lykos deps" in COMPONENTS, "the caveat does not point at `lykos deps`"
+    assert ".lb-stage" in (STATIC / "index.html").read_text(), "no CSS for the stage chips"
+
+
 def test_the_ledger_links_to_the_prove_out_shortlist():
     """The coverage ledger's verification line is the case-level entry into the prove-out shortlist:
     clicking it filters the findings board to the real, on-attack-surface findings."""
