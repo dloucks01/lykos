@@ -433,3 +433,39 @@ def test_the_builder_chain_has_a_deadline(tmp_path):
     # and it says so rather than reporting a plain failure
     if not r["ok"]:
         assert "budget" in (r.get("log") or "") or r["system"] is not None
+
+
+def test_executable_build_also_surfaces_shared_libraries():
+    """When a project build produces executables, the built shared libraries are surfaced TOO
+    (a 'libraries' key), so the bulk of a project's code (its .so, not the thin executables) is
+    reachable as targets -- not only the fallback library-only build."""
+    import inspect
+
+    from lykos.analyze import source_project
+    src = inspect.getsource(source_project.build_source_project)
+    assert "_elf_libraries(root, start)" in src and '"libraries"' in src
+
+
+def test_ingest_registers_built_shared_libraries_as_targets(store, case, tmp_path):
+    """_ingest_built_project registers the built .so libraries as case targets (deduped by sha),
+    alongside the primary executable -- so a project's libraries (where the bulk of the code is)
+    become analysable, not just the thin executables and harnesses."""
+    from lykos.analyze.ingest import _ingest_built_project
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "a.c").write_text("int f(void){return 0;}\n")
+
+    def _mk(name, kind_byte, filler):
+        p = root / name
+        p.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8 + kind_byte + b"\x00" + filler)
+        return p
+
+    exe = _mk("app", b"\x02", b"X" * 300)             # ET_EXEC
+    lib1 = _mk("libcore.so", b"\x03", b"Y" * 500)
+    lib2 = _mk("libutil.so", b"\x03", b"Z" * 400)
+    built = {"ok": True, "system": "cmake", "kind": "executable", "compiler": "clang",
+             "primary": exe, "binaries": [exe], "libraries": [lib1, lib2], "lib_dirs": []}
+    _ingest_built_project(store, case.id, root, built, "proj")
+    names = {t.filename for t in store.targets.list_by_case(case.id)}
+    assert "proj" in names                                   # the primary (named by the ingest name)
+    assert "libcore.so" in names and "libutil.so" in names, names

@@ -445,12 +445,21 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
             full_log += f"\n== {system} ==\n{log}"
             bins = _elf_executables(root, start)
             kind = "executable"
+            libs = []
             if not bins:                                 # a library build (shared object)
                 bins = _elf_libraries(root, start)
                 kind = "library"
+            else:
+                # A large project's real code often lives in its shared libraries, not only in the
+                # thin executables and in-tree fuzz harnesses. Surface the built .so's ALONGSIDE the
+                # executables: they are not runnable as programs, but
+                # the binary static detectors, CVE fingerprinting and symbolic execution all read a
+                # .so, so registering them widens coverage past the entry-point executables.
+                libs = _elf_libraries(root, start)
             if bins:
                 return {"ok": True, "system": system, "kind": kind, "binaries": bins,
-                        "primary": bins[0], "compiler": Path(cc).name, "log": full_log[-4000:]}
+                        "libraries": libs, "primary": bins[0], "compiler": Path(cc).name,
+                        "log": full_log[-4000:]}
         if not confine:
             full_log += ("\n== note: build ran UNCONFINED (bwrap unavailable) -- the project's "
                          "build scripts executed with this user's full privileges ==\n")

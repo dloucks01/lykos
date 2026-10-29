@@ -515,6 +515,31 @@ def _ingest_built_project(store, case_id, root, built, filename):
                                      "lib_dirs": built.get("lib_dirs") or []})
         except OSError:
             continue
+    # The built SHARED LIBRARIES too -- a large project's bulk of code often lives in its .so, not
+    # in the thin executables + test harnesses. A .so is not runnable as a program, so the dynamic
+    # engines report DID NOT RUN on it -- but the binary static detectors, CVE fingerprinting and
+    # symbolic execution read it, so registering it reaches the library code the executables only
+    # link. Bounded by MAX_ENTRY_POINTS (largest first), deduped against the executables by sha.
+    _seen = {info["sha256"]}
+    for lib in (built.get("libraries") or [])[:MAX_ENTRY_POINTS]:
+        try:
+            lp = Path(lib)
+            if not lp.is_file():
+                continue
+            li = hash_all_file(lp)
+            if not li["size"] or li["sha256"] in _seen:
+                continue
+            _seen.add(li["sha256"])
+            store.put_artifact(case_id, "target-blob", src=lp)
+            store.targets.upsert(case_id, lp.name, li["sha256"],
+                                 md5=li["md5"], sha1=li["sha1"], size=li["size"])
+            store.put_artifact(case_id, "source-project", data=buf_bytes,
+                               meta={"binary_sha": li["sha256"], "filename": lp.name,
+                                     "build_system": built.get("system"),
+                                     "compiler": built.get("compiler"),
+                                     "lib_dirs": built.get("lib_dirs") or []})
+        except OSError:
+            continue
     return main
 
 
