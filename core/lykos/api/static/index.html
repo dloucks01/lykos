@@ -528,6 +528,12 @@
   .tm-bar > span { display: block; height: 100%; background: var(--accent); }
   .tm-tab tr.tm-noyield .tm-bar > span { background: #8b8d98; }
   .tm-pct { display: inline-block; width: 36px; text-align: right; font-size: .72rem; color: var(--muted); margin-left: 4px; vertical-align: middle; }
+  .ledger-build { margin: 10px 0; padding: 10px 12px; border-radius: 8px; font-size: .84rem; }
+  .ledger-build.fail { border: 1px solid color-mix(in srgb, var(--high, #db6d28) 45%, transparent); background: color-mix(in srgb, var(--high, #db6d28) 9%, transparent); }
+  .ledger-build.fail .lb-head { font-weight: 600; color: var(--high, #db6d28); }
+  .ledger-build .lb-reason { margin: 4px 0; color: var(--muted); font-size: .8rem; word-break: break-word; }
+  .ledger-build .lb-caveat { color: var(--fg); }
+  .ledger-build.note { color: var(--muted); background: var(--panel-2); }
   .ledger-distinct { margin-top: 7px; font-size: .82rem; color: var(--fg); }
   .ledger-verify { margin-top: 5px; font-size: .82rem; display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
   .ledger-verify .lv-shortlist { color: #2ea043; }

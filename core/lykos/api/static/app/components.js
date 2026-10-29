@@ -1213,12 +1213,20 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
   // so label the worklist with findings − weaponized, not the length of the capped list.
   const candTotal = Math.max(cands.length, (wpn.findings || 0) - (wpn.weaponized || 0));
   const byState = wpn.by_state || {};
+  const bld = ledger.build || {};
   return html`
     <div class="card ledger">
       <div class="ledger-head">Coverage ledger</div>
       <div class="ledger-sub">Full coverage is an asymptote, so this is the honest account of the gap
         along three axes — which checks ran, which findings are weaponized, and how much code the
         search exercised — with the worklist to close it.</div>
+      ${bld && bld.built === false ? html`
+        <div class="ledger-build fail">
+          <div class="lb-head">⚠ Build produced no binaries — static-source analysis only</div>
+          ${bld.reason ? html`<div class="lb-reason mono">${bld.reason}</div>` : null}
+          <div class="lb-caveat">${bld.caveat}</div>
+        </div>`
+        : bld && bld.caveat ? html`<div class="ledger-build note">Build: ${bld.caveat}</div>` : null}
 
       <!-- Axis B: analysis checks / weakness classes -->
       <div class="ledger-axis">

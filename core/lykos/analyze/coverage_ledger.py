@@ -115,6 +115,54 @@ def _run_status(runs: list) -> str:
     return "pending"
 
 
+#: Lines in a failed build log that usually name the real cause (a missing header / package / tool).
+_BUILD_ERR_HINTS = ("fatal error:", "No such file or directory", "not found", "could not find",
+                    "Could NOT find", "undefined reference", "command not found", "cmake: not found")
+
+
+def _build_failure_reason(log: Optional[str]) -> Optional[str]:
+    """The most telling line from a failed build log -- usually the missing header/package/tool."""
+    if not log:
+        return None
+    for line in log.splitlines():
+        s = line.strip()
+        if any(h in s for h in _BUILD_ERR_HINTS):
+            return s[:200]
+    tail = log.strip().splitlines()
+    return tail[-1][:200] if tail else None
+
+
+def _build_status(store, case_id: str) -> Optional[dict]:
+    """The source-project build OUTCOME as a coverage caveat. For a source case the binary /
+    dynamic / symbolic capability all hinge on the build producing binaries; when it did not (a
+    missing build-time dependency on the air-gapped box) the case degrades to STATIC-SOURCE only --
+    a property of the run's setup, not of the code -- and the operator must be told so they can
+    stage the dependency. None when this is not a source project (a plain binary upload)."""
+    try:
+        metas = [a.meta or {} for a in store.artifacts.list_by_case(case_id)
+                 if a.kind == "source-project"]
+    except Exception:                                        # noqa: BLE001 -- ledger must render
+        return None
+    if not metas:
+        return None
+    failed = next((m for m in metas if m.get("build_failed")), None)
+    if failed:
+        return {"built": False, "system": failed.get("build_system"),
+                "reason": _build_failure_reason(failed.get("build_log")),
+                "caveat": "the source build produced NO binaries, so this case is STATIC-SOURCE "
+                          "ONLY -- no disassembly, fuzzing, symbolic execution, sanitizer oracle or "
+                          "CVE fingerprint ran. A setup outcome (a missing build-time dependency on "
+                          "this box), not a clean result: stage the project's build dependencies "
+                          "and re-ingest for the binary / dynamic / symbolic capability."}
+    system = next((m.get("build_system") for m in metas if m.get("build_system")), None)
+    out: dict[str, Any] = {"built": True, "system": system}
+    if system == "cmake-fuzzers":
+        out["caveat"] = ("built the in-tree fuzz harnesses + core shared libraries (not a full "
+                         "project build); dynamic coverage is the harnesses' entry points, while "
+                         "binary / symbolic analysis also covers the registered libraries.")
+    return out
+
+
 def build_ledger(store, case_id: str) -> dict[str, Any]:
     """The coverage ledger for a case: check coverage (classes), weaponization coverage, code
     coverage, and a combined gaps worklist. Read-only."""
@@ -197,8 +245,17 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         "noise": sum(1 for v in _dk_verdict.values() if v == "instrumentation-noise"),
     }
 
+    # ---- the source-project BUILD OUTCOME (a coverage caveat for a source case) ----
+    build = _build_status(store, case_id)
+
     # ---- combined GAPS worklist ----
     gaps: list[str] = []
+    if build and not build.get("built"):
+        # The loudest gap: a failed build means the whole binary/dynamic capability did not run.
+        gaps.append("BUILD PRODUCED NO BINARIES -- static-source-only"
+                    + (f" (build failed: {build['reason']})" if build.get("reason") else "")
+                    + ". Stage the project's build dependencies and re-ingest for binary/dynamic/"
+                    "symbolic coverage.")
     if not_run:
         gaps.append(f"{len(not_run)} analysis check(s) did not run on this case "
                     f"(classes never looked for): "
@@ -229,6 +286,8 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
                           "by_state": by_state, "unweaponized": unweaponized[:200],
                           "distinct": distinct, "verification": verification},
         "code": code,
+        # The source build outcome: did it produce binaries, or is this static-source-only?
+        "build": build,
         "gaps": gaps,
     }
 

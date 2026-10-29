@@ -112,3 +112,29 @@ def test_ledger_renders_in_html():
     h = _coverage_ledger_html(led)
     assert "Coverage ledger" in h and "4/10" in h and "60%" in h
     assert "Uninitialised-memory oracle" in h and "Gaps" in h and "libx.so" in h
+
+
+def test_ledger_surfaces_a_failed_build_as_a_coverage_caveat(store, case):
+    """A source case whose build produced no binaries is the loudest coverage caveat: static-source
+    only, with the failure reason, as the TOP gap -- the whole binary/dynamic capability did not run."""
+    store.put_artifact(case.id, "source-project", data=b"tree",
+                       meta={"filename": "proj", "build_failed": True,
+                             "build_log": "cmake configuring\nfatal error: openssl/ssl.h: "
+                                          "No such file or directory\nbuild aborted"})
+    led = CL.build_ledger(store, case.id)
+    b = led["build"]
+    assert b and b["built"] is False
+    assert "openssl/ssl.h" in (b["reason"] or "")
+    assert "STATIC-SOURCE" in b["caveat"]
+    assert led["gaps"] and "BUILD PRODUCED NO BINARIES" in led["gaps"][0]   # the top gap
+
+
+def test_ledger_notes_a_harness_only_build(store, case):
+    store.put_artifact(case.id, "source-project", data=b"tree",
+                       meta={"filename": "proj", "build_system": "cmake-fuzzers"})
+    b = CL.build_ledger(store, case.id)["build"]
+    assert b["built"] is True and "harness" in (b.get("caveat") or "")
+
+
+def test_ledger_build_is_none_for_a_non_source_case(store, case):
+    assert CL.build_ledger(store, case.id)["build"] is None   # no source-project artifact

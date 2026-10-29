@@ -199,6 +199,15 @@ def _coverage_ledger_html(led: dict[str, Any]) -> str:
          '<p class="muted">Full coverage is an asymptote; this is the honest account of the gap — '
          'which classes of check ran, how much was weaponized, how much code was exercised — with the '
          'gaps as a worklist.</p>']
+    # The build outcome, up top: a source case whose build produced no binaries is static-source
+    # ONLY -- the loudest coverage caveat, because the whole binary/dynamic capability did not run.
+    bld = led.get("build") or {}
+    if bld and not bld.get("built"):
+        rr = f' <span class="mono">{esc(bld["reason"])}</span>' if bld.get("reason") else ""
+        p.append('<p class="headline tone-high">Build produced no binaries — static-source analysis '
+                 f'only.{rr}</p><p class="muted">{esc(bld.get("caveat") or "")}</p>')
+    elif bld.get("caveat"):
+        p.append(f'<p class="muted ledger-build-note">Build: {esc(bld["caveat"])}</p>')
     p.append('<div class="stats">')
     p.append(_stat(f'{ch.get("ran", 0)}/{ch.get("total", 0)}', "checks run"))
     p.append(_stat(len(ch.get("classes_checked") or []), "CWE classes covered"))

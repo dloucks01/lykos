@@ -212,6 +212,14 @@ def test_the_prove_out_plan_and_exploitability_walk_into_the_spine():
     assert "onExploits=" in APP, "the app never wires the exploitability->Exploits hop"
 
 
+def test_the_ledger_surfaces_the_build_outcome_caveat():
+    """A source case whose build produced no binaries is flagged in the ledger as static-source
+    only -- the whole binary/dynamic capability hinges on the build, so the GUI says so loudly."""
+    assert "ledger-build" in COMPONENTS, "the ledger panel has no build-caveat banner"
+    assert "Build produced no binaries" in COMPONENTS, "no static-source-only caveat text"
+    assert "ledger.build" in COMPONENTS, "the panel never reads the build outcome"
+
+
 def test_the_ledger_links_to_the_prove_out_shortlist():
     """The coverage ledger's verification line is the case-level entry into the prove-out shortlist:
     clicking it filters the findings board to the real, on-attack-surface findings."""
