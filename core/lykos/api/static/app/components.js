@@ -1314,6 +1314,45 @@ export function LedgerPanel({ ledger, busy, onOpenFinding, onFilterCwe, onFocusT
     </div>`;
 }
 
+
+// The time & yield of each TECHNIQUE, with the overall analysis time -- which techniques earned
+// their clock. Each row cross-links into the spine: clicking a technique filters the findings to
+// the ones it discovered. A technique that spent the most time for zero findings and zero crashes
+// is flagged "no yield" -- the FreeRDP fuzzers' story, made visible. Hookless (render-testable).
+export function TimingPanel({ timing, busy, onFilterStage }) {
+  if (!timing) return busy ? html`<div class="timing-panel"><${Spinner} label="Measuring…" /></div>` : null;
+  const ov = timing.overall || {};
+  const techs = timing.techniques || [];
+  const compute = ov.compute_seconds || 0;
+  return html`
+    <div class="timing-panel">
+      <div class="tm-head">Time &amp; yield per technique</div>
+      <p class="tm-sub">Wall-clock <b>${ov.wall_human || "—"}</b> · total compute ${ov.compute_human || "—"}
+        across ${techs.length} techniques (${ov.runs || 0} runs; compute exceeds wall-clock because the
+        worker pool runs targets in parallel). Yield = findings + reproduced crashes.</p>
+      <table class="tm-tab"><thead><tr><th>technique</th><th>time</th><th>share of compute</th>
+        <th>runs</th><th>findings</th><th>crashes</th></tr></thead><tbody>
+        ${techs.map((t) => {
+          const pct = compute ? Math.round((100 * t.seconds) / compute) : 0;
+          const zero = t.seconds > 0 && !t.findings && !t.crashes;
+          return html`<tr class=${zero ? "tm-noyield" : ""} key=${t.stage}>
+            <td>${onFilterStage
+              ? html`<button class="tm-fn clk" title="show the findings this technique discovered"
+                  onClick=${() => onFilterStage(t.stage, t.label)}>${t.label}${zero
+                    ? html` <span class="tm-muted">(no yield)</span>` : ""}</button>`
+              : html`<span>${t.label}${zero ? html` <span class="tm-muted">(no yield)</span>` : ""}</span>`}</td>
+            <td class="tm-num">${t.human}</td>
+            <td class="tm-bar-cell"><span class="tm-bar"><span style=${`width:${pct}%`}></span></span>
+              <span class="tm-pct">${pct}%</span></td>
+            <td class="tm-num">${t.runs}</td>
+            <td class="tm-num">${t.findings}</td>
+            <td class="tm-num">${t.crashes}</td>
+          </tr>`;
+        })}
+      </tbody></table>
+    </div>`;
+}
+
 // ── Verdict layer ───────────────────────────────────────────────────────────────────────────
 // The answer, up top. Everything below (target facts, findings, the analysis drawer) is the
 // working; these components are the verdict: per binary, the worst effect an attacker can drive it

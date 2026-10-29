@@ -117,6 +117,8 @@ export const api = {
   // The coverage ledger: the three axes (checks/classes run, findings weaponized, code exercised)
   // + the gaps worklist -- the "how close to 100%" dashboard.
   coverage: (caseId) => _req("GET", `/cases/${caseId}/coverage`),
+  // Per-technique time + yield and the overall analysis time (the timing panel).
+  timing: (caseId) => _req("GET", `/cases/${caseId}/timing`),
   systemmap: (caseId) => _req("GET", `/cases/${caseId}/systemmap`),
   // The false-positive review verdicts for a case: { input_sha: {runs, crashed, signal,
   // deterministic} }. Lets a reopened case restore its VerifyBadges (the live run gets them from

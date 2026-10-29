@@ -184,6 +184,24 @@ function renderInfo(vnode) {
   ck("FindingCard renders the instrumentation-artifact verdict badge",
     /instrumentation artifact/.test(noise.all) && noise.classes.some((c) => /vb-instrumentation-noise/.test(c)));
 
+  // ---- TimingPanel (hookless): time & yield per technique, with the stage cross-link ----
+  const tm = renderInfo(h(C.TimingPanel, {
+    timing: {
+      overall: { wall_human: "5m 0s", compute_human: "6m 0s", runs: 3, compute_seconds: 360 },
+      techniques: [
+        { stage: "fuzz", label: "Black-box fuzzing", seconds: 300, human: "5m 0s", runs: 1, findings: 0, crashes: 0 },
+        { stage: "int_overflow_scan", label: "Int-overflow allocs", seconds: 10, human: "10s", runs: 1, findings: 2, crashes: 0 },
+      ],
+    },
+    onFilterStage() {},
+  }));
+  ck("TimingPanel renders the overall time + technique rows",
+    tm.threw.length === 0 && /yield per technique/.test(tm.all) && /Black-box fuzzing/.test(tm.all)
+    && /5m 0s/.test(tm.all));
+  ck("TimingPanel flags a zero-yield technique", /no yield/.test(tm.all));
+  ck("TimingPanel rows are clickable stage cross-links",
+    tm.classes.some((c) => /tm-fn clk/.test(c)));
+
   // A candidate must NOT be styled as demonstrated.
   const cand = renderInfo(h(C.FindingCard, {
     finding: { id: "F2", cwe: "CWE-120", title: "strcpy", severity: "high", state: "candidate" },

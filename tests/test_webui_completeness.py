@@ -192,6 +192,16 @@ def test_a_finding_links_to_its_discovering_stage():
     assert "viz.stage" in (STATIC / "app" / "util.js").read_text(), "filterByViz ignores a stage filter"
 
 
+def test_timing_panel_is_in_the_gui_and_cross_links_to_stage_findings():
+    """The time & yield table (report-only before) now lives in the GUI's ledger tab, and each
+    technique row filters the findings board to the stage it discovered."""
+    assert "export function TimingPanel" in COMPONENTS, "no TimingPanel component"
+    assert "<${TimingPanel}" in APP, "the ledger tab never renders the timing panel"
+    assert "onFilterStage=${showStageFindings}" in APP, "timing rows don't cross-link to a stage"
+    assert "api.timing" in APP, "the app never fetches timing"
+    assert "timing:" in (STATIC / "app" / "api.js").read_text(), "no timing API client"
+
+
 def test_the_evidence_modal_walks_the_reachability_path_into_the_graph():
     """Spine: the EvidenceModal renders the source->sink reachability path, and each hop focuses
     that function in the call graph -- walking the path from the finding to the sink."""

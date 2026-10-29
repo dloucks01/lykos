@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction, failedTargets, operatorSettings } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, LedgerPanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, EngagementMap, CurationFilter,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, LedgerPanel, TimingPanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, ScansPanel, SelftestPanel, CrashesPanel, CallGraphCanvas, CaseOverview, EngagementMap, CurationFilter,
   RunSignalsStrip, DoctorPanel, SeedsField, BuildFoot,
 } from "./components.js";
 
@@ -163,6 +163,7 @@ function App() {
   const [coverage, setCoverage] = useState({});
   const [ledger, setLedger] = useState(null);         // coverage ledger (3-axis "how close to 100%?" dashboard)
   const [ledgerBusy, setLedgerBusy] = useState(false);
+  const [timing, setTiming] = useState(null);         // per-technique time + yield (shown beside the ledger)
   const [verifications, setVerifications] = useState({});  // input_sha -> replay review result
   const [codeFn, setCodeFn] = useState(null);       // {fn, finding} for the open code view
   const [evidence, setEvidence] = useState(null);   // {finding, focus} for the evidence inspector
@@ -262,7 +263,7 @@ function App() {
   // scorecard, console and open modals used to survive into the next case and read as its own.
   const resetCaseView = useCallback(() => {
     setLog([]); setFindings([]); setPocs([]); setAdvice(null); setUnavailable([]); setSysmap(null);
-    setCoverage({}); setLedger(null); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]);
+    setCoverage({}); setLedger(null); setTiming(null); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]);
     setOpenLog(null); setFuzzLive(null); setFuzzState(null); setInvChosen(null); setBgActivity(null);
     setConsoleLines([]); consoleSeen.current = new Set();
     setActiveTid(null); setTab("findings"); setViz(null); setCgFocus(null);
@@ -864,7 +865,7 @@ function App() {
     setRunning(true);
     setRan(true);
     setUnavailable([]);
-    setCoverage({}); setLedger(null); setVerifications({});
+    setCoverage({}); setLedger(null); setTiming(null); setVerifications({});
     const ctrl = newController();
     ctrlRef.current = ctrl;
     const ids = targets.map((t) => t.id);
@@ -1119,6 +1120,9 @@ function App() {
       .then((led) => { if (live) setLedger(led || null); })
       .catch(() => { if (live) setLedger(null); })
       .finally(() => { if (live) setLedgerBusy(false); });
+    // Timing rides on the same tab (both are case-level measurement built from runs + findings).
+    api.timing(caseId).then((tm) => { if (live) setTiming(tm || null); }).catch(() => {
+      if (live) setTiming(null); });
     return () => { live = false; };
   }, [tab, caseId, findings.length]);
 
@@ -1518,6 +1522,8 @@ function App() {
                 <${LedgerPanel} ledger=${ledger} busy=${ledgerBusy}
                   onOpenFinding=${openFindingById} onFilterCwe=${filterByCwe}
                   onFocusTarget=${focusTargetByName} />
+                <${TimingPanel} timing=${timing} busy=${ledgerBusy}
+                  onFilterStage=${showStageFindings} />
               </div>
             ` : tab === "exploits" ? html`
               <div class="wb-panel">

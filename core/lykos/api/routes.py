@@ -33,6 +33,7 @@ _TARGET_STR = re.compile(r"^/targets/([^/]+)/strings$")
 _TARGET_FIND = re.compile(r"^/targets/([^/]+)/findings$")
 _CASE_FIND = re.compile(r"^/cases/([^/]+)/findings$")
 _CASE_COVERAGE = re.compile(r"^/cases/([^/]+)/coverage$")
+_CASE_TIMING = re.compile(r"^/cases/([^/]+)/timing$")
 _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 # Operator curation (doc 47 P3): the per-finding verdict + note, and the case-wide map.
 _FIND_CURATION = re.compile(r"^/findings/([^/]+)/curation$")

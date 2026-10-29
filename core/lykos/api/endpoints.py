@@ -525,6 +525,18 @@ class EndpointsMixin:
             out["invocation"] = found
         return out
 
+    def _get_timing(self, cid):
+        """Per-technique time + yield and the overall analysis time -- the GUI's timing panel.
+        Same model the report's `timing` section uses (one source: analyze.timing)."""
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            from ..analyze.timing import build_timing
+            return self._json(build_timing(s, cid))
+        finally:
+            s.close()
+
     def _get_coverage(self, cid):
         """The coverage ledger for a case: the three axes (checks/classes run, findings weaponized,
         code exercised) + the gaps worklist -- the GUI's 'how close to 100%' dashboard."""

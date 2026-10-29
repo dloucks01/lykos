@@ -506,6 +506,22 @@
   .ax-tag { color: var(--faint); font-weight: 400; font-size: .74rem; margin-left: 6px; }
   .ax-val { font-size: .82rem; font-weight: 600; white-space: nowrap; }
   .ax-note { color: var(--muted); font-size: .76rem; margin-top: 6px; }
+  .timing-panel { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .timing-panel .tm-head { font-size: 1rem; font-weight: 600; }
+  .timing-panel .tm-sub { color: var(--muted); font-size: .82rem; margin: 4px 0 10px; }
+  .tm-tab { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  .tm-tab th { text-align: left; color: var(--faint); font-weight: 600; font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; padding: 3px 8px; }
+  .tm-tab td { padding: 4px 8px; border-top: 1px solid var(--line); vertical-align: middle; }
+  .tm-tab td.tm-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .tm-tab .tm-fn { background: none; border: none; font: inherit; color: var(--accent-2); cursor: pointer; padding: 0; text-align: left; }
+  .tm-tab .tm-fn:hover { text-decoration: underline; }
+  .tm-tab .tm-muted { color: var(--muted); font-style: italic; }
+  .tm-tab tr.tm-noyield td { color: var(--muted); }
+  .tm-bar-cell { white-space: nowrap; width: 34%; }
+  .tm-bar { display: inline-block; width: calc(100% - 44px); height: 8px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; vertical-align: middle; }
+  .tm-bar > span { display: block; height: 100%; background: var(--accent); }
+  .tm-tab tr.tm-noyield .tm-bar > span { background: #8b8d98; }
+  .tm-pct { display: inline-block; width: 36px; text-align: right; font-size: .72rem; color: var(--muted); margin-left: 4px; vertical-align: middle; }
   .ledger-distinct { margin-top: 7px; font-size: .82rem; color: var(--fg); }
   .ledger-distinct b { color: var(--accent-2); font-size: .9rem; }
   .ledger-distinct .ld-muted { color: var(--muted); }
