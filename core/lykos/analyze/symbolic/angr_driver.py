@@ -97,6 +97,96 @@ def build_args(base, mode, symbolic):
     return args, shown
 
 
+def _run_uc(angr, proj, spec, result, out_path):
+    """UNDER-CONSTRAINED symbolic execution of ONE function, entered in isolation with symbolic args
+    and symbolic-filled lazy memory (no driver, no calling context) -- so code no harness reaches is
+    still examined. The SOUND, low-false-positive signal is a DATA-dependent unconstrained instruction
+    pointer: a state whose PC became symbolic AND depends on memory the function READ (`mem_*`
+    variables), i.e. attacker-influenceable DATA reached control flow -- a control-hijack candidate.
+    A PC that depends only on an argument register (`reg_*`) is a benign indirect call through a
+    passed function pointer (a callback) and is NOT flagged (validated on a fixture). Under-constrained
+    isolation is unsound for a CONFIRMATION, so the caller files this strictly as a `candidate` with
+    the explicit 'assumes the function's inputs are attacker-reachable' caveat; it never claims a
+    proven bug."""
+    import signal as _sig
+    import time as _t
+    fn = str(spec.get("uc_fn") or "")
+    addr = _int(fn)
+    if addr is None:
+        sym = proj.loader.find_symbol(fn)
+        if sym is None:
+            result.update(ok=True, uc={"function": fn, "reached": False,
+                          "note": "function symbol not found"})
+            _write(out_path, result)
+            return 0
+        addr = sym.rebased_addr
+    O = angr.options
+    fill = {O.SYMBOL_FILL_UNCONSTRAINED_MEMORY, O.SYMBOL_FILL_UNCONSTRAINED_REGISTERS, O.LAZY_SOLVES}
+    try:
+        st = proj.factory.call_state(addr, add_options=fill)
+    except Exception as e:                                   # noqa: BLE001
+        result.update(ok=True, uc={"function": fn, "reached": False, "note": f"call_state: {e}"})
+        _write(out_path, result)
+        return 0
+    simgr = proj.factory.simulation_manager(st, save_unconstrained=True)
+    max_seconds = float(spec.get("max_seconds", 60))
+    max_states = int(spec.get("max_states", 400))
+    deadline = _t.time() + max_seconds
+    steps = {"n": 0}
+
+    def step_func(lsm):
+        steps["n"] += 1
+        if _t.time() > deadline:
+            lsm.move(from_stash="active", to_stash="deferred")
+        if len(lsm.active) > max_states:
+            lsm.split(from_stash="active", limit=max_states, to_stash="spilled")
+        return lsm
+
+    class _DL(Exception):
+        pass
+
+    cutoff = False
+    have_alarm = True
+    try:
+        _sig.signal(_sig.SIGALRM, lambda s, f: (_ for _ in ()).throw(_DL()))
+        _sig.alarm(max(1, int(max_seconds) + 5))
+    except Exception:                                        # noqa: BLE001 -- no SIGALRM on this OS
+        have_alarm = False
+    try:
+        while simgr.active and _t.time() < deadline and steps["n"] < 1500:
+            simgr.step(step_func=step_func)
+    except _DL:
+        cutoff = True
+    except Exception as e:                                   # noqa: BLE001 -- a stuck/odd explore
+        result.update(ok=True, uc={"function": fn, "reached": True, "error": str(e)[:200]})
+        _write(out_path, result)
+        return 0
+    finally:
+        if have_alarm:
+            try:
+                _sig.alarm(0)
+            except Exception:                                # noqa: BLE001
+                pass
+    # GATE: a data-dependent unconstrained PC (depends on memory the function read) is the candidate;
+    # a reg-only PC (a callback argument) is not.
+    witnesses = []
+    for u in list(simgr.unconstrained)[:16]:
+        try:
+            pcv = sorted(str(v) for v in u.regs.pc.variables)
+        except Exception:                                    # noqa: BLE001
+            pcv = []
+        if any("mem" in v for v in pcv):
+            witnesses.append(pcv[:6])
+    result.update(ok=True, cutoff=bool(cutoff) or steps["n"] >= 1500,
+                  uc={"function": fn, "reached": True,
+                      "unconstrained": len(simgr.unconstrained),
+                      "data_to_pc": len(witnesses), "hijackable": bool(witnesses),
+                      "witness_vars": witnesses[:3], "steps": steps["n"],
+                      "deadended": len(simgr.deadended)})
+    _write(out_path, result)
+    return 0
+
+
 def _load_project(angr, spec, binary):
     """Open the binary with angr, falling back to the raw 'blob' loader when CLE has no backend
     for it (a firmware image or headerless dump). Without this a non-ELF target raised
@@ -160,6 +250,10 @@ def main(spec_path, out_path):
         num_find = int(spec.get("num_find", 6))
 
         proj = _load_project(angr, spec, binary)
+        # UNDER-CONSTRAINED mode: analyse one function in isolation (no driver) -- a self-contained
+        # path that never touches the concolic machinery below. See _run_uc.
+        if mode == "uc":
+            return _run_uc(angr, proj, spec, result, out_path)
         # Finding-directed steering: resolve each named function to its rebased address through
         # angr's loader and add it to the find set, so exploration heads for the statically-suspected
         # sites. Best-effort -- a static/inlined function absent from the symbol table is skipped, so
