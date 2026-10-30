@@ -34,6 +34,9 @@ SAN_ENV = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:symbolize=1:allocato
            "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:abort_on_error=1"}
 FATAL = {"SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE", "SIGABRT", "SIGTRAP"}
 _ID_MARK = re.compile(rb"uid=\d+\(")
+_SHELLS = {"sh", "bash", "dash", "zsh"}
+_EXECVE = re.compile(r'execve\("([^"]*)"(?:,.*)?\)\s*=\s*0')
+_MARKER_EXE = "id"           # the program the solver pins an injectable exec/path to
 
 _ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
 _UBSAN_ERR = re.compile(r"(\S+?):(\d+):\d+: runtime error: (.*)$", re.M)
@@ -153,6 +156,49 @@ def _native_runs(target: Target, data: bytes, n: int) -> list:
     return [replay(target, target.exe, data) for _ in range(n)]
 
 
+def _exec_markers(target: Target, data: bytes) -> set:
+    """Basenames of the programs the target successfully execve'd on this input, via strace
+    (the syscall-effect oracle). Run inside bwrap when available; empty set if strace is absent."""
+    strace = shutil.which("strace")
+    if not strace:
+        return set()
+    from ..analyze.dynamic import sandbox
+    tmp = tempfile.mkdtemp(prefix="lykos-strace-")
+    try:
+        log = os.path.join(tmp, "trace")
+        argv, stdin_bytes = list(target.argv), b""
+        inp = os.path.join(tmp, "input")
+        with open(inp, "wb") as fh:
+            fh.write(data if target.mode != "arg" else data.split(b"\0", 1)[0])
+        if target.mode == "stdin":
+            stdin_bytes = data
+        elif target.mode == "arg":
+            a = data.split(b"\0", 1)[0].decode("latin-1")
+            argv = [a if x == "@@" else x for x in argv] if "@@" in argv else argv + [a]
+        else:
+            argv = [inp if x == "@@" else x for x in argv] if "@@" in argv else argv + [inp]
+        inner = [strace, "-f", "-qq", "-e", "trace=execve", "-o", log, "--", str(target.exe), *argv]
+        prefix = sandbox.isolate_prefix(str(Path(target.exe).parent), net=False,
+                                        ro_binds=[tmp], rw_binds=[tmp])
+        try:
+            sandbox.run_reaped(prefix + inner, input=stdin_bytes, timeout=10.0,
+                               capture_output=True)
+        except Exception:        # noqa: BLE001 - a trace failure is "no evidence", not a crash
+            return set()
+        execs = set()
+        try:
+            with open(log, errors="replace") as fh:
+                for ln in fh:
+                    m = _EXECVE.search(ln)
+                    if m:
+                        execs.add(os.path.basename(m.group(1)))
+        except OSError:
+            return set()
+        return execs
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def validate(target: Target, hyp: Hypothesis, data: bytes):
     """-> (Verdict, incidental) where incidental is (kind, file, line, func) for a sanitizer
     report that fired somewhere other than this site, else None."""
@@ -163,7 +209,16 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
             return Verdict(True, "exec-marker", "the injected `id` executed: "
                            + (r.stderr + r.stdout)[hit.start():hit.start() + 60]
                            .decode("latin-1", "replace").split("\n")[0], hyp.line), None
-        return Verdict(False, "exec-marker", "the injected command did not run"), None
+        # output can be swallowed (a popen pipe the program reads) or absent (`id <bad-user>`
+        # errors): the syscall oracle proves the exec itself. The solver pins an injectable sink
+        # to `id`, so an execve of `id` that the program would never make on its own is the proof.
+        execs = _exec_markers(target, data)
+        if _MARKER_EXE in execs:
+            return Verdict(True, "exec-syscall",
+                           f"strace observed execve of the injected program ({_MARKER_EXE})",
+                           hyp.line), None
+        return Verdict(False, "exec-marker",
+                       f"the injected command did not run (execs seen: {sorted(execs) or 'none'})"), None
 
     if target.asan_exe is not None:
         agree, last, incidental = 0, None, None

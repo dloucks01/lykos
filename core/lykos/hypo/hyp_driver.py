@@ -56,6 +56,20 @@ FMT_SINKS = {"printf": 0, "vprintf": 0, "fprintf": 1, "vfprintf": 1, "dprintf": 
              "sprintf": 1, "vsprintf": 1, "snprintf": 2, "vsnprintf": 2, "syslog": 1, "vsyslog": 1,
              "__printf_chk": 1, "__fprintf_chk": 2, "__sprintf_chk": 3, "__snprintf_chk": 4}
 CMD_SINKS = {"system": 0, "popen": 0}
+# exec-family program launchers (CWE-78/88). path_arg = the index of the program-path argument;
+# shell_cmd_arg = the index of a shell command string when the launcher is used as a `-c` wrapper
+# (execl("/bin/sh","sh","-c",CMD) -> arg 3), else None.
+EXEC_SINKS = {"execl": (0, 3), "execlp": (0, 3), "execle": (0, 3),
+              "execv": (0, None), "execvp": (0, None), "execvpe": (0, None),
+              "posix_spawn": (1, None), "posix_spawnp": (1, None)}
+# programs a solved exec path is pinned to: executing one is proof, and its output carries the
+# marker the validator looks for (`uid=`). First that exists on the host wins.
+MARKER_PROGS = ("/usr/bin/id", "/bin/id")
+NULL_PAGE = 0x1000          # an access below this is a NULL (+ small offset) dereference
+# malloc/calloc/realloc fail (return NULL) at or above this size: AddressSanitizer's allocation
+# limit (with allocator_may_return_null) and far beyond any host's memory, so the analysed and the
+# validator builds both fail there
+ALLOC_FAIL_SIZE = 1 << 40
 ALLOC_SINKS = {"malloc": 0, "realloc": 1, "_Znwm": 0, "_Znam": 0, "valloc": 0, "aligned_alloc": 1}
 COPY_SINKS = {"memcpy", "memmove", "strcpy", "strncpy", "strcat", "strncat", "sprintf", "vsprintf",
               "snprintf", "read", "fread", "fgets", "recv", "recvfrom", "memset", "gets", "scanf",
@@ -77,6 +91,7 @@ HIJACK_MARK = {64: 0x4141414141414141, 32: 0x41414141}
 CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-787",
        "stack-read": "CWE-125", "heap-read": "CWE-125", "global-read": "CWE-125",
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
+       "null-deref": "CWE-476", "div-zero": "CWE-369",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -358,20 +373,36 @@ class Driver:
                 ch[a] = (size, False)
                 state.globals["chunks"] = ch
 
+            def _may_fail(state, size, addr):
+                """C allocators return NULL when they cannot satisfy the request. angr's never do,
+                which hid every unchecked-allocation NULL dereference (CWE-476/690)."""
+                try:
+                    if not state.solver.symbolic(size):
+                        return claripy.BVV(0, state.arch.bits) \
+                            if state.solver.eval(size) >= ALLOC_FAIL_SIZE else addr
+                    big = claripy.UGE(size.zero_extend(max(0, state.arch.bits - size.size()))
+                                      if size.size() < state.arch.bits else size, ALLOC_FAIL_SIZE)
+                    if not state.solver.satisfiable(extra_constraints=[big]):
+                        return addr
+                    a = addr if not isinstance(addr, int) else claripy.BVV(addr, state.arch.bits)
+                    return claripy.If(big, claripy.BVV(0, state.arch.bits), a)
+                except Exception:
+                    return addr
+
             def _malloc(self, sim_size):
                 addr = o_malloc(self, sim_size)
                 _rec(self.state, addr, sim_size)
-                return addr
+                return _may_fail(self.state, sim_size, addr)
 
             def _calloc(self, n, sz):
                 addr = o_calloc(self, n, sz)
                 _rec(self.state, addr, n * sz)
-                return addr
+                return _may_fail(self.state, n * sz, addr)
 
             def _realloc(self, ptr, size):
                 addr = o_realloc(self, ptr, size)
                 _rec(self.state, addr, size)
-                return addr
+                return _may_fail(self.state, size, addr)
 
             def _free(self, ptr):
                 st = self.state
@@ -881,7 +912,7 @@ class Driver:
                 kinds = []
                 if base in FMT_SINKS:
                     kinds.append("format-string")
-                if base in CMD_SINKS:
+                if base in CMD_SINKS or base in EXEC_SINKS:
                     kinds.append("cmd-injection")
                 if base in ALLOC_SINKS:
                     kinds.append("int-overflow-alloc")
@@ -890,7 +921,36 @@ class Driver:
                 for kd in kinds:
                     self._add_hyp(kd, ins, cs, f, callee=base)
             self._propose_stores(f)
+            if self.x86:
+                self._propose_divs(f)
         self.call_sites = {h["site"]: h for h in self.hyps.values() if h["callee"]}
+
+    def _propose_divs(self, f):
+        """x86 integer division sites (`div`/`idiv`). The divisor operand is recorded so the
+        runtime check can read its live value and ask whether it can be zero (CWE-369). Non-x86
+        `sdiv`/`udiv` do not trap on a zero divisor, so there is nothing to detonate there; a
+        source build's UBSan still catches it through the validator."""
+        import capstone
+        self.div_ops = getattr(self, "div_ops", {})
+        for blk_node in f.blocks:
+            try:
+                insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
+            except Exception:
+                continue
+            for i in insns:
+                if i.mnemonic not in ("div", "idiv"):
+                    continue
+                o = i.insn.operands[0]
+                if o.type == capstone.x86.X86_OP_REG:
+                    desc = ("reg", i.insn.reg_name(o.reg), o.size)
+                elif o.type == capstone.x86.X86_OP_MEM:
+                    m = o.mem
+                    desc = ("mem", i.insn.reg_name(m.base) if m.base else None,
+                            i.insn.reg_name(m.index) if m.index else None, m.scale, m.disp, o.size)
+                else:
+                    continue
+                self.div_ops[i.address] = desc
+                self._add_hyp("div-zero", i.address, blk_node.addr, f)
 
     def _propose_stores(self, f):
         """Indexed / pointer stores (address computed from loaded values, scaled or added) and
@@ -1070,6 +1130,8 @@ class Driver:
                                       SimConcretizationStrategyMax()]
         st.inspect.b("mem_write", when=angr.BP_BEFORE, action=self._on_write)
         st.inspect.b("mem_read", when=angr.BP_BEFORE, action=self._on_read)
+        for addr in getattr(self, "div_ops", {}):
+            st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_div)
         return st
 
     # ------------------------------------------------------------------ DWARF stack objects
@@ -1285,7 +1347,8 @@ class Driver:
             if ln is None:
                 ln = 1
             sym = s.solver.symbolic(addr)
-            if not sym and not s.globals.get("chunks") and not self.dlocals:
+            if not sym and not s.globals.get("chunks") and not self.dlocals \
+                    and s.solver.eval(addr) >= NULL_PAGE:
                 return
             self._check_access(s, addr, ln, write=False)
         except Deadline:
@@ -1315,6 +1378,15 @@ class Driver:
         sym_len = s.solver.symbolic(ln_ast)
         chunks = s.globals.get("chunks", {})
         conds = []
+        nul = self._null_cond(s, addr, sym_addr, site)
+        if nul is True:
+            # this path dereferences the zero page: nothing else about the access matters
+            conds = [("null-deref", None, f"{'writes' if write else 'reads'} through a NULL pointer",
+                      0)]
+            return self._file_conds(s, conds, site, addr, ln_ast, write)
+        if nul is not None:
+            conds.append(("null-deref", nul, f"{'writes' if write else 'reads'} through a pointer "
+                          f"that can be NULL", 0))
         if not sym_addr and not sym_len:
             # ---- concrete fast path: pure Python, a solver call only for symbolic chunk sizes
             lo = s.solver.eval(addr)
@@ -1448,6 +1520,31 @@ class Driver:
                                                  claripy.UGE(end, sp0 + self.word)),
                                       f"{'writes' if write else 'reads'} outside the current stack "
                                       f"frame at an input-controlled index", sp0))
+        self._file_conds(s, conds, site, addr, ln_ast, write)
+
+    def _null_cond(self, s, addr, sym_addr, site):
+        """CWE-476 at this access: True (the address IS in the zero page on this path), a claripy
+        condition (it CAN be), or None. Checked only for the program's own accesses and for copy-sink
+        calls (`site` given): libc models probe addresses for reasons of their own. A symbolic address
+        is only asked about when it carries a choice between pointers (an If: a table lookup with a
+        NULL slot, an allocation that can fail) -- one extra query per pointer-select, not per
+        indexed access."""
+        ins = s.scratch.ins_addr
+        if site is None and not (ins is not None and self._is_prog_code(ins)):
+            return None
+        if not sym_addr:
+            return True if s.solver.eval(addr) < NULL_PAGE else None
+
+        def has_if(e, depth=0):
+            return e.op == "If" or (depth < 3 and any(
+                has_if(x, depth + 1) for x in e.args if hasattr(x, "op")))
+        if not has_if(addr):
+            return None
+        return self.claripy.ULT(addr, NULL_PAGE)
+
+    def _file_conds(self, s, conds, site, addr, ln_ast, write):
+        """Solve each candidate violation at `site` and file the satisfiable ones."""
+        claripy = self.claripy
         if not conds:
             return
         if site is None:
@@ -1702,7 +1799,27 @@ class Driver:
                         return
 
     def _check_cmd(self, s, h):
-        cmd = self._arg(s, CMD_SINKS[h["callee"]])
+        callee = h["callee"]
+        if callee in CMD_SINKS:                         # system()/popen(): arg is the shell string
+            self._check_shell_arg(s, h, self._arg(s, CMD_SINKS[callee]))
+            return
+        path_i, shell_i = EXEC_SINKS[callee]            # exec family
+        # a shell wrapper (execl("/bin/sh","sh","-c",CMD)): the command string arg is injectable
+        # exactly like system()
+        if shell_i is not None:
+            try:
+                p0 = self._input_bytes_at(s, self._arg(s, path_i))[0]
+                path0 = bytes(s.solver.eval(b) for b in p0 if not b.symbolic).split(b"\0")[0]
+            except Exception:
+                path0 = b""
+            if path0.endswith(b"/sh") or path0.endswith(b"/bash") or path0 == b"sh":
+                self._check_shell_arg(s, h, self._arg(s, shell_i))
+                return
+        # otherwise the program PATH itself: if input reaches it, pin it to a marker program -- a
+        # solved input that makes the process exec `id` is proof of arbitrary-program execution
+        self._check_exec_path(s, h, self._arg(s, path_i))
+
+    def _check_shell_arg(self, s, h, cmd):
         try:
             bs, first = self._input_bytes_at(s, cmd)
         except Exception:
@@ -1721,6 +1838,27 @@ class Driver:
                                    f"injected '{pay.decode().strip()}' runs as a shell command",
                                    extra=[cond])
                     return
+
+    def _check_exec_path(self, s, h, pathptr):
+        try:
+            bs, first = self._input_bytes_at(s, pathptr)
+        except Exception:
+            return
+        if first is None:
+            return
+        claripy = self.claripy
+        for prog in MARKER_PROGS:
+            tgt = prog.encode() + b"\0"
+            if first + len(tgt) > len(bs):
+                continue
+            if not all(bs[first + t].symbolic for t in range(len(tgt))):
+                continue
+            cond = claripy.And(*[bs[first + t] == tgt[t] for t in range(len(tgt))])
+            if s.solver.satisfiable(extra_constraints=[cond]):
+                self.violation(s, "cmd-injection", h["site"],
+                               f"the program path passed to {h['callee']}() is input-controlled; "
+                               f"set to {prog} it runs an arbitrary program", extra=[cond])
+                return
 
     def _cmd_payloads(self, s, bs, first):
         """Payloads for the shell quoting context where input starts. `grep -w '%s'` puts input
@@ -1815,6 +1953,13 @@ class Driver:
                 self._guarded(self._hijack, s)
             sm.stashes["unconstrained"] = []
             for e in sm.errored:
+                if e.state.addr < NULL_PAGE:
+                    # the path JUMPED into the zero page: a call through a NULL function pointer
+                    # (a decoder/handler table slot nobody filled). No extra constraint: this path
+                    # already does it.
+                    self._guarded(lambda st: self.violation(
+                        st, "null-deref", self._jump_site(st),
+                        "calls through a NULL function pointer"), e.state)
                 key = f"{type(e.error).__name__}@{e.state.addr:#x}"
                 errs = self.stats.setdefault("errored", {})
                 errs[key] = errs.get(key, 0) + 1
@@ -1870,6 +2015,52 @@ class Driver:
         except self.claripy.errors.ClaripyError:
             self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
 
+    def _on_div(self, s):
+        """At an x86 `div`/`idiv`: read the live divisor operand and, if it can be zero on this
+        path, file a divide-by-zero (CWE-369). The validator replays it: a divisor fixed by
+        constants is unsatisfiable here, and one that is zero only under uninitialised (zero-fill)
+        memory will not reproduce, so neither reaches `confirmed`."""
+        try:
+            desc = self.div_ops.get(s.scratch.ins_addr)
+            if desc is None:
+                return
+            claripy = self.claripy
+            if desc[0] == "reg":
+                _, reg, size = desc
+                val = getattr(s.regs, reg)
+            else:
+                _, base, index, scale, disp, size = desc
+                ea = claripy.BVV(0, self.arch_bits)
+                if base:
+                    ea = ea + getattr(s.regs, base)
+                if index:
+                    ea = ea + getattr(s.regs, index) * scale
+                ea = ea + disp
+                val = s.memory.load(ea, size, endness=s.arch.memory_endness)
+            zero = val == 0
+            if s.solver.satisfiable(extra_constraints=[zero]):
+                self.violation(s, "div-zero", s.scratch.ins_addr,
+                               "the divisor can be zero", extra=[zero])
+        except Deadline:
+            raise
+        except self.claripy.errors.ClaripyError:
+            self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
+        except Exception:
+            pass
+
+    def _jump_site(self, s):
+        """The program instruction that transferred control here (the indirect call/jump)."""
+        try:
+            src = s.history.jump_source
+        except Exception:
+            return None
+        if src is None:
+            return None
+        try:
+            return self.p.factory.block(src).instruction_addrs[-1]
+        except Exception:
+            return src
+
     def _hijack(self, s):
         claripy = self.claripy
         mark = HIJACK_MARK.get(self.arch_bits, 0x41414141)
@@ -1878,6 +2069,10 @@ class Driver:
             site = s.history.jump_source
         except Exception:
             pass
+        nul = claripy.ULT(s.regs.ip, NULL_PAGE)
+        if s.solver.satisfiable(extra_constraints=[nul]):
+            self.violation(s, "null-deref", self._jump_site(s),
+                           "calls through a function pointer that can be NULL", extra=[nul])
         cond = s.regs.ip == mark
         if s.solver.satisfiable(extra_constraints=[cond]):
             self.violation(s, "control-flow-hijack", site,

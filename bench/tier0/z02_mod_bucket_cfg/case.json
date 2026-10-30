@@ -1,0 +1,28 @@
+{
+  "id": "z02_mod_bucket_cfg",
+  "summary": "key/bucket placement over stdin: BUCKETS 0 makes the slot computation a modulo by zero",
+  "class": "div-zero",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-369",
+      "kind": "div-zero",
+      "line": 29,
+      "function": "main",
+      "oracle": "asan",
+      "asan_kind": "ubsan:division",
+      "note": "buckets is range-checked above 64 and below 0, but 0 is accepted",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

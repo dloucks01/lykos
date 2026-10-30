@@ -1,0 +1,31 @@
+{
+  "id": "e02_execl_sh_c_host",
+  "summary": "reachability watcher: host names spliced into an sh -c ping command line",
+  "class": "cmd-injection",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-78",
+      "kind": "cmd-injection",
+      "line": 13,
+      "function": "check",
+      "oracle": "exec",
+      "note": "host text is pasted into a shell command executed via execl(\"/bin/sh\", \"sh\", \"-c\", ...)",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": [
+    "ping"
+  ]
+}

@@ -24,7 +24,7 @@ TIMEOUT = 20
 SHELLS = {"sh", "bash", "dash"}
 
 ENV = dict(os.environ)
-ENV["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=0:symbolize=1"
+ENV["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=0:symbolize=1:allocator_may_return_null=1"
 ENV["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
 ENV["LC_ALL"] = "C"
 

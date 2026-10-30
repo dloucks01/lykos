@@ -1,0 +1,18 @@
+{
+  "id": "n09_null_checked",
+  "summary": "decoder table with NULL slots skipped and a size-checked, NULL-checked allocation",
+  "class": "negative",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

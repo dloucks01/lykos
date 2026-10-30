@@ -1,0 +1,30 @@
+{
+  "id": "p02_malloc_unchecked",
+  "summary": "blob container: malloc of the declared payload size is used without a NULL check",
+  "class": "null-deref",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-476",
+      "kind": "null-deref",
+      "line": 39,
+      "function": "main",
+      "oracle": "asan",
+      "asan_kind": "ubsan:null",
+      "note": "an absurd declared size makes malloc return NULL (CWE-690)",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

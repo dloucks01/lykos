@@ -1,0 +1,20 @@
+{
+  "id": "n08_div_checked",
+  "summary": "statsum with the empty-channel check: no division by zero",
+  "class": "negative",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

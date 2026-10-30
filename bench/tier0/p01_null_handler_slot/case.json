@@ -1,0 +1,32 @@
+{
+  "id": "p01_null_handler_slot",
+  "summary": "message-log decoder: the decoder table has NULL slots for reserved types, dereferenced unchecked",
+  "class": "null-deref",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-476",
+      "kind": "null-deref",
+      "line": 50,
+      "function": "main",
+      "oracle": "asan",
+      "asan_kind": "ubsan:null",
+      "note": "type 2 is in range (< 8) but decoders[2] is NULL",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

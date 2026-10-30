@@ -1,0 +1,33 @@
+{
+  "id": "e01_execl_helper_path",
+  "summary": "service prober: the config's helper= path is executed with execl()",
+  "class": "cmd-injection",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-78",
+      "kind": "cmd-injection",
+      "line": 32,
+      "function": "main",
+      "oracle": "exec",
+      "note": "any program path from the config file is executed",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": [
+    "true"
+  ]
+}
