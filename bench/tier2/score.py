@@ -98,8 +98,8 @@ def score_target(tid, fuzz_seconds):
         vb, verr = _run(v_asan, data, mode, argv, env)
         if not vb:
             continue
-        sig = hashlib.sha1(b"\n".join(l for l in verr.split(b"\n")
-                                      if b"#1 " in l or b"#2 " in l)[:2] or [verr[:60]]).hexdigest()[:12]
+        frames = [l for l in verr.split(b"\n") if b"#1 " in l or b"#2 " in l][:2]
+        sig = hashlib.sha1(b"\n".join(frames) or verr[:60]).hexdigest()[:12]
         if sig in seen:
             continue
         seen.add(sig)
