@@ -5,9 +5,13 @@ import { api } from "../app/api.js";
 
 export const store = {
   cases: [], caseId: null, targets: [], targetId: null,
-  findings: [], pocs: [], loading: false, error: null,
+  target: null,                 // full target detail (mitigations, arch, hashes…)
+  findings: [], pocs: [], selectedId: null,
+  loading: false, error: null,
   _subs: new Set(),
 };
+
+export function selectFinding(id) { store.selectedId = id; emit(); }
 
 export function subscribe(fn) { store._subs.add(fn); return () => store._subs.delete(fn); }
 function emit() { for (const fn of store._subs) fn(); }
@@ -33,14 +37,19 @@ export async function selectCase(caseId) {
 }
 
 export async function selectTarget(targetId) {
-  store.targetId = targetId; store.loading = true; store.error = null; emit();
+  store.targetId = targetId; store.loading = true; store.error = null;
+  store.target = null; store.selectedId = null; emit();
   try {
-    const [findings, pocs] = await Promise.all([
+    const [target, findings, pocs] = await Promise.all([
+      api.getTarget(targetId).catch(() => null),
       api.targetFindings(targetId).catch(() => []),
       api.pocs(targetId).catch(() => []),
     ]);
+    store.target = target;
     store.findings = Array.isArray(findings) ? findings : (findings.findings || []);
     store.pocs = Array.isArray(pocs) ? pocs : (pocs.pocs || []);
+    // default selection: the first (highest-ranked) finding, chosen by the caller's sort
+    store.selectedId = store.findings[0] ? store.findings[0].id : null;
   } catch (e) { store.error = String(e); }
   store.loading = false; emit();
 }
