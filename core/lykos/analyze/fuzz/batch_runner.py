@@ -521,7 +521,13 @@ def main():
     wf = "/tmp/lykos-fuzz-input.bin"        # fixed: a per-batch name leaked into diagnostics
     (count, n_blocks) = struct.unpack("<II", _readn(8))
     blocks = list(struct.unpack("<%dQ" % n_blocks, _readn(8 * n_blocks))) if n_blocks else []
-    libc = ctypes.CDLL("libc.so.6", use_errno=True) if blocks else None
+    # Trace (ptrace) when coverage blocks are requested OR when the caller needs the faulting PC
+    # (crash attribution during validation). Without this a validation run -- which asks for no
+    # coverage -- took the untraced fast path and could never report WHERE it crashed, so the
+    # native-crash oracle could never attribute a crash to its site.
+    want_fault = os.environ.get("LYKOS_FAULT_PC") == "1"
+    trace = bool(blocks) or want_fault
+    libc = ctypes.CDLL("libc.so.6", use_errno=True) if trace else None
     if libc is not None:
         libc.ptrace.restype = ctypes.c_long
         libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p,
@@ -561,7 +567,7 @@ def main():
             argv = [exe] + base_argv + [carrier]
             stdin = b""
         reached, fault_pc = [], 0
-        if blocks:
+        if trace:
             rc, so, se, flags, reached, fault_pc = _trace_one(libc, argv, stdin, per_timeout,
                                                               blocks, exe, plan, sanitizer)
         else:

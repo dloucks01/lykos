@@ -185,7 +185,7 @@ def _native_runs(target: Target, data: bytes, n: int) -> list:
     payload = data.split(b"\0", 1)[0] if target.mode == "arg" else data
     res = sandbox.run_batch(str(target.exe), [payload] * n, mode=target.mode, base_argv=base,
                             timeout=10.0, arch=target.arch, endianness=target.endianness,
-                            bits=target.bits)
+                            bits=target.bits, fault_pc=True)
     if res:
         return [Replay(bool(r.crashed), r.signal_name, r.stdout or b"", r.stderr or b"",
                        r.fault_pc, r.note or "") for r in res]

@@ -272,7 +272,7 @@ def _batch_runner_path() -> str:
 
 def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
               arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048,
-              blocks=(), guard_page: bool = False):
+              blocks=(), guard_page: bool = False, fault_pc: bool = False):
     """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
 
     `blocks` are image-relative basic-block addresses to watch; each result then carries the
@@ -338,6 +338,11 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
         if guarded:
             env = dict(env if env is not None else os.environ)
             env["LYKOS_PRELOAD"] = _genv.get("LD_PRELOAD", "").split(":")[0]
+    if fault_pc:
+        # ask the runner to ptrace and report the faulting PC even with no coverage blocks -- the
+        # crash attribution the native-crash validator needs. Added last so no env setup clobbers it.
+        env = dict(env if env is not None else os.environ)
+        env["LYKOS_FAULT_PC"] = "1"
     rc, out, err, timed, _dur = _spawn(cmd, bytes(blob), budget,
                                        _rlimits(mem_mb, int(budget) + 5, set_as=False,
                                                 nproc=_nproc_cap(False)), env=env)
