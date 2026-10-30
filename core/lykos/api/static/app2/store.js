@@ -6,12 +6,18 @@ import { api } from "../app/api.js";
 export const store = {
   cases: [], caseId: null, targets: [], targetId: null,
   target: null,                 // full target detail (mitigations, arch, hashes…)
+  advice: null,                 // invocation shape, decompiled count, headline
   findings: [], pocs: [], selectedId: null,
+  view: "overview",             // "overview" (binary) | "finding"
+  filter: "all",                // findings filter
   loading: false, error: null,
   _subs: new Set(),
 };
 
-export function selectFinding(id) { store.selectedId = id; emit(); }
+export function setView(v) { store.view = v; emit(); }
+export function setFilter(f) { store.filter = f; emit(); }
+
+export function selectFinding(id) { store.selectedId = id; store.view = "finding"; emit(); }
 
 export function subscribe(fn) { store._subs.add(fn); return () => store._subs.delete(fn); }
 function emit() { for (const fn of store._subs) fn(); }
@@ -38,20 +44,35 @@ export async function selectCase(caseId) {
 
 export async function selectTarget(targetId) {
   store.targetId = targetId; store.loading = true; store.error = null;
-  store.target = null; store.selectedId = null; emit();
+  store.target = null; store.advice = null; store.selectedId = null; store.view = "overview"; emit();
   try {
-    const [target, findings, pocs] = await Promise.all([
+    const [target, advice, findings, pocs] = await Promise.all([
       api.getTarget(targetId).catch(() => null),
+      api.advice(targetId).catch(() => null),
       api.targetFindings(targetId).catch(() => []),
       api.pocs(targetId).catch(() => []),
     ]);
     store.target = target;
+    store.advice = advice;
     store.findings = Array.isArray(findings) ? findings : (findings.findings || []);
     store.pocs = Array.isArray(pocs) ? pocs : (pocs.pocs || []);
-    // default selection: the first (highest-ranked) finding, chosen by the caller's sort
     store.selectedId = store.findings[0] ? store.findings[0].id : null;
   } catch (e) { store.error = String(e); }
   store.loading = false; emit();
 }
 
 export function artifactUrl(sha) { return `/artifacts/${sha}`; }
+
+// Fetch raw artifact bytes (a PoC payload) for the hexdump, cached by sha.
+const _bytesCache = new Map();
+export async function fetchBytes(sha) {
+  if (!sha) return null;
+  if (_bytesCache.has(sha)) return _bytesCache.get(sha);
+  try {
+    const r = await fetch(artifactUrl(sha));
+    if (!r.ok) return null;
+    const b = new Uint8Array(await r.arrayBuffer());
+    _bytesCache.set(sha, b);
+    return b;
+  } catch (e) { return null; }
+}
