@@ -1,0 +1,10 @@
+{
+  "id": "stb_image",
+  "summary": "stb_image.h single-header image decoder; vuln.h = 2015 version, fixed.h = latest. Real historical parser bugs; the differential (crashes vuln, survives fixed) is the ground truth.",
+  "upstream": "github.com/nothings/stb (stb_image.h)",
+  "mode": "file",
+  "argv": ["@@"],
+  "extra_flags": ["-lm"],
+  "fuzz_seconds": 300,
+  "class": "memory-safety (image parser)"
+}
