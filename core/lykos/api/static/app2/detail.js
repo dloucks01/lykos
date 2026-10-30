@@ -13,7 +13,34 @@ const CH_LABEL = {
   "recipe-assumptions": "Assumptions", "recipe-ceiling": "Ceiling", dynamic: "Reached / how found",
   effects: "Effects", poc: "Proof", detonation: "Detonation", chain: "Primitive chain",
 };
-const IN_POC = new Set(["soundness", "reproduce", "poc-input"]);
+const IN_POC = new Set(["soundness", "reproduce", "poc-input", "customize", "exploit-script"]);
+
+// "Customize / retarget this PoC": the knobs the operator can change (write target/value, RCE path)
+// and the editable, downloadable builder script.
+function Customize({ finding }) {
+  const guide = (finding.evidence || []).find((e) => e.channel === "customize");
+  const script = (finding.evidence || []).find((e) => e.channel === "exploit-script");
+  if (!guide && !script) return null;
+  let head = "", knobs = [];
+  if (guide) {
+    const lines = guide.detail.split("\n");
+    knobs = lines.filter((l) => l.trim().startsWith("- ")).map((l) => l.trim().slice(2));
+    head = lines.filter((l) => !l.trim().startsWith("- ")).join(" ").trim();
+  }
+  const dl = script ? "data:text/x-python;charset=utf-8," + encodeURIComponent(script.detail) : null;
+  const knob = (t) => {
+    const i = t.indexOf("—");
+    return i < 0 ? html`<li>${t}</li>`
+      : html`<li><b class="knob-k">${t.slice(0, i).trim()}</b> — ${t.slice(i + 1).trim()}</li>`;
+  };
+  return html`<div class="sect"><div class="sect-h">Customize / retarget this PoC</div>
+    ${head ? html`<div class="why">${head}</div>` : null}
+    ${knobs.length ? html`<ul class="knobs">${knobs.map(knob)}</ul>` : null}
+    ${script ? html`<div class="blk"><div class="blk-h">Editable exploit builder
+      <a class="dl-link" href=${dl} download="poc.py">⬇ poc.py</a></div>
+      <pre class="script">${script.detail}</pre></div>` : null}
+  </div>`;
+}
 
 // Evidence as a flowing report: a label, then the text — spaced, not boxed.
 function Evidence({ finding }) {
@@ -107,6 +134,8 @@ export function DetailPane({ finding, pocs, advice }) {
       ${miw.length ? html`<div class="miw-h">mitigations in the way</div>
         <ul class="miw">${miw.map((m) => html`<li>${m}</li>`)}</ul>` : null}
     </div>` : null}
+
+    <${Customize} finding=${finding} />
 
     ${(fn && (fn.callees || fn.callers)) ? html`<div class="sect"><div class="sect-h">Cross-references</div>
       <${XRefs} callers=${fn.callers} callees=${fn.callees} /></div>` : null}
