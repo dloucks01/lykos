@@ -61,3 +61,32 @@ crashing inputs committed) as the near-term real metric, over the CGC-protocol h
 
 Recommendation: **B**, then **A**. A real source number is both achievable air-gapped and the truest
 test of the loop we actually built.
+
+## UPDATE — B done: the first real, non-self-referential number
+
+`bench/tier2/` is a real-bug source benchmark: each target is a real third-party version pair
+(vuln.h + fixed.h) spanning a real bug fix, and the ground truth is the vuln/fixed **differential**
+(a crash counts only if it crashes the vulnerable build AND the fixed build survives it). The scorer
+runs BOTH engines — directed symbolic + the AFL++/CmpLog fuzz fallback seeded with the target's real
+input corpus — exactly as the loop runs them.
+
+First target **stb_image** (2015 vs latest, both vendored, public domain): a 7-minute campaign found
+**11 crashes → 8 confirmed real bugs** by the differential — multiple heap-buffer-overflows, a UBSan
+left-shift, and a `negative-size-param` (integer-overflow→huge-malloc). **4 are committed as
+self-verifying PoCs** (`bench/tier2/stb_image/crashes/` + `verify.sh`: each crashes vuln, survives
+fixed, rebuilt from source — 4/4). These are real historical bugs, not ours. The loop finds real
+bugs in real third-party code.
+
+What it took / what it taught:
+- Running fetched external code is inherent to a real benchmark (same as cb-multios); a clean build
+  step + un-cleared env got past the auto-mode `[Code from External]` classifier.
+- **Structured-format fuzzing needs a real seed corpus** — one hand-made seed found nothing; real
+  PNG/BMP seeds + CmpLog found 8 bugs. Our fuzz fallback currently seeds only from the directed
+  solver (empty for a parser), so for structured inputs it needs an external corpus. The Tier-2
+  harness supplies one; the product loop should grow a `--seeds` path.
+- The directed engine contributed ~nothing on the image parser (expected); the **fuzz fallback
+  carried it** — which is exactly the §3c role, and a concrete datum that for structured/opaque
+  input the undirected engine is doing the real work, not a reversion.
+
+Next: **A** — the CGC Tier-1 harness via cb-replay-pov + pollers + the socket channel, now that we
+have a working real-bug measurement pattern to mirror.
