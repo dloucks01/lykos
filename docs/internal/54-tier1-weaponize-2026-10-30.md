@@ -60,18 +60,32 @@ unaffected.
 Result on Palindrome: **3145 → 40 hypotheses**, now all CB code (KeyExpansion, cgc_check, cgc_fdwait
 …), 71 own functions. The scaling blocker is removed.
 
-### Remaining Step-5 work (reach/trigger, not scale)
+### Step-5 reach/trigger — hybrid fuzz fallback LANDED (0b7c245)
 
-With scoping fixed, the vuln still wasn't triggered within budget — a pure **reach/trigger** gap,
-which is what the rest of Step 5 is for:
+The first and biggest reach/trigger lever is built: **AFL++ with CmpLog as the fallback engine**
+(doc 52 §3c). When the directed symbolic engine confirms nothing in budget, the loop fuzzes an
+afl-clang-fast build (+ a CmpLog build, `AFL_LLVM_CMPLOG=1`), seeded with every input the driver
+reached the sinks with, and hands each crash to the SAME validator (so the fuzzer only proposes —
+0 false confirmations by construction). Reach-gated (only when directed came up empty) and bounded.
 
-1. **Input sizing.** CGC vulns often need larger / structured inputs than the 200–512 B default;
-   size from the challenge's POV length.
-2. **CCBSE backward climb (doc 52 §3b).** When directed reach from the entry stalls on a deep
-   function, start symbolic execution at the site's function and climb callers.
-3. **Hybrid fuzz fallback (doc 52 §3c).** Seed AFL++/CmpLog with the driver's partial prefixes;
-   fuzzing as the per-hypothesis fallback, reach-gated and plateau-bailed.
-4. **Per-hypothesis budgets** so one deep function cannot starve the rest.
+Verified: `h02_offbyone_nul` (off-by-one heap overflow behind a `comment:` tag parser) is a directed
+MISS; the fallback produced 4 crashes and the validator confirmed `copy@prog.c:29` (the declared
+bug) + `int-overflow-alloc@26`. **CmpLog was essential** — plain AFL found 0 (could not guess the
+keyword), CmpLog discovered `comment:`. This also subsumes the input-sizing gap (AFL grows inputs,
+so the 64 KB case i02 is now reachable by the fallback). `bench/tier0/fuzz_check.py` regresses it.
+
+Caveat: source targets get the instrumented + CmpLog builds; a bare CGC binary falls back to AFL
+qemu-mode, which is slower and flaky here — so the fallback helps Tier-2 (Magma/ARVO source) and
+Tier-0 recall most; binary-CGC reach still leans on the directed engine + CCBSE.
+
+### Remaining Step-5 work
+
+1. **CCBSE backward climb (doc 52 §3b).** When directed reach from the entry stalls on a deep
+   function, start symbolic execution at the site's function and climb callers (the main lever left
+   for binary CGC, where qemu-mode fuzzing is weak).
+2. **Per-hypothesis budgets** so one deep function cannot starve the rest (today one budget covers
+   the whole run).
+3. Then the **Tier-1 CGC sweep** for a real number (now that scoping + the fallback exist).
 
 ### Baseline
 
