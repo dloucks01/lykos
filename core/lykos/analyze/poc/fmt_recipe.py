@@ -704,7 +704,20 @@ def _fmt_customize(target, target_bytes, *, arg_offset, slot_name, slot_addr, va
         f"- ARG OFFSET ({arg_offset}) — where your bytes land in the varargs; fixed for this binary.\n"
         f"- RCE / spawn a shell — {rce}"
     )
-    ev = [{"channel": "customize", "detail": guide}]
+    binname = getattr(target, "filename", "the_binary")
+    usage = (
+        "WHAT IT IS — a self-contained builder script, not just the raw bytes. It runs the target to "
+        "self-calibrate the stack offset, proves the format string is attacker-controlled (an info "
+        "leak), then writes the payload file. Nothing to guess.\n"
+        "WORKFLOW —\n"
+        "1. Download the builder (`poc.py`) below.\n"
+        f"2. Run it on the binary: `python3 poc.py ./{binname}` — writes `fmt_write.bin`.\n"
+        f"3. Deliver the payload: `./{binname} < fmt_write.bin` — triggers the effect.\n"
+        f"ON SOURCE — build the source first (e.g. `gcc -o {binname} src.c`), then run the builder on "
+        "the compiled binary. The Code view shows WHERE the bug is; the builder is HOW to weaponize it."
+    )
+    ev = [{"channel": "builder-usage", "detail": usage},
+          {"channel": "customize", "detail": guide}]
     try:
         from . import exploit_script
         facts = {"cwe": "CWE-134", "sink": sink_name or "printf",

@@ -13,14 +13,35 @@ const CH_LABEL = {
   "recipe-assumptions": "Assumptions", "recipe-ceiling": "Ceiling", dynamic: "Reached / how found",
   effects: "Effects", poc: "Proof", detonation: "Detonation", chain: "Primitive chain",
 };
-const IN_POC = new Set(["soundness", "reproduce", "poc-input", "customize", "exploit-script"]);
+const IN_POC = new Set(["soundness", "reproduce", "poc-input", "customize",
+                        "exploit-script", "builder-usage"]);
 
-// "Customize / retarget this PoC": the knobs the operator can change (write target/value, RCE path)
-// and the editable, downloadable builder script.
+// render text with `inline code` spans
+function ic(text) {
+  return (text || "").split(/(`[^`]+`)/).map((p) =>
+    (p.startsWith("`") && p.endsWith("`")) ? html`<code class="ic">${p.slice(1, -1)}</code>` : p);
+}
+
+function BuilderUsage({ detail }) {
+  const grab = (re) => { const m = detail.match(re); return m ? m[1].trim() : ""; };
+  const whatIs = grab(/WHAT IT IS —\s*([\s\S]*?)(?=\nWORKFLOW —|\nON SOURCE —|$)/);
+  const flow = grab(/WORKFLOW —\s*([\s\S]*?)(?=\nON SOURCE —|$)/)
+    .split("\n").filter((l) => /^\d+\./.test(l.trim())).map((l) => l.trim().replace(/^\d+\.\s*/, ""));
+  const onSrc = grab(/ON SOURCE —\s*([\s\S]*?)$/);
+  return html`<div class="usage">
+    ${whatIs ? html`<div class="u-part"><div class="u-k">What it is</div><div>${ic(whatIs)}</div></div>` : null}
+    ${flow.length ? html`<div class="u-part"><div class="u-k">Workflow</div>
+      <ol class="u-steps">${flow.map((s) => html`<li>${ic(s)}</li>`)}</ol></div>` : null}
+    ${onSrc ? html`<div class="u-part"><div class="u-k">On source</div><div>${ic(onSrc)}</div></div>` : null}
+  </div>`;
+}
+
+// "Customize / retarget this PoC": how the builder works + the knobs + the editable script.
 function Customize({ finding }) {
+  const usage = (finding.evidence || []).find((e) => e.channel === "builder-usage");
   const guide = (finding.evidence || []).find((e) => e.channel === "customize");
   const script = (finding.evidence || []).find((e) => e.channel === "exploit-script");
-  if (!guide && !script) return null;
+  if (!usage && !guide && !script) return null;
   let head = "", knobs = [];
   if (guide) {
     const lines = guide.detail.split("\n");
@@ -30,12 +51,14 @@ function Customize({ finding }) {
   const dl = script ? "data:text/x-python;charset=utf-8," + encodeURIComponent(script.detail) : null;
   const knob = (t) => {
     const i = t.indexOf("—");
-    return i < 0 ? html`<li>${t}</li>`
-      : html`<li><b class="knob-k">${t.slice(0, i).trim()}</b> — ${t.slice(i + 1).trim()}</li>`;
+    return i < 0 ? html`<li>${ic(t)}</li>`
+      : html`<li><b class="knob-k">${t.slice(0, i).trim()}</b> — ${ic(t.slice(i + 1).trim())}</li>`;
   };
   return html`<div class="sect"><div class="sect-h">Customize / retarget this PoC</div>
-    ${head ? html`<div class="why">${head}</div>` : null}
-    ${knobs.length ? html`<ul class="knobs">${knobs.map(knob)}</ul>` : null}
+    ${usage ? html`<${BuilderUsage} detail=${usage.detail} />` : null}
+    ${head ? html`<div class="blk"><div class="blk-h">How to retarget it</div>
+      <div class="why">${ic(head)}</div>
+      ${knobs.length ? html`<ul class="knobs">${knobs.map(knob)}</ul>` : null}</div>` : null}
     ${script ? html`<div class="blk"><div class="blk-h">Editable exploit builder
       <a class="dl-link" href=${dl} download="poc.py">⬇ poc.py</a></div>
       <pre class="script">${script.detail}</pre></div>` : null}
