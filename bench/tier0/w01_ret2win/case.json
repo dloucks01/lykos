@@ -1,0 +1,31 @@
+{
+  "id": "w01_ret2win",
+  "summary": "loginbox: unbounded strcpy into name[64] overflows the saved return address (stack overflow -> RIP control); win() is the ret2win target",
+  "class": "stack",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 0,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "line": 19,
+      "function": "greet",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "read(0,name,512) writes up to 512 bytes into name[64], overflowing the saved RIP",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

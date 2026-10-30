@@ -74,6 +74,7 @@ class Hypothesis:
     reached: int = 0
     note: str = ""
     solutions: list = field(default_factory=list)
+    exploit: Optional[dict] = None   # Step 4 weaponization result (L2/L3), when climbed
 
     @property
     def line(self) -> Optional[int]:
@@ -113,7 +114,7 @@ class Hypothesis:
                 "func": self.func,
                 "func_addr": f"{self.func_addr:#x}" if isinstance(self.func_addr, int) else None,
                 "func_size": self.func_size, "location": self.location, "status": self.status,
-                "reached": self.reached, "note": self.note,
+                "reached": self.reached, "note": self.note, "exploit": self.exploit,
                 "solutions": [s.to_dict() for s in self.solutions]}
 
     @classmethod

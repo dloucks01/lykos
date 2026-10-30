@@ -1,0 +1,11 @@
+{
+  "id": "n17_ret2win_bounded",
+  "summary": "loginbox with a bounded strncpy: no overflow, win() unreachable",
+  "class": "negative",
+  "difficulty": "easy",
+  "invocation": { "argv": [], "input_mode": "stdin" },
+  "cflags": ["-O0", "-g", "-fno-stack-protector", "-no-pie"],
+  "seed_exit": 0,
+  "bugs": [],
+  "intended_exec": []
+}

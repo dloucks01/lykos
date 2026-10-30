@@ -78,9 +78,19 @@ def save(out_dir, report: dict) -> Path:
                 f"{h.kind} ({h.cwe}) at {h.location or hex(h.site or 0)} in {h.func}\n"
                 f"solver: {sol.detail}\nvalidator ({sol.verdict.method}, "
                 f"{sol.verdict.runs} run(s)): {sol.verdict.detail}\n")
-            lines.append(f"- **{h.kind}** ({h.cwe}) at `{h.location or hex(h.site or 0)}` in "
-                         f"`{h.func}` — {sol.detail}. Validated by {sol.verdict.method}: "
-                         f"{sol.verdict.detail}. PoC: `{d.relative_to(out)}/`")
+            line = (f"- **{h.kind}** ({h.cwe}) at `{h.location or hex(h.site or 0)}` in "
+                    f"`{h.func}` — {sol.detail}. Validated by {sol.verdict.method}: "
+                    f"{sol.verdict.detail}. PoC: `{d.relative_to(out)}/`")
+            if h.exploit:
+                ex = h.exploit
+                tag = ex.get("level", "?")
+                line += (f"\n    - **Exploit {tag}** ({ex.get('strategy', '')}): "
+                         f"{ex.get('evidence') or ex.get('note') or ''}")
+                if ex.get("payload_b64"):
+                    import base64
+                    (d / "exploit.bin").write_bytes(base64.b64decode(ex["payload_b64"]))
+                    line += f" Payload: `{(d / 'exploit.bin').relative_to(out)}`"
+            lines.append(line)
         crash = [h for h in hyps if h.crashes_unattributed()]
         if crash:
             lines.append("\nReproducible crashes NOT attributable to their site (no sanitizer build; "

@@ -2461,6 +2461,16 @@ class Driver:
             site = s.history.jump_source
         except Exception:
             pass
+        # weaponization re-solve: pin the hijacked instruction pointer to a chosen address (a win
+        # function) instead of the marker, so the solved input is a framing-aware ret2win payload.
+        target_ip = self.spec.get("hijack_to")
+        if target_ip is not None:
+            cond = s.regs.ip == int(target_ip)
+            if s.solver.satisfiable(extra_constraints=[cond]):
+                self.violation(s, "control-flow-hijack", site,
+                               f"ret2win: instruction pointer redirected to {int(target_ip):#x}",
+                               extra=[cond])
+            return
         nul = claripy.ULT(s.regs.ip, NULL_PAGE)
         if s.solver.satisfiable(extra_constraints=[nul]):
             self.violation(s, "null-deref", self._jump_site(s),
