@@ -35,7 +35,7 @@ validator is the precision filter, and failures come back as exclusions).
 spec.json: binary, argv (list, "@@" = input carrier), input_mode (file|stdin|arg), input_size,
            max_seconds, max_states, width, exclude {hyp_id: [b64,...]}, only [hyp_id,...],
            max_rss_mb (default 8192: past it the driver writes partial results and exits 3),
-           solver_timeout_ms (default 10000), solver_max_mb (default min(4096, max_rss_mb/2))
+           solver_timeout_ms (default 10000), solver_max_mb (z3 heap cap, default max_rss_mb)
 out.json : ok, angr_version, stats, hypotheses:[{id, kind, cwe, site, func, func_addr, callee,
            status, reached, solutions:[{input_b64, detail, values}], note}], error
 """
@@ -125,6 +125,7 @@ class Driver:
         self.main_obj = self.p.loader.main_object
         self.x86 = self.p.arch.name in ("AMD64", "X86")
         self._install_models()
+        self.dlocals = self._dwarf_locals()
         self._globals_table()
 
     def _globals_table(self):
@@ -213,8 +214,16 @@ class Driver:
             def run(self, dst, char, num, _destlen):   # noqa: D401
                 return super().run(dst, char, num)
 
+        class PreciseSscanf(angr.SimProcedure):
+            """sscanf with C semantics (literals, whitespace, widths, failure branch); angr's
+            ignores literal text, always succeeds and pins every %s at its maximum length."""
+            def run(self, src, fmt):   # noqa: D401
+                return drv._sscanf(self, src, fmt, va_start=2)
+
         for name, cls in (("snprintf", BoundedSnprintf), ("sprintf", BoundedSprintf),
-                          ("memset", BoundedMemset), ("__memset_chk", BoundedMemsetChk)):
+                          ("memset", BoundedMemset), ("__memset_chk", BoundedMemsetChk),
+                          ("sscanf", PreciseSscanf), ("__isoc99_sscanf", PreciseSscanf),
+                          ("__isoc23_sscanf", PreciseSscanf)):
             sym = self.p.loader.find_symbol(name)
             if sym is not None:
                 self.p.hook_symbol(name, cls(), replace=True)
@@ -418,6 +427,219 @@ class Driver:
         st.memory.store(dst, claripy.Concat(*outb))
         return total.zero_extend(st.arch.bits - 32)
 
+    SCANF_WS = b" \t\n\v\f\r"
+    SCANF_INT = {b"d": (10, True), b"i": (10, True), b"u": (10, False), b"x": (16, False),
+                 b"X": (16, False), b"o": (8, False)}
+
+    def _sscanf(self, proc, src, fmt, va_start):
+        """Solver-encoded sscanf. No forking: the return value is a sum of If(ok_k, 1, 0) over the
+        conversions and every store is conditional on ok_k, so the caller's `!= N` branch splits
+        the paths. Token lengths are symbolic; positions after a variable-length token are
+        resolved over their feasible values (at most POS_FANOUT, else a sound subset)."""
+        claripy, st = self.claripy, proc.state
+        try:
+            f = st.solver.eval(st.memory.load(fmt, 256, inspect=False), cast_to=bytes).split(b"\0")[0]
+            if st.solver.symbolic(st.memory.load(fmt, len(f) + 1, inspect=False)):
+                raise ValueError("symbolic format")
+        except Exception:
+            from angr.procedures.libc.sscanf import sscanf as _ss
+            return proc.inline_call(_ss, src, fmt).ret_expr
+        cc = proc.cc
+        regs = list(getattr(cc, "ARG_REGS", []) or [])
+
+        def arg(i):
+            if i < len(regs):
+                return getattr(st.regs, regs[i])
+            return st.memory.load(st.regs.sp + (i - len(regs) + 1) * self.word, self.word,
+                                  endness=st.arch.memory_endness, inspect=False)
+
+        M = max(32, min(1024, st.libc.max_str_len))
+        blob = st.memory.load(src, M, inspect=False)
+        B = [blob.get_byte(t) for t in range(M)]
+        WS = [claripy.BVV(c, 8) for c in self.SCANF_WS]
+        FAN = int(self.spec.get("scanf_pos_fanout", 64))
+
+        def is_ws(b):
+            return claripy.Or(*[b == w for w in WS])
+
+        class Pos:
+            """A position: concrete, or a symbolic ast resolved (lazily, only if a later directive
+            reads at it) over its [min, max] range -- all of it when <= FAN values, else FAN evenly
+            spaced values kept by constraint (an under-approximation: every input stays real)."""
+            def __init__(self, ast):
+                self.ast = ast
+                self._vals = None
+
+            @property
+            def vals(self):
+                if self._vals is None:
+                    if not st.solver.symbolic(self.ast):
+                        self._vals = [st.solver.eval(self.ast)]
+                    else:
+                        lo, hi = st.solver.min(self.ast), st.solver.max(self.ast)
+                        hi = min(hi, lo + M)
+                        if hi - lo + 1 <= FAN:
+                            self._vals = list(range(lo, hi + 1))
+                        else:
+                            step = (hi - lo) / (FAN - 1)
+                            self._vals = sorted({lo + round(i * step) for i in range(FAN)})
+                            st.add_constraints(claripy.Or(*[self.ast == v for v in self._vals]))
+                return self._vals
+
+            def at(self, j):
+                """byte at position + j"""
+                if len(self.vals) == 1:
+                    k = self.vals[0] + j
+                    return B[k] if k < M else claripy.BVV(0, 8)
+                e = claripy.BVV(0, 8)
+                for v in self.vals:
+                    k = v + j
+                    e = claripy.If(self.ast == v, B[k] if k < M else claripy.BVV(0, 8), e)
+                return e
+
+        W32 = 32
+        pos = Pos(claripy.BVV(0, W32))
+        ok = claripy.true()
+        count = claripy.BVV(0, W32)
+        argi = va_start
+        consumed_any = False
+
+        def skip_ws(pos, ok, maxw=8):
+            """C: a whitespace directive (and most conversions) skip ANY run of whitespace. Runs
+            are bounded at maxw (longer runs are excluded from the success branch)."""
+            if all(len(pos.vals) == 1 and pos.vals[0] + t < M and not st.solver.symbolic(B[pos.vals[0] + t])
+                   and st.solver.eval(B[pos.vals[0] + t]) not in self.SCANF_WS for t in range(1)):
+                return pos, ok            # concrete non-whitespace next: nothing to skip
+            n = claripy.BVS("scanf_ws", W32)
+            st.add_constraints(claripy.ULE(n, maxw))
+            conds = []
+            for j in range(maxw + 1):
+                inside = claripy.ULT(claripy.BVV(j, W32), n)
+                at_end = n == j
+                conds.append(claripy.If(inside, is_ws(pos.at(j)), claripy.true()))
+                conds.append(claripy.Or(claripy.Not(at_end), claripy.Not(is_ws(pos.at(j)))))
+            return Pos(pos.ast + n), claripy.And(ok, *conds)
+
+        k = 0
+        while k < len(f):
+            c = f[k:k + 1]
+            if c in (b" ", b"\t", b"\n"):
+                pos, ok = skip_ws(pos, ok)
+                k += 1
+                continue
+            if c != b"%" or f[k + 1:k + 2] == b"%":
+                lit = b"%" if c == b"%" else c
+                ok = claripy.And(ok, pos.at(0) == lit[0])
+                pos = Pos(pos.ast + 1)
+                k += 2 if c == b"%" else 1
+                continue
+            j = k + 1
+            suppress = f[j:j + 1] == b"*"
+            if suppress:
+                j += 1
+            d0 = j
+            while j < len(f) and f[j:j + 1].isdigit():
+                j += 1
+            width = int(f[d0:j]) if j > d0 else None
+            lm = b""
+            while j < len(f) and f[j:j + 1] in b"hlLqjzt":
+                lm += f[j:j + 1]
+                j += 1
+            conv = f[j:j + 1]
+            k = j + 1
+            if conv == b"n":
+                if not suppress:
+                    dst = arg(argi)
+                    argi += 1
+                    st.memory.store(dst, pos.ast, endness=st.arch.memory_endness, condition=ok)
+                continue
+            if conv == b"c":
+                n = width or 1
+                cond = claripy.And(*[pos.at(t) != 0 for t in range(n)])
+                ok = claripy.And(ok, cond)
+                if not suppress:
+                    dst = arg(argi)
+                    argi += 1
+                    st.memory.store(dst, claripy.Concat(*[pos.at(t) for t in range(n)]), condition=ok)
+                    count = count + claripy.If(ok, claripy.BVV(1, W32), claripy.BVV(0, W32))
+                pos = Pos(pos.ast + n)
+                continue
+            if conv == b"s":
+                pos, ok = skip_ws(pos, ok)
+                N = width if width else max(1, M - 1 - (pos.vals[0] if len(pos.vals) == 1 else 0))
+                L = claripy.BVS("scanf_tok_len", W32)
+                st.add_constraints(claripy.UGE(L, 1), claripy.ULE(L, N))   # ranges only: hard
+                cons = []
+                for t in range(N + 1):
+                    b = pos.at(t)
+                    inside = claripy.ULT(claripy.BVV(t, W32), L)
+                    if t < N:
+                        cons.append(claripy.If(inside, claripy.And(b != 0, claripy.Not(is_ws(b))),
+                                               claripy.true()))
+                    # the token ends at a delimiter, NUL, or the width
+                    if t < N:
+                        cons.append(claripy.Or(L != t, b == 0, is_ws(b)))
+                tok_ok = claripy.And(*cons)
+                ok = claripy.And(ok, tok_ok)
+                if not suppress:
+                    dst = arg(argi)
+                    argi += 1
+                    data = claripy.Concat(*[claripy.If(claripy.ULT(claripy.BVV(t, W32), L),
+                                                       pos.at(t), claripy.BVV(0, 8))
+                                            for t in range(N + 1)])
+                    size = (L + 1).zero_extend(self.arch_bits - W32) if self.arch_bits > W32 else L + 1
+                    st.memory.store(dst, data, size=size, condition=ok)
+                    count = count + claripy.If(ok, claripy.BVV(1, W32), claripy.BVV(0, W32))
+                pos = Pos(pos.ast + L)
+                consumed_any = True
+                continue
+            if conv in self.SCANF_INT:
+                base, signed = self.SCANF_INT[conv]
+                pos, ok = skip_ws(pos, ok)
+                nbits = 64 if lm in (b"l", b"ll", b"q", b"j", b"z", b"t") and self.arch_bits == 64 else \
+                    (16 if lm == b"h" else 8 if lm == b"hh" else 32)
+                maxd = width or {10: 19 if nbits == 64 else 10, 16: 16 if nbits == 64 else 8,
+                                 8: 22 if nbits == 64 else 11}[base]
+                neg = (pos.at(0) == ord("-")) if signed else claripy.false()
+                has_sign = claripy.Or(pos.at(0) == ord("-"), pos.at(0) == ord("+")) if signed else claripy.false()
+                off = claripy.If(has_sign, claripy.BVV(1, W32), claripy.BVV(0, W32))
+                p1 = Pos(pos.ast + off)
+                D = claripy.BVS("scanf_digits", W32)
+                st.add_constraints(claripy.UGE(D, 1), claripy.ULE(D, maxd))
+                cons = []
+                val = claripy.BVV(0, 64)
+                for t in range(maxd + 1):
+                    b = p1.at(t)
+                    if base == 16:
+                        dig = claripy.Or(claripy.And(claripy.UGE(b, ord("0")), claripy.ULE(b, ord("9"))),
+                                         claripy.And(claripy.UGE(b, ord("a")), claripy.ULE(b, ord("f"))),
+                                         claripy.And(claripy.UGE(b, ord("A")), claripy.ULE(b, ord("F"))))
+                        dv = claripy.If(claripy.ULE(b, ord("9")), b - ord("0"),
+                                        claripy.If(claripy.UGE(b, ord("a")), b - ord("a") + 10, b - ord("A") + 10))
+                    else:
+                        dig = claripy.And(claripy.UGE(b, ord("0")), claripy.ULE(b, ord("0") + base - 1))
+                        dv = b - ord("0")
+                    inside = claripy.ULT(claripy.BVV(t, W32), D)
+                    if t < maxd:
+                        cons.append(claripy.If(inside, dig, claripy.true()))
+                        cons.append(claripy.Or(D != t, claripy.Not(dig)))
+                        val = claripy.If(inside, val * base + dv.zero_extend(56), val)
+                tok_ok = claripy.And(*cons)
+                ok = claripy.And(ok, tok_ok)
+                val = claripy.If(neg, -val, val)
+                if not suppress:
+                    dst = arg(argi)
+                    argi += 1
+                    st.memory.store(dst, val[nbits - 1:0], endness=st.arch.memory_endness, condition=ok)
+                    count = count + claripy.If(ok, claripy.BVV(1, W32), claripy.BVV(0, W32))
+                pos = Pos(p1.ast + D)
+                continue
+            # %[ / floats / anything else: fall back to angr's model
+            from angr.procedures.libc.sscanf import sscanf as _ss
+            return proc.inline_call(_ss, src, fmt).ret_expr
+        del consumed_any
+        return count.zero_extend(self.arch_bits - W32) if self.arch_bits > W32 else count
+
     def _fallback_fmt(self, proc, dst, size, fmt, va_start):
         from angr.procedures.libc.snprintf import snprintf as _sn
         from angr.procedures.libc.sprintf import sprintf as _sp
@@ -598,9 +820,9 @@ class Driver:
             args = [prog] + _place(base, self.inp)
         st = self.p.factory.full_init_state(args=args, add_options=opts,
                                             remove_options={angr.options.LAZY_SOLVES}, **kw)
-        if mode == "arg":
-            for k in range(n):
-                st.solver.add(self.inp.get_byte(k) != 0)
+        # arg mode: the argument ends at its first NUL (solve() cuts there), so its length is
+        # free. Forcing every byte non-zero pinned it to exactly input_size, which made any
+        # length-bounded path (strcpy into a small buffer, a length check) unsatisfiable.
         st.libc.max_str_len = max(st.libc.max_str_len, min(1024, n + 16))
         st.libc.max_buffer_size = max(st.libc.max_buffer_size, min(1024, n + 16))
         st.libc.max_variable_size = 4096
@@ -624,6 +846,121 @@ class Driver:
         st.inspect.b("mem_write", when=angr.BP_BEFORE, action=self._on_write)
         st.inspect.b("mem_read", when=angr.BP_BEFORE, action=self._on_read)
         return st
+
+    # ------------------------------------------------------------------ DWARF stack objects
+    def _dwarf_locals(self):
+        """{function entry (as loaded): [(name, cfa_offset, size)]} for locals/params whose DWARF
+        location is DW_OP_fbreg on a DW_OP_call_frame_cfa frame base (gcc/clang -g). Gives the
+        object-level stack oracle what ASan knows: where each array ends. Stripped binaries or
+        register/location-list variables simply contribute nothing (frame-level oracle only)."""
+        out = {}
+        if self.spec.get("no_dwarf"):
+            return out
+        try:
+            from elftools.elf.elffile import ELFFile
+        except Exception:
+            return out
+        delta = self.main_obj.mapped_base - self.main_obj.linked_base
+
+        def sleb(bs):
+            res, shift = 0, 0
+            for b in bs:
+                res |= (b & 0x7f) << shift
+                shift += 7
+                if not b & 0x80:
+                    if b & 0x40:
+                        res -= 1 << shift
+                    return res
+            return None
+
+        def tsize(die, depth=0):
+            if die is None or depth > 20:
+                return None
+            if die.tag == "DW_TAG_array_type":
+                el = tsize(die.get_DIE_from_attribute("DW_AT_type"), depth + 1) \
+                    if "DW_AT_type" in die.attributes else None
+                n = 1
+                for ch in die.iter_children():
+                    if ch.tag != "DW_TAG_subrange_type":
+                        continue
+                    if "DW_AT_count" in ch.attributes:
+                        n *= ch.attributes["DW_AT_count"].value
+                    elif "DW_AT_upper_bound" in ch.attributes and \
+                            isinstance(ch.attributes["DW_AT_upper_bound"].value, int) and \
+                            ch.attributes["DW_AT_upper_bound"].form != "DW_FORM_exprloc" and \
+                            not ch.attributes["DW_AT_upper_bound"].form.startswith("DW_FORM_ref"):
+                        n *= ch.attributes["DW_AT_upper_bound"].value + 1
+                    else:
+                        return None          # VLA / unknown bound
+                return el * n if el else None
+            if "DW_AT_byte_size" in die.attributes:
+                return die.attributes["DW_AT_byte_size"].value
+            if "DW_AT_type" in die.attributes:
+                return tsize(die.get_DIE_from_attribute("DW_AT_type"), depth + 1)
+            return None
+
+        try:
+            with open(self.spec["binary"], "rb") as fh:
+                elf = ELFFile(fh)
+                if not elf.has_dwarf_info():
+                    return out
+                for cu in elf.get_dwarf_info().iter_CUs():
+                    for die in cu.iter_DIEs():
+                        if die.tag != "DW_TAG_subprogram" or "DW_AT_low_pc" not in die.attributes:
+                            continue
+                        fb = die.attributes.get("DW_AT_frame_base")
+                        if fb is None or fb.value != [0x9c]:      # DW_OP_call_frame_cfa
+                            continue
+                        objs = []
+                        stack = [die]
+                        while stack:
+                            d = stack.pop()
+                            for ch in d.iter_children():
+                                if ch.tag == "DW_TAG_lexical_block":
+                                    stack.append(ch)
+                                    continue
+                                if ch.tag not in ("DW_TAG_variable", "DW_TAG_formal_parameter"):
+                                    continue
+                                loc = ch.attributes.get("DW_AT_location")
+                                if loc is None or loc.form != "DW_FORM_exprloc" or not loc.value \
+                                        or loc.value[0] != 0x91:   # DW_OP_fbreg
+                                    continue
+                                off = sleb(loc.value[1:])
+                                sz = tsize(ch.get_DIE_from_attribute("DW_AT_type")) \
+                                    if "DW_AT_type" in ch.attributes else None
+                                if off is None or not sz:
+                                    continue
+                                nm = ch.attributes["DW_AT_name"].value.decode("utf-8", "replace") \
+                                    if "DW_AT_name" in ch.attributes else "?"
+                                objs.append((nm, off, sz))
+                        if objs:
+                            out[die.attributes["DW_AT_low_pc"].value + delta] = objs
+        except Exception:
+            return {}
+        self.stats["dwarf_funcs"] = len(out)
+        return out
+
+    def _stack_objects(self, s):
+        """[(lo, hi, name, function)] for the DWARF locals of every frame on the call stack."""
+        if not self.dlocals:
+            return []
+        res = []
+        cfa_adj = self.word if self.x86 else 0
+        for sp, _ra, fa in self._frames(s):
+            objs = self.dlocals.get(fa)
+            if not objs:
+                continue
+            cfa = sp + cfa_adj
+            for nm, off, sz in objs:
+                res.append((cfa + off, cfa + off + sz, nm, self._fname(fa)))
+        return res
+
+    @staticmethod
+    def _obj_at(objs, a):
+        for o in objs:
+            if o[0] <= a < o[1]:
+                return o
+        return None
 
     # ------------------------------------------------------------------ oracles
     def _site_for(self, s):
@@ -680,6 +1017,7 @@ class Driver:
             if ln is None:
                 expr = s.inspect.mem_write_expr
                 ln = (expr.size() // 8) if expr is not None else 1
+            self._note_store_reach(s, addr)
             self._check_access(s, addr, ln, write=True)
         except Deadline:
             raise
@@ -687,6 +1025,31 @@ class Driver:
             self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
         except Exception:
             pass
+
+    def _note_store_reach(self, s, addr):
+        """Reach accounting for proposed store sites. A store that only ever hits ONE concrete
+        address (`*minv = x` through a pointer argument) can never go out of bounds: once it has
+        been reached SATURATE_REACHES times, stop steering toward it. Indexed stores keep moving
+        and stay live (a loop bug needs many visits before the index runs off the end)."""
+        ins = s.scratch.ins_addr
+        if ins is None:
+            return
+        h = self.hyps.get(f"store@{ins:#x}")
+        if h is None or h["solutions"] or h.get("saturated"):
+            return
+        h["reached"] += 1
+        if h["status"] == "proposed":
+            h["status"] = "reached"
+        if s.solver.symbolic(addr):
+            h["_multi"] = True
+            return
+        seen = h.setdefault("_addrs", set())
+        if len(seen) < 2:
+            seen.add(s.solver.eval(addr))
+        if not h.get("_multi") and len(seen) == 1 and h["reached"] > self.SATURATE_REACHES:
+            h["saturated"] = True
+            h["note"] = (h.get("note") or "") + " (single fixed address: saturated)"
+            self._recompute_dmin()
 
     def _on_read(self, s):
         try:
@@ -697,7 +1060,7 @@ class Driver:
             if ln is None:
                 ln = 1
             sym = s.solver.symbolic(addr)
-            if not sym and not s.globals.get("chunks"):
+            if not sym and not s.globals.get("chunks") and not self.dlocals:
                 return
             self._check_access(s, addr, ln, write=False)
         except Deadline:
@@ -731,6 +1094,14 @@ class Driver:
             # ---- concrete fast path: pure Python, a solver call only for symbolic chunk sizes
             lo = s.solver.eval(addr)
             hi = lo + s.solver.eval(ln_ast)
+            ins = s.scratch.ins_addr
+            if self._is_stack(s, lo) and (write or (ins is not None and self._is_prog_code(ins))):
+                # (reads by libc models, e.g. strlen's chunked scan, run past buffers by design)
+                o = self._obj_at(self._stack_objects(s), lo)
+                if o is not None and hi > o[1]:
+                    conds.append(("stack-write" if write else "stack-read", None,
+                                  f"{'writes' if write else 'reads'} {hi - o[1]} byte(s) past the end of "
+                                  f"local '{o[2]}' ({o[1] - o[0]} bytes) of {o[3]}", o[0], None, "obj"))
             if write and self.x86 and self._is_stack(s, lo):
                 for sp, ra, fa in self._frames(s):
                     if lo <= sp < hi:
@@ -781,6 +1152,25 @@ class Driver:
                                   f"overwrites the saved return address of {self._fname(fa)} "
                                   f"(slot {sp:#x})", sp))
                     break                 # the innermost frame above the write is the one it smashes
+            if self._is_stack(s, a_lo):
+                objs = self._stack_objects(s)
+                gb = self._const_base(addr) if sym_addr else a_lo
+                o = self._obj_at(objs, gb) if gb is not None else None
+                if o is not None:
+                    olo, ohi = o[0], o[1]
+                    if sym_addr:
+                        cond = claripy.Or(claripy.ULT(addr, olo), claripy.UGT(end, ohi))
+                        # the nearest out-of-bounds access: the natural PoC, and inside the
+                        # redzone a sanitizer build actually checks (a far index skips it)
+                        near = claripy.Or(claripy.And(claripy.UGE(addr, ohi), claripy.ULT(addr, ohi + 32)),
+                                          claripy.And(claripy.ULT(addr, olo), claripy.UGE(addr, olo - 32)))
+                        why = (f"{'writes' if write else 'reads'} outside local '{o[2]}' "
+                               f"({ohi - olo} bytes) of {o[3]} at an input-controlled index")
+                    else:
+                        cond, near = claripy.UGT(end, ohi), None
+                        why = (f"{'writes' if write else 'reads'} past the end of local '{o[2]}' "
+                               f"({ohi - olo} bytes) of {o[3]} (length from input)")
+                    conds.append(("stack-write" if write else "stack-read", cond, why, olo, near, "obj"))
             if chunks and not self._is_stack(s, a_lo):
                 base = self._chunk_for(chunks, a_lo)
                 if base is not None:
@@ -794,10 +1184,11 @@ class Driver:
                                       f"{'writes' if write else 'reads'} chunk {base:#x} after free()",
                                       base))
                     else:
+                        near = claripy.ULT(addr, base + size + 32) if sym_addr else None
                         conds.append(("heap-write" if write else "heap-read",
                                       claripy.And(claripy.UGE(addr, base), claripy.UGT(end, base + size)),
                                       f"{'writes' if write else 'reads'} past the end of the chunk "
-                                      f"allocated at {base:#x}", base))
+                                      f"allocated at {base:#x}", base, near))
             if not sym_addr and not self._is_stack(s, a_lo):
                 obj = self._gobj(a_lo)
                 if obj is not None:
@@ -811,11 +1202,13 @@ class Driver:
                 obj = self._gobj(gb) if gb is not None else None
                 if obj is not None:
                     lo_, hi_, name = obj
+                    near = claripy.Or(claripy.And(claripy.UGE(addr, hi_), claripy.ULT(addr, hi_ + 32)),
+                                      claripy.And(claripy.ULT(addr, lo_), claripy.UGE(addr, lo_ - 32)))
                     conds.append(("global-write" if write else "global-read",
                                   claripy.Or(claripy.ULT(addr, lo_), claripy.UGT(end, hi_)),
                                   f"{'writes' if write else 'reads'} outside global '{name}' "
-                                  f"[{lo_:#x},{hi_:#x}) at an input-controlled index", lo_))
-                elif self._is_stack(s, a_lo):
+                                  f"[{lo_:#x},{hi_:#x}) at an input-controlled index", lo_, near))
+                elif self._is_stack(s, a_lo) and not any(len(c) > 5 and c[5] == "obj" for c in conds):
                     fr = self._frames(s)
                     if fr:
                         sp0 = fr[0][0]
@@ -829,7 +1222,10 @@ class Driver:
             return
         if site is None:
             site = self._site_for(s)
-        for kind, cond, why, key in conds:
+        for c in conds:
+            kind, cond, why, key = c[:4]
+            near = c[4] if len(c) > 4 else None
+            is_obj = len(c) > 5 and c[5] == "obj"
             hid = f"{kind}@{site:#x}" if site is not None else f"{kind}@?"
             h = self.hyps.get(hid)
             if h is not None and (len(h["solutions"]) >= 2 or h.get("saturated")):
@@ -838,7 +1234,9 @@ class Driver:
             if cond is not None and not s.solver.satisfiable(extra_constraints=extra):
                 self.stats["unsat_checks"] += 1
                 continue
-            if kind == "stack-write" and cond is not None:
+            if near is not None and s.solver.satisfiable(extra_constraints=extra + [near]):
+                extra = extra + [near]
+            elif kind == "stack-write" and cond is not None and not is_obj:
                 strong = claripy.UGE(addr + ln_ast, key + self.word)
                 if s.solver.satisfiable(extra_constraints=extra + [strong]):
                     extra = extra + [strong]
@@ -947,16 +1345,23 @@ class Driver:
                 self._check_cmd(s, h)
             elif kind == "int-overflow-alloc":
                 self._check_alloc(s, h)
+            if kind != "copy" and h["reached"] > self.SATURATE_REACHES and not h["solutions"]:
+                # reached over and over and never violable (a constant format string, a fixed
+                # command): stop steering the search toward it
+                h["saturated"] = True
+                self._recompute_dmin()
         # copy sinks: check the write the call is about to do, then pin a symbolic size to one
         # feasible in-bounds value for the rest of this path (keeps the libc model from building a
         # max_memcpy_size-wide conditional store that every later solver query pays for)
         hc = self.hyps.get(f"copy@{src:#x}")
         if hc is not None:
             self._copy_call(s, hc)
-            if h["reached"] > 40 and not h["solutions"]:
-                h["saturated"] = True
+            if hc["reached"] > self.SATURATE_REACHES and not hc["solutions"] and not hc.get("saturated"):
+                hc["saturated"] = True
                 self._recompute_dmin()
         return h_any
+
+    SATURATE_REACHES = 24
 
     # dst arg index, size expression builder
     COPY_SIZE = {"memcpy": (0, lambda a: a(2)), "memmove": (0, lambda a: a(2)),
@@ -1056,7 +1461,7 @@ class Driver:
         if first is None:
             return
         claripy = self.claripy
-        for pay in CMD_PAYLOADS:
+        for pay in self._cmd_payloads(s, bs, first):
             for start in range(first, len(bs) - len(pay) + 1):
                 if not all(bs[start + t].symbolic for t in range(len(pay))):
                     continue
@@ -1067,6 +1472,30 @@ class Driver:
                                    f"injected '{pay.decode().strip()}' runs as a shell command",
                                    extra=[cond])
                     return
+
+    def _cmd_payloads(self, s, bs, first):
+        """Payloads for the shell quoting context where input starts. `grep -w '%s'` puts input
+        inside single quotes, where `;id;#` is inert text: the payload must close the quote."""
+        quote, esc = None, False
+        for b in bs[:first]:
+            if b.symbolic:
+                break
+            c = chr(s.solver.eval(b))
+            if esc:
+                esc = False
+            elif c == "\\" and quote != "'":
+                esc = True
+            elif quote is None and c in "'\"":
+                quote = c
+            elif c == quote:
+                quote = None
+        if quote is None:
+            return CMD_PAYLOADS
+        q = quote.encode()
+        own = [q + p for p in CMD_PAYLOADS if not p.startswith(b"\n")]
+        if quote == '"':
+            own += [b"$(id)", b"`id`"]   # substitutions still run inside double quotes
+        return own
 
     def _check_alloc(self, s, h):
         claripy = self.claripy
@@ -1100,7 +1529,11 @@ class Driver:
     def explore(self):
         angr = self.angr
         st = self.initial_state()
-        sm = self.p.factory.simulation_manager(st, save_unconstrained=True)
+        # Any exception while stepping one state (angr's stock libc models raise IndexError /
+        # TypeError on unusual arguments) drops THAT state, never the whole run. Deadline and
+        # the memory guard are BaseException-based and still propagate.
+        sm = self.p.factory.simulation_manager(st, save_unconstrained=True,
+                                               resilience=(Exception,))
         width = int(self.spec.get("width", 24))
         max_states = int(self.spec.get("max_states", 2000))
         deadline = self.t0 + float(self.spec.get("max_seconds", 120))
@@ -1132,6 +1565,10 @@ class Driver:
             for s in list(sm.unconstrained):
                 self._guarded(self._hijack, s)
             sm.stashes["unconstrained"] = []
+            for e in sm.errored:
+                key = f"{type(e.error).__name__}@{e.state.addr:#x}"
+                errs = self.stats.setdefault("errored", {})
+                errs[key] = errs.get(key, 0) + 1
             sm.stashes["errored"] = []
             sm.stashes["deadended"] = []
             pool = sm.active + sm.deferred
@@ -1139,8 +1576,22 @@ class Driver:
                 pool.sort(key=self.score)
             if len(pool) > max_states:
                 pool = pool[:max_states]
-            sm.stashes["active"] = pool[:width]
-            sm.stashes["deferred"] = pool[width:]
+            # States that can still reach an open hypothesis get the active slots. States that
+            # cannot (score >= INF) get at most a sixth of them while any directed state exists:
+            # stepping them costs every directed lineage time (a 17-iteration loop bug starved
+            # behind 20+ such states). With no directed state left, explore freely for the oracles.
+            directed = [x for x in pool if self.score(x) < INF] if self.dmin else []
+            if directed:
+                act = directed[:width]
+                spare = max(2, width // 6) if len(act) < width else 0
+                rest = [x for x in pool if self.score(x) >= INF]
+                act += rest[:spare]
+                ids = {id(x) for x in act}
+                sm.stashes["active"] = act
+                sm.stashes["deferred"] = [x for x in pool if id(x) not in ids]
+            else:
+                sm.stashes["active"] = pool[:width]
+                sm.stashes["deferred"] = pool[width:]
             if all((h["solutions"] or h.get("saturated")) for h in self.hyps.values()
                    if h["kind"] in ("copy", "store", "format-string", "cmd-injection", "int-overflow-alloc")) \
                     and self.hyps:
@@ -1221,6 +1672,8 @@ def _dump(drv, res, out_path):
     for h in list(drv.hyps.values()):
         hh = dict(h)
         hh.pop("triggered_by", None)
+        for k in [k for k in hh if k.startswith("_")]:
+            hh.pop(k)
         hh["site"] = f"{h['site']:#x}" if isinstance(h.get("site"), int) else None
         hh["block"] = f"{h['block']:#x}" if isinstance(h.get("block"), int) else None
         hh["func_addr"] = f"{h['func_addr']:#x}" if isinstance(h.get("func_addr"), int) else None
@@ -1236,22 +1689,21 @@ def _dump(drv, res, out_path):
 
 
 def _bound_solver(spec, rss_cap_mb):
-    """Give every claripy solver a per-query timeout and a z3 memory limit. claripy's defaults are
-    a 5-minute timeout and no memory limit, and a single bad query (a long ITE chain from a parsing
-    loop) has grown z3 from ~400MB to 116GB in seconds -- too fast for any polling guard. Past the
-    bound z3 returns unknown, claripy raises ClaripySolverInterruptError, and the check is skipped."""
+    """Give every claripy solver a per-query timeout (claripy's default is 5 minutes, so one hard
+    query can eat a whole budget) and cap z3's heap. Past the bound z3 returns unknown, claripy
+    raises ClaripySolverInterruptError, and that one check is skipped."""
     import z3
     from claripy.frontend.full_frontend import FullFrontend
     timeout = int(spec.get("solver_timeout_ms", 10000))
-    max_mb = int(spec.get("solver_max_mb", max(512, min(4096, rss_cap_mb // 2))))
-    z3.set_param("memory_max_size", max_mb)     # process-wide backstop (covers simplify etc.)
+    # z3 counts its WHOLE heap (every cached AST of every state) against this, not one query,
+    # so it sits at the RSS cap: it only stops z3 from overrunning the cap on its own.
+    z3.set_param("memory_max_size", int(spec.get("solver_max_mb", rss_cap_mb)))
     orig = FullFrontend.__init__
 
     def init(self, solver_backend, timeout_=None, max_memory=None, **kw):
         timeout_ = kw.pop("timeout", timeout_)
-        orig(self, solver_backend,
-             timeout=timeout if timeout_ is None else timeout_,
-             max_memory=max_mb if max_memory is None else max_memory, **kw)
+        orig(self, solver_backend, timeout=timeout if timeout_ is None else timeout_,
+             max_memory=max_memory, **kw)
 
     FullFrontend.__init__ = init
 
@@ -1291,16 +1743,9 @@ def _start_mem_guard(drv, res, out_path, cap_mb):
                 os._exit(3)
 
     threading.Thread(target=watch, name="hyp-mem-guard", daemon=True).start()
-    # The thread cannot run while one C call holds the GIL (a giant list multiply did exactly
-    # that). An address-space limit turns such an allocation into a MemoryError instead.
-    try:
-        import resource
-        lim = (2 * cap_mb + 4096) << 20
-        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        if soft == resource.RLIM_INFINITY or soft > lim:
-            resource.setrlimit(resource.RLIMIT_AS, (lim, hard))
-    except (ImportError, ValueError, OSError):
-        pass
+    # No RLIMIT_AS backstop: z3 and angr's native code abort the whole process (SIGABRT, no
+    # output) when an allocation fails, and virtual size runs far ahead of RSS. The hard cap
+    # belongs to the caller's cgroup (systemd-run --scope -p MemoryMax=..., as the bench does).
 
 
 if __name__ == "__main__":

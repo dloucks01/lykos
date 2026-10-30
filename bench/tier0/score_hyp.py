@@ -14,7 +14,7 @@ Only then is the answer key consulted:
   * found               = a confirmation at a declared bug line (exec oracle: injected exec)
   * false confirmation  = a confirmation anywhere else, or on a negative case
 
-usage: score_hyp.py [--budget S] [--jobs N] [--out DIR] [--json FILE] [case-id ...]
+usage: score_hyp.py [--budget S] [--jobs N] [--out DIR] [--json FILE] [--keep DIR] [case-id ...]
 """
 import argparse
 import base64
@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-DRIVER = os.path.join(ROOT, "core", "lykos", "hypo", "hyp_driver.py")
+DRIVER = os.environ.get("HYP_DRIVER") or os.path.join(ROOT, "core", "lykos", "hypo", "hyp_driver.py")
 ANGR_PY = os.path.join(ROOT, "vendor", "angr-venv", "bin", "python")
 sys.path.insert(0, HERE)
 import selfcheck as sc  # noqa: E402  (same replay environment and report parser)
@@ -107,11 +107,16 @@ def validate(case, h, sol, asan, lines, work):
     return ok, line, f"{kind} at {func}:{line}, site line {site}"
 
 
-def score_case(cid, bindir, budget):
+def score_case(cid, bindir, budget, keep=None):
     cdir = os.path.join(HERE, cid)
     with open(os.path.join(cdir, "case.json")) as fh:
         case = json.load(fh)
-    work = tempfile.mkdtemp(prefix=f"hyp-{cid}-")
+    if keep:
+        work = os.path.join(keep, cid)
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work)
+    else:
+        work = tempfile.mkdtemp(prefix=f"hyp-{cid}-")
     # the analyzer sees only prog (+ seed) in a clean directory
     prog = os.path.join(work, "prog")
     shutil.copy(os.path.join(bindir, cid, "prog"), prog)
@@ -145,7 +150,8 @@ def score_case(cid, bindir, budget):
                 found.setdefault(bug["id"], row)
             else:
                 false_conf.append(row)
-    shutil.rmtree(work, ignore_errors=True)
+    if not keep:
+        shutil.rmtree(work, ignore_errors=True)
     return {"id": cid, "class": case["class"], "bugs": [b["id"] for b in case["bugs"]],
             "found": sorted(found), "found_rows": found, "false": false_conf, "rows": rows,
             "error": out.get("error"), "stats": out.get("stats", {}), "wall": out.get("wall"),
@@ -158,6 +164,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--out", help="build dir to (re)use")
     ap.add_argument("--json", help="write full results here")
+    ap.add_argument("--keep", help="keep each case's work dir (spec, out.json, driver.log) here")
     ap.add_argument("cases", nargs="*")
     a = ap.parse_args()
     ids = a.cases or sorted(d for d in os.listdir(HERE)
@@ -170,7 +177,7 @@ def main():
         return 2
     t0 = time.time()
     with ThreadPoolExecutor(a.jobs) as ex:
-        results = list(ex.map(lambda c: score_case(c, bindir, a.budget), ids))
+        results = list(ex.map(lambda c: score_case(c, bindir, a.budget, a.keep), ids))
     nb = sum(len(r["bugs"]) for r in results)
     nf = sum(len(r["found"]) for r in results)
     nfalse = sum(len(r["false"]) for r in results)
