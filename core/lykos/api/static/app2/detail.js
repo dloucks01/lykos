@@ -7,6 +7,53 @@ import { PocDeliverable, ConfirmationLadder } from "./poc.js";
 import { Disasm, StackFrame, XRefs } from "./code.js";
 import { fetchFunctionAt } from "./store.js";
 
+// classify a leaked 64-bit word by its address range -> what it is + what it gives the attacker.
+function classifyWord(w) {
+  let v; try { v = BigInt(w); } catch (e) { return null; }
+  if (v === 0n) return { t: "null", c: "null", s: "" };
+  const bytes = []; let t = v;
+  for (let i = 0; i < 8; i++) { bytes.push(Number(t & 0xffn)); t >>= 8n; }
+  const nz = bytes.filter((b) => b !== 0);
+  if (nz.length && nz.every((b) => b >= 0x20 && b < 0x7f)) {
+    const s = bytes.filter((b) => b).map((b) => String.fromCharCode(b)).join("");
+    return { t: "echoed input / ASCII", c: "ascii", s: `"${s}" — your own bytes, not a useful leak` };
+  }
+  if (v >= 0x7fffff000000n && v < 0x800000000000n)
+    return { t: "stack pointer", c: "stk", s: "leaks the stack layout — defeats stack ASLR" };
+  if (v >= 0x7f0000000000n && v < 0x7fffff000000n)
+    return { t: "library pointer (libc / ld)", c: "lib", s: "compute the libc base from it → ret2libc / one-gadget" };
+  if (v >= 0x555500000000n && v < 0x565600000000n)
+    return { t: "PIE code pointer", c: "code", s: "a PIE image address — defeats PIE/ASLR for the binary" };
+  if (v >= 0x400000n && v < 0x500000n)
+    return { t: "code pointer (no-PIE image)", c: "code", s: "an image / code-segment address" };
+  if (v >= 0x1000n && v < 0x400000n)
+    return { t: "heap / low pointer", c: "heap", s: "a heap or low-mapping address" };
+  return { t: "data word", c: "data", s: "" };
+}
+
+function Disclosure({ finding }) {
+  const seen = new Set(), words = [];
+  for (const e of finding.evidence || []) {
+    if (!["effects", "injection", "disclosure", "dynamic", "leak"].includes(e.channel)) continue;
+    for (const m of (e.detail || "").match(/0x[0-9a-fA-F]{6,}/g) || []) {
+      if (!seen.has(m)) { seen.add(m); words.push(m); }
+    }
+  }
+  const rows = words.map((w) => ({ w, ...classifyWord(w) })).filter((r) => r.t);
+  const useful = rows.filter((r) => ["stk", "lib", "code"].includes(r.c)).length;
+  if (rows.length < 2 || !useful) return null;   // only show for a real multi-word leak
+  return html`<div class="sect"><div class="sect-h">Disclosed memory</div>
+    <div class="dsc-sum">This leak discloses <b>${rows.length}</b> live memory words;
+      <b>${useful}</b> are address pointers that defeat the mitigations the control bugs need.</div>
+    <div class="disc">
+      <div class="drow dhead"><span>#</span><span>leaked value</span><span>what it is</span><span>significance</span></div>
+      ${rows.map((r, i) => html`<div class=${"drow dc-" + r.c}>
+        <span class="didx">${i}</span><span class="dval mono">${r.w}</span>
+        <span class="dcls">${r.t}</span><span class="dsig">${r.s}</span></div>`)}
+    </div>
+  </div>`;
+}
+
 const CH_LABEL = {
   "root-cause": "Root cause", exploitability: "Exploitability", dataflow: "Dataflow",
   recipe: "Exploitation recipe", "recipe-input": "Computed input", "recipe-plan": "Write plan",
@@ -14,7 +61,7 @@ const CH_LABEL = {
   effects: "Effects", poc: "Proof", detonation: "Detonation", chain: "Primitive chain",
 };
 const IN_POC = new Set(["soundness", "reproduce", "poc-input", "customize",
-                        "exploit-script", "builder-usage"]);
+                        "exploit-script", "builder-usage", "effects", "poc"]);
 
 // render text with `inline code` spans
 function ic(text) {
@@ -139,6 +186,8 @@ export function DetailPane({ finding, pocs, advice }) {
 
     <div class="sect"><div class="sect-h">Attack flow</div>
       <${AttackFlow} finding=${finding} advice=${advice} pocs=${pocs} /></div>
+
+    <${Disclosure} finding=${finding} />
 
     ${hasCode ? html`<div class="sect"><div class="sect-h">
         Code — <span class="mono">${fn.name || ""}</span> ${fn.addr ? html`<span class="muted">@ ${fn.addr}</span>` : null}</div>
