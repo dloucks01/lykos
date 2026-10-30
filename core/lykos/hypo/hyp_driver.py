@@ -68,7 +68,10 @@ BORING_FUNCS = {"_start", "_init", "_fini", "deregister_tm_clones", "register_tm
 
 # payloads tried for injection sinks, strongest first; the core's oracle looks for their effect
 FMT_PAYLOADS = [b"%n%n%n%n", b"%s%s%s%s%s%s", b"%n%n", b"%x%n"]
-CMD_PAYLOADS = [b";id;#", b"|id|", b"$(id)", b"`id`", b"\nid\n", b";id"]
+# `id>&2`: the marker reaches the process's stderr even when the command's stdout is a popen()
+# pipe the program swallows, so the validator can prove execution from captured output alone
+# (inside the replay sandbox, where no exec tracer is available).
+CMD_PAYLOADS = [b";id>&2;#", b"|id>&2|", b"$(id>&2)", b"`id>&2`", b"\nid>&2\n", b";id>&2"]
 HIJACK_MARK = {64: 0x4141414141414141, 32: 0x41414141}
 
 CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-787",
@@ -961,7 +964,8 @@ class Driver:
         if self.only and hid not in self.only:
             return
         self.hyps[hid] = {"id": hid, "kind": kind, "cwe": CWE.get(kind), "site": ins,
-                          "block": block, "func": f.name, "func_addr": f.addr, "callee": callee,
+                          "block": block, "func": f.name, "func_addr": f.addr,
+                          "func_size": getattr(f, "size", None), "callee": callee,
                           "status": "proposed", "reached": 0, "solutions": [], "note": note,
                           "triggered_by": []}
         self.site_of_block.setdefault(block, []).append(hid)
@@ -1514,6 +1518,7 @@ class Driver:
             f = self.func_of(site) if site is not None else None
             h = {"id": hid, "kind": kind, "cwe": CWE.get(kind), "site": site, "block": None,
                  "func": f.name if f else None, "func_addr": f.addr if f else None,
+                 "func_size": getattr(f, "size", None) if f else None,
                  "callee": None, "status": "proposed", "reached": 1, "solutions": [],
                  "note": "found by the access oracle during exploration", "triggered_by": []}
             self.hyps[hid] = h
@@ -1738,7 +1743,7 @@ class Driver:
         q = quote.encode()
         own = [q + p for p in CMD_PAYLOADS if not p.startswith(b"\n")]
         if quote == '"':
-            own += [b"$(id)", b"`id`"]   # substitutions still run inside double quotes
+            own += [b"$(id>&2)", b"`id>&2`"]   # substitutions still run inside double quotes
         return own
 
     def _check_alloc(self, s, h):

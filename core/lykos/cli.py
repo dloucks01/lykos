@@ -53,6 +53,53 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_hunt(args) -> int:
+    """The hypothesis loop (doc 52): every finding it prints was REPLAYED and fired its oracle at
+    the claimed site. Hypotheses it solved but could not validate are counted, never listed as
+    findings."""
+    import json as _json
+    import shlex
+
+    from .hypo import loop
+    argv = shlex.split(args.argv) if args.argv is not None else None
+    log = (lambda _m: None) if (args.quiet or args.json) else \
+        (lambda m: print(m, file=sys.stderr, flush=True))
+    try:
+        rep = loop.hunt(args.target, argv=argv, mode=args.input_mode, budget=args.budget,
+                        out_dir=args.out, input_size=args.input_size, mem_mb=args.mem_mb, log=log)
+    except RuntimeError as e:
+        print(f"lykos hunt: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        out = dict(rep)
+        out["results"] = [dict(r, hypotheses=[h.to_dict() for h in r["hypotheses"]])
+                          for r in rep["results"]]
+        print(_json.dumps(out, indent=1, default=str))
+        return 0
+    total = 0
+    for r in rep["results"]:
+        conf = [h for h in r["hypotheses"] if h.status == "confirmed"]
+        total += len(conf)
+        print(f"\n{r['binary']}")
+        if r.get("error"):
+            print(f"  solver: {r['error']}")
+        for h in sorted(conf, key=lambda h: (h.location or "", h.id)):
+            s = h.confirmed_solution()
+            print(f"  CONFIRMED  {h.kind:<20} {h.cwe or '':<8} {h.location or hex(h.site or 0):<22} "
+                  f"in {h.func}  [{s.verdict.method}]")
+        for h in r["hypotheses"]:
+            if h.crashes_unattributed():
+                print(f"  CRASHES    {h.kind:<20} {h.cwe or '':<8} {h.location or hex(h.site or 0):<22} "
+                      f"in {h.func}  [reproducible crash, not attributable to the site]")
+        unconf = sum(1 for h in r["hypotheses"] if h.status == "unconfirmed")
+        print(f"  {len(conf)} confirmed, {unconf} solved but not validated, "
+              f"{len(r['hypotheses'])} hypotheses")
+        for i in r.get("incidental") or []:
+            print(f"  also hit   {i['kind']} at {i['where']} (while replaying {i['hypothesis']})")
+    print(f"\n{total} validated finding(s)" + (f"; PoCs in {args.out}" if args.out and total else ""))
+    return 0
+
+
 def _cmd_analyze(args) -> int:
     """Point the pipeline at a binary and print what it did and what it found.
 
@@ -693,6 +740,27 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
     an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
     an.set_defaults(func=_cmd_analyze)
+
+    hu = sub.add_parser("hunt",
+                        help="find vulnerabilities in a binary or C/C++ source and prove each with "
+                             "a validated PoC (the hypothesis loop: propose -> solve -> replay)")
+    hu.add_argument("target", help="an ELF binary, a C/C++ source file, or a source project dir")
+    hu.add_argument("--budget", type=float, default=600.0,
+                    help="wall-clock seconds for the whole hunt (default 600)")
+    hu.add_argument("--argv", default=None,
+                    help="how the program is invoked, one shell-quoted string with @@ where the "
+                         "input goes, e.g. --argv '-c @@' (default: inferred)")
+    hu.add_argument("--input-mode", choices=["stdin", "file", "arg"], default=None,
+                    help="how input reaches the program (default: inferred from its imports)")
+    hu.add_argument("--input-size", type=int, default=300,
+                    help="bytes of symbolic input to solve over (default 300)")
+    hu.add_argument("--mem-mb", type=int, default=8192,
+                    help="memory cap for the solver process (default 8192)")
+    hu.add_argument("--out", default=None,
+                    help="write hunt.json, findings.md and PoC folders here")
+    hu.add_argument("--json", action="store_true", help="print the result as JSON")
+    hu.add_argument("-q", "--quiet", action="store_true", help="no per-step progress")
+    hu.set_defaults(func=_cmd_hunt)
 
     rp = sub.add_parser("report",
                         help="render a kept case's report (html | pdf | sarif | json) offline")

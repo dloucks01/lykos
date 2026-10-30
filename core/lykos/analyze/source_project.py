@@ -62,18 +62,26 @@ def _project_root(root: Path) -> Path:
     return cur
 
 
+# The ANALYSIS build for the hypothesis loop (lykos hunt): what symbolic execution walks. No
+# sanitizer (its instrumentation multiplies the paths angr must explore) and -O0 so DWARF maps every
+# store to its line and every local to its stack slot; the sanitizer build above is its validator.
+_PLAIN_FLAGS = ["-g", "-O0", "-fno-omit-frame-pointer", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+                "-D_GNU_SOURCE", "-w", "-Wno-error=implicit-function-declaration",
+                "-Wno-error=implicit-int", "-Wno-error=int-conversion"]
+
+
 def _which_cc():
     return (shutil.which("gcc") or shutil.which("clang"),
             shutil.which("g++") or shutil.which("clang++"))
 
 
-def _write_wrappers(bindir: Path):
+def _write_wrappers(bindir: Path, flag_list=None):
     """A cc/c++ wrapper pair that appends `_SAN_FLAGS` to the real compiler. Putting them on PATH as
     `cc`/`gcc`/`clang` (and the C++ names) forces instrumentation through make/cmake/configure."""
     cc, cxx = _which_cc()
     if not cc or not cxx:
         return None
-    flags = " ".join(_SAN_FLAGS)
+    flags = " ".join(_SAN_FLAGS if flag_list is None else flag_list)
     for names, real in ((("cc", "gcc", "clang"), cc), (("c++", "g++", "clang++"), cxx)):
         body = f'#!/bin/sh\nexec "{real}" {flags} "$@"\n'
         for n in names:
@@ -242,7 +250,8 @@ def _run_group(argv, *, cwd, env, timeout: float):
     return proc.returncode, text
 
 
-def build_source_project(root, *, timeout: int = 300, total: int | None = None) -> dict:
+def build_source_project(root, *, timeout: int = 300, total: int | None = None,
+                         sanitize: bool = True, opt: str | None = None) -> dict:
     """Build the project rooted at `root` with sanitizers forced in. Returns
     {ok, system, binaries:[Path], primary:Path|None, compiler, log}. `binaries` is largest-first;
     `primary` is the biggest produced executable. `ok` is False (with the build log) when nothing
@@ -255,14 +264,18 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
     import tempfile
     import time
     wrapdir = Path(tempfile.mkdtemp(prefix="lykos-ccwrap-"))
-    _write_wrappers(wrapdir)
+    flag_list = _SAN_FLAGS if sanitize else _PLAIN_FLAGS
+    if opt:              # e.g. "-O0" for a validator build: -O1 can optimise the planted UB away
+        flag_list = [opt if f.startswith("-O") else f for f in flag_list]
+    san_ld = "-fsanitize=address,undefined" if sanitize else ""
+    _write_wrappers(wrapdir, flag_list)
     env = dict(os.environ)
     env["PATH"] = f"{wrapdir}:{env.get('PATH', '')}"
     env["CC"], env["CXX"] = "cc", "c++"                   # the wrappers, resolved via PATH
-    flags = " ".join(_SAN_FLAGS)
+    flags = " ".join(flag_list)
     env["CFLAGS"] = (env.get("CFLAGS", "") + " " + flags).strip()
     env["CXXFLAGS"] = (env.get("CXXFLAGS", "") + " " + flags).strip()
-    env["LDFLAGS"] = (env.get("LDFLAGS", "") + " -fsanitize=address,undefined").strip()
+    env["LDFLAGS"] = (env.get("LDFLAGS", "") + " " + san_ld).strip()
 
     # A DEADLINE FOR THE WHOLE CHAIN, not just per command. `timeout` bounds one command, and the
     # chain is cmake -> autotools -> make -> loose with up to two commands each: a project that
@@ -398,7 +411,7 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None) 
         start_make = time.time()
         argv = ["make", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
                 f"CFLAGS={flags}", f"CXXFLAGS={flags}",
-                "LDFLAGS=-fsanitize=address,undefined"]
+                f"LDFLAGS={san_ld}"]
         rcm, o = _run(argv[:1] + ["-B"] + argv[1:])
         if rcm != 0 and not _elf_executables(root, start_make) \
                 and not _elf_libraries(root, start_make):

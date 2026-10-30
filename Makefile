@@ -4,7 +4,7 @@ PY ?= python3
 CORPUS_BUDGET ?= 600
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle engines repo-tarball test coverage lint typecheck gui ci bundle verify verify-e2e eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
+.PHONY: doctor toolchain-bundle engines repo-tarball test bench-tier0 coverage lint typecheck gui ci bundle verify verify-e2e eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
 
 help:
 	@echo "run the app with ./start (UI) and ./lykos (CLI); build the air-gap package with ./package"
@@ -40,6 +40,11 @@ repo-tarball:
 
 test:
 	$(PY) -m pytest tests/ -q
+
+# The north-star metric (docs/internal/52): validated PoCs at the planted site / known bugs on the
+# Tier-0 corpus, through the same engine + validator `lykos hunt` ships. ~6 min on 8 workers.
+bench-tier0:
+	$(PY) bench/tier0/score_hyp.py --budget $${BUDGET:-120} --jobs $${JOBS:-8}
 
 # Line/branch coverage INCLUDING the capabilities that only exist as subprocesses. Without
 # the sitecustomize shim below, the ptrace helper, the AFL++ batch runner and the angr and
