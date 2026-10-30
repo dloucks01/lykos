@@ -987,7 +987,12 @@ def _finding_html(f: dict) -> str:
         p.append('<div class="evlabel">Proof-of-Concept</div><div class="pocs">')
         for pc in pocs:
             lvl = pc.get("level") or "?"
-            ok = "verified" if pc.get("verified") else "unverified"
+            # doc 58: a PoC's provenance is the honest signal -- a detonation fired the oracle; a
+            # sound construction stands on its reach+trigger argument (no execution needed).
+            prov = pc.get("provenance")
+            ok = ({"detonated": "detonated — oracle fired",
+                   "constructed": "constructed — sound, not run here"}.get(prov)
+                  or ("verified" if pc.get("verified") else "unverified"))
             dl = ""
             if pc.get("bundle_b64"):
                 fn = f'poc-{(pc.get("bundle_sha") or lvl)[:12]}.tar.gz'
@@ -1006,21 +1011,33 @@ def _finding_html(f: dict) -> str:
                     dl += (f' <span class="muted">not embedded — fetch from '
                            f'<span class="mono">{esc(where)}</span> on the analysis server'
                            f'</span>')
+            elif pc.get("input_sha"):
+                # doc 58 lightweight PoC: the payload bytes are the deliverable (no package).
+                dl = (f' <span class="muted mono">payload {esc(pc["input_sha"][:16])}…</span>'
+                      ' <span class="muted">— the few-line repro is below</span>')
             p.append(f'<div class="poc">{_badge(lvl, "#8e4ec6")} '
                      f'<span class="mono">{esc(pc.get("signal") or "")}</span> '
                      f'<span class="muted">{ok}</span>{dl}</div>')
         p.append('</div>')
     # How to reproduce: the concrete recipe a reader re-runs -- the channel, the crashing input
     # hash, and the PoC bundle. Anchored to hashes so it is deterministic.
-    crashes = f.get("crashes", [])
-    repro = crashes[0] if crashes else None
-    if repro:
-        chan = esc(repro.get("input_mode") or "stdin")
-        ish = esc((repro.get("input_sha") or "")[:16])
+    # doc 58: prefer the constructed PoC's own few-line repro (payload + one command) when present.
+    repro_ev = next((e.get("detail") for e in (f.get("evidence") or [])
+                     if isinstance(e, dict) and e.get("channel") == "reproduce"), None)
+    if repro_ev:
+        body = "<br>".join(esc(ln) for ln in repro_ev.strip().splitlines())
         p.append('<div class="evlabel">Reproduction</div>'
-                 f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
-                 f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
-                 'carries the exact bytes and the invocation.</div>')
+                 f'<div class="repro mono">{body}</div>')
+    else:
+        crashes = f.get("crashes", [])
+        repro = crashes[0] if crashes else None
+        if repro:
+            chan = esc(repro.get("input_mode") or "stdin")
+            ish = esc((repro.get("input_sha") or "")[:16])
+            p.append('<div class="evlabel">Reproduction</div>'
+                     f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
+                     f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
+                     'carries the exact bytes and the invocation.</div>')
     # Remediation: every finding ends with what to DO about it -- the report is a fix list, not
     # just an inventory.
     p.append('<div class="evlabel">Remediation</div>'

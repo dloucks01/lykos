@@ -731,6 +731,7 @@ def build_report(
                     "id": p.id, "level": p.level, "verified": p.verified,
                     "signal": p.signal_name, "input_sha": p.input_sha,
                     "bundle_sha": p.bundle_sha, "created_at": _iso(p.created_at),
+                    "provenance": getattr(p, "provenance", None),
                 }
                 if p.bundle_sha:
                     # Where to get it, in every mode. With embedding off the report showed a

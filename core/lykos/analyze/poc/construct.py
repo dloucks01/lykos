@@ -100,11 +100,18 @@ def record_constructed_poc(ctx, target, *, cwe: str, technique: str, level: str,
         observe.absorbed(_log, "constructed PoC finding not filed")
         return None
     try:
-        pid = PocDAO(ctx.conn).insert(target.id, target.case_id, finding_id=fid, level=level,
-                                      verified=detonated, provenance=prov, input_sha=sha,
-                                      signal_name=signal_name)
-        if fid:
-            PocDAO(ctx.conn).set_finding(pid, fid)
+        pd = PocDAO(ctx.conn)
+        # dedup: this stage is reachable from more than one caller (inject + exploit), so guard
+        # against inserting the same constructed PoC twice for one finding.
+        dup = any(getattr(x, "finding_id", None) == fid and getattr(x, "input_sha", None) == sha
+                  and getattr(x, "provenance", None) == prov
+                  for x in pd.list_by_target(target.id))
+        if not dup:
+            pid = pd.insert(target.id, target.case_id, finding_id=fid, level=level,
+                            verified=detonated, provenance=prov, input_sha=sha,
+                            signal_name=signal_name)
+            if fid:
+                pd.set_finding(pid, fid)
     except Exception:                                    # noqa: BLE001
         observe.absorbed(_log, "constructed PoC row not inserted")
     try:
