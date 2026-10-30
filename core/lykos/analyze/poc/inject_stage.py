@@ -186,6 +186,14 @@ def synthesize_injection_stage(ctx) -> dict:
     # of the recovered frame and image. Compute and file it as concrete payload bytes for each
     # CWE-134 site, whether or not this sandbox could run the target (additive: a demonstrated
     # format exploit from build_exploit suppresses it).
+    # CWE-78 command injection: construct + DETONATE (a shell separator + echo-nonce marker).
+    # Different oracle from the memory-corruption classes; additive and best-effort.
+    try:
+        from . import cmdi_construct
+        cmdi_construct.construct_command_injections(ctx, target)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "command-injection construct skipped")
+
     if "format-string" in applicable:
         fmt_ok = any(c.get("cwe") == "CWE-134" for c in confirmed)
         from . import fmt_recipe

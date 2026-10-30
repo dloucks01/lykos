@@ -120,6 +120,26 @@ def _reaches(exe, payload, vaddr, input_mode, argv, timeout) -> bool:
     return reached
 
 
+def runs_injected_command(exe: str, payload: bytes, marker: bytes, *, input_mode: str = "stdin",
+                          argv=None, timeout: float = 6.0) -> bool:
+    """CWE-78 oracle: True if delivering `payload` makes the injected marker command RUN -- i.e.
+    `marker` appears in the target's output. The payload injects `echo <marker>`; its appearance is
+    proof of arbitrary command execution (sound when paired with a benign negative control)."""
+    import subprocess
+    try:
+        if input_mode == "stdin":
+            r = subprocess.run([exe] + [str(a) for a in (argv or [])], input=payload,
+                               capture_output=True, timeout=timeout)
+        elif input_mode == "arg":
+            r = subprocess.run([exe] + [str(a) for a in (argv or [])] + [payload.decode("latin1")],
+                               capture_output=True, timeout=timeout)
+        else:
+            return False
+        return marker in ((r.stdout or b"") + (r.stderr or b""))
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
 def probe_fmt_offset(exe: str, *, input_mode: str = "stdin", argv=None, timeout: float = 6.0):
     """Recover the printf-varargs arg offset of a format-string sink by delivering the %p probe and
     scanning the output -- the dynamic fallback when the static frame recovery can't place the
