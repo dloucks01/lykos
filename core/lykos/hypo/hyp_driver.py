@@ -111,7 +111,7 @@ CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-7
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
        "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
        "uninit-read": "CWE-457", "mem-leak": "CWE-401", "resource-exhaustion": "CWE-400",
-       "toctou": "CWE-367", "type-confusion": "CWE-843",
+       "toctou": "CWE-367", "type-confusion": "CWE-843", "auth-bypass": "CWE-287",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -956,6 +956,8 @@ class Driver:
                     self._propose_loops(f)
                 if self.spec.get("typeconf"):
                     self._propose_icalls(f)
+                if self.spec.get("auth"):
+                    self._propose_auth(f)
             if self.spec.get("uninit"):
                 self._propose_uninit(f)
         # TOCTOU (CWE-367): a filename check anywhere plus an input-controlled open is the signal.
@@ -1015,6 +1017,41 @@ class Driver:
             ea = ea + disp
             return s.memory.load(ea, size, endness=s.arch.memory_endness)
         return None
+
+    def _propose_auth(self, f):
+        """Blocks that reference the configured 'authenticated' marker string (CWE-287/863). The
+        marker is the privileged path; the driver solves an input that reaches it. The validator
+        re-runs with a FRESHLY RANDOMISED secret -- a legitimate credential could not grant under
+        it, so a grant there proves a real bypass. The driver cannot tell a backdoor from the real
+        password, so the secret-swap is the gate."""
+        import capstone
+        marker = (self.spec.get("auth_marker") or "LYKOS_AUTH_OK").encode()
+        if not hasattr(self, "_auth_addr"):
+            try:
+                hits = list(self.p.loader.memory.find(marker))
+            except Exception:
+                hits = []
+            self._auth_addr = hits[0] if hits else -1
+        if self._auth_addr < 0:
+            return
+        self.auth_sites = getattr(self, "auth_sites", set())
+        for blk_node in f.blocks:
+            try:
+                insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
+            except Exception:
+                continue
+            for i in insns:
+                hit = False
+                for op in i.insn.operands:
+                    if op.type == capstone.x86.X86_OP_IMM and op.imm == self._auth_addr:
+                        hit = True
+                    elif op.type == capstone.x86.X86_OP_MEM and op.mem.base and \
+                            i.insn.reg_name(op.mem.base) == "rip" and \
+                            i.address + i.size + op.mem.disp == self._auth_addr:
+                        hit = True
+                if hit and i.address not in self.auth_sites:
+                    self.auth_sites.add(i.address)
+                    self._add_hyp("auth-bypass", i.address, blk_node.addr, f)
 
     ICALL_CAP = 16
 
@@ -1272,6 +1309,9 @@ class Driver:
             kw["stdin"] = angr.SimFileStream(name="stdin", content=self.inp, has_end=True)
         else:   # arg
             args = [prog] + _place(base, self.inp)
+        env = self.spec.get("env")       # e.g. a sentinel LYKOS_SECRET for the auth-bypass class
+        if env:
+            kw["env"] = {str(k): str(v) for k, v in env.items()}
         st = self.p.factory.full_init_state(args=args, add_options=opts,
                                             remove_options={angr.options.LAZY_SOLVES}, **kw)
         # arg mode: the argument ends at its first NUL (solve() cuts there), so its length is
@@ -1318,6 +1358,8 @@ class Driver:
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_loop)
         for addr in getattr(self, "icalls", set()):
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_icall)
+        for addr in getattr(self, "auth_sites", set()):
+            st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_auth)
         return st
 
     # ------------------------------------------------------------------ DWARF stack objects
@@ -2307,6 +2349,41 @@ class Driver:
             self.violation(s, "uninit-read", ins,
                            f"frame local ({h.get('note') or 'local'}) is read before any store "
                            f"reaches it on this path", extra=[])
+        except Deadline:
+            raise
+        except Exception:
+            pass
+
+    def _on_auth(self, s):
+        """At a reference to the authenticated marker: solve reaching inputs. Several paths reach
+        the grant; the validator's secret-swap confirms the one(s) that grant without the secret
+        (CWE-287/863)."""
+        try:
+            ins = s.scratch.ins_addr
+            h = self.hyps.get(f"auth-bypass@{ins:#x}")
+            if h is None or len(h["solutions"]) >= 3:
+                return
+            h["reached"] += 1
+            if h["status"] == "proposed":
+                h["status"] = "reached"
+            # Prefer a DEGENERATE credential (empty / all-zero input): if the grant path is still
+            # satisfiable with the first input byte a line terminator or NUL, the grant does not
+            # depend on the secret's value -- the canonical bypass. A legitimate equality check
+            # pins the input to the secret, so this is unsatisfiable there and we fall back to a
+            # plain solve (which the validator's secret-swap then rejects).
+            why = ("the authenticated path grants with a degenerate credential, independent of the "
+                   "secret; the validator re-runs with a randomised secret to confirm")
+            try:
+                b0 = self.inp.get_byte(0)
+                for term in (0x0a, 0x00, 0x0d):
+                    if s.solver.satisfiable(extra_constraints=[b0 == term]):
+                        self.violation(s, "auth-bypass", ins, why, extra=[b0 == term])
+                        return
+            except Exception:
+                pass
+            self.violation(s, "auth-bypass", ins,
+                           "the authenticated path is reached; the validator re-runs with a "
+                           "randomised secret to confirm the grant does not depend on it", extra=[])
         except Deadline:
             raise
         except Exception:

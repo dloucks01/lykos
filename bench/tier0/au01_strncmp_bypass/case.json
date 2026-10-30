@@ -1,0 +1,22 @@
+{
+  "id": "au01_strncmp_bypass",
+  "summary": "login: strncmp(token, secret, strlen(token)) accepts an empty token as matching any secret -- authentication bypass (CWE-287)",
+  "class": "auth",
+  "difficulty": "medium",
+  "invocation": { "argv": [], "input_mode": "stdin" },
+  "cflags": ["-O0", "-g", "-fno-stack-protector", "-no-pie"],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-287",
+      "kind": "auth-bypass",
+      "line": 18,
+      "function": "main",
+      "oracle": "auth",
+      "note": "empty token -> strncmp length 0 -> matches any secret; grants LYKOS_AUTH_OK",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

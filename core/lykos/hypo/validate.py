@@ -31,6 +31,7 @@ from .model import Hypothesis, Verdict
 
 REPLAYS = 3
 RESOURCE_TIMEOUT = 6.0        # a correctly-bounded program finishes well under this
+AUTH_MARKER_ENV = b"LYKOS_AUTH_OK"    # the privileged-path marker the auth-bypass oracle looks for
 SAN_ENV = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:symbolize=1:allocator_may_return_null=1",
            "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:abort_on_error=1"}
 MSAN_ENV = {"MSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:print_stats=0:exitcode=99"}
@@ -376,6 +377,34 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
         if agree == REPLAYS:
             return Verdict(True, "msan", last, hyp.line, agree), None
         return Verdict(False, "msan", last or "", None, agree), incidental
+
+    if hyp.kind == "auth-bypass":
+        # secret-swap oracle: re-run with a freshly randomised secret the solver never saw. A
+        # legitimate credential could not grant under it, so the authenticated marker appearing
+        # proves the grant does not depend on knowing the secret -- a real bypass (CWE-287/863).
+        import secrets
+        s2 = secrets.token_hex(24)
+        marker = (AUTH_MARKER_ENV or b"LYKOS_AUTH_OK")
+        granted = control = 0
+        for _ in range(REPLAYS):
+            r = replay(target, target.exe, data, env={"LYKOS_SECRET": s2})
+            if marker in r.stdout or marker in r.stderr:
+                granted += 1
+        # a wrong credential must NOT grant, or the marker is meaningless on this target
+        for _ in range(REPLAYS):
+            rc = replay(target, target.exe, b"lykos-wrong-" + s2.encode()[:8] + b"\n",
+                        env={"LYKOS_SECRET": s2})
+            if marker in rc.stdout or marker in rc.stderr:
+                control += 1
+        if granted == REPLAYS and control == 0:
+            return Verdict(True, "auth-secret-swap", "granted access under a freshly randomised "
+                           "secret the input cannot match (a legitimate credential could not)",
+                           hyp.line), None
+        if control == REPLAYS:
+            return Verdict(False, "auth-secret-swap",
+                           "the marker also appears for a wrong credential: not a usable oracle"), None
+        return Verdict(False, "auth-secret-swap", f"did not grant under a randomised secret "
+                       f"({granted}/{REPLAYS}): legitimate-credential path"), None
 
     if hyp.kind == "type-confusion":
         # UBSan's vptr check (in the address,undefined build) reports a bad downcast exactly where

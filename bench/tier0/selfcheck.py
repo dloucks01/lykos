@@ -237,6 +237,25 @@ def toctou_win(binary, case, tries=150):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def auth_granted(binary, case, data, workdir, secret):
+    """True if the program prints the authenticated marker for `data` under LYKOS_SECRET=secret."""
+    inv = case["invocation"]
+    mode = inv["input_mode"]
+    env = {**ENV, "LYKOS_SECRET": secret}
+    if mode == "arg":
+        argv = [binary] + [data.decode("latin-1") if a == "@@" else a for a in inv["argv"]]
+        stdin = b""
+    else:
+        argv = [binary] + [a for a in inv["argv"] if a != "@@"]
+        stdin = data if mode == "stdin" else b""
+    try:
+        p = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           cwd=workdir, env=env, timeout=TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return b"LYKOS_AUTH_OK" in (p.stdout or b"")
+
+
 def unintended(execs, case, binary):
     allowed = SHELLS | set(case.get("intended_exec", [])) | {os.path.basename(binary)}
     return [e for e in execs if os.path.basename(e) not in allowed]
@@ -281,10 +300,21 @@ def check_clean(label, binary, case, data, workdir, expect_rc=None):
         won, why = toctou_win(binary.replace("prog_asan", "prog"), case)
         if won:
             problems.append("TOCTOU race won: " + why)
+    if case.get("class") == "auth":
+        import secrets as _secrets
+        if auth_granted(binary.replace("prog_asan", "prog"), case, data, workdir,
+                        _secrets.token_hex(24)):
+            problems.append("granted under a randomised secret")
     return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
 
 
 def check_bug(binary, case, bug, data, workdir):
+    if bug["oracle"] == "auth":
+        import secrets as _secrets
+        s2 = _secrets.token_hex(24)
+        if auth_granted(binary.replace("prog_asan", "prog"), case, data, workdir, s2):
+            return True, "granted under a randomised secret the input cannot match"
+        return False, "not granted under a randomised secret"
     if bug["oracle"] == "toctou":
         won, why = toctou_win(binary.replace("prog_asan", "prog"), case)
         return (True, "won race: " + why) if won else (False, "no race: " + why)

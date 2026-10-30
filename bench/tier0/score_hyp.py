@@ -65,6 +65,10 @@ def score_case(cid, bindir, budget, keep=None):
         extra.setdefault("toctou", True)
     if case["class"] == "type-confusion":        # vtable-call proposing is gated; on for its corpus
         extra.setdefault("typeconf", True)
+    if case["class"] == "auth":                  # marker-reference proposing is gated; on for its corpus
+        extra.setdefault("auth", True)
+        extra.setdefault("auth_marker", "LYKOS_AUTH_OK")
+        extra.setdefault("env", {"LYKOS_SECRET": "A" * 32})
     t0 = time.time()
     out = engine.run_driver(prog, argv=inv["argv"], input_mode=inv["input_mode"], budget=budget,
                             input_size=max(300, min(4096, 2 * seed_len)), mem_mb=8192,

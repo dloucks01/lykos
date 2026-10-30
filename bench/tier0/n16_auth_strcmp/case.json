@@ -1,0 +1,11 @@
+{
+  "id": "n16_auth_strcmp",
+  "summary": "login that compares the whole token with strcmp: empty/partial tokens are rejected",
+  "class": "auth",
+  "difficulty": "medium",
+  "invocation": { "argv": [], "input_mode": "stdin" },
+  "cflags": ["-O0", "-g", "-fno-stack-protector", "-no-pie"],
+  "seed_exit": 1,
+  "bugs": [],
+  "intended_exec": []
+}
