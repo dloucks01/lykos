@@ -457,7 +457,7 @@ class Driver:
         blob = st.memory.load(src, M, inspect=False)
         B = [blob.get_byte(t) for t in range(M)]
         WS = [claripy.BVV(c, 8) for c in self.SCANF_WS]
-        FAN = int(self.spec.get("scanf_pos_fanout", 64))
+        FAN = int(self.spec.get("scanf_pos_fanout", 8))
 
         def is_ws(b):
             return claripy.Or(*[b == w for w in WS])
@@ -504,12 +504,15 @@ class Driver:
         argi = va_start
         consumed_any = False
 
-        def skip_ws(pos, ok, maxw=8):
+        skipped = [False]          # the previous directive already skipped whitespace
+
+        def skip_ws(pos, ok, maxw=2):
             """C: a whitespace directive (and most conversions) skip ANY run of whitespace. Runs
-            are bounded at maxw (longer runs are excluded from the success branch)."""
-            if all(len(pos.vals) == 1 and pos.vals[0] + t < M and not st.solver.symbolic(B[pos.vals[0] + t])
-                   and st.solver.eval(B[pos.vals[0] + t]) not in self.SCANF_WS for t in range(1)):
-                return pos, ok            # concrete non-whitespace next: nothing to skip
+            are bounded at maxw (longer runs are excluded from the success branch); a skip right
+            after a skip is a no-op."""
+            if skipped[0]:
+                return pos, ok
+            skipped[0] = True
             n = claripy.BVS("scanf_ws", W32)
             st.add_constraints(claripy.ULE(n, maxw))
             conds = []
@@ -528,6 +531,7 @@ class Driver:
                 k += 1
                 continue
             if c != b"%" or f[k + 1:k + 2] == b"%":
+                skipped[0] = False
                 lit = b"%" if c == b"%" else c
                 ok = claripy.And(ok, pos.at(0) == lit[0])
                 pos = Pos(pos.ast + 1)
@@ -554,6 +558,7 @@ class Driver:
                     st.memory.store(dst, pos.ast, endness=st.arch.memory_endness, condition=ok)
                 continue
             if conv == b"c":
+                skipped[0] = False
                 n = width or 1
                 cond = claripy.And(*[pos.at(t) != 0 for t in range(n)])
                 ok = claripy.And(ok, cond)
@@ -591,6 +596,7 @@ class Driver:
                     st.memory.store(dst, data, size=size, condition=ok)
                     count = count + claripy.If(ok, claripy.BVV(1, W32), claripy.BVV(0, W32))
                 pos = Pos(pos.ast + L)
+                skipped[0] = False
                 consumed_any = True
                 continue
             if conv in self.SCANF_INT:
@@ -633,6 +639,7 @@ class Driver:
                     st.memory.store(dst, val[nbits - 1:0], endness=st.arch.memory_endness, condition=ok)
                     count = count + claripy.If(ok, claripy.BVV(1, W32), claripy.BVV(0, W32))
                 pos = Pos(p1.ast + D)
+                skipped[0] = False
                 continue
             # %[ / floats / anything else: fall back to angr's model
             from angr.procedures.libc.sscanf import sscanf as _ss
@@ -842,7 +849,14 @@ class Driver:
                 return self._eval(memory, addr, self._k, **kw)
 
         st.memory.read_strategies = [_Few(int(self.spec.get("read_fanout", 2)))]
-        st.memory.write_strategies = [_Few(1)]
+        # Writes: angr's own policy -- a symbolic store when the address spans <= 32 values, else
+        # pin it to the MAXIMUM. An arbitrary single value (the earlier _Few(1)) pinned
+        # `s[strcspn(s, "\r\n")] = 0` to whatever the solver liked -- often 0, emptying the line
+        # and killing every path that needed its prefix. The max keeps the longest line.
+        from angr.concretization_strategies import (SimConcretizationStrategyMax,
+                                                    SimConcretizationStrategyRange)
+        st.memory.write_strategies = [SimConcretizationStrategyRange(32),
+                                      SimConcretizationStrategyMax()]
         st.inspect.b("mem_write", when=angr.BP_BEFORE, action=self._on_write)
         st.inspect.b("mem_read", when=angr.BP_BEFORE, action=self._on_read)
         return st
