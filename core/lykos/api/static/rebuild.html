@@ -264,6 +264,17 @@
   .ev-lbl { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--accent-tx); margin-bottom:7px; font-weight:600; }
   .ev-txt { font-size:13px; color:var(--tx); white-space:pre-wrap; line-height:1.65; }
 
+  /* related findings (dedup) */
+  .row-rel { color:var(--tx3); }
+  .rel-note { font-size:12.5px; margin-bottom:10px; }
+  .rel { border:1px solid var(--border); border-radius:var(--r); overflow:hidden; }
+  .rel-i { display:grid; grid-template-columns:70px 1fr 100px 110px; gap:12px; padding:8px 14px;
+           border-top:1px solid var(--border); font-size:12.5px; align-items:baseline; }
+  .rel-i:first-child { border-top:none; }
+  .rel-cwe { color:var(--tx2); font-weight:600; } .rel-t { color:var(--tx); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rel-st { font-size:11px; } .rel-st.st-poc-backed { color:var(--green); } .rel-st.st-confirmed { color:var(--blue); }
+  .rel-st.st-corroborated { color:var(--yellow); } .rel-st.st-candidate { color:var(--tx3); }
+  .rel-d { font-family:var(--mono); font-size:11px; text-align:right; }
   /* meta footer */
   .meta { margin-top:36px; padding-top:16px; border-top:1px solid var(--border);
           display:flex; gap:20px; flex-wrap:wrap; font-size:11.5px; color:var(--tx3); }

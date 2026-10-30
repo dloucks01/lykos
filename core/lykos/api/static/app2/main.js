@@ -18,7 +18,34 @@ function bestPoc(pocs, fid) {
   return m.slice().sort((a, b) => r(b) - r(a))[0];
 }
 
-function Row({ f, pocs, sel, onClick }) {
+const LVL = { L3: 3, L2: 2, L1: 1 };
+// Rank a finding for "which is the representative of its cluster": a real PoC first (level),
+// then state, then severity.
+function findingScore(f, pocs) {
+  const p = bestPoc(pocs, f.id);
+  const lvl = p && p.input_sha ? (LVL[String(p.level).replace(/^L?/, "L")] || 0) : 0;
+  const det = p && (p.provenance === "detonated" || p.verified) ? 1 : 0;
+  return [lvl, det, 3 - (STATE_RANK[f.state] ?? 9), 4 - (SEV_RANK[f.severity] ?? 9)];
+}
+// Cluster key: findings in the same FUNCTION are one issue; siteless ones cluster by CWE+title
+// shape (addresses stripped) so identical crashes/leaks collapse. Grouping only — nothing is hidden.
+function clusterKey(f) {
+  if (f.function_addr) return "fn:" + f.function_addr;
+  const t = (f.title || f.detector || "").replace(/0x[0-9a-fA-F]+/g, "").replace(/\s+/g, " ").trim().slice(0, 48);
+  return "t:" + (f.cwe || "") + ":" + t;
+}
+function cluster(findings, pocs) {
+  const groups = new Map();
+  for (const f of findings) {
+    const k = clusterKey(f);
+    (groups.get(k) || groups.set(k, []).get(k)).push(f);
+  }
+  const cmp = (a, b) => { const x = findingScore(a, pocs), y = findingScore(b, pocs);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0; };
+  return [...groups.values()].map((g) => { g.sort(cmp); return { rep: g[0], members: g.slice(1) }; });
+}
+
+function Row({ f, pocs, sel, onClick, members = 0 }) {
   const p = bestPoc(pocs, f.id);
   const det = p && (p.provenance === "detonated" || p.verified);
   const hasPoc = p && p.input_sha;
@@ -30,6 +57,8 @@ function Row({ f, pocs, sel, onClick }) {
         <span class="row-cwe">${f.cwe || ""}</span>
         <span class="row-sep">·</span>
         <span class=${"row-state st-" + (f.state || "candidate")}>${f.state || "candidate"}</span>
+        ${members ? html`<span class="row-sep">·</span>
+          <span class="row-rel" title=${members + " related finding(s) merged into this issue"}>+${members} related</span>` : null}
       </div>
     </div>
     ${hasPoc
@@ -43,16 +72,21 @@ function App() {
   const [, force] = useState(0);
   useEffect(() => { const u = subscribe(() => force((n) => n + 1)); loadCases(); return u; }, []);
   const s = store;
-  const findings = s.findings.slice().sort((a, b) =>
-    (STATE_RANK[a.state] ?? 9) - (STATE_RANK[b.state] ?? 9) ||
-    (SEV_RANK[a.severity] ?? 9) - (SEV_RANK[b.severity] ?? 9));
+  const findings = s.findings;
+  // cluster into issues, rank clusters by their representative
+  const clusters = cluster(findings, s.pocs).sort((a, b) => {
+    const x = findingScore(a.rep, s.pocs), y = findingScore(b.rep, s.pocs);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return y[i] - x[i]; return 0;
+  });
   const f = s.filter;
   const match = (x) => f === "all" ? true
     : f === "poc" ? !!(bestPoc(s.pocs, x.id) && bestPoc(s.pocs, x.id).input_sha)
     : f === "confirmed" ? (x.state === "confirmed" || x.state === "poc-backed")
     : x.state === f;
-  const shown = findings.filter(match);
-  const sel = findings.find((x) => x.id === s.selectedId);
+  const shown = clusters.filter((c) => match(c.rep));
+  const selC = clusters.find((c) => c.rep.id === s.selectedId)
+    || clusters.find((c) => c.members.some((m) => m.id === s.selectedId));
+  const sel = selC ? selC.rep : null;
   const confirmed = findings.filter((x) => x.state === "poc-backed" || x.state === "confirmed").length;
   const withPoc = findings.filter((x) => bestPoc(s.pocs, x.id) && bestPoc(s.pocs, x.id).input_sha).length;
   return html`<div class="wb">
@@ -75,15 +109,15 @@ function App() {
       <aside class="list">
         <div class="filters">${FILTERS.map(([k, l]) =>
           html`<button class=${"fb" + (f === k ? " on" : "")} onClick=${() => setFilter(k)}>${l}</button>`)}</div>
-        <div class="list-sum"><b>${shown.length}</b>/${findings.length} findings · ${confirmed} confirmed · ${withPoc} with PoC</div>
+        <div class="list-sum"><b>${shown.length}</b> issues · ${findings.length} findings · ${confirmed} confirmed · ${withPoc} with PoC</div>
         <div class="rows">${s.loading ? html`<div class="pane-pad muted">loading…</div>`
-          : shown.length ? shown.map((x) => html`<${Row} f=${x} pocs=${s.pocs}
-              sel=${sel && x.id === sel.id} onClick=${() => selectFinding(x.id)} />`)
+          : shown.length ? shown.map((c) => html`<${Row} f=${c.rep} pocs=${s.pocs} members=${c.members.length}
+              sel=${sel && c.rep.id === sel.id} onClick=${() => selectFinding(c.rep.id)} />`)
           : html`<div class="pane-pad muted">no findings match</div>`}</div>
       </aside>
       <section class="pane">
         ${s.view === "finding" && sel
-          ? html`<${DetailPane} finding=${sel} pocs=${s.pocs} advice=${s.advice} />`
+          ? html`<${DetailPane} finding=${sel} pocs=${s.pocs} advice=${s.advice} related=${selC ? selC.members : []} />`
           : html`<${BinaryOverview} target=${s.target} advice=${s.advice} findings=${findings} pocs=${s.pocs} />`}
       </section>
     </div>

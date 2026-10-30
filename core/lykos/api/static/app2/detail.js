@@ -157,7 +157,19 @@ function AttackFlow({ finding, advice, pocs }) {
   </div>`;
 }
 
-export function DetailPane({ finding, pocs, advice }) {
+function Related({ related }) {
+  if (!related || !related.length) return null;
+  return html`<div class="sect"><div class="sect-h">Related findings · ${related.length}</div>
+    <div class="rel-note muted">Other detectors' views of this same issue (same function / shape), merged here:</div>
+    <div class="rel">${related.map((r) => html`<div class="rel-i">
+      <span class=${"rel-cwe"}>${r.cwe || ""}</span>
+      <span class="rel-t">${r.title || r.detector}</span>
+      <span class=${"rel-st st-" + (r.state || "candidate")}>${r.state || "candidate"}</span>
+      <span class="rel-d muted">${r.detector}</span></div>`)}</div>
+  </div>`;
+}
+
+export function DetailPane({ finding, pocs, advice, related }) {
   const [fn, setFn] = useState(null);
   const faddr = finding && finding.function_addr;
   useEffect(() => {
@@ -213,6 +225,8 @@ export function DetailPane({ finding, pocs, advice }) {
       <${XRefs} callers=${fn.callers} callees=${fn.callees} /></div>` : null}
 
     <${Evidence} finding=${finding} />
+
+    <${Related} related=${related} />
 
     <div class="meta">
       <span>detector <b>${finding.detector}</b></span>
