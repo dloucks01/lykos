@@ -143,6 +143,33 @@ def run(binary, case, data, workdir, strace=False, extra_env=None):
     return p.returncode, p.stderr.decode("utf-8", "replace"), execs, opens
 
 
+def run_timed(binary, case, data, workdir, timeout):
+    """True if `binary` does NOT exit within `timeout` seconds on this input (a hang)."""
+    import signal as _sig
+    inv = case["invocation"]
+    mode = inv["input_mode"]
+    inp = os.path.join(workdir, "rinput.bin")
+    with open(inp, "wb") as fh:
+        fh.write(data)
+    argv = [binary]
+    for a in inv["argv"]:
+        argv.append((inp if mode == "file" else data) if a == "@@" else a)
+    stdin = open(inp, "rb") if mode == "stdin" else subprocess.DEVNULL
+    try:
+        p = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, cwd=workdir, env=ENV, start_new_session=True)
+        try:
+            p.wait(timeout=timeout)
+            return False
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(p.pid), _sig.SIGKILL)
+            p.wait()
+            return True
+    finally:
+        if hasattr(stdin, "close"):
+            stdin.close()
+
+
 def unintended(execs, case, binary):
     allowed = SHELLS | set(case.get("intended_exec", [])) | {os.path.basename(binary)}
     return [e for e in execs if os.path.basename(e) not in allowed]
@@ -180,10 +207,18 @@ def check_clean(label, binary, case, data, workdir, expect_rc=None):
         lk = parse_lsan(lerr)
         if lk:
             problems.append("LSan leak at prog.c:%d" % lk[0][1])
+    if case.get("class") == "resource":
+        if run_timed(binary.replace("prog_asan", "prog"), case, data, workdir, 4):
+            problems.append("did not terminate within 4s")
     return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
 
 
 def check_bug(binary, case, bug, data, workdir):
+    if bug["oracle"] == "timeout":
+        pbin = binary.replace("prog_asan", "prog")
+        if run_timed(pbin, case, data, workdir, 6):
+            return True, "did not terminate within 6s"
+        return False, "terminated within 6s"
     if bug["oracle"] == "lsan":
         _, lerr, _, _ = run(binary, case, data, workdir, extra_env=LSAN_ENV)
         lines = [ln for _f, ln in parse_lsan(lerr)]

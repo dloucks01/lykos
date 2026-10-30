@@ -106,7 +106,7 @@ CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-7
        "stack-read": "CWE-125", "heap-read": "CWE-125", "global-read": "CWE-125",
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
        "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
-       "uninit-read": "CWE-457", "mem-leak": "CWE-401",
+       "uninit-read": "CWE-457", "mem-leak": "CWE-401", "resource-exhaustion": "CWE-400",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -942,6 +942,8 @@ class Driver:
             self._propose_stores(f)
             if self.x86:
                 self._propose_divs(f)
+                if self.spec.get("resource"):
+                    self._propose_loops(f)
             if self.spec.get("uninit"):
                 self._propose_uninit(f)
         self.call_sites = {h["site"]: h for h in self.hyps.values() if h["callee"]}
@@ -961,17 +963,81 @@ class Driver:
             for i in insns:
                 if i.mnemonic not in ("div", "idiv"):
                     continue
-                o = i.insn.operands[0]
-                if o.type == capstone.x86.X86_OP_REG:
-                    desc = ("reg", i.insn.reg_name(o.reg), o.size)
-                elif o.type == capstone.x86.X86_OP_MEM:
-                    m = o.mem
-                    desc = ("mem", i.insn.reg_name(m.base) if m.base else None,
-                            i.insn.reg_name(m.index) if m.index else None, m.scale, m.disp, o.size)
-                else:
+                desc = self._op_desc(i.insn, i.insn.operands[0])
+                if desc is None or desc[0] == "imm":
                     continue
                 self.div_ops[i.address] = desc
                 self._add_hyp("div-zero", i.address, blk_node.addr, f)
+
+    def _op_desc(self, insn, op):
+        """A readable descriptor of a capstone x86 operand: ('reg',name,size) | ('mem',base,index,
+        scale,disp,size) | ('imm',value). None for anything else."""
+        import capstone
+        if op.type == capstone.x86.X86_OP_REG:
+            return ("reg", insn.reg_name(op.reg), op.size)
+        if op.type == capstone.x86.X86_OP_MEM:
+            m = op.mem
+            return ("mem", insn.reg_name(m.base) if m.base else None,
+                    insn.reg_name(m.index) if m.index else None, m.scale, m.disp, op.size)
+        if op.type == capstone.x86.X86_OP_IMM:
+            return ("imm", op.imm)
+        return None
+
+    def _oper_value(self, s, desc):
+        """The live value of an operand descriptor as an AST, or None for an immediate."""
+        claripy = self.claripy
+        if desc[0] == "reg":
+            return getattr(s.regs, desc[1])
+        if desc[0] == "mem":
+            _, base, index, scale, disp, size = desc
+            ea = claripy.BVV(0, self.arch_bits)
+            if base:
+                ea = ea + getattr(s.regs, base)
+            if index:
+                ea = ea + getattr(s.regs, index) * scale
+            ea = ea + disp
+            return s.memory.load(ea, size, endness=s.arch.memory_endness)
+        return None
+
+    LOOP_CAP = 24
+    LOOP_THRESHOLD = 1 << 24          # an input-controlled bound at least this large can exhaust
+
+    def _propose_loops(self, f):
+        """Comparison sites inside loops (CWE-400/835): if a compare operand is an input-derived
+        value with no small upper bound, the loop's trip count is attacker-controlled and can be
+        driven to run essentially forever. The validator replays and confirms non-termination."""
+        import capstone  # noqa: F401
+        try:
+            import networkx as nx
+            loop_blocks = set()
+            for comp in nx.strongly_connected_components(f.graph):
+                if len(comp) > 1:
+                    loop_blocks |= {n.addr for n in comp}
+                else:
+                    n = next(iter(comp))
+                    if f.graph.has_edge(n, n):
+                        loop_blocks.add(n.addr)
+        except Exception:
+            return
+        self.loop_cmps = getattr(self, "loop_cmps", {})
+        for blk_node in f.blocks:
+            if blk_node.addr not in loop_blocks:
+                continue
+            try:
+                insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
+            except Exception:
+                continue
+            for i in insns:
+                if i.mnemonic not in ("cmp", "test") or len(i.insn.operands) != 2:
+                    continue
+                d0 = self._op_desc(i.insn, i.insn.operands[0])
+                d1 = self._op_desc(i.insn, i.insn.operands[1])
+                if d0 is None or d1 is None:
+                    continue
+                if len(self.loop_cmps) >= self.LOOP_CAP:
+                    return
+                self.loop_cmps[i.address] = (d0, d1)
+                self._add_hyp("resource-exhaustion", i.address, blk_node.addr, f)
 
     UNINIT_CAP = 32
 
@@ -1207,6 +1273,8 @@ class Driver:
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_div)
         for addr in getattr(self, "uninit_reads", set()):
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_uninit)
+        for addr in getattr(self, "loop_cmps", {}):
+            st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_loop)
         return st
 
     # ------------------------------------------------------------------ DWARF stack objects
@@ -2183,6 +2251,37 @@ class Driver:
             self.violation(s, "uninit-read", ins,
                            f"frame local ({h.get('note') or 'local'}) is read before any store "
                            f"reaches it on this path", extra=[])
+        except Deadline:
+            raise
+        except Exception:
+            pass
+
+    def _on_loop(self, s):
+        """At a loop comparison: if an operand is an input-derived value whose maximum is large,
+        the loop's trip count is attacker-controlled. Solve the input that pins it to that maximum;
+        the validator replays and confirms the program does not terminate (CWE-400/835)."""
+        try:
+            rec = self.loop_cmps.get(s.scratch.ins_addr)
+            if rec is None:
+                return
+            h = self.hyps.get(f"resource-exhaustion@{s.scratch.ins_addr:#x}")
+            if h is None or h["solutions"]:
+                return
+            for desc in rec:
+                val = self._oper_value(s, desc)
+                if val is None or not val.symbolic:
+                    continue
+                if not any(v.startswith("input") for v in val.variables):
+                    continue
+                try:
+                    mx = s.solver.max(val)
+                except self.claripy.errors.ClaripyError:
+                    continue
+                if mx >= self.LOOP_THRESHOLD:
+                    self.violation(s, "resource-exhaustion", s.scratch.ins_addr,
+                                   f"a loop bound is input-controlled and can reach {mx:#x}: the "
+                                   f"loop can be driven to run unboundedly", extra=[val == mx])
+                    return
         except Deadline:
             raise
         except Exception:

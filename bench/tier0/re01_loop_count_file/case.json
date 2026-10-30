@@ -1,0 +1,32 @@
+{
+  "id": "re01_loop_count_file",
+  "summary": "sumcount: a repeat count read from the RUN file header drives an unbounded work loop (resource exhaustion)",
+  "class": "resource",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 0,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-400",
+      "kind": "resource-exhaustion",
+      "line": 24,
+      "function": "main",
+      "oracle": "timeout",
+      "note": "the loop bound `count` is taken from the input with no upper limit",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

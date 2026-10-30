@@ -1,0 +1,21 @@
+{
+  "id": "n13_loop_capped",
+  "summary": "sumcount that clamps the repeat count to a safe maximum: always terminates quickly",
+  "class": "resource",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 0,
+  "bugs": [],
+  "intended_exec": []
+}

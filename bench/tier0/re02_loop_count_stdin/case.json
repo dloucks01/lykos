@@ -1,0 +1,30 @@
+{
+  "id": "re02_loop_count_stdin",
+  "summary": "spincalc: a 4-byte iteration count from stdin drives an unbounded nested compute loop (resource exhaustion)",
+  "class": "resource",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 0,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-400",
+      "kind": "resource-exhaustion",
+      "line": 14,
+      "function": "main",
+      "oracle": "timeout",
+      "note": "the loop bound `n` is read from stdin with no upper limit",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

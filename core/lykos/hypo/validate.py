@@ -30,6 +30,7 @@ from typing import Optional
 from .model import Hypothesis, Verdict
 
 REPLAYS = 3
+RESOURCE_TIMEOUT = 6.0        # a correctly-bounded program finishes well under this
 SAN_ENV = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:symbolize=1:allocator_may_return_null=1",
            "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:abort_on_error=1"}
 MSAN_ENV = {"MSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:print_stats=0:exitcode=99"}
@@ -84,6 +85,7 @@ class Replay:
     stderr: bytes
     fault_pc: Optional[int] = None
     note: str = ""
+    timed_out: bool = False
 
 
 def _program_frame(text: str, start: int, source_root: Optional[Path]):
@@ -169,7 +171,7 @@ def replay(target: Target, exe: Path, data: bytes, *, timeout: float = 10.0,
                         endianness=target.endianness, bits=target.bits, ro_binds=binds,
                         env_overrides=env, capture=1 << 20)
         return Replay(bool(r.crashed), r.signal_name, r.stdout or b"", r.stderr or b"",
-                      r.fault_pc, r.note or "")
+                      r.fault_pc, r.note or "", bool(getattr(r, "timed_out", False)))
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -304,6 +306,19 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
         if agree == REPLAYS:
             return Verdict(True, "msan", last, hyp.line, agree), None
         return Verdict(False, "msan", last or "", None, agree), incidental
+
+    if hyp.kind == "resource-exhaustion":
+        # the proof is non-termination: the plain build, given this input, does not finish within
+        # a generous limit on every replay. A correctly-bounded loop returns well under it, so a
+        # 3/3 timeout is a real denial-of-service symptom at the input-controlled loop.
+        hangs = 0
+        for _ in range(REPLAYS):
+            if replay(target, target.exe, data, timeout=RESOURCE_TIMEOUT).timed_out:
+                hangs += 1
+        if hangs == REPLAYS:
+            return Verdict(True, "timeout", f"did not terminate within {RESOURCE_TIMEOUT:.0f}s on "
+                           f"{REPLAYS}/{REPLAYS} replays (input-controlled loop)", hyp.line, hangs), None
+        return Verdict(False, "timeout", f"terminated within the limit ({hangs}/{REPLAYS} hung)"), None
 
     if hyp.kind == "mem-leak":
         # LeakSanitizer rides on the ASan build (detect_leaks=1). Confirm only when a leaked block

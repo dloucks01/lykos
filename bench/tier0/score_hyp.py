@@ -59,6 +59,8 @@ def score_case(cid, bindir, budget, keep=None):
         extra.setdefault("uninit", True)
     if case["class"] == "memleak":               # leak proposing is gated (noisy); on for its corpus
         extra.setdefault("leak", True)
+    if case["class"] == "resource":              # loop-bound proposing is gated; on for its corpus
+        extra.setdefault("resource", True)
     t0 = time.time()
     out = engine.run_driver(prog, argv=inv["argv"], input_mode=inv["input_mode"], budget=budget,
                             input_size=max(300, min(4096, 2 * seed_len)), mem_mb=8192,
