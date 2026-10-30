@@ -137,7 +137,8 @@ def hypotheses_from(out: dict, binary) -> list:
         hy = Hypothesis(id=h["id"], kind=h["kind"], cwe=h.get("cwe"), site=fileaddr(h.get("site")),
                         func=h.get("func"), func_addr=fileaddr(h.get("func_addr")),
                         func_size=h.get("func_size"), reached=int(h.get("reached") or 0),
-                        note=h.get("note") or "")
+                        note=h.get("note") or "", potential=bool(h.get("potential")),
+                        potential_note=h.get("potential_note") or "")
         for s in h.get("solutions") or []:
             import base64
             hy.solutions.append(Solution(base64.b64decode(s.get("input_b64", "")),

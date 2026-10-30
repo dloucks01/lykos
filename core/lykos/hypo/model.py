@@ -75,6 +75,8 @@ class Hypothesis:
     note: str = ""
     solutions: list = field(default_factory=list)
     exploit: Optional[dict] = None   # Step 4 weaponization result (L2/L3), when climbed
+    potential: bool = False          # CCBSE under-constrained hit: reachable-in-function, unproven
+    potential_note: str = ""
 
     @property
     def line(self) -> Optional[int]:
@@ -103,6 +105,8 @@ class Hypothesis:
             self.status = "unconfirmed"
         elif self.solutions:
             self.status = "solved"
+        elif self.potential:
+            self.status = "potential"       # CCBSE: triggerable in the function, caller unproven
         elif self.reached:
             self.status = "reached"
         else:
@@ -115,6 +119,7 @@ class Hypothesis:
                 "func_addr": f"{self.func_addr:#x}" if isinstance(self.func_addr, int) else None,
                 "func_size": self.func_size, "location": self.location, "status": self.status,
                 "reached": self.reached, "note": self.note, "exploit": self.exploit,
+                "potential": self.potential, "potential_note": self.potential_note,
                 "solutions": [s.to_dict() for s in self.solutions]}
 
     @classmethod
@@ -124,4 +129,5 @@ class Hypothesis:
         return cls(d["id"], d["kind"], d.get("cwe"), _hex(d.get("site")), d.get("func"),
                    _hex(d.get("func_addr")), d.get("func_size"), d.get("location"),
                    d.get("status", "proposed"), int(d.get("reached") or 0), d.get("note") or "",
-                   [Solution.from_dict(s) for s in d.get("solutions") or []], d.get("exploit"))
+                   [Solution.from_dict(s) for s in d.get("solutions") or []], d.get("exploit"),
+                   bool(d.get("potential")), d.get("potential_note") or "")

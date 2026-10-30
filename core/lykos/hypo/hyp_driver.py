@@ -1356,6 +1356,22 @@ class Driver:
             kw["env"] = {str(k): str(v) for k, v in env.items()}
         st = self.p.factory.full_init_state(args=args, add_options=opts,
                                             remove_options={angr.options.LAZY_SOLVES}, **kw)
+        self._configure_state(st, n)
+        return st
+
+    def _func_state(self, func_addr):
+        """An UNDER-CONSTRAINED state entered at a function (symbolic args/memory), for CCBSE: run
+        the oracles from the function itself when forward exploration never reached it."""
+        angr = self.angr
+        opts = {angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY,
+                angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS}
+        st = self.p.factory.call_state(func_addr, add_options=opts,
+                                       remove_options={angr.options.LAZY_SOLVES})
+        self._configure_state(st, int(getattr(self, "inp_len", 0) or self.spec.get("input_size", 512)))
+        return st
+
+    def _configure_state(self, st, n):
+        angr = self.angr
         # arg mode: the argument ends at its first NUL (solve() cuts there), so its length is
         # free. Forcing every byte non-zero pinned it to exactly input_size, which made any
         # length-bounded path (strcpy into a small buffer, a length check) unsatisfiable.
@@ -1402,7 +1418,6 @@ class Driver:
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_icall)
         for addr in getattr(self, "auth_sites", set()):
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_auth)
-        return st
 
     # ------------------------------------------------------------------ DWARF stack objects
     def _dwarf_locals(self):
@@ -1889,6 +1904,21 @@ class Driver:
                  "callee": None, "status": "proposed", "reached": 1, "solutions": [],
                  "note": "found by the access oracle during exploration", "triggered_by": []}
             self.hyps[hid] = h
+        if getattr(self, "uc_mode", False):
+            # CCBSE / under-constrained: we entered mid-program with symbolic args, so there is no
+            # real input to solve. Record the site as POTENTIAL when the violation is satisfiable
+            # here; a real caller must still reproduce it before it can be confirmed (doc 52 §3b).
+            if h["solutions"] or h.get("potential") or h["status"] == "confirmed":
+                return
+            try:
+                if s.solver.satisfiable(extra_constraints=list(extra)):
+                    h["potential"] = True
+                    h["status"] = "potential"
+                    h["potential_note"] = why
+                    self.stats["potentials"] = self.stats.get("potentials", 0) + 1
+            except Exception:
+                pass
+            return
         if len(h["solutions"]) >= 3:
             return
         self.stats["violations"] += 1
@@ -1898,6 +1928,55 @@ class Driver:
             h["solutions"].append(sol)
             h["status"] = "solved"
             self._mark_directing_solved(site)
+
+    def _ccbse(self):
+        """Backward-climb recall (doc 52 §3b). For hypotheses forward exploration never REACHED,
+        run under-constrained SE from the function entry (symbolic args) and mark the site
+        POTENTIAL if the violation is satisfiable there. Potentials are recall, never confirmations
+        -- a real caller/input must still reproduce one, so they go in a separate list and are
+        never validated. Bounded hard: this is UC execution and prone to state blow-up."""
+        deadline = self.t0 + float(self.spec.get("max_seconds", 120))
+        budget = min(float(self.spec.get("ccbse_seconds", 45)), max(0.0, deadline - time.time()))
+        if budget <= 2:
+            return
+        funcs = {}
+        for h in self.hyps.values():
+            if (not h["solutions"] and not h.get("potential") and h["reached"] == 0
+                    and h.get("func_addr") is not None and h.get("block") is not None):
+                funcs.setdefault(h["func_addr"], []).append(h)
+        funcs = dict(list(funcs.items())[:self.CCBSE_FUNC_CAP])
+        self.stats["ccbse_funcs"] = len(funcs)
+        if not funcs:
+            return
+        self.uc_mode = True
+        end = time.time() + budget
+        try:
+            for fa, hs in funcs.items():
+                if time.time() >= end:
+                    break
+                self._ccbse_one(fa, hs, per=max(3.0, (end - time.time()) / max(1, len(funcs))))
+        finally:
+            self.uc_mode = False
+
+    CCBSE_FUNC_CAP = 16
+
+    def _ccbse_one(self, func_addr, hs, per):
+        try:
+            st = self._func_state(func_addr)
+        except Exception:
+            return
+        targets = {h["block"] for h in hs}
+        sm = self.p.factory.simulation_manager(st, resilience=(Exception,))
+        end = time.time() + per
+        steps = 0
+        while sm.active and time.time() < end and steps < 400:
+            sm.step()
+            steps += 1
+            sm.stashes["active"] = sm.active[:8]      # bounded breadth: UC states explode otherwise
+            sm.stashes["unconstrained"] = []
+            sm.stashes["errored"] = []
+            if all(h.get("potential") for h in hs):
+                break
 
     def _mark_directing_solved(self, site):
         changed = False
@@ -2250,7 +2329,10 @@ class Driver:
         width = int(self.spec.get("width", 24))
         max_states = int(self.spec.get("max_states", 2000))
         rss_cap = int(self.spec.get("max_rss_mb", 8192))
-        deadline = self.t0 + float(self.spec.get("max_seconds", 120))
+        # Reserve a slice for the CCBSE backward-climb pass so forward exploration cannot eat the
+        # whole budget and starve it.
+        reserve = float(self.spec.get("ccbse_seconds", 45)) if self.spec.get("ccbse") else 0.0
+        deadline = self.t0 + float(self.spec.get("max_seconds", 120)) - reserve
         sm.stashes.setdefault("deferred", [])
         while time.time() < deadline:
             if not sm.active:
@@ -2567,6 +2649,13 @@ def main(spec_path, out_path):
             drv.explore()
         except Deadline:
             res["stats"]["cutoff"] = True
+        if spec.get("ccbse"):
+            try:
+                drv._ccbse()
+            except Deadline:
+                res["stats"]["cutoff"] = True
+            except Exception:      # noqa: BLE001 - CCBSE is best-effort recall, never fails a run
+                pass
         res["ok"] = True
     except Deadline:
         res["ok"] = bool(drv.hyps)
