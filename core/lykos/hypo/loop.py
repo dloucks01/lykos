@@ -24,6 +24,35 @@ from .weaponize import weaponize
 MIN_ROUND = 30.0
 
 
+def _is_large_static(exe) -> bool:
+    """A big statically-linked ELF (no PT_INTERP): its functions are mostly inlined libc/CRT, so
+    the proposer must scope to the target's own code (CB scoping) or it floods on libc."""
+    try:
+        data = Path(exe).read_bytes()
+    except OSError:
+        return False
+    if data[:4] != b"\x7fELF" or len(data) < 64:
+        return False
+    is64 = data[4] == 2
+    endc = "<" if data[5] == 1 else ">"
+    import struct
+    if is64:
+        e_phoff = struct.unpack_from(endc + "Q", data, 32)[0]
+        e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 54)
+    else:
+        e_phoff = struct.unpack_from(endc + "I", data, 28)[0]
+        e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 42)
+    has_interp = False
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        if off + 4 > len(data):
+            break
+        if struct.unpack_from(endc + "I", data, off)[0] == 3:    # PT_INTERP
+            has_interp = True
+            break
+    return (not has_interp) and len(data) > 400_000
+
+
 def _display(target, hyps):
     """Source locations in the operator's own tree, not the temporary build copy."""
     if not (target.source_root and target.display_root):
@@ -68,6 +97,9 @@ def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
     # uninitialised-memory proposing only earns its cost (extra directing targets) when there is
     # an MSan build to confirm against; otherwise it can never reach `confirmed`.
     base_extra = {"uninit": True} if target.msan_exe else {}
+    if _is_large_static(target.exe):
+        base_extra["cb_scope"] = True
+        log(f"large static binary: scoping proposers to the target's own code")
     out = engine.run_driver(target.exe, argv=target.argv, input_mode=target.mode,
                             budget=max(MIN_ROUND, budget * 0.7), input_size=input_size,
                             mem_mb=mem_mb, extra=dict(base_extra))

@@ -42,6 +42,7 @@ out.json : ok, angr_version, stats, hypotheses:[{id, kind, cwe, site, func, func
 import base64
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -105,6 +106,11 @@ FMT_PAYLOADS = [b"%n%n%n%n", b"%s%s%s%s%s%s", b"%n%n", b"%x%n"]
 # (inside the replay sandbox, where no exec tracer is available).
 CMD_PAYLOADS = [b";id>&2;#", b"|id>&2|", b"$(id>&2)", b"`id>&2`", b"\nid>&2\n", b";id>&2"]
 HIJACK_MARK = {64: 0x4141414141414141, 32: 0x41414141}
+# source paths that are the toolchain/libc, not the target's own code (for CB scoping on static
+# binaries built with -g libc)
+_SYS_SRC = re.compile(r"(?:^|/)(?:sysdeps|glibc[-/]|csu|nptl|malloc|stdio-common|stdlib|libio|"
+                      r"string|wcsmbs|locale|elf|dlfcn|newlib|musl|gcc[-/]|libgcc|crt)/|"
+                      r"^/usr/(?:lib|include)/|libc-start\.|dl-")
 
 CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-787",
        "stack-read": "CWE-125", "heap-read": "CWE-125", "global-read": "CWE-125",
@@ -911,15 +917,51 @@ class Driver:
             return proc.inline_call(_sp, dst, fmt).ret_expr
         return proc.inline_call(_sn, dst, size, fmt).ret_expr
 
+    def _own_functions(self):
+        """Addresses of the TARGET's OWN functions, excluding statically-linked libc/loader code,
+        for scoping proposers on big static binaries (CGC/Tier-1). The signal is DWARF: the
+        program's code resolves to a real `source.c:line`, while libc/CRT resolves to `??:?` or an
+        object-only `malloc.o:?`. Returns None when addr2line is unavailable (propose everywhere)."""
+        import shutil
+        import subprocess
+        exe = shutil.which("addr2line")
+        funcs = [f for f in self.cfg.kb.functions.values()
+                 if not (f.is_plt or f.is_simprocedure or f.is_syscall)
+                 and self.main_obj.contains_addr(f.addr)]
+        if not exe or not funcs:
+            return None
+        delta = self.main_obj.mapped_base - self.main_obj.linked_base
+        try:
+            r = subprocess.run([exe, "-e", self.spec["binary"]]
+                               + [hex(f.addr - delta) for f in funcs],
+                               capture_output=True, text=True, timeout=180, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        own = set()
+        for f, ln in zip(funcs, r.stdout.splitlines()):
+            ln = ln.split(" (discriminator")[0].strip()
+            if not ln or ln.startswith("??") or ln.endswith(":?"):
+                continue                                  # no DWARF line: library/CRT code
+            path = ln.rsplit(":", 1)[0]
+            if path.endswith(".o") or _SYS_SRC.search(path):
+                continue                                  # object-only or system source: not ours
+            own.add(f.addr)
+        return own or None
+
     # ------------------------------------------------------------------ propose
     def propose(self):
         kb = self.cfg.kb
         has_check = False                 # TOCTOU: the program performs a filename check somewhere
         open_sites = []                   # (ins, cs, func, callee) of input-openable sinks
+        own = self._own_functions() if self.spec.get("cb_scope") else None
+        if own is not None:
+            self.stats["own_functions"] = len(own)
         for f in list(kb.functions.values()):
             if f.is_plt or f.is_simprocedure or f.name in BORING_FUNCS or f.is_syscall:
                 continue
             if not self.main_obj.contains_addr(f.addr):
+                continue
+            if own is not None and f.addr not in own:
                 continue
             for cs in f.get_call_sites():
                 tgt = f.get_call_target(cs)
