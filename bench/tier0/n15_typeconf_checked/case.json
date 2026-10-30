@@ -1,0 +1,11 @@
+{
+  "id": "n15_typeconf_checked",
+  "summary": "shapes that downcasts only when the object was created as a Square: no type confusion",
+  "class": "type-confusion",
+  "difficulty": "medium",
+  "invocation": { "argv": ["@@"], "input_mode": "file" },
+  "cflags": ["-O0", "-g", "-fno-stack-protector", "-no-pie"],
+  "seed_exit": 0,
+  "bugs": [],
+  "intended_exec": []
+}

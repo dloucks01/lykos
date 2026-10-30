@@ -63,6 +63,8 @@ def score_case(cid, bindir, budget, keep=None):
         extra.setdefault("resource", True)
     if case["class"] == "toctou":                # check-then-use proposing is gated; on for its corpus
         extra.setdefault("toctou", True)
+    if case["class"] == "type-confusion":        # vtable-call proposing is gated; on for its corpus
+        extra.setdefault("typeconf", True)
     t0 = time.time()
     out = engine.run_driver(prog, argv=inv["argv"], input_mode=inv["input_mode"], budget=budget,
                             input_size=max(300, min(4096, 2 * seed_len)), mem_mb=8192,

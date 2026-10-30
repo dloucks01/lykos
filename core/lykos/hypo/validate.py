@@ -377,6 +377,26 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
             return Verdict(True, "msan", last, hyp.line, agree), None
         return Verdict(False, "msan", last or "", None, agree), incidental
 
+    if hyp.kind == "type-confusion":
+        # UBSan's vptr check (in the address,undefined build) reports a bad downcast exactly where
+        # it happens. The driver's site is the vtable call; the FINDING is attributed to UBSan's
+        # line (precise), on 3/3 replays.
+        if target.asan_exe is None:
+            return Verdict(False, "ubsan-vptr", "no sanitizer build for the vptr check"), None
+        agree, last, line, func = 0, None, None, None
+        for _ in range(REPLAYS):
+            r = replay(target, target.asan_exe, data, env=SAN_ENV)
+            rep = parse_sanitizer(r.stderr.decode("utf-8", "replace"), target.source_root)
+            if not rep or "downcast" not in (rep[0] or ""):
+                last = f"no bad-downcast report ({r.signal or 'clean exit'})"
+                break
+            _kind, func, path, line, _al = rep
+            last = f"{_kind} in {func} at {os.path.basename(path or '?')}:{line}"
+            agree += 1
+        if agree == REPLAYS:
+            return Verdict(True, "ubsan-vptr", last, line, agree), None
+        return Verdict(False, "ubsan-vptr", last or "", None, agree), None
+
     if hyp.kind == "toctou":
         if target.mode not in ("arg", "stdin"):
             return Verdict(False, "toctou-race",

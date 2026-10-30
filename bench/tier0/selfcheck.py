@@ -29,14 +29,15 @@ ENV["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
 ENV["LC_ALL"] = "C"
 MSAN_ENV = {"MSAN_OPTIONS": "halt_on_error=1:abort_on_error=0:print_stats=0:exitcode=99"}
 
+_SRCRE = r"\S*prog\.(?:c|cpp|cc)"
 ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
-UBSAN_ERR = re.compile(r"(\S*prog\.c):(\d+):\d+: runtime error: (.*)$", re.M)
-FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
+UBSAN_ERR = re.compile(r"(" + _SRCRE + r"):(\d+):\d+: runtime error: (.*)$", re.M)
+FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (" + _SRCRE + r"):(\d+)", re.M)
 EXECVE = re.compile(r'execve\("([^"]*)",.*\)\s*=\s*(-?\d+)')
 OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
 TRAVERSAL_TAIL = "etc/passwd"
 MSAN_ERR = re.compile(r"MemorySanitizer: use-of-uninitialized-value", re.M)
-MSAN_FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
+MSAN_FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (" + _SRCRE + r"):(\d+)", re.M)
 LSAN_ERR = re.compile(r"LeakSanitizer: detected memory leaks", re.M)
 LEAK_BLOCK = re.compile(r"(?:Direct|Indirect) leak of .*? allocated from:\n((?:\s*#\d+ .*\n)+)", re.S)
 LSAN_ENV = {"ASAN_OPTIONS": "detect_leaks=1:abort_on_error=0:symbolize=1:allocator_may_return_null=1"}

@@ -111,7 +111,7 @@ CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-7
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
        "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
        "uninit-read": "CWE-457", "mem-leak": "CWE-401", "resource-exhaustion": "CWE-400",
-       "toctou": "CWE-367",
+       "toctou": "CWE-367", "type-confusion": "CWE-843",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -954,6 +954,8 @@ class Driver:
                 self._propose_divs(f)
                 if self.spec.get("resource"):
                     self._propose_loops(f)
+                if self.spec.get("typeconf"):
+                    self._propose_icalls(f)
             if self.spec.get("uninit"):
                 self._propose_uninit(f)
         # TOCTOU (CWE-367): a filename check anywhere plus an input-controlled open is the signal.
@@ -1013,6 +1015,30 @@ class Driver:
             ea = ea + disp
             return s.memory.load(ea, size, endness=s.arch.memory_endness)
         return None
+
+    ICALL_CAP = 16
+
+    def _propose_icalls(self, f):
+        """Indirect call sites (CWE-843): a call through a pointer loaded from memory is typically
+        a C++ virtual dispatch. If the object's dynamic type was confused by a bad downcast, the
+        UBSan vptr check fires when the vtable is used. The driver cannot see the confusion, so it
+        proposes the indirect call and solves reaching inputs; UBSan is the gate."""
+        import capstone
+        self.icalls = getattr(self, "icalls", set())
+        for blk_node in f.blocks:
+            try:
+                insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
+            except Exception:
+                continue
+            for i in insns:
+                if i.mnemonic != "call" or not i.insn.operands:
+                    continue
+                if i.insn.operands[0].type == capstone.x86.X86_OP_IMM:
+                    continue                      # direct call: not a vtable dispatch
+                if len(self.icalls) >= self.ICALL_CAP:
+                    return
+                self.icalls.add(i.address)
+                self._add_hyp("type-confusion", i.address, blk_node.addr, f)
 
     LOOP_CAP = 24
     LOOP_THRESHOLD = 1 << 24          # an input-controlled bound at least this large can exhaust
@@ -1290,6 +1316,8 @@ class Driver:
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_uninit)
         for addr in getattr(self, "loop_cmps", {}):
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_loop)
+        for addr in getattr(self, "icalls", set()):
+            st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_icall)
         return st
 
     # ------------------------------------------------------------------ DWARF stack objects
@@ -2279,6 +2307,26 @@ class Driver:
             self.violation(s, "uninit-read", ins,
                            f"frame local ({h.get('note') or 'local'}) is read before any store "
                            f"reaches it on this path", extra=[])
+        except Deadline:
+            raise
+        except Exception:
+            pass
+
+    def _on_icall(self, s):
+        """At an indirect (vtable) call: solve a reaching input. Several distinct paths reach the
+        call; each yields a different input, and UBSan vptr confirms the one(s) that reach the call
+        with a confused object type (CWE-843)."""
+        try:
+            ins = s.scratch.ins_addr
+            h = self.hyps.get(f"type-confusion@{ins:#x}")
+            if h is None or len(h["solutions"]) >= 3:
+                return
+            h["reached"] += 1
+            if h["status"] == "proposed":
+                h["status"] = "reached"
+            self.violation(s, "type-confusion", ins,
+                           "an indirect (vtable) call is reached; the validator checks whether the "
+                           "object's dynamic type is confused (UBSan vptr)", extra=[])
         except Deadline:
             raise
         except Exception:

@@ -34,17 +34,22 @@ fi
 fail=0
 for id in "${CASES[@]}"; do
     src="$HERE/$id/prog.c"
+    cc_use="$CC"
+    if [ -f "$HERE/$id/prog.cpp" ]; then          # C++ case (type confusion): compile with g++
+        src="$HERE/$id/prog.cpp"
+        cc_use="${CXX:-g++}"
+    fi
     manifest="$HERE/$id/case.json"
     flags="$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["cflags"]))' "$manifest")"
     aflags="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(" ".join(c["asan_cflags"]) if "asan_cflags" in c else "")' "$manifest")"
     [ -n "$aflags" ] || aflags="$ASAN_DEFAULT"
     mkdir -p "$OUT/$id"
     # shellcheck disable=SC2086
-    if ! "$CC" $flags $QUIET -o "$OUT/$id/prog" "$src"; then
+    if ! "$cc_use" $flags $QUIET -o "$OUT/$id/prog" "$src"; then
         echo "BUILD FAIL $id (prog)" >&2; fail=1
     fi
     # shellcheck disable=SC2086
-    if ! "$CC" $aflags $QUIET -o "$OUT/$id/prog_asan" "$src"; then
+    if ! "$cc_use" $aflags $QUIET -o "$OUT/$id/prog_asan" "$src"; then
         echo "BUILD FAIL $id (prog_asan)" >&2; fail=1
     fi
     needs_msan="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print("1" if c.get("class")=="uninit" or any(b.get("oracle")=="msan" for b in c.get("bugs",[])) else "")' "$manifest")"

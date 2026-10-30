@@ -1,0 +1,23 @@
+{
+  "id": "tx01_bad_downcast",
+  "summary": "shapes: a Circle is downcast to Square based on a forged kind byte, a bad-downcast type confusion (CWE-843)",
+  "class": "type-confusion",
+  "difficulty": "medium",
+  "invocation": { "argv": ["@@"], "input_mode": "file" },
+  "cflags": ["-O0", "-g", "-fno-stack-protector", "-no-pie"],
+  "seed_exit": 0,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-843",
+      "kind": "type-confusion",
+      "line": 25,
+      "function": "main",
+      "oracle": "asan",
+      "asan_kind": "ubsan:downcast",
+      "note": "static_cast<Square*>(s) where s may be a Circle; UBSan vptr flags the bad downcast",
+      "file": "prog.cpp"
+    }
+  ],
+  "intended_exec": []
+}
