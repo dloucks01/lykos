@@ -326,20 +326,28 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
     """-> (Verdict, incidental) where incidental is (kind, file, line, func) for a sanitizer
     report that fired somewhere other than this site, else None."""
     if hyp.kind == "cmd-injection":
-        r = replay(target, target.exe, data)
-        hit = _ID_MARK.search(r.stdout) or _ID_MARK.search(r.stderr)
-        if hit:
-            return Verdict(True, "exec-marker", "the injected `id` executed: "
-                           + (r.stderr + r.stdout)[hit.start():hit.start() + 60]
-                           .decode("latin-1", "replace").split("\n")[0], hyp.line), None
-        # output can be swallowed (a popen pipe the program reads) or absent (`id <bad-user>`
-        # errors): the syscall oracle proves the exec itself. The solver pins an injectable sink
-        # to `id`, so an execve of `id` that the program would never make on its own is the proof.
+        # PRIMARY oracle: strace observes an execve of the injected program (`id`). The program
+        # would not exec `id` on its own, so the syscall itself is the proof -- stronger than any
+        # output, and immune to a program that merely PRINTS "uid=" in a banner.
         execs = _exec_markers(target, data)
         if _MARKER_EXE in execs:
             return Verdict(True, "exec-syscall",
                            f"strace observed execve of the injected program ({_MARKER_EXE})",
                            hyp.line), None
+        # FALLBACK (strace saw no exec of `id`): the `uid=` output marker, guarded by a benign
+        # control -- confirm only when the marker appears on the PoC and NOT on a benign input, so
+        # a program that prints "uid=" on its own path cannot be a false positive. The control is
+        # what makes this sound, so it applies whether or not strace is present.
+        r = replay(target, target.exe, data)
+        hit = _ID_MARK.search(r.stdout) or _ID_MARK.search(r.stderr)
+        if hit:
+            ctrl = replay(target, target.exe, b"\n")
+            if not (_ID_MARK.search(ctrl.stdout) or _ID_MARK.search(ctrl.stderr)):
+                return Verdict(True, "exec-marker", "the injected `id` output appeared (absent on a "
+                               "benign input): " + (r.stderr + r.stdout)[hit.start():hit.start() + 60]
+                               .decode("latin-1", "replace").split("\n")[0], hyp.line), None
+            return Verdict(False, "exec-marker",
+                           "`uid=` appears on a benign input too: not caused by the injection"), None
         return Verdict(False, "exec-marker",
                        f"the injected command did not run (execs seen: {sorted(execs) or 'none'})"), None
 
@@ -437,16 +445,20 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
         return Verdict(False, "toctou-race", why), None
 
     if hyp.kind == "resource-exhaustion":
-        # the proof is non-termination: the plain build, given this input, does not finish within
-        # a generous limit on every replay. A correctly-bounded loop returns well under it, so a
-        # 3/3 timeout is a real denial-of-service symptom at the input-controlled loop.
-        hangs = 0
-        for _ in range(REPLAYS):
-            if replay(target, target.exe, data, timeout=RESOURCE_TIMEOUT).timed_out:
-                hangs += 1
+        # DIFFERENTIAL non-termination: the PoC must hang on every replay AND a trivial input must
+        # NOT. Without the baseline, an always-slow program (a fixed heavy loop that ignores input)
+        # or heavy host load would be mistaken for input-controlled unbounded consumption. Both runs
+        # share the host load, so the differential is what is sound -- not the absolute timeout.
+        base = replay(target, target.exe, b"", timeout=RESOURCE_TIMEOUT)
+        if base.timed_out:
+            return Verdict(False, "timeout", "the program does not terminate even on a trivial "
+                           "input: the slowness is not attributable to this input"), None
+        hangs = sum(1 for _ in range(REPLAYS)
+                    if replay(target, target.exe, data, timeout=RESOURCE_TIMEOUT).timed_out)
         if hangs == REPLAYS:
-            return Verdict(True, "timeout", f"did not terminate within {RESOURCE_TIMEOUT:.0f}s on "
-                           f"{REPLAYS}/{REPLAYS} replays (input-controlled loop)", hyp.line, hangs), None
+            return Verdict(True, "timeout", f"the PoC did not terminate within {RESOURCE_TIMEOUT:.0f}s "
+                           f"on {REPLAYS}/{REPLAYS} replays while a trivial input returned at once "
+                           f"(input-controlled unbounded loop)", hyp.line, hangs), None
         return Verdict(False, "timeout", f"terminated within the limit ({hangs}/{REPLAYS} hung)"), None
 
     if hyp.kind == "mem-leak":

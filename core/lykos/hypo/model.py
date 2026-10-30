@@ -124,4 +124,4 @@ class Hypothesis:
         return cls(d["id"], d["kind"], d.get("cwe"), _hex(d.get("site")), d.get("func"),
                    _hex(d.get("func_addr")), d.get("func_size"), d.get("location"),
                    d.get("status", "proposed"), int(d.get("reached") or 0), d.get("note") or "",
-                   [Solution.from_dict(s) for s in d.get("solutions") or []])
+                   [Solution.from_dict(s) for s in d.get("solutions") or []], d.get("exploit"))
