@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -73,12 +74,13 @@ _SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
 _MSAN = ["-fsanitize=memory", "-fsanitize-memory-track-origins=2", "-fno-omit-frame-pointer"]
 
 
-def _compile_plain(src: Path, out: Path, extra=(), cc: Optional[str] = None) -> str:
+def _compile_plain(src: Path, out: Path, extra=(), cc: Optional[str] = None, env=None) -> str:
     cc = cc or _cc(src.suffix.lower() not in (".c",))
     if not cc:
         raise RuntimeError("no C/C++ compiler found (need gcc or clang)")
+    e = {**os.environ, **env} if env else None
     r = subprocess.run([cc, *_PLAIN, *extra, "-o", str(out), str(src), "-lm"], capture_output=True,
-                       text=True, timeout=300, check=False)
+                       text=True, timeout=300, check=False, env=e)
     if r.returncode != 0 or not out.exists():
         raise RuntimeError(f"plain build failed:\n{r.stderr[-3000:]}")
     return r.stderr
@@ -86,6 +88,17 @@ def _compile_plain(src: Path, out: Path, extra=(), cc: Optional[str] = None) -> 
 
 def _clang(cxx: bool) -> Optional[str]:
     return shutil.which("clang++") if cxx else shutil.which("clang")
+
+
+def _afl_cc(cxx: bool) -> Optional[str]:
+    """AFL++ instrumenting compiler for the fuzz fallback (Step 5, doc 52 §3c)."""
+    names = (["afl-clang-fast++", "afl-c++", "afl-g++-fast"] if cxx
+             else ["afl-clang-fast", "afl-cc", "afl-gcc-fast"])
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
 
 
 def prepare(path, *, argv: Optional[list] = None, mode: Optional[str] = None,
@@ -117,9 +130,26 @@ def prepare(path, *, argv: Optional[list] = None, mode: Optional[str] = None,
         else:
             log += "\nclang not found: MSan (uninit) validation disabled"
             msan = None
+        afl = work / (p.stem + "_afl")
+        cmplog = work / (p.stem + "_cmplog")
+        afl_cc = _afl_cc(p.suffix.lower() not in (".c",))
+        if afl_cc:
+            try:
+                log += _compile_plain(p, afl, cc=afl_cc)
+            except RuntimeError as e:        # the fuzz fallback simply has no instrumented build
+                log += f"\nAFL build failed, fuzz fallback uses qemu-mode: {e}"
+                afl = None
+            try:                             # CmpLog build: lets AFL solve magic/keyword compares
+                log += _compile_plain(p, cmplog, cc=afl_cc, env={"AFL_LLVM_CMPLOG": "1"})
+            except RuntimeError as e:
+                log += f"\nCmpLog build failed: {e}"
+                cmplog = None
+        else:
+            afl = cmplog = None
         a, m = infer_invocation(plain, argv, mode)
         return Prepared("source-file", [Target(exe=plain, argv=a, mode=m, asan_exe=san,
-                                               msan_exe=msan, source_root=p.parent)], log, work)
+                                               msan_exe=msan, afl_exe=afl, afl_cmplog=cmplog,
+                                               source_root=p.parent)], log, work)
     if p.is_dir():
         from ..analyze.source_project import build_source_project, is_source_project
         if not is_source_project(p):

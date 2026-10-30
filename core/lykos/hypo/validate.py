@@ -71,6 +71,8 @@ class Target:
     mode: str = "file"                                    # file | stdin | arg
     asan_exe: Optional[Path] = None
     msan_exe: Optional[Path] = None                       # clang MemorySanitizer build (uninit)
+    afl_exe: Optional[Path] = None                        # afl-instrumented build (fuzz fallback)
+    afl_cmplog: Optional[Path] = None                     # AFL CmpLog build (solves keyword compares)
     arch: Optional[str] = None
     endianness: Optional[str] = None
     bits: Optional[int] = None

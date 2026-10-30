@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import engine, store
+from . import engine, fuzzrun, store
 from .build import prepare
 from .validate import validate
 from .weaponize import weaponize, weaponize_fmt
@@ -124,6 +124,43 @@ def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
         _display(target, new)
         hyps = engine.merge(hyps, new)
         _validate_all(target, hyps, incidental, log)
+    # Step 5: hybrid fuzz fallback -- an undirected engine alongside the directed solver. Seed AFL
+    # with every input the driver REACHED the sinks with, fuzz the (instrumented) build, and run
+    # each crash through the SAME validator (the gate), so the fuzzer only supplies candidates and
+    # can never produce a false confirmation.
+    left = t_end - time.time()
+    # Reach-gate: the fallback is for when the DIRECTED engine came up empty (a structured input it
+    # could not solve). If it already confirmed a bug, do not spend the AFL budget.
+    settled = any(h.status == "confirmed" for h in hyps)
+    unsettled = [h for h in hyps if h.status != "confirmed"]
+    if left >= MIN_ROUND and not settled and unsettled \
+            and target.mode in ("file", "stdin") and fuzzrun.available():
+        seeds = [s.data for h in hyps for s in h.solutions]
+        secs = int(min(left - 10, 120))
+        log(f"fuzz fallback: {secs}s, {len(seeds)} seed(s) from the directed solver")
+        crashes = fuzzrun.fuzz(target, seeds, seconds=secs, log=log)
+        import base64 as _b
+        if crashes:
+            log(f"fuzz produced {len(crashes)} crashing input(s); validating")
+        for c in crashes:
+            for h in hyps:
+                if h.status == "confirmed":
+                    continue
+                v, inc = validate(target, h, c)
+                if v.confirmed:
+                    from .model import Solution as _S
+                    s = _S(c, "found by the directed-fuzzing fallback", None)
+                    s.verdict = v
+                    h.solutions.append(s)
+                    h.settle()
+                    log(f"  {h.id:<34} CONFIRMED by fuzz ({v.method})")
+                    break
+                if inc:
+                    kind, path, line, func = inc
+                    where = f"{os.path.basename(path or '?')}:{line}"
+                    if not any(i["where"] == where and i["kind"] == kind for i in incidental):
+                        incidental.append({"kind": kind, "where": where, "func": func,
+                                           "hypothesis": "fuzz", "input_b64": _b.b64encode(c).decode()})
     _drop_known(hyps, incidental)
     # Step 4: climb control-flow-hijack hypotheses to an exploit. The driver's symbolic RIP control
     # is the candidate; weaponize's own differential (clean exit with the win address vs a crash
