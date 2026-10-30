@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Tier-1 scorer: run the hunt loop on DARPA CGC challenges (cb-multios Linux port) and measure
-validated, vulnerability-specific crashes (doc 52 §3, Step 5 exit criterion).
+"""!! INVALID AS A TIER-1 MEASUREMENT -- DO NOT TRUST ITS NUMBER (see docs/internal/57) !!
 
-Ground truth is the vulnerable/patched PAIR each challenge ships: a crash is counted ONLY when
-the solved input crashes the vulnerable binary AND does NOT crash the patched one. A crash that
-also crashes the patched binary is an incidental defect, not the planted vulnerability, and is
-reported separately -- this keeps "false confirmations = 0" meaningful on real binaries.
-
-CGC binaries are statically linked and stdin/stdout driven (the Linux port maps transmit/receive
-to fd 1/0), so the driver is run with input_mode=stdin and CB scoping (own-code only).
-
-usage: score_cgc.py [--budget S] [--jobs N] [--input-size N] [--limit N] [challenge-dir ...]
+This harness assumed a CGC challenge takes raw stdin and that the `.pov` file is an input to
+replay. Both are wrong: cb-multios CBs are SOCKET-driven, and a `.pov` is itself an ELF *driver
+program* run via tools/cb-replay-pov.py over a type-1/type-2 negotiation. Feeding the POV as stdin
+does not reproduce the bug, so the vuln/patched differential here never fires -- the 0/N it reports
+reflects the WRONG INPUT MODEL, not the engine. A correct Tier-1 harness must drive the CB through
+cb-replay-pov.py (POV -> confirmed crash = ground truth) and feed our loop the CB's real channel,
+seeded from the poller/ traffic. Kept only as a record of the mistake and the CB-scoping result
+(scoping DID work: ~150-270 own functions, ~75-135 hypotheses, not the 3145-hyp libc flood).
 """
 import argparse
 import os
