@@ -162,6 +162,21 @@ def chain_primitive_stage(ctx) -> dict:
     win = win if win[0] else None
     pie = (target.mitigations or {}).get("pie") == "on"
 
+    # doc 58: the common STACK-array unchecked-index write -> saved-return-address overwrite with a
+    # RAW-binary read input -- the shape the menu/global-array hijack below does not model. Construct
+    # it directly and confirm by detonation; if it lands a poc-backed L3, that function is done (the
+    # recipe fallback self-skips via its `poc:` dedup key).
+    if not pie:
+        try:
+            from . import oob_construct
+            if oob_construct.construct_stack_oob_writes(ctx, target):
+                ctx.emit("chain.done", payload={"applicable": True,
+                         "note": "constructed + detonated an oob-index-write -> control-hijack L3"})
+                ctx.progress(pct=100, msg="oob-index-write -> control hijack: L3 constructed")
+                return {}
+        except Exception:                                  # noqa: BLE001 -- best-effort; fall through
+            observe.absorbed(_log, "stack-oob construct skipped")
+
     # Without a reachable win, a HIJACK has nothing to point at -- but an arbitrary WRITE does not
     # need one. A write-what-where plus the arbitrary read that comes with it leaks the libc base
     # out of a GOT slot and forges a FILE, so exit() calls system("/bin/sh"): no win function, no
