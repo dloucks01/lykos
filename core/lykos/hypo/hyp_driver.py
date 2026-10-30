@@ -210,6 +210,68 @@ class Driver:
                     st.memory.store(dst, data, size=size)
                 return dst
 
+        class LeanStrlen(angr.SimProcedure):
+            def run(self, src):   # noqa: D401
+                return drv._lean_strlen(self.state, src)[0]
+
+        class LeanStrcpy(angr.SimProcedure):
+            def run(self, dst, src):   # noqa: D401
+                st = self.state
+                L, nbytes = drv._lean_strlen(st, src)
+                n = L + 1
+                st.memory.store(dst, st.memory.load(src, nbytes, inspect=False),
+                                size=n if n.symbolic else n.concrete_value)
+                return dst
+
+        class LeanStrdup(angr.SimProcedure):
+            def run(self, src):   # noqa: D401
+                st = self.state
+                L, nbytes = drv._lean_strlen(st, src)
+                n = L + 1
+                new = self.inline_call(angr.SIM_PROCEDURES["libc"]["malloc"], n).ret_expr
+                st.memory.store(new, st.memory.load(src, nbytes, inspect=False),
+                                size=n if n.symbolic else n.concrete_value)
+                return new
+
+        class LeanStrcspn(angr.SimProcedure):
+            reject = True
+
+            def run(self, src, chars):   # noqa: D401
+                return drv._lean_span(self.state, src, chars, reject=self.reject)
+
+        class LeanStrspn(LeanStrcspn):
+            reject = False
+
+        class LineFgets(angr.SimProcedure):
+            """fgets that reads ONE line. angr's reads the maximum (size-1, or to EOF) from symbolic
+            input unless SHORT_READS is on globally, so the whole input was always one line and
+            no multi-command bug (AUTH then ADMIN, USER then SHOW) was reachable. SHORT_READS
+            globally would let fread/read return impossible short counts on a regular file."""
+            def run(self, dst, size, file_ptr):   # noqa: D401
+                from cle.backends.externs.simdata.io_file import io_file_data_for_arch
+                st = self.state
+                if size.size() < self.arch.bits:
+                    size = size.zero_extend(self.arch.bits - size.size())
+                fd = st.mem[file_ptr + io_file_data_for_arch(st.arch)["fd"]:].int.resolved
+                simfd = st.posix.get_fd(fd)
+                if simfd is None:
+                    return claripy.BVV(0, self.arch.bits)
+                if st.solver.is_true(size <= 1):
+                    return claripy.BVV(0, self.arch.bits)
+                want = claripy.BVS("fgets_len", self.arch.bits)
+                st.add_constraints(claripy.ULE(want, size - 1), claripy.UGE(want, 1))
+                data, real = simfd.read_data(want)
+                nb = len(data) // 8
+                for i in range(nb):
+                    byte = data.get_byte(i)
+                    st.add_constraints(claripy.If(
+                        claripy.BVV(i + 1, self.arch.bits) != real,
+                        claripy.Or(claripy.UGE(claripy.BVV(i, self.arch.bits), real), byte != 0x0a),
+                        claripy.Or(claripy.BVV(i + 2, self.arch.bits) == size, simfd.eof(), byte == 0x0a)))
+                st.memory.store(dst, data, size=real)
+                st.memory.store(dst + real, claripy.BVV(0, 8))
+                return real
+
         class BoundedMemsetChk(BoundedMemset):
             def run(self, dst, char, num, _destlen):   # noqa: D401
                 return super().run(dst, char, num)
@@ -222,11 +284,34 @@ class Driver:
 
         for name, cls in (("snprintf", BoundedSnprintf), ("sprintf", BoundedSprintf),
                           ("memset", BoundedMemset), ("__memset_chk", BoundedMemsetChk),
+                          ("strlen", LeanStrlen), ("strcpy", LeanStrcpy), ("strdup", LeanStrdup),
+                          ("__strdup", LeanStrdup),
                           ("sscanf", PreciseSscanf), ("__isoc99_sscanf", PreciseSscanf),
                           ("__isoc23_sscanf", PreciseSscanf)):
             sym = self.p.loader.find_symbol(name)
             if sym is not None:
                 self.p.hook_symbol(name, cls(), replace=True)
+        # Line-structured input (opt-in until it scores): an exact strcspn makes `s[strcspn(s,
+        # "\r\n")] = 0` pin the line at its MAX length (write concretization), and angr's fgets
+        # already reads the whole input as one line, so a multi-command bug (AUTH then ADMIN)
+        # needs both line_fgets (a symbolic line length) and a cheaper line strategy than
+        # per-byte newline constraints -- measured: alone each regresses the corpus.
+        for flag, name, cls in (("precise_strcspn", "strcspn", LeanStrcspn),
+                                ("precise_strcspn", "strspn", LeanStrspn),
+                                ("line_fgets", "fgets", LineFgets)):
+            if self.spec.get(flag) and self.p.loader.find_symbol(name) is not None:
+                self.p.hook_symbol(name, cls(), replace=True)
+        # glibc >= 2.38 links C23 names (__isoc23_strtol, __isoc23_fscanf, ...): angr stubs the ones
+        # it does not know, which returns an arbitrary value. Route each to its plain model.
+        libc = angr.SIM_PROCEDURES.get("libc", {})
+        for name in list(self.main_obj.imports):
+            for pre in ("__isoc23_", "__isoc99_"):
+                if not name.startswith(pre):
+                    continue
+                base = name[len(pre):]
+                cur = self.p._sim_procedures.get(getattr(self.p.loader.find_symbol(name), "rebased_addr", -1))
+                if base in libc and (cur is None or cur.is_stub):
+                    self.p.hook_symbol(name, libc[base](), replace=True)
 
         heap_cls = None
         try:
@@ -408,24 +493,100 @@ class Driver:
             if nlim == 0:
                 return total.zero_extend(st.arch.bits - 32)
             W = min(W, nlim)
-        old = st.memory.load(dst, W, inspect=False)
+        # Store exactly the bytes C writes -- total+1, or nlim under snprintf truncation -- as a
+        # symbolic-size store. A fixed W-byte store (keeping old bytes past the end) looked like an
+        # unconditional overflow to the access oracle: "solved" by any input, short ones included,
+        # so the site saturated on junk and the real overflow was never asked for.
         outb = []
         for kpos in range(W):
             if kpos < P:
                 b = claripy.BVV(pre[kpos], 8)
             else:
                 jj = kpos - P
-                tail = old.get_byte(kpos)
-                for t in range(S, -1, -1):
-                    vb = claripy.BVV(post[t], 8) if t < S else claripy.BVV(0, 8)
-                    tail = claripy.If(claripy.BVV(jj, 32) == L + t, vb, tail)
+                tail = claripy.BVV(0, 8)
+                for t in range(S - 1, -1, -1):
+                    tail = claripy.If(claripy.BVV(jj, 32) == L + t, claripy.BVV(post[t], 8), tail)
                 b = claripy.If(claripy.ULT(claripy.BVV(jj, 32), L),
                                src[jj] if jj < maxv else claripy.BVV(0, 8), tail)
             if nlim is not None and kpos == nlim - 1:
                 b = claripy.If(claripy.UGE(total, kpos), claripy.BVV(0, 8), b)
             outb.append(b)
-        st.memory.store(dst, claripy.Concat(*outb))
+        written = total + 1
+        if nlim is not None:
+            written = claripy.If(claripy.ULT(written, nlim), written, claripy.BVV(nlim, 32))
+        st.memory.store(dst, claripy.Concat(*outb), size=written.zero_extend(st.arch.bits - 32))
         return total.zero_extend(st.arch.bits - 32)
+
+    def _lean_strlen(self, st, src):
+        """(length ast, bytes worth copying incl. the NUL) with no solver call per byte. angr's
+        strlen goes through memory.find, which asks the solver about EVERY byte -- 80 of 90 s on a
+        line parser. Here: the first-NUL If-chain over the symbolic bytes, cut at the first
+        concrete NUL, bound to a fresh leaf (definitional constraint)."""
+        claripy = self.claripy
+        M = max(16, st.libc.max_str_len)
+        blob = st.memory.load(src, M, inspect=False)
+        chain, cap = [], None
+        for t in range(M):
+            b = blob.get_byte(t)
+            if not b.symbolic:
+                if b.concrete_value == 0:
+                    cap = t
+                    break
+                continue
+            chain.append((t, b))
+        if cap is None:
+            if not chain:                       # M non-NUL concrete bytes: no terminator in range
+                return claripy.BVV(M, self.arch_bits), M
+            st.add_constraints(claripy.Or(*[b == 0 for _, b in chain]))
+            cap = M
+        L = claripy.BVV(cap, self.arch_bits)
+        for t, b in reversed(chain):
+            L = claripy.If(b == 0, claripy.BVV(t, self.arch_bits), L)
+        if L.symbolic:
+            r = claripy.BVS("strlen", self.arch_bits)
+            st.add_constraints(r == L)
+            L = r
+        return L, min(cap + 1, M)
+
+    def _lean_span(self, st, src, chars, reject):
+        """strcspn (reject=True) / strspn over a concrete character set, as a first-match If-chain
+        bound to a leaf. angr leaves strcspn a stub returning an arbitrary value, so
+        `s[strcspn(s, "\r\n")] = 0` wrote anywhere -- a stream of bogus "overwrites the saved
+        return address" violations and corrupted paths."""
+        claripy = self.claripy
+        try:
+            cs = st.solver.eval(st.memory.load(chars, 64, inspect=False), cast_to=bytes).split(b"\0")[0]
+        except Exception:
+            return st.solver.Unconstrained("strspn", self.arch_bits)
+        M = max(16, st.libc.max_str_len)
+        blob = st.memory.load(src, M, inspect=False)
+        stops = list(cs) + [0] if reject else None
+        L, chain = None, []
+        for t in range(M):
+            b = blob.get_byte(t)
+            if reject:
+                hit = claripy.Or(*[b == c for c in stops])
+            else:
+                hit = claripy.Not(claripy.Or(*[b == c for c in cs])) if cs else claripy.true()
+            if not b.symbolic:
+                if hit.is_true():
+                    L = t
+                    break
+                continue
+            chain.append((t, hit))
+        if L is None:
+            if not chain:
+                return claripy.BVV(M, self.arch_bits)
+            st.add_constraints(claripy.Or(*[h for _, h in chain]))
+            L = M
+        res = claripy.BVV(L, self.arch_bits)
+        for t, hit in reversed(chain):
+            res = claripy.If(hit, claripy.BVV(t, self.arch_bits), res)
+        if res.symbolic:
+            r = claripy.BVS("strspn", self.arch_bits)
+            st.add_constraints(r == res)
+            res = r
+        return res
 
     SCANF_WS = b" \t\n\v\f\r"
     SCANF_INT = {b"d": (10, True), b"i": (10, True), b"u": (10, False), b"x": (16, False),
@@ -459,8 +620,8 @@ class Driver:
         WS = [claripy.BVV(c, 8) for c in self.SCANF_WS]
         FAN = int(self.spec.get("scanf_pos_fanout", 8))
 
-        def is_ws(b):
-            return claripy.Or(*[b == w for w in WS])
+        def is_ws(b):      # isspace: ' ' or \t..\r
+            return claripy.Or(b == 0x20, claripy.And(claripy.UGE(b, 9), claripy.ULE(b, 13)))
 
         class Pos:
             """A position: concrete, or a symbolic ast resolved (lazily, only if a later directive
@@ -469,6 +630,7 @@ class Driver:
             def __init__(self, ast):
                 self.ast = ast
                 self._vals = None
+                self._at = {}
 
             @property
             def vals(self):
@@ -487,20 +649,38 @@ class Driver:
                 return self._vals
 
             def at(self, j):
-                """byte at position + j"""
+                """byte at position + j. For an uncertain position the ITE over its values is
+                bound ONCE to a fresh byte (a definitional constraint, always sound) so every
+                later use -- token checks, stored data, the return value's condition -- carries
+                a leaf instead of a copy of the ITE."""
+                if j in self._at:
+                    return self._at[j]
                 if len(self.vals) == 1:
                     k = self.vals[0] + j
-                    return B[k] if k < M else claripy.BVV(0, 8)
-                e = claripy.BVV(0, 8)
-                for v in self.vals:
-                    k = v + j
-                    e = claripy.If(self.ast == v, B[k] if k < M else claripy.BVV(0, 8), e)
+                    e = B[k] if k < M else claripy.BVV(0, 8)
+                else:
+                    e = claripy.BVV(0, 8)
+                    for v in self.vals:
+                        k = v + j
+                        e = claripy.If(self.ast == v, B[k] if k < M else claripy.BVV(0, 8), e)
+                    t = claripy.BVS("scanf_byte", 8)
+                    st.add_constraints(t == e)
+                    e = t
+                self._at[j] = e
                 return e
 
         W32 = 32
         pos = Pos(claripy.BVV(0, W32))
         ok = claripy.true()
         count = claripy.BVV(0, W32)
+
+        def bind(cond):
+            """Bind a match condition to a fresh boolean leaf (definitional, always sound): the
+            stores conditioned on it and every strlen/strcpy later scanning them carry the leaf,
+            not the whole formula."""
+            b = claripy.BoolS("scanf_ok")
+            st.add_constraints(b == cond)
+            return b
         argi = va_start
         consumed_any = False
 
@@ -561,7 +741,7 @@ class Driver:
                 skipped[0] = False
                 n = width or 1
                 cond = claripy.And(*[pos.at(t) != 0 for t in range(n)])
-                ok = claripy.And(ok, cond)
+                ok = bind(claripy.And(ok, cond))
                 if not suppress:
                     dst = arg(argi)
                     argi += 1
@@ -585,7 +765,7 @@ class Driver:
                     if t < N:
                         cons.append(claripy.Or(L != t, b == 0, is_ws(b)))
                 tok_ok = claripy.And(*cons)
-                ok = claripy.And(ok, tok_ok)
+                ok = bind(claripy.And(ok, tok_ok))
                 if not suppress:
                     dst = arg(argi)
                     argi += 1
@@ -631,7 +811,7 @@ class Driver:
                         cons.append(claripy.Or(D != t, claripy.Not(dig)))
                         val = claripy.If(inside, val * base + dv.zero_extend(56), val)
                 tok_ok = claripy.And(*cons)
-                ok = claripy.And(ok, tok_ok)
+                ok = bind(claripy.And(ok, tok_ok))
                 val = claripy.If(neg, -val, val)
                 if not suppress:
                     dst = arg(argi)
@@ -833,6 +1013,10 @@ class Driver:
         st.libc.max_str_len = max(st.libc.max_str_len, min(1024, n + 16))
         st.libc.max_buffer_size = max(st.libc.max_buffer_size, min(1024, n + 16))
         st.libc.max_variable_size = 4096
+        # angr's string models (strncmp, strcmp, ...) assume at most buf_symbolic_bytes (60)
+        # symbolic bytes before a NUL and ADD that as a constraint: any longer input-derived
+        # string silently made the path unsat. Keep it in step with max_str_len.
+        st.libc.buf_symbolic_bytes = max(st.libc.buf_symbolic_bytes, st.libc.max_str_len)
         st.libc.max_memcpy_size = max(st.libc.max_memcpy_size, n + 16)
         # Symbolic addresses (buf[off] after `off += len`) are resolved to a FEW concrete values
         # instead of an ITE over thousands: the record-parsing loops every file format has would
@@ -855,7 +1039,7 @@ class Driver:
         # and killing every path that needed its prefix. The max keeps the longest line.
         from angr.concretization_strategies import (SimConcretizationStrategyMax,
                                                     SimConcretizationStrategyRange)
-        st.memory.write_strategies = [SimConcretizationStrategyRange(32),
+        st.memory.write_strategies = [SimConcretizationStrategyRange(int(self.spec.get("write_range", 32))),
                                       SimConcretizationStrategyMax()]
         st.inspect.b("mem_write", when=angr.BP_BEFORE, action=self._on_write)
         st.inspect.b("mem_read", when=angr.BP_BEFORE, action=self._on_read)
@@ -1170,6 +1354,11 @@ class Driver:
                 objs = self._stack_objects(s)
                 gb = self._const_base(addr) if sym_addr else a_lo
                 o = self._obj_at(objs, gb) if gb is not None else None
+                if sym_addr and (o is None or not s.solver.satisfiable(extra_constraints=[
+                        claripy.And(claripy.UGE(addr, o[0]), claripy.ULT(addr, o[1]))])):
+                    # `s + n - 1` folds the -1 into the constant term, which then names the
+                    # neighbouring object: use the object a feasible access actually lands in
+                    o = self._obj_at(objs, s.solver.eval(addr))
                 if o is not None:
                     olo, ohi = o[0], o[1]
                     if sym_addr:
@@ -1437,6 +1626,12 @@ class Driver:
         first_sym = None
         for k in range(maxlen):
             b = s.memory.load(ptr + k, 1, inspect=False)
+            if b.symbolic:
+                # a byte that only LOOKS symbolic (a size-conditional store of a constant prefix)
+                # is its constant: otherwise the quote context and first input byte are lost
+                vals = s.solver.eval_upto(b, 2)
+                if len(vals) == 1:
+                    b = self.claripy.BVV(vals[0], 8)
             out.append(b)
             if b.symbolic:
                 if first_sym is None and any(v.startswith("input") for v in b.variables):
@@ -1583,7 +1778,21 @@ class Driver:
                 key = f"{type(e.error).__name__}@{e.state.addr:#x}"
                 errs = self.stats.setdefault("errored", {})
                 errs[key] = errs.get(key, 0) + 1
+                tr = self.stats.setdefault("errored_trace", {})
+                if key not in tr:       # first traceback per kind: the evidence to fix a model
+                    import traceback as _tb
+                    tr[key] = (str(e.error)[:200] + " | " + " <- ".join(
+                        f"{f.name}:{f.lineno}" for f in reversed(_tb.extract_tb(e.traceback)[-5:]))) \
+                        if getattr(e, "traceback", None) else str(e.error)[:300]
             sm.stashes["errored"] = []
+            for e in sm.deadended:
+                try:
+                    src = e.history.jump_source or e.history.addr
+                except Exception:
+                    src = None
+                key = self._fname(self.func_of(src).addr) if src and self.func_of(src) else hex(e.addr)
+                dd = self.stats.setdefault("deadended", {})
+                dd[key] = dd.get(key, 0) + 1
             sm.stashes["deadended"] = []
             pool = sm.active + sm.deferred
             if self.dmin is not None:
