@@ -23,6 +23,7 @@ function Row({ f, pocs, sel, onClick }) {
   const det = p && (p.provenance === "detonated" || p.verified);
   const hasPoc = p && p.input_sha;
   return html`<div class=${"row sev-" + (f.severity || "info") + (sel ? " sel" : "")} onClick=${onClick}>
+    <span class="dot" title=${f.severity}></span>
     <div class="row-l">
       <div class="row-title">${f.title || f.detector}</div>
       <div class="row-sub">
