@@ -229,6 +229,76 @@ def _strace_log(target: Target, data: bytes, trace: str) -> Optional[str]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+_TOCTOU_MARK = b"LYKOS_TOCTOU_WIN"
+TOCTOU_TRIES = 200
+
+
+def _toctou_run(target: Target, link: str, cwd: str) -> bytes:
+    """Run the program with its path input pointing at `link`; return stdout+stderr. Runs
+    directly (not under bwrap): the exploit is a host-side symlink race on our own temp dir."""
+    import subprocess
+    if target.mode == "stdin":
+        argv = [str(target.exe)] + [a for a in target.argv if a != "@@"]
+        stdin = (link + "\n").encode()
+    else:   # arg
+        argv = [str(target.exe)] + [link if a == "@@" else a for a in target.argv]
+        stdin = b""
+    try:
+        p = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           cwd=cwd, timeout=5)
+        return (p.stdout or b"") + (p.stderr or b"")
+    except (subprocess.TimeoutExpired, OSError):
+        return b""
+
+
+def _relink(link: str, dest: str):
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(dest, link)
+
+
+def _toctou_win(target: Target, tries: int = TOCTOU_TRIES):
+    """Win a symlink-swap race between the program's filename check and its open. Returns
+    (won, reason). SOUND: the target file is built to FAIL the program's check (its marker never
+    surfaces in a steady-target run), so the marker appearing during racing proves the check
+    passed on the benign file while the open resolved to the target -- a real TOCTOU."""
+    tmp = tempfile.mkdtemp(prefix="lykos-toctou-")
+    try:
+        benign, tgt, link = (os.path.join(tmp, n) for n in ("benign", "target", "link"))
+        with open(benign, "wb") as f:
+            f.write(b"BENIGN\n")
+        with open(tgt, "wb") as f:                 # large + marked: the size check rejects it
+            f.write((_TOCTOU_MARK + b"\n") * 600)
+        _relink(link, benign)
+        if _TOCTOU_MARK in _toctou_run(target, link, tmp):
+            return False, "benign run already shows the marker (misconfigured)"
+        _relink(link, tgt)
+        if _TOCTOU_MARK in _toctou_run(target, link, tmp):
+            return False, "no effective check: the program serves the target steadily (not a TOCTOU)"
+        import threading
+        for _ in range(tries):
+            _relink(link, benign)
+            stop = threading.Event()
+
+            def swapper():
+                while not stop.is_set():
+                    try:
+                        _relink(link, tgt)
+                        _relink(link, benign)
+                    except OSError:
+                        pass
+            th = threading.Thread(target=swapper, daemon=True)
+            th.start()
+            out = _toctou_run(target, link, tmp)
+            stop.set()
+            th.join(timeout=2)
+            if _TOCTOU_MARK in out:
+                return True, f"served the swapped-in target after the check passed on the benign file"
+        return False, f"race not won in {tries} attempts"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _exec_markers(target: Target, data: bytes) -> set:
     """Basenames of the programs the target successfully execve'd on this input."""
     log = _strace_log(target, data, "execve")
@@ -306,6 +376,16 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
         if agree == REPLAYS:
             return Verdict(True, "msan", last, hyp.line, agree), None
         return Verdict(False, "msan", last or "", None, agree), incidental
+
+    if hyp.kind == "toctou":
+        if target.mode not in ("arg", "stdin"):
+            return Verdict(False, "toctou-race",
+                           "TOCTOU replay needs a path supplied as an argument or on stdin"), None
+        won, why = _toctou_win(target)
+        if won:
+            return Verdict(True, "toctou-race",
+                           f"won a check-to-use race: {why}", hyp.line), None
+        return Verdict(False, "toctou-race", why), None
 
     if hyp.kind == "resource-exhaustion":
         # the proof is non-termination: the plain build, given this input, does not finish within

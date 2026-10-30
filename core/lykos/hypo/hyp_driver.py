@@ -71,6 +71,10 @@ MARKER_PROGS = ("/usr/bin/id", "/bin/id")
 # prefix before the first input byte.
 OPEN_SINKS = {"fopen": 0, "fopen64": 0, "freopen": 0, "open": 0, "open64": 0, "openat": 1,
               "opendir": 0, "creat": 0, "creat64": 0}
+# filename CHECK calls (the "check" of a check-then-use / TOCTOU, CWE-367). Their presence plus an
+# input-controlled open is the static signal; the validator proves the race by winning it.
+CHECK_SINKS = {"access", "faccessat", "stat", "lstat", "stat64", "lstat64", "__xstat",
+               "__lxstat", "__xstat64", "__lxstat64", "euidaccess", "eaccess", "statx"}
 # pinned traversal payload: enough `../` to climb out of any base dir, then a sentinel tail the
 # validator recognises in an open() syscall path (`../` present AND this tail = escaped the base).
 TRAVERSAL_TAIL = b"etc/passwd"
@@ -107,6 +111,7 @@ CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-7
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
        "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
        "uninit-read": "CWE-457", "mem-leak": "CWE-401", "resource-exhaustion": "CWE-400",
+       "toctou": "CWE-367",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -909,6 +914,8 @@ class Driver:
     # ------------------------------------------------------------------ propose
     def propose(self):
         kb = self.cfg.kb
+        has_check = False                 # TOCTOU: the program performs a filename check somewhere
+        open_sites = []                   # (ins, cs, func, callee) of input-openable sinks
         for f in list(kb.functions.values()):
             if f.is_plt or f.is_simprocedure or f.name in BORING_FUNCS or f.is_syscall:
                 continue
@@ -924,6 +931,8 @@ class Driver:
                     ins = blk.instruction_addrs[-1]
                 except Exception:
                     continue
+                if base in CHECK_SINKS:
+                    has_check = True
                 kinds = []
                 if base in FMT_SINKS:
                     kinds.append("format-string")
@@ -931,6 +940,7 @@ class Driver:
                     kinds.append("cmd-injection")
                 if base in OPEN_SINKS:
                     kinds.append("path-traversal")
+                    open_sites.append((ins, cs, f, base))
                 if base in ALLOC_SINKS:
                     kinds.append("int-overflow-alloc")
                 if self.spec.get("leak") and base in LEAK_SINKS:
@@ -946,6 +956,11 @@ class Driver:
                     self._propose_loops(f)
             if self.spec.get("uninit"):
                 self._propose_uninit(f)
+        # TOCTOU (CWE-367): a filename check anywhere plus an input-controlled open is the signal.
+        # The validator proves it by winning a symlink-swap race between the check and the use.
+        if self.spec.get("toctou") and has_check:
+            for ins, cs, f, base in open_sites:
+                self._add_hyp("toctou", ins, cs, f, callee=base)
         self.call_sites = {h["site"]: h for h in self.hyps.values() if h["callee"]}
 
     def _propose_divs(self, f):
@@ -1813,7 +1828,7 @@ class Driver:
             return
         h_any = None
         for kind in ("format-string", "cmd-injection", "int-overflow-alloc", "path-traversal",
-                     "mem-leak", "copy"):
+                     "mem-leak", "toctou", "copy"):
             h = self.hyps.get(f"{kind}@{src:#x}")
             if h is None:
                 continue
@@ -1833,6 +1848,8 @@ class Driver:
                 self._check_open_path(s, h)
             elif kind == "mem-leak":
                 self._check_leak(s, h)
+            elif kind == "toctou":
+                self._check_toctou(s, h)
             if kind != "copy" and h["reached"] > self.SATURATE_REACHES and not h["solutions"]:
                 # reached over and over and never violable (a constant format string, a fixed
                 # command): stop steering the search toward it
@@ -2034,6 +2051,17 @@ class Driver:
                            f"input bytes extend the path passed to {h['callee']}(); `../` "
                            f"sequences climb out of the base {prefix.decode('latin-1', 'replace')!r} "
                            f"to an arbitrary file", extra=[cond])
+
+    def _check_toctou(self, s, h):
+        """CWE-367: this open is reached and the program also performs a filename check. The
+        driver only solves a REACHING input (the exploit is a timing race it cannot run); the
+        validator wins a symlink-swap race between the check and this use to confirm."""
+        if h["solutions"]:
+            return
+        self.violation(s, "toctou", h["site"],
+                       f"an input-controlled path reaches {h['callee']}() in a program that also "
+                       f"checks a filename; the validator races a symlink swap between check and use",
+                       extra=[])
 
     def _check_leak(self, s, h):
         """CWE-401: the allocation here is reached. The driver cannot prove the block is never

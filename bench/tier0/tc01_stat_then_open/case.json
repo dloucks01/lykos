@@ -1,0 +1,31 @@
+{
+  "id": "tc01_stat_then_open",
+  "summary": "catsmall: stat() size check then a re-open of the same path after a window -- a check-to-use race (TOCTOU)",
+  "class": "toctou",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-367",
+      "kind": "toctou",
+      "line": 24,
+      "function": "main",
+      "oracle": "toctou",
+      "note": "stat(argv[1]) checks size, then fopen(argv[1]) re-resolves the path after a window",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

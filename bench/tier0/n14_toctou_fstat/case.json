@@ -1,0 +1,21 @@
+{
+  "id": "n14_toctou_fstat",
+  "summary": "catsmall that opens first and fstat()s the fd: the checked object is the used object, no race",
+  "class": "toctou",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [],
+  "intended_exec": [],
+  "seed_exit": 1
+}

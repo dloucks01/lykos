@@ -170,6 +170,72 @@ def run_timed(binary, case, data, workdir, timeout):
             stdin.close()
 
 
+TOCTOU_MARK = b"LYKOS_TOCTOU_WIN"
+
+
+def toctou_win(binary, case, tries=150):
+    """Win a check-to-use symlink race: the target file fails the program's check (its marker
+    never surfaces steadily), so the marker appearing while racing proves a TOCTOU. Returns
+    (won, reason)."""
+    import threading
+    mode = case["invocation"]["input_mode"]
+    if mode not in ("arg", "stdin"):
+        return False, "not an arg/stdin path input"
+    tmp = tempfile.mkdtemp(prefix="tc-")
+    try:
+        benign, tgt, link = (os.path.join(tmp, n) for n in ("benign", "target", "link"))
+        with open(benign, "wb") as f:
+            f.write(b"BENIGN\n")
+        with open(tgt, "wb") as f:
+            f.write((TOCTOU_MARK + b"\n") * 600)
+
+        def relink(dest):
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(dest, link)
+
+        def one():
+            if mode == "stdin":
+                argv = [binary] + [a for a in case["invocation"]["argv"] if a != "@@"]
+                stdin = (link + "\n").encode()
+            else:
+                argv = [binary] + [link if a == "@@" else a for a in case["invocation"]["argv"]]
+                stdin = b""
+            try:
+                p = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, cwd=tmp, env=ENV, timeout=5)
+                return (p.stdout or b"") + (p.stderr or b"")
+            except (subprocess.TimeoutExpired, OSError):
+                return b""
+        relink(benign)
+        if TOCTOU_MARK in one():
+            return False, "benign already shows marker"
+        relink(tgt)
+        if TOCTOU_MARK in one():
+            return False, "no effective check (steady target served)"
+        for _ in range(tries):
+            relink(benign)
+            stop = threading.Event()
+
+            def swap():
+                while not stop.is_set():
+                    try:
+                        relink(tgt)
+                        relink(benign)
+                    except OSError:
+                        pass
+            th = threading.Thread(target=swap, daemon=True)
+            th.start()
+            out = one()
+            stop.set()
+            th.join(timeout=2)
+            if TOCTOU_MARK in out:
+                return True, "served swapped-in target after the check"
+        return False, "race not won in %d tries" % tries
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def unintended(execs, case, binary):
     allowed = SHELLS | set(case.get("intended_exec", [])) | {os.path.basename(binary)}
     return [e for e in execs if os.path.basename(e) not in allowed]
@@ -210,10 +276,17 @@ def check_clean(label, binary, case, data, workdir, expect_rc=None):
     if case.get("class") == "resource":
         if run_timed(binary.replace("prog_asan", "prog"), case, data, workdir, 4):
             problems.append("did not terminate within 4s")
+    if case.get("class") == "toctou":
+        won, why = toctou_win(binary.replace("prog_asan", "prog"), case)
+        if won:
+            problems.append("TOCTOU race won: " + why)
     return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
 
 
 def check_bug(binary, case, bug, data, workdir):
+    if bug["oracle"] == "toctou":
+        won, why = toctou_win(binary.replace("prog_asan", "prog"), case)
+        return (True, "won race: " + why) if won else (False, "no race: " + why)
     if bug["oracle"] == "timeout":
         pbin = binary.replace("prog_asan", "prog")
         if run_timed(pbin, case, data, workdir, 6):
