@@ -42,7 +42,7 @@ def _build(cc, out, src, inc, extra, env=None):
     return out if (r.returncode == 0 and out.exists()) else None
 
 
-def score_target(tid, fuzz_seconds):
+def score_target(tid, fuzz_seconds, dump_crashes=False):
     from lykos.hypo import engine
     from lykos.hypo.validate import Target, replay
     from lykos.analyze.fuzz.aflpp import locate_afl, run_campaign
@@ -94,6 +94,9 @@ def score_target(tid, fuzz_seconds):
     # DIFFERENTIAL: crashes vuln, survives fixed -> a real bug the fix addressed
     env = {**os.environ, **ASAN_ENV}
     real, seen, incidental = 0, set(), 0
+    dumpdir = (tdir / "crashes") if dump_crashes else None
+    if dumpdir:
+        dumpdir.mkdir(exist_ok=True)
     for data in cand:
         vb, verr = _run(v_asan, data, mode, argv, env)
         if not vb:
@@ -108,6 +111,14 @@ def score_target(tid, fuzz_seconds):
             incidental += 1
         else:
             real += 1
+            if dumpdir:  # a confirmed real (vuln-only) bug: keep it as a self-verifying PoC
+                kind = b""
+                for tok in (b"heap-buffer-overflow", b"stack-buffer-overflow", b"global-buffer-overflow",
+                            b"negative-size-param", b"left_shift", b"SEGV", b"null"):
+                    if tok in verr:
+                        kind = b"_" + tok.replace(b"-", b"_"); break
+                name = f"poc_{sig}{kind.decode('ascii','replace')}.bin"
+                (dumpdir / name).write_bytes(data)
     import shutil
     shutil.rmtree(work, ignore_errors=True)
     return {"id": tid, "real": real, "incidental": incidental, "crashes": len(cand)}
@@ -134,13 +145,15 @@ def _run(exe, data, mode, argv, env):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fuzz-seconds", type=int, default=300)
+    ap.add_argument("--dump-crashes", action="store_true",
+                    help="write each confirmed real (vuln-only) bug input to <target>/crashes/ as a PoC")
     ap.add_argument("targets", nargs="*")
     a = ap.parse_args()
     ids = a.targets or sorted(d.name for d in HERE.iterdir()
                               if (d / "meta.json").exists())
     tot_real = tot_inc = 0
     for tid in ids:
-        r = score_target(tid, a.fuzz_seconds)
+        r = score_target(tid, a.fuzz_seconds, dump_crashes=a.dump_crashes)
         tot_real += r.get("real", 0)
         tot_inc += r.get("incidental", 0)
         print(f"{r['id']:<16} real-bugs={r.get('real',0)} incidental={r.get('incidental',0)} "
