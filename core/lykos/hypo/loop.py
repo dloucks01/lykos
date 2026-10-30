@@ -19,7 +19,7 @@ from typing import Callable, Optional
 from . import engine, store
 from .build import prepare
 from .validate import validate
-from .weaponize import weaponize
+from .weaponize import weaponize, weaponize_fmt
 
 MIN_ROUND = 30.0
 
@@ -148,6 +148,27 @@ def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
         if ex.get("level") == "L3" and ex.get("confirmed") and ex.get("payload_b64"):
             sol = _Solution(_b64.b64decode(ex["payload_b64"]), ex.get("evidence", ""), None)
             sol.verdict = _Verdict(True, "ret2win", ex.get("evidence", ""), h.line, runs=1)
+            h.solutions.append(sol)
+            h.settle()
+    # Step 4 (B3): climb confirmed/solved format-string hypotheses to a write-what-where primitive.
+    for h in hyps:
+        if h.kind != "format-string" or time.time() >= t_end:
+            continue
+        if not (h.status == "confirmed" or h.solutions):
+            continue
+        try:
+            ex = weaponize_fmt(target, h, log=log)
+        except Exception as e:                          # noqa: BLE001 - weaponize never fails a hunt
+            ex = {"level": "error", "note": f"weaponize_fmt raised: {e}"}
+        if not ex:
+            continue
+        h.exploit = ex
+        log(f"  {h.id:<34} exploit {ex.get('level')}: "
+            f"{ex.get('evidence') or ex.get('note') or ex.get('strategy')}")
+        if ex.get("level") == "L3" and ex.get("confirmed") and ex.get("payload_b64") \
+                and h.status != "confirmed":
+            sol = _Solution(_b64.b64decode(ex["payload_b64"]), ex.get("evidence", ""), None)
+            sol.verdict = _Verdict(True, "fmt-www", ex.get("evidence", ""), h.line, runs=1)
             h.solutions.append(sol)
             h.settle()
     return {"binary": str(target.exe), "asan": str(target.asan_exe) if target.asan_exe else None,
