@@ -84,6 +84,26 @@ Each slice's "done" = a produced PoC on a target where we know the ground truth 
 sources / planted Tier-0), plus a red-run diagnosis that names which stage failed (static missed the
 site / no trigger hypothesis / solver stalled / target wouldn't execute).
 
+## Progress — class 1 (CWE-134 format string)
+Branch `rework/poc-engine-doc58`. Status as of 2026-10-30:
+- **Root model** (commit bf7dfe2): `poc.provenance` (migration v20); `construct.record_constructed_poc`
+  (sound construction → `confirmed`; detonation → `poc-backed`); `detonate.reaches_address` (INT3
+  breakpoint control-flow oracle, thread-safe, 0 false positives on benign input incl. a leaking %p).
+- **1a surfacing** (5ee01ef): CLI + HTML report headline the lightweight PoC (payload .bin + few-line
+  repro), provenance-labelled; report/model + serializer carry provenance.
+- **1b non-runnable static** (48a9a54): `_static_layout_from_frame` recovers the arg offset from the
+  decompiler frame map with NO execution (fmtvuln: offset 6 from the frame, == the probe). Constructed
+  PoC is the air-gap deliverable; detonation upgrades it to poc-backed when the binary runs here.
+- **1c generalization**: printf (k=0) AND fprintf (k=1) both reach a detonation-confirmed L3. PIE
+  correctly produces NO false PoC (one-shot requires `not pie`; `_construct_by_probe` bails on PIE) —
+  a PIE fmt bug can only become a two-stage recipe. 0-false-confirmation preserved.
+- **Honest gaps still open**: snprintf/syslog shapes untested (same generic k-indexed code, expected
+  to work); the PIE two-stage leak+write recipe is still a recipe, not yet a constructed two-stage
+  PoC; no real-world binary validated yet; a CONSTRUCTED (non-detonated) PoC currently rests on a
+  "structural, not taint-proven" reachability note — tighten to require a reach/taint signal before
+  claiming `confirmed` without detonation. DETECTION gap found (not this rework): the PIE build's
+  printf sink was not flagged CWE-134 at all.
+
 ## What this explicitly retires
 The fuzz-led benchmark framing as a proxy for the product; "corroborated recipe, nothing further" as
 a terminal output; execution as the confirmation gate; the giant multi-file `bundle.py` package as
