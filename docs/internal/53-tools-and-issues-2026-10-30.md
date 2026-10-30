@@ -22,6 +22,25 @@ of `vendor/`, the host, `core/lykos/analyze/` and `tools/` against the loop
 Host notes: rizin missing (doctor reports OK through the r2 fallback — issue 7); honggfuzz, rr,
 klee, infer, ropper, libqasan absent; symqemu is x86-64 only.
 
+### 1a. Fetched 2026-10-30 (user space, no root; versions + SHA-256 in `vendor/tools/MANIFEST.txt`)
+
+| Tool | Version | Where | Notes |
+|---|---|---|---|
+| rizin | 0.9.1 static | `vendor/tools/rizin` | doctor now finds real rizin (issue 7 closed on this host) |
+| infer | v1.3.0 | `vendor/tools/infer` | |
+| honggfuzz | 2.6 @ 940b958 | `vendor/tools/honggfuzz` | release 2.6 predates binutils 2.46's `disassembler()` API; dev headers via `apt-get download` into `hfdeps/` |
+| libqasan | AFL++ v4.33c | `vendor/tools/aflpp/libqasan.so` | needed a glibc-2.43 `_Generic` compat include; `LYKOS_QASAN` set by vendorenv |
+| ropper | Ropper@a2ffccf | `vendor/tools/ropper-venv` | release 1.13.10 no longer builds on Python 3.14 (`ast.Str`) |
+| KLEE | 3.3 (container, pinned digest) | `vendor/tools/bin/klee` | dev-side; not air-gap bundled |
+| rr | — | — | **needs root**: `sudo apt install rr && sudo sysctl kernel.perf_event_paranoid=1` |
+| strace | 6.19 (host) | — | added to the bundle's package list (`toolchain.py`) |
+| clang sanitizers | clang 21 | host | memory, thread, integer+implicit-conversion+nullability, address+undefined all build and run |
+| corpora | cb-multios 810d7b2 (225/241 built), Magma 75d1ae7, ARVO bc2a373 + ARVO-Meta 51cfeab | `bench/external/` (gitignored) | cb-multios needs `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` on CMake 4 and legacy-C errors downgraded |
+
+`vendorenv.activate` puts `vendor/tools/bin` on PATH (behind the toolchain's scoped wrappers) and
+points `LYKOS_QASAN` at the built libqasan; `lykos doctor` reports each tool. The bundle builder
+does not yet carry `vendor/tools/` into the air-gap package — open item.
+
 ## 2. Reused by the loop (keep)
 
 sandbox (`analyze/dynamic/sandbox.py`: `run`, `run_batch` fault PCs are file vaddrs), batch_runner,

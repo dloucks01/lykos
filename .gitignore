@@ -63,3 +63,7 @@ leak-*
 
 # build stamp written by packaging/make-runnable.sh into the shipped tree only
 /BUILD_INFO.json
+
+# Benchmark corpora fetched for Tier-1/2 (CGC cb-multios, Magma, ARVO): large, third-party, never
+# committed. Fetched by the tools/corpora step (docs/internal/53).
+/bench/external/

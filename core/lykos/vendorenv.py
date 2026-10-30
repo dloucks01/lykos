@@ -231,10 +231,22 @@ def activate(force: bool = False) -> dict:
         _prepend_path(bins)
         summary["bin"] = bins
 
+    # Stand-alone tools fetched into vendor/tools/ (rizin static release, honggfuzz, infer, ropper,
+    # the KLEE container wrapper -- docs/internal/53): self-contained, so their bin dir can join PATH
+    # directly (behind the toolchain's scoped wrappers, which stay first).
+    tools_bin = vendor / "tools" / "bin" if vendor else None
+    if tools_bin and tools_bin.is_dir():
+        _prepend_path(summary["bin"] + [str(tools_bin)])
+        summary["bin"] = summary["bin"] + [str(tools_bin)]
+
     # Point the engine-specific locators at their vendored copies when the operator has not
     # already chosen one. These honour their own env vars first (see each locate_* function),
     # so an explicit choice is never overridden.
     env = summary["env"]
+    qasan = vendor / "tools" / "aflpp" / "libqasan.so" if vendor else None
+    if qasan and qasan.is_file() and not os.environ.get("LYKOS_QASAN"):
+        os.environ["LYKOS_QASAN"] = str(qasan)
+        env["LYKOS_QASAN"] = str(qasan)
     ghidra = _find_ghidra(vendor, prefix)
     if ghidra:
         for var in ("LYKOS_GHIDRA", "GHIDRA_INSTALL_DIR"):

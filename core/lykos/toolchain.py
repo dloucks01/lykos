@@ -422,6 +422,32 @@ def _probe_qasan():
     return str(p) if p else None
 
 
+def _probe_strace():
+    return _v("strace", "-V")
+
+
+def _probe_honggfuzz():
+    return _v("honggfuzz", "--version")
+
+
+def _probe_infer():
+    return _v("infer", "--version")
+
+
+def _probe_ropper():
+    return _v("ropper", "--version") or (shutil.which("ropper") and "installed")
+
+
+def _probe_klee():
+    # a container wrapper (vendor/tools/bin/klee): report presence, not a 30-second image start
+    w = shutil.which("klee")
+    return f"container wrapper ({w})" if w else None
+
+
+def _probe_rr():
+    return _v("rr", "--version")
+
+
 def _probe_weggli():
     from .analyze.weggli import weggli_bin
     w = weggli_bin()
@@ -569,6 +595,36 @@ TOOLS: tuple = (
          "the dislocator + valgrind lanes cover the common case; qasan adds shadow-memory depth",
          "build AFL++ qemu_mode with libqasan, then LYKOS_QASAN=/path/libqasan.so",
          _probe_qasan, tier="optional"),
+    Tool("strace", "strace (syscall tracer)",
+         "the syscall-effect oracle (exec/open arguments) for command injection, path traversal "
+         "and TOCTOU validation on native targets",
+         "those validators fall back to output markers; path traversal cannot be proven on a "
+         "target that does not print what it opened",
+         "apt-get install strace", _probe_strace, tier="recommended", apt=("strace",)),
+    Tool("honggfuzz", "honggfuzz -- optional fallback fuzzer",
+         "a second coverage-guided engine for the hypothesis loop's fuzz fallback (doc 52 step 5)",
+         "AFL++ remains the fallback fuzzer",
+         "build from source into vendor/tools/honggfuzz (docs/internal/53)",
+         _probe_honggfuzz, tier="optional"),
+    Tool("infer", "Infer (Meta, MIT) -- optional source analyzer",
+         "an independent interprocedural proposer for source targets (null deref, leaks, races)",
+         "proposals come from lykos' own checks only",
+         "unpack the official release into vendor/tools/infer (docs/internal/53)",
+         _probe_infer, tier="optional"),
+    Tool("ropper", "ropper -- optional gadget finder",
+         "a cross-check for lykos' own gadget search in the exploit ladder",
+         "lykos' built-in gadget finder and ROP solver are used alone",
+         "vendor/tools/ropper-venv (docs/internal/53)", _probe_ropper, tier="optional"),
+    Tool("klee", "KLEE -- optional, dev-side container",
+         "a second symbolic engine to cross-check the angr hypothesis driver on source targets",
+         "angr is the only symbolic engine",
+         "podman pull docker.io/klee/klee:3.3; wrapper vendor/tools/bin/klee (not air-gap bundled)",
+         _probe_klee, tier="optional"),
+    Tool("rr", "rr record/replay -- optional, needs root to set up",
+         "deterministic replay of a validated PoC for root-cause and race analysis",
+         "PoCs are replayed live (N-run agreement) instead of recorded",
+         "sudo apt install rr && sudo sysctl kernel.perf_event_paranoid=1",
+         _probe_rr, tier="optional", apt=("rr",)),
     Tool("weggli", "weggli (source variant analysis)",
          "AST pattern matching over C/C++ source: run the vuln-pattern pack and hunt variants of a "
          "known bug (lykos weggli-scan)",
