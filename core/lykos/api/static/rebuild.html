@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lykos · PoC workbench (rebuild)</title>
+<script type="importmap">
+{ "imports": {
+  "preact": "./vendor/preact.module.js",
+  "preact/hooks": "./vendor/hooks.module.js",
+  "htm": "./vendor/htm.module.js"
+} }
+</script>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1115; --fg:#e6e8ec; --mut:#8b93a1; --line:#232733;
+          --card:#161a22; --acc:#8e4ec6; --det:#2ea043; --con:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-sans-serif,system-ui,sans-serif; }
+  .mono { font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .muted { color:var(--mut); }
+  .top { display:flex; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); }
+  .brand { font-weight:650; }
+  select { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:5px 8px; }
+  main { padding:16px; max-width:900px; margin:0 auto; }
+  .summary { margin-bottom:12px; color:var(--mut); }
+  .err { background:#3a1416; color:#ffb4b4; padding:8px 16px; }
+  .fcard { background:var(--card); border:1px solid var(--line); border-radius:10px; margin:10px 0; overflow:hidden; }
+  .fc-head { display:flex; gap:10px; align-items:center; padding:10px 12px; cursor:pointer; }
+  .fc-head .ftitle { flex:1; }
+  .fc-head .state { font-size:12px; color:var(--mut); }
+  .sev { font-size:11px; text-transform:uppercase; padding:1px 7px; border-radius:20px; border:1px solid var(--line); }
+  .sev.critical { color:#ff6b6b; border-color:#ff6b6b55; } .sev.high { color:#ff9f43; border-color:#ff9f4355; }
+  .sev.medium { color:#ffd93d; } .sev.low,.sev.info { color:var(--mut); }
+  .cwe { font-size:12px; color:var(--acc); }
+  .fc-body { padding:0 12px 12px; border-top:1px solid var(--line); }
+  .ladder2 { display:flex; gap:6px; margin:10px 0; flex-wrap:wrap; }
+  .rung { font-size:11px; padding:2px 9px; border-radius:20px; border:1px solid var(--line); color:var(--mut); }
+  .rung.on { color:var(--fg); border-color:var(--acc); }
+  .rung.cur { background:var(--acc); color:#fff; border-color:var(--acc); }
+  .deliver { background:#0c0e13; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .deliver.none { opacity:.9; }
+  .dl-h { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  .lvl { font-weight:700; color:var(--acc); }
+  .b2 { font-size:11px; padding:1px 8px; border-radius:20px; }
+  .b2.det { background:#143d1f; color:#5fe08a; } .b2.con { background:#122a4d; color:#7db6ff; }
+  .sig { font-size:12px; color:var(--mut); } .mono, pre { font-family:ui-monospace,Menlo,monospace; }
+  .dl-row { display:flex; gap:10px; align-items:center; margin-bottom:8px; }
+  .btn { display:inline-block; background:var(--acc); color:#fff; text-decoration:none; padding:5px 12px; border-radius:7px; font-size:13px; }
+  pre.repro2, pre.sound { background:#06070a; border:1px solid var(--line); border-radius:6px; padding:9px; font-size:12px; overflow:auto; white-space:pre-wrap; }
+  details.sfold summary { cursor:pointer; color:var(--mut); font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="./app2/main.js"></script>
+</body>
+</html>

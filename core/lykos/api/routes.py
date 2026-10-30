@@ -61,7 +61,7 @@ _CASE_SEED_ID = re.compile(r"^/cases/([^/]+)/seeds/([0-9a-fA-F]{64})$")
 # subtrees are served, and only plain web asset types -- nothing else under the package is
 # reachable, and a name with `..` or a leading slash never resolves.
 _STATIC_ASSET = re.compile(
-    r"^/((?:app|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
+    r"^/((?:app|app2|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
 _ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".mjs": "text/javascript; charset=utf-8",
