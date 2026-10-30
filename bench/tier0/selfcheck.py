@@ -32,6 +32,8 @@ ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?addres
 UBSAN_ERR = re.compile(r"(\S*prog\.c):(\d+):\d+: runtime error: (.*)$", re.M)
 FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
 EXECVE = re.compile(r'execve\("([^"]*)",.*\)\s*=\s*(-?\d+)')
+OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
+TRAVERSAL_TAIL = "etc/passwd"
 
 
 def ubsan_kind(msg):
@@ -92,7 +94,7 @@ def run(binary, case, data, workdir, strace=False):
     if strace:
         if os.path.exists(trace):
             os.remove(trace)
-        argv = ["strace", "-f", "-qq", "-e", "trace=execve", "-o", trace] + argv
+        argv = ["strace", "-f", "-qq", "-e", "trace=execve,open,openat,creat", "-o", trace] + argv
     stdin = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
     try:
         p = subprocess.run(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -100,14 +102,17 @@ def run(binary, case, data, workdir, strace=False):
     finally:
         if stdin_path:
             stdin.close()
-    execs = []
+    execs, opens = [], []
     if strace and os.path.exists(trace):
         with open(trace, errors="replace") as fh:
             for ln in fh:
                 m = EXECVE.search(ln)
                 if m and m.group(2) == "0":
                     execs.append(m.group(1))
-    return p.returncode, p.stderr.decode("utf-8", "replace"), execs
+                o = OPENPATH.search(ln)
+                if o:
+                    opens.append(o.group(1))
+    return p.returncode, p.stderr.decode("utf-8", "replace"), execs, opens
 
 
 def unintended(execs, case, binary):
@@ -115,8 +120,13 @@ def unintended(execs, case, binary):
     return [e for e in execs if os.path.basename(e) not in allowed]
 
 
+def traversed(opens):
+    """Open paths that escaped a base directory: a `../` sequence AND the sentinel tail."""
+    return [p for p in opens if "../" in p and TRAVERSAL_TAIL in p]
+
+
 def check_clean(label, binary, case, data, workdir, expect_rc=None):
-    rc, err, execs = run(binary, case, data, workdir, strace=True)
+    rc, err, execs, opens = run(binary, case, data, workdir, strace=True)
     rep = parse_report(err)
     bad = unintended(execs, case, binary)
     problems = []
@@ -128,17 +138,25 @@ def check_clean(label, binary, case, data, workdir, expect_rc=None):
         problems.append("exit %d != %d" % (rc, expect_rc))
     if bad:
         problems.append("unintended exec %s" % bad)
+    if case.get("class") == "path-traversal" and traversed(opens):
+        problems.append("escaped base via %s" % traversed(opens)[0])
     return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
 
 
 def check_bug(binary, case, bug, data, workdir):
     if bug["oracle"] == "exec":
-        rc, err, execs = run(binary, case, data, workdir, strace=True)
+        rc, err, execs, opens = run(binary, case, data, workdir, strace=True)
         bad = unintended(execs, case, binary)
         if bad:
             return True, "injected exec %s" % [os.path.basename(b) for b in bad]
         return False, "no unintended execve (saw %s)" % [os.path.basename(e) for e in execs]
-    rc, err, _ = run(binary, case, data, workdir)
+    if bug["oracle"] == "openat":
+        rc, err, execs, opens = run(binary, case, data, workdir, strace=True)
+        hit = traversed(opens)
+        if hit:
+            return True, "opened out-of-base path %s" % hit[0]
+        return False, "no out-of-base open (saw %s)" % opens[:3]
+    rc, err, _, _ = run(binary, case, data, workdir)
     rep = parse_report(err)
     if not rep:
         return False, "no sanitizer report (rc=%d)" % rc

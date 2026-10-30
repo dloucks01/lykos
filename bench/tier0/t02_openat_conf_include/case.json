@@ -1,0 +1,32 @@
+{
+  "id": "t02_openat_conf_include",
+  "summary": "cfgread: an include name is appended to the relative base conf.d/ and opened via openat() with no check for `..`",
+  "class": "path-traversal",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-22",
+      "kind": "path-traversal",
+      "line": 18,
+      "function": "main",
+      "oracle": "openat",
+      "note": "include name is concatenated onto conf.d/ and opened via openat(); ../ escapes the base",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

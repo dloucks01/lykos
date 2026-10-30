@@ -37,6 +37,10 @@ _ID_MARK = re.compile(rb"uid=\d+\(")
 _SHELLS = {"sh", "bash", "dash", "zsh"}
 _EXECVE = re.compile(r'execve\("([^"]*)"(?:,.*)?\)\s*=\s*0')
 _MARKER_EXE = "id"           # the program the solver pins an injectable exec/path to
+# an open-family syscall's path argument (the first quoted string; for openat the dirfd is not
+# quoted, so the first quoted token is still the path).
+_OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
+_TRAVERSAL_TAIL = "etc/passwd"   # driver pins the traversal to `../`*N + this tail
 
 _ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
 _UBSAN_ERR = re.compile(r"(\S+?):(\d+):\d+: runtime error: (.*)$", re.M)
@@ -156,12 +160,12 @@ def _native_runs(target: Target, data: bytes, n: int) -> list:
     return [replay(target, target.exe, data) for _ in range(n)]
 
 
-def _exec_markers(target: Target, data: bytes) -> set:
-    """Basenames of the programs the target successfully execve'd on this input, via strace
-    (the syscall-effect oracle). Run inside bwrap when available; empty set if strace is absent."""
+def _strace_log(target: Target, data: bytes, trace: str) -> Optional[str]:
+    """Run the target once under `strace -e trace=<trace>` inside bwrap and return the trace text,
+    or None if strace is absent or the trace could not be produced. The syscall-effect oracle."""
     strace = shutil.which("strace")
     if not strace:
-        return set()
+        return None
     from ..analyze.dynamic import sandbox
     tmp = tempfile.mkdtemp(prefix="lykos-strace-")
     try:
@@ -177,26 +181,43 @@ def _exec_markers(target: Target, data: bytes) -> set:
             argv = [a if x == "@@" else x for x in argv] if "@@" in argv else argv + [a]
         else:
             argv = [inp if x == "@@" else x for x in argv] if "@@" in argv else argv + [inp]
-        inner = [strace, "-f", "-qq", "-e", "trace=execve", "-o", log, "--", str(target.exe), *argv]
+        inner = [strace, "-f", "-qq", "-e", f"trace={trace}", "-o", log, "--", str(target.exe), *argv]
         prefix = sandbox.isolate_prefix(str(Path(target.exe).parent), net=False,
                                         ro_binds=[tmp], rw_binds=[tmp])
         try:
             sandbox.run_reaped(prefix + inner, input=stdin_bytes, timeout=10.0,
                                capture_output=True)
         except Exception:        # noqa: BLE001 - a trace failure is "no evidence", not a crash
-            return set()
-        execs = set()
+            return None
         try:
             with open(log, errors="replace") as fh:
-                for ln in fh:
-                    m = _EXECVE.search(ln)
-                    if m:
-                        execs.add(os.path.basename(m.group(1)))
+                return fh.read()
         except OSError:
-            return set()
-        return execs
+            return None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _exec_markers(target: Target, data: bytes) -> set:
+    """Basenames of the programs the target successfully execve'd on this input."""
+    log = _strace_log(target, data, "execve")
+    if not log:
+        return set()
+    return {os.path.basename(m.group(1)) for m in _EXECVE.finditer(log)}
+
+
+def _traversal_opens(target: Target, data: bytes) -> list:
+    """Open-family syscall paths that escaped a base directory on this input: a `../` sequence
+    AND the pinned sentinel tail. Such a path cannot be formed without the attacker's bytes."""
+    log = _strace_log(target, data, "open,openat,creat")
+    if not log:
+        return []
+    hits = []
+    for m in _OPENPATH.finditer(log):
+        p = m.group(1)
+        if "../" in p and _TRAVERSAL_TAIL in p:
+            hits.append(p)
+    return hits
 
 
 def validate(target: Target, hyp: Hypothesis, data: bytes):
@@ -219,6 +240,18 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
                            hyp.line), None
         return Verdict(False, "exec-marker",
                        f"the injected command did not run (execs seen: {sorted(execs) or 'none'})"), None
+
+    if hyp.kind == "path-traversal":
+        # no sanitizer catches a traversal: the proof is the syscall itself -- the process issued
+        # an open() for a path carrying `../` out of its base to the pinned sentinel, which it
+        # could not have built without the attacker's bytes.
+        hits = _traversal_opens(target, data)
+        if hits:
+            return Verdict(True, "openat", f"the process opened a path outside its base: {hits[0]}",
+                           hyp.line), None
+        if shutil.which("strace") is None:
+            return Verdict(False, "openat", "strace unavailable: cannot observe the open syscall"), None
+        return Verdict(False, "openat", "no out-of-base open() observed on replay"), None
 
     if target.asan_exe is not None:
         agree, last, incidental = 0, None, None

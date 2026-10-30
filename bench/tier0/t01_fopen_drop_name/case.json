@@ -1,0 +1,32 @@
+{
+  "id": "t01_fopen_drop_name",
+  "summary": "filebox: a requested name is appended to a fixed drop directory and opened with no check for `..`",
+  "class": "path-traversal",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-22",
+      "kind": "path-traversal",
+      "line": 14,
+      "function": "serve",
+      "oracle": "openat",
+      "note": "name is concatenated onto /var/lib/filebox/drop/ and opened; ../ escapes the base",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

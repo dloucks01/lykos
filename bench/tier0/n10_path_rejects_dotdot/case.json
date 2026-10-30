@@ -1,0 +1,21 @@
+{
+  "id": "n10_path_rejects_dotdot",
+  "summary": "filebox that rejects any name containing `..` before building the path: no traversal",
+  "class": "path-traversal",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [],
+  "intended_exec": []
+}

@@ -65,6 +65,16 @@ EXEC_SINKS = {"execl": (0, 3), "execlp": (0, 3), "execle": (0, 3),
 # programs a solved exec path is pinned to: executing one is proof, and its output carries the
 # marker the validator looks for (`uid=`). First that exists on the host wins.
 MARKER_PROGS = ("/usr/bin/id", "/bin/id")
+# file-opening sinks (CWE-22 path traversal). value = index of the path argument. A traversal is
+# a finding only when attacker bytes EXTEND a program-chosen base directory: if the whole path is
+# attacker input there is no confinement to escape, so the check requires a concrete '/'-bearing
+# prefix before the first input byte.
+OPEN_SINKS = {"fopen": 0, "fopen64": 0, "freopen": 0, "open": 0, "open64": 0, "openat": 1,
+              "opendir": 0, "creat": 0, "creat64": 0}
+# pinned traversal payload: enough `../` to climb out of any base dir, then a sentinel tail the
+# validator recognises in an open() syscall path (`../` present AND this tail = escaped the base).
+TRAVERSAL_TAIL = b"etc/passwd"
+TRAVERSAL_PAYLOAD = b"../" * 12 + TRAVERSAL_TAIL
 NULL_PAGE = 0x1000          # an access below this is a NULL (+ small offset) dereference
 # malloc/calloc/realloc fail (return NULL) at or above this size: AddressSanitizer's allocation
 # limit (with allocator_may_return_null) and far beyond any host's memory, so the analysed and the
@@ -91,7 +101,7 @@ HIJACK_MARK = {64: 0x4141414141414141, 32: 0x41414141}
 CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-787",
        "stack-read": "CWE-125", "heap-read": "CWE-125", "global-read": "CWE-125",
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
-       "null-deref": "CWE-476", "div-zero": "CWE-369",
+       "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -914,6 +924,8 @@ class Driver:
                     kinds.append("format-string")
                 if base in CMD_SINKS or base in EXEC_SINKS:
                     kinds.append("cmd-injection")
+                if base in OPEN_SINKS:
+                    kinds.append("path-traversal")
                 if base in ALLOC_SINKS:
                     kinds.append("int-overflow-alloc")
                 if base in COPY_SINKS:
@@ -1669,7 +1681,7 @@ class Driver:
         if src is None:
             return
         h_any = None
-        for kind in ("format-string", "cmd-injection", "int-overflow-alloc", "copy"):
+        for kind in ("format-string", "cmd-injection", "int-overflow-alloc", "path-traversal", "copy"):
             h = self.hyps.get(f"{kind}@{src:#x}")
             if h is None:
                 continue
@@ -1685,6 +1697,8 @@ class Driver:
                 self._check_cmd(s, h)
             elif kind == "int-overflow-alloc":
                 self._check_alloc(s, h)
+            elif kind == "path-traversal":
+                self._check_open_path(s, h)
             if kind != "copy" and h["reached"] > self.SATURATE_REACHES and not h["solutions"]:
                 # reached over and over and never violable (a constant format string, a fixed
                 # command): stop steering the search toward it
@@ -1860,6 +1874,33 @@ class Driver:
                                f"set to {prog} it runs an arbitrary program", extra=[cond])
                 return
 
+    def _check_open_path(self, s, h):
+        """CWE-22 at a file-open sink: input bytes extend a program-chosen base directory, and
+        `../` sequences in those bytes can climb out of it. A fully attacker-controlled path
+        (first input byte at offset 0, no concrete base) is intended `open(argv[1])`, not a
+        traversal, so it is skipped -- the base prefix is what the attacker is escaping."""
+        try:
+            bs, first = self._input_bytes_at(s, self._arg(s, OPEN_SINKS[h["callee"]]))
+        except Exception:
+            return
+        if first is None or first == 0:
+            return
+        prefix = bytes(s.solver.eval(b) for b in bs[:first] if not b.symbolic)
+        if b"/" not in prefix:
+            return                              # the concrete prefix is not a directory path
+        tgt = TRAVERSAL_PAYLOAD
+        if first + len(tgt) > len(bs):
+            return
+        if not all(bs[first + t].symbolic for t in range(len(tgt))):
+            return
+        claripy = self.claripy
+        cond = claripy.And(*[bs[first + t] == tgt[t] for t in range(len(tgt))])
+        if s.solver.satisfiable(extra_constraints=[cond]):
+            self.violation(s, "path-traversal", h["site"],
+                           f"input bytes extend the path passed to {h['callee']}(); `../` "
+                           f"sequences climb out of the base {prefix.decode('latin-1', 'replace')!r} "
+                           f"to an arbitrary file", extra=[cond])
+
     def _cmd_payloads(self, s, bs, first):
         """Payloads for the shell quoting context where input starts. `grep -w '%s'` puts input
         inside single quotes, where `;id;#` is inert text: the payload must close the quote."""
@@ -2001,7 +2042,8 @@ class Driver:
                 sm.stashes["active"] = pool[:width]
                 sm.stashes["deferred"] = pool[width:]
             if all((h["solutions"] or h.get("saturated")) for h in self.hyps.values()
-                   if h["kind"] in ("copy", "store", "format-string", "cmd-injection", "int-overflow-alloc")) \
+                   if h["kind"] in ("copy", "store", "format-string", "cmd-injection",
+                                    "int-overflow-alloc", "path-traversal")) \
                     and self.hyps:
                 # every directing target settled: keep going only for oracle finds until drained
                 if not sm.deferred and not sm.active:
