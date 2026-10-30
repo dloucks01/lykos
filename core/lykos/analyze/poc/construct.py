@@ -44,6 +44,7 @@ def record_constructed_poc(ctx, target, *, cwe: str, technique: str, level: str,
                            dedup_key: Optional[str] = None, title: Optional[str] = None,
                            summary: Optional[str] = None, lead=None,
                            detonated: bool = False, signal_name: Optional[str] = None,
+                           function_addr=None, site_addr=None,
                            extra_evidence: Optional[list] = None) -> Optional[str]:
     """File a soundly-constructed PoC. Returns the finding id, or None on failure.
 
@@ -90,11 +91,17 @@ def record_constructed_poc(ctx, target, *, cwe: str, technique: str, level: str,
         ev.extend(extra_evidence)
     try:
         fd = FindingDAO(ctx.conn)
-        fd.upsert(target.id, target.case_id, {
+        row = {
             "cwe": cwe, "title": title or f"{technique} ({'detonated' if detonated else 'constructed'} {level} PoC)",
             "severity": severity, "detector": detector, "state": state,
             "confidence": DETONATED_CONFIDENCE if detonated else CONSTRUCTED_CONFIDENCE,
-            "dedup_key": key, "site_detail": technique, "evidence": ev})
+            "dedup_key": key, "site_detail": technique, "evidence": ev}
+        # link the finding to its code so the UI can pull the function's disasm/frame/xrefs
+        if function_addr is not None:
+            row["function_addr"] = function_addr
+        if site_addr is not None:
+            row["site_addr"] = site_addr
+        fd.upsert(target.id, target.case_id, row)
         fid = fd.id_for_dedup(target.id, key)
     except Exception:                                    # noqa: BLE001
         observe.absorbed(_log, "constructed PoC finding not filed")

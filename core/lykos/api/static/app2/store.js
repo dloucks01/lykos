@@ -7,6 +7,7 @@ export const store = {
   cases: [], caseId: null, targets: [], targetId: null,
   target: null,                 // full target detail (mitigations, arch, hashes…)
   advice: null,                 // invocation shape, decompiled count, headline
+  functions: [],                // function list (addr -> id mapping for code lookup)
   findings: [], pocs: [], selectedId: null,
   view: "overview",             // "overview" (binary) | "finding"
   filter: "all",                // findings filter
@@ -46,14 +47,16 @@ export async function selectTarget(targetId) {
   store.targetId = targetId; store.loading = true; store.error = null;
   store.target = null; store.advice = null; store.selectedId = null; store.view = "overview"; emit();
   try {
-    const [target, advice, findings, pocs] = await Promise.all([
+    const [target, advice, functions, findings, pocs] = await Promise.all([
       api.getTarget(targetId).catch(() => null),
       api.advice(targetId).catch(() => null),
+      api.functions(targetId).catch(() => []),
       api.targetFindings(targetId).catch(() => []),
       api.pocs(targetId).catch(() => []),
     ]);
     store.target = target;
     store.advice = advice;
+    store.functions = Array.isArray(functions) ? functions : (functions.functions || []);
     store.findings = Array.isArray(findings) ? findings : (findings.findings || []);
     store.pocs = Array.isArray(pocs) ? pocs : (pocs.pocs || []);
     store.selectedId = store.findings[0] ? store.findings[0].id : null;
@@ -62,6 +65,20 @@ export async function selectTarget(targetId) {
 }
 
 export function artifactUrl(sha) { return `/artifacts/${sha}`; }
+
+const _norm = (a) => (a == null ? null : (typeof a === "string" ? parseInt(a, 16) : a));
+
+// Fetch the full function detail (disasm ir, stack frame, callees/callers) for a code address.
+const _fnCache = new Map();
+export async function fetchFunctionAt(addr) {
+  const want = _norm(addr);
+  if (want == null) return null;
+  const fn = (store.functions || []).find((f) => _norm(f.addr) === want);
+  if (!fn) return null;
+  if (_fnCache.has(fn.id)) return _fnCache.get(fn.id);
+  try { const d = await api.getFunction(fn.id); _fnCache.set(fn.id, d); return d; }
+  catch (e) { return null; }
+}
 
 // Fetch raw artifact bytes (a PoC payload) for the hexdump, cached by sha.
 const _bytesCache = new Map();

@@ -1,8 +1,11 @@
 // The finding detail pane: full analysis for one finding, every state. PoC deliverable, the attack
 // FLOW (how the payload reaches the effect), status, exploitability, and the evidence trail as a
 // flowing report (no cards/bubbles).
+import { useState, useEffect } from "preact/hooks";
 import { html } from "./html.js";
 import { PocDeliverable, ConfirmationLadder } from "./poc.js";
+import { Disasm, StackFrame, XRefs } from "./code.js";
+import { fetchFunctionAt } from "./store.js";
 
 const CH_LABEL = {
   "root-cause": "Root cause", exploitability: "Exploitability", dataflow: "Dataflow",
@@ -58,10 +61,19 @@ function AttackFlow({ finding, advice, pocs }) {
 }
 
 export function DetailPane({ finding, pocs, advice }) {
+  const [fn, setFn] = useState(null);
+  const faddr = finding && finding.function_addr;
+  useEffect(() => {
+    let on = true; setFn(null);
+    if (faddr != null) fetchFunctionAt(faddr).then((d) => { if (on) setFn(d); });
+    return () => { on = false; };
+  }, [faddr]);
   if (!finding) return html`<div class="pane-pad muted">Select a finding.</div>`;
   const a = finding.analysis || {};
   const x = finding.exploitability || {};
   const miw = x.mitigations_in_way || [];
+  const site = finding.site_addr;
+  const hasCode = fn && (fn.ir || fn.decompiled);
   return html`<div class="detail">
     <div class="d-head">
       <span class=${"sev " + (finding.severity || "info")}>${finding.severity}</span>
@@ -78,6 +90,13 @@ export function DetailPane({ finding, pocs, advice }) {
     <div class="sect"><div class="sect-h">Attack flow</div>
       <${AttackFlow} finding=${finding} advice=${advice} pocs=${pocs} /></div>
 
+    ${hasCode ? html`<div class="sect"><div class="sect-h">
+        Code — <span class="mono">${fn.name || ""}</span> ${fn.addr ? html`<span class="muted">@ ${fn.addr}</span>` : null}</div>
+      <${Disasm} ir=${fn.ir} siteAddr=${site} signature=${fn.signature} source=${fn.decompiled || null} /></div>` : null}
+
+    ${(fn && fn.frame) ? html`<div class="sect"><div class="sect-h">Memory layout — stack frame</div>
+      <${StackFrame} frame=${fn.frame} /></div>` : null}
+
     ${(a.why_state || a.to_promote) ? html`<div class="sect"><div class="sect-h">Status</div>
       ${a.why_state ? html`<div class="why">${a.why_state}</div>` : null}
       ${a.to_promote ? html`<div class="promote"><span class="pr-k">To advance</span> ${a.to_promote}</div>` : null}
@@ -88,6 +107,9 @@ export function DetailPane({ finding, pocs, advice }) {
       ${miw.length ? html`<div class="miw-h">mitigations in the way</div>
         <ul class="miw">${miw.map((m) => html`<li>${m}</li>`)}</ul>` : null}
     </div>` : null}
+
+    ${(fn && (fn.callees || fn.callers)) ? html`<div class="sect"><div class="sect-h">Cross-references</div>
+      <${XRefs} callers=${fn.callers} callees=${fn.callees} /></div>` : null}
 
     <${Evidence} finding=${finding} />
 

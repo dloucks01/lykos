@@ -63,12 +63,26 @@ function Soundness({ detail }) {
   </div>`;
 }
 
-function Repro({ detail }) {
-  const lines = detail.split("\n").filter((l) => l.length);
-  return html`<pre class="term">${lines.map((l) =>
-    l.trim().startsWith("#")
-      ? html`<div class="t-com">${l}</div>`
-      : html`<div class="t-cmd"><span class="t-p">$</span> ${l}</div>`)}</pre>`;
+// The exact steps the tester runs to use the payload and see the effect.
+function Steps({ repro, signal, sha, bytes }) {
+  let cmd = null, note = null;
+  if (repro) {
+    const lines = repro.split("\n").map((l) => l.trim()).filter(Boolean);
+    cmd = lines.find((l) => !l.startsWith("#")) || null;
+    note = lines.filter((l) => l.startsWith("#")).map((l) => l.replace(/^#\s?/, "")).join(" ");
+  }
+  let i = 0;
+  const num = () => ++i;
+  return html`<ol class="steps">
+    <li><span class="st-n">${num()}</span><div class="st-b">
+      Download the payload — <a class="lk" href=${artifactUrl(sha)} download=${`poc-${sha.slice(0, 12)}.bin`}>poc.bin</a>
+      ${bytes ? html`<span class="muted"> (${bytes.length} bytes)</span>` : null}</div></li>
+    ${cmd ? html`<li><span class="st-n">${num()}</span><div class="st-b">
+      Run the target against it:<pre class="cmd"><span class="t-p">$</span> ${cmd}</pre></div></li>` : null}
+    <li><span class="st-n">${num()}</span><div class="st-b">
+      Observe the effect — <span class="st-eff">${signal || "the finding's effect fires"}</span></div></li>
+    ${note ? html`<li class="st-note muted">${note}</li>` : null}
+  </ol>`;
 }
 
 export function PocDeliverable({ finding, pocs }) {
@@ -101,7 +115,8 @@ export function PocDeliverable({ finding, pocs }) {
       ${best.signal ? html`<span class="dl-sig mono">${best.signal}</span>` : null}
       <a class="btn sm" href=${artifactUrl(sha)} download=${`poc-${sha.slice(0, 12)}.bin`}>⬇ payload</a>
     </div>
-    ${repro ? html`<div class="blk"><div class="blk-h">Reproduce</div><${Repro} detail=${repro.detail} /></div>` : null}
+    <div class="blk"><div class="blk-h">How to use this PoC</div>
+      <${Steps} repro=${repro && repro.detail} signal=${best.signal} sha=${sha} bytes=${bytes} /></div>
     <div class="blk"><div class="blk-h">Payload ${bytes ? html`<span class="muted">· ${bytes.length} bytes</span>` : null}</div>
       <pre class="hex">${bytes ? hexdump(bytes) : "loading…"}</pre></div>
     ${sound ? html`<div class="blk"><div class="blk-h">Why this works</div><${Soundness} detail=${sound.detail} /></div>` : null}

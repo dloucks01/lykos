@@ -618,6 +618,8 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                         summary=f"{name}(buf) at {s}: %hhn-write &{win[0]} over {dyn['slot']}@GOT "
                                 f"({dyn['got']:#x}); control reach to {win[0]} confirmed by detonation",
                         lead=lead, detonated=True,
+                        function_addr=getattr(lead, "function_addr", None),
+                        site_addr=getattr(lead, "site_addr", None),
                         signal_name=f"control reached {win[0]} ({int(win[1]):#x})")
                     if fid:
                         fids.append(fid)
@@ -643,6 +645,8 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                     dedup_key=f"poc:CWE-134:fmt-write:{site}:{target.id}",
                     title=f"Format-string write-what-where at {site}",
                     summary=plan["summary"], lead=lead,
+                    function_addr=getattr(lead, "function_addr", None),
+                    site_addr=getattr(lead, "site_addr", None),
                     detonated=detonated, signal_name=signal_name)
                 if fid:
                     fids.append(fid)
