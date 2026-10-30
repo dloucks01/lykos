@@ -67,6 +67,7 @@ def run_driver(case, prog, work, budget, seed_len):
     spec = {"binary": prog, "argv": inv["argv"], "input_mode": inv["input_mode"],
             "input_size": max(300, min(4096, 2 * seed_len)), "max_seconds": budget,
             "max_rss_mb": 6000}
+    spec.update(json.loads(os.environ.get("HYP_SPEC_EXTRA") or "{}"))   # A/B driver flags
     sp, op = os.path.join(work, "spec.json"), os.path.join(work, "out.json")
     with open(sp, "w") as fh:
         json.dump(spec, fh)

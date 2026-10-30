@@ -243,34 +243,57 @@ class Driver:
             reject = False
 
         class LineFgets(angr.SimProcedure):
-            """fgets that reads ONE line. angr's reads the maximum (size-1, or to EOF) from symbolic
-            input unless SHORT_READS is on globally, so the whole input was always one line and
-            no multi-command bug (AUTH then ADMIN, USER then SHOW) was reachable. SHORT_READS
-            globally would let fread/read return impossible short counts on a regular file."""
+            """fgets that reads ONE line, forking one successor per candidate line length. angr's
+            reads the maximum from symbolic input (the whole input = one line), so no multi-command
+            bug (AUTH then ADMIN, USER then SHOW) was reachable. A single symbolic length is the
+            exact semantics but makes every later read start at a symbolic file offset (If-chains
+            over all of them); KLEE-style forking keeps offsets concrete and lets the directed
+            search pick the useful lengths. Lengths are sampled (an under-approximation: every
+            path is real); `\r` padding before the newline covers the gaps for chomping parsers."""
+            CANDS = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
+
             def run(self, dst, size, file_ptr):   # noqa: D401
                 from cle.backends.externs.simdata.io_file import io_file_data_for_arch
                 st = self.state
-                if size.size() < self.arch.bits:
-                    size = size.zero_extend(self.arch.bits - size.size())
+                bits = self.arch.bits
                 fd = st.mem[file_ptr + io_file_data_for_arch(st.arch)["fd"]:].int.resolved
                 simfd = st.posix.get_fd(fd)
-                if simfd is None:
-                    return claripy.BVV(0, self.arch.bits)
-                if st.solver.is_true(size <= 1):
-                    return claripy.BVV(0, self.arch.bits)
-                want = claripy.BVS("fgets_len", self.arch.bits)
-                st.add_constraints(claripy.ULE(want, size - 1), claripy.UGE(want, 1))
-                data, real = simfd.read_data(want)
-                nb = len(data) // 8
-                for i in range(nb):
-                    byte = data.get_byte(i)
-                    st.add_constraints(claripy.If(
-                        claripy.BVV(i + 1, self.arch.bits) != real,
-                        claripy.Or(claripy.UGE(claripy.BVV(i, self.arch.bits), real), byte != 0x0a),
-                        claripy.Or(claripy.BVV(i + 2, self.arch.bits) == size, simfd.eof(), byte == 0x0a)))
-                st.memory.store(dst, data, size=real)
-                st.memory.store(dst + real, claripy.BVV(0, 8))
-                return real
+                try:
+                    if hasattr(simfd, "_read_file"):          # stdin: a duplex descriptor
+                        pos, fsize = simfd._read_pos, simfd._read_file.size
+                    else:
+                        pos, fsize = simfd.tell(), simfd.size
+                    if callable(fsize):
+                        fsize = fsize()
+                    concrete = all(x is not None for x in (pos, fsize)) and not any(
+                        st.solver.symbolic(x) for x in (size, pos, fsize) if not isinstance(x, int))
+                except Exception:
+                    concrete = False
+                if simfd is None or not concrete:
+                    return self.inline_call(angr.SIM_PROCEDURES["libc"]["fgets"], dst, size,
+                                            file_ptr).ret_expr
+                room = st.solver.eval(size) - 1
+                left = (fsize if isinstance(fsize, int) else st.solver.eval(fsize)) - \
+                    (pos if isinstance(pos, int) else st.solver.eval(pos))
+                cap = min(room, left)
+                if cap <= 0:
+                    return claripy.BVV(0, bits)
+                self.inhibit_autoret = True
+                for k in sorted({c for c in self.CANDS if c < cap} | {cap}):
+                    s2 = st.copy()
+                    data, _real = s2.posix.get_fd(fd).read_data(k)
+                    cons = [data.get_byte(i) != 0x0a for i in range(k - 1)]
+                    if k < cap:
+                        cons.append(data.get_byte(k - 1) == 0x0a)
+                    if cons:
+                        s2.add_constraints(*cons)
+                    if not s2.satisfiable():
+                        continue
+                    s2.memory.store(dst, data)
+                    s2.memory.store(dst + k, claripy.BVV(0, 8))
+                    ret_addr = self.cc.teardown_callsite(s2, return_val=dst, prototype=self.prototype)
+                    self.successors.add_successor(s2, ret_addr, claripy.true(), "Ijk_Ret")
+                return None
 
         class BoundedMemsetChk(BoundedMemset):
             def run(self, dst, char, num, _destlen):   # noqa: D401
@@ -1425,6 +1448,8 @@ class Driver:
             return
         if site is None:
             site = self._site_for(s)
+        hs = self.hyps.get(f"store@{site:#x}") if (write and site is not None) else None
+        nsol = self.stats["violations"]
         for c in conds:
             kind, cond, why, key = c[:4]
             near = c[4] if len(c) > 4 else None
@@ -1444,6 +1469,16 @@ class Driver:
                 if s.solver.satisfiable(extra_constraints=extra + [strong]):
                     extra = extra + [strong]
             self.violation(s, kind, site, why, extra=extra)
+        if hs is not None and not hs["solutions"] and not hs.get("saturated") \
+                and self.stats["violations"] == nsol:
+            # every predicate at this store was unsatisfiable again: after SATURATE_REACHES such
+            # visits stop steering toward it (an in-bounds chomp `s[strcspn(s, "\n")] = 0`
+            # otherwise held the search in a parser loop for the whole budget)
+            hs["_unsat_n"] = hs.get("_unsat_n", 0) + 1
+            if hs["_unsat_n"] > self.SATURATE_REACHES:
+                hs["saturated"] = True
+                hs["note"] = (hs.get("note") or "") + " (never violable: saturated)"
+                self._recompute_dmin()
 
     def _const_base(self, ast):
         """The constant term of an address expression like base + idx*scale (best effort)."""
