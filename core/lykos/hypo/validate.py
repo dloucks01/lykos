@@ -33,6 +33,8 @@ REPLAYS = 3
 SAN_ENV = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:symbolize=1:allocator_may_return_null=1",
            "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:abort_on_error=1"}
 MSAN_ENV = {"MSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:print_stats=0:exitcode=99"}
+LSAN_ENV = {"ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:symbolize=1:allocator_may_return_null=1",
+            "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:abort_on_error=1"}
 FATAL = {"SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE", "SIGABRT", "SIGTRAP"}
 _ID_MARK = re.compile(rb"uid=\d+\(")
 _SHELLS = {"sh", "bash", "dash", "zsh"}
@@ -44,6 +46,8 @@ _OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
 _TRAVERSAL_TAIL = "etc/passwd"   # driver pins the traversal to `../`*N + this tail
 
 _MSAN_ERR = re.compile(r"(?:WARNING|ERROR): MemorySanitizer: (use-of-uninitialized-value)", re.M)
+_LSAN_ERR = re.compile(r"LeakSanitizer: detected memory leaks", re.M)
+_LEAK_BLOCK = re.compile(r"(?:Direct|Indirect) leak of .*? allocated from:\n((?:\s*#\d+ .*\n)+)", re.S)
 _ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
 _UBSAN_ERR = re.compile(r"(\S+?):(\d+):\d+: runtime error: (.*)$", re.M)
 _FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S+?):(\d+)", re.M)
@@ -120,6 +124,19 @@ def parse_msan(stderr: str, source_root: Optional[Path] = None):
     if not m:
         return None
     return _program_frame(stderr, m.end(), source_root)
+
+
+def parse_lsan(stderr: str, source_root: Optional[Path] = None):
+    """(func, file, line) for each leaked allocation's first in-program frame (the allocation
+    site LeakSanitizer reports), or [] when no leak was detected."""
+    if not _LSAN_ERR.search(stderr):
+        return []
+    out = []
+    for m in _LEAK_BLOCK.finditer(stderr):
+        fr = _program_frame(m.group(1), 0, source_root)
+        if fr:
+            out.append(fr)
+    return out
 
 
 def _same_file(report_path: Optional[str], location: Optional[str]) -> bool:
@@ -287,6 +304,29 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
         if agree == REPLAYS:
             return Verdict(True, "msan", last, hyp.line, agree), None
         return Verdict(False, "msan", last or "", None, agree), incidental
+
+    if hyp.kind == "mem-leak":
+        # LeakSanitizer rides on the ASan build (detect_leaks=1). Confirm only when a leaked block
+        # was allocated at this site line, on every replay; a leak elsewhere is incidental.
+        if target.asan_exe is None:
+            return Verdict(False, "lsan", "no sanitizer build for leak detection"), None
+        agree, last, incidental = 0, None, None
+        for _ in range(REPLAYS):
+            r = replay(target, target.asan_exe, data, env=LSAN_ENV)
+            leaks = parse_lsan(r.stderr.decode("utf-8", "replace"), target.source_root)
+            if not leaks:
+                last = f"no leak reported ({r.signal or 'clean exit'})"
+                break
+            lines = sorted({ln for _f, _p, ln in leaks})
+            last = f"block(s) leaked, allocated at line(s) {lines}; site line {hyp.line}"
+            if hyp.line not in lines:
+                f0 = leaks[0]
+                incidental = ("memory-leak", f0[1], f0[2], f0[0])
+                break
+            agree += 1
+        if agree == REPLAYS:
+            return Verdict(True, "lsan", last, hyp.line, agree), None
+        return Verdict(False, "lsan", last or "", None, agree), incidental
 
     if target.asan_exe is not None:
         agree, last, incidental = 0, None, None

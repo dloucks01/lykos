@@ -57,6 +57,8 @@ def score_case(cid, bindir, budget, keep=None):
     extra = json.loads(os.environ.get("HYP_SPEC_EXTRA") or "{}")
     if has_msan:                                 # uninit proposing only pays off with an MSan gate
         extra.setdefault("uninit", True)
+    if case["class"] == "memleak":               # leak proposing is gated (noisy); on for its corpus
+        extra.setdefault("leak", True)
     t0 = time.time()
     out = engine.run_driver(prog, argv=inv["argv"], input_mode=inv["input_mode"], budget=budget,
                             input_size=max(300, min(4096, 2 * seed_len)), mem_mb=8192,

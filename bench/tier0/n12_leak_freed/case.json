@@ -1,0 +1,19 @@
+{
+  "id": "n12_leak_freed",
+  "summary": "sesslog that frees the label before returning: no leak",
+  "class": "memleak",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [],
+  "intended_exec": []
+}

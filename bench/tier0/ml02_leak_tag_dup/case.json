@@ -1,0 +1,32 @@
+{
+  "id": "ml02_leak_tag_dup",
+  "summary": "tagcopy: a strdup() of the file's TAG line is printed but never freed (memory leak)",
+  "class": "memleak",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-401",
+      "kind": "mem-leak",
+      "line": 23,
+      "function": "main",
+      "oracle": "lsan",
+      "note": "strdup(buf+4) on the TAG: path is never freed before return",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

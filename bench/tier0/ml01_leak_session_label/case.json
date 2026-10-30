@@ -1,0 +1,30 @@
+{
+  "id": "ml01_leak_session_label",
+  "summary": "sesslog: on the OPEN command the label buffer is allocated and never freed (memory leak)",
+  "class": "memleak",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-401",
+      "kind": "mem-leak",
+      "line": 15,
+      "function": "main",
+      "oracle": "lsan",
+      "note": "malloc(64) on the OPEN path is never freed before return",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

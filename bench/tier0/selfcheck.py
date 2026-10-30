@@ -37,6 +37,9 @@ OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
 TRAVERSAL_TAIL = "etc/passwd"
 MSAN_ERR = re.compile(r"MemorySanitizer: use-of-uninitialized-value", re.M)
 MSAN_FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
+LSAN_ERR = re.compile(r"LeakSanitizer: detected memory leaks", re.M)
+LEAK_BLOCK = re.compile(r"(?:Direct|Indirect) leak of .*? allocated from:\n((?:\s*#\d+ .*\n)+)", re.S)
+LSAN_ENV = {"ASAN_OPTIONS": "detect_leaks=1:abort_on_error=0:symbolize=1:allocator_may_return_null=1"}
 
 
 def parse_msan(stderr):
@@ -46,6 +49,18 @@ def parse_msan(stderr):
         return None
     fr = MSAN_FRAME.search(stderr, m.end())
     return (fr.group(1), int(fr.group(3))) if fr else None
+
+
+def parse_lsan(stderr):
+    """[(function, line)] for each leaked allocation's first in-program (prog.c) frame."""
+    if not LSAN_ERR.search(stderr):
+        return []
+    out = []
+    for m in LEAK_BLOCK.finditer(stderr):
+        fr = MSAN_FRAME.search(m.group(1))
+        if fr:
+            out.append((fr.group(1), int(fr.group(3))))
+    return out
 
 
 def ubsan_kind(msg):
@@ -160,10 +175,23 @@ def check_clean(label, binary, case, data, workdir, expect_rc=None):
             mr = parse_msan(merr)
             if mr:
                 problems.append("MSan use-of-uninitialized at prog.c:%d" % mr[1])
+    if case.get("class") == "memleak":
+        _, lerr, _, _ = run(binary, case, data, workdir, extra_env=LSAN_ENV)
+        lk = parse_lsan(lerr)
+        if lk:
+            problems.append("LSan leak at prog.c:%d" % lk[0][1])
     return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
 
 
 def check_bug(binary, case, bug, data, workdir):
+    if bug["oracle"] == "lsan":
+        _, lerr, _, _ = run(binary, case, data, workdir, extra_env=LSAN_ENV)
+        lines = [ln for _f, ln in parse_lsan(lerr)]
+        if not lines:
+            return False, "no leak reported"
+        if bug["line"] not in lines:
+            return False, "leak at line(s) %s != declared %d" % (sorted(set(lines)), bug["line"])
+        return True, "leaked allocation at prog.c:%d" % bug["line"]
     if bug["oracle"] == "msan":
         mbin = binary.replace("prog_asan", "prog_msan")
         if not os.path.exists(mbin):

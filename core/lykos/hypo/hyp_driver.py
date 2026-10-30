@@ -81,6 +81,10 @@ NULL_PAGE = 0x1000          # an access below this is a NULL (+ small offset) de
 # validator builds both fail there
 ALLOC_FAIL_SIZE = 1 << 40
 ALLOC_SINKS = {"malloc": 0, "realloc": 1, "_Znwm": 0, "_Znam": 0, "valloc": 0, "aligned_alloc": 1}
+# allocators whose result can be LEAKED (CWE-401). Proposing a leak is cheap (solve a reaching
+# input; LeakSanitizer decides at exit) but noisy, so it is gated on spec["leak"].
+LEAK_SINKS = {"malloc", "calloc", "realloc", "strdup", "strndup", "valloc", "aligned_alloc",
+              "_Znwm", "_Znam", "asprintf", "getline"}
 COPY_SINKS = {"memcpy", "memmove", "strcpy", "strncpy", "strcat", "strncat", "sprintf", "vsprintf",
               "snprintf", "read", "fread", "fgets", "recv", "recvfrom", "memset", "gets", "scanf",
               "sscanf", "fscanf", "__isoc99_scanf", "__isoc99_sscanf", "__isoc99_fscanf", "stpcpy",
@@ -102,7 +106,7 @@ CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-7
        "stack-read": "CWE-125", "heap-read": "CWE-125", "global-read": "CWE-125",
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
        "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
-       "uninit-read": "CWE-457",
+       "uninit-read": "CWE-457", "mem-leak": "CWE-401",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -929,6 +933,8 @@ class Driver:
                     kinds.append("path-traversal")
                 if base in ALLOC_SINKS:
                     kinds.append("int-overflow-alloc")
+                if self.spec.get("leak") and base in LEAK_SINKS:
+                    kinds.append("mem-leak")
                 if base in COPY_SINKS:
                     kinds.append("copy")
                 for kd in kinds:
@@ -1738,7 +1744,8 @@ class Driver:
         if src is None:
             return
         h_any = None
-        for kind in ("format-string", "cmd-injection", "int-overflow-alloc", "path-traversal", "copy"):
+        for kind in ("format-string", "cmd-injection", "int-overflow-alloc", "path-traversal",
+                     "mem-leak", "copy"):
             h = self.hyps.get(f"{kind}@{src:#x}")
             if h is None:
                 continue
@@ -1756,6 +1763,8 @@ class Driver:
                 self._check_alloc(s, h)
             elif kind == "path-traversal":
                 self._check_open_path(s, h)
+            elif kind == "mem-leak":
+                self._check_leak(s, h)
             if kind != "copy" and h["reached"] > self.SATURATE_REACHES and not h["solutions"]:
                 # reached over and over and never violable (a constant format string, a fixed
                 # command): stop steering the search toward it
@@ -1957,6 +1966,17 @@ class Driver:
                            f"input bytes extend the path passed to {h['callee']}(); `../` "
                            f"sequences climb out of the base {prefix.decode('latin-1', 'replace')!r} "
                            f"to an arbitrary file", extra=[cond])
+
+    def _check_leak(self, s, h):
+        """CWE-401: the allocation here is reached. The driver cannot prove the block is never
+        freed (that is a whole-program property), so it only solves a REACHING input; the
+        validator replays under LeakSanitizer and confirms only if the block is still unfreed at
+        exit. One reaching input is enough -- more would just be duplicate leaks."""
+        if h["solutions"]:
+            return
+        self.violation(s, "mem-leak", h["site"],
+                       f"the block allocated by {h['callee']}() is reached on this path; "
+                       f"LeakSanitizer decides whether it leaks at exit", extra=[])
 
     def _cmd_payloads(self, s, bs, first):
         """Payloads for the shell quoting context where input starts. `grep -w '%s'` puts input
