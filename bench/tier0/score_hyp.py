@@ -49,18 +49,22 @@ def score_case(cid, bindir, budget, keep=None):
     prog = os.path.join(work, "prog")
     shutil.copy(os.path.join(bindir, cid, "prog"), prog)
     asan = os.path.join(bindir, cid, "prog_asan")
+    msan = os.path.join(bindir, cid, "prog_msan")
+    has_msan = os.path.exists(msan)
     seed = os.path.join(cdir, "seed.bin")
     seed_len = os.path.getsize(seed) if os.path.exists(seed) else 0
     inv = case["invocation"]
+    extra = json.loads(os.environ.get("HYP_SPEC_EXTRA") or "{}")
+    if has_msan:                                 # uninit proposing only pays off with an MSan gate
+        extra.setdefault("uninit", True)
     t0 = time.time()
     out = engine.run_driver(prog, argv=inv["argv"], input_mode=inv["input_mode"], budget=budget,
                             input_size=max(300, min(4096, 2 * seed_len)), mem_mb=8192,
-                            extra=json.loads(os.environ.get("HYP_SPEC_EXTRA") or "{}"),
-                            workdir=Path(work))
+                            extra=extra, workdir=Path(work))
     wall = round(time.time() - t0, 1)
     hyps = engine.hypotheses_from(out, prog)
     target = Target(exe=Path(prog), argv=list(inv["argv"]), mode=inv["input_mode"],
-                    asan_exe=Path(asan))
+                    asan_exe=Path(asan), msan_exe=Path(msan) if has_msan else None)
     bug_lines = {b["line"]: b for b in case["bugs"]}
     found, false_conf, rows = {}, [], []
     for h in hyps:

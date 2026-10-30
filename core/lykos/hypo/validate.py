@@ -32,6 +32,7 @@ from .model import Hypothesis, Verdict
 REPLAYS = 3
 SAN_ENV = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:symbolize=1:allocator_may_return_null=1",
            "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:abort_on_error=1"}
+MSAN_ENV = {"MSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:print_stats=0:exitcode=99"}
 FATAL = {"SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE", "SIGABRT", "SIGTRAP"}
 _ID_MARK = re.compile(rb"uid=\d+\(")
 _SHELLS = {"sh", "bash", "dash", "zsh"}
@@ -42,6 +43,7 @@ _MARKER_EXE = "id"           # the program the solver pins an injectable exec/pa
 _OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
 _TRAVERSAL_TAIL = "etc/passwd"   # driver pins the traversal to `../`*N + this tail
 
+_MSAN_ERR = re.compile(r"(?:WARNING|ERROR): MemorySanitizer: (use-of-uninitialized-value)", re.M)
 _ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
 _UBSAN_ERR = re.compile(r"(\S+?):(\d+):\d+: runtime error: (.*)$", re.M)
 _FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S+?):(\d+)", re.M)
@@ -62,6 +64,7 @@ class Target:
     argv: list = field(default_factory=lambda: ["@@"])   # "@@" = where the input goes
     mode: str = "file"                                    # file | stdin | arg
     asan_exe: Optional[Path] = None
+    msan_exe: Optional[Path] = None                       # clang MemorySanitizer build (uninit)
     arch: Optional[str] = None
     endianness: Optional[str] = None
     bits: Optional[int] = None
@@ -108,6 +111,15 @@ def parse_sanitizer(stderr: str, source_root: Optional[Path] = None):
             return a.group(1).strip(), fr[0], fr[1], fr[2], al
         return a.group(1).strip(), None, None, None, al
     return None
+
+
+def parse_msan(stderr: str, source_root: Optional[Path] = None):
+    """(func, file, line) of the first MemorySanitizer use-of-uninitialized-value report's first
+    in-program frame, or None. MSan reports the frame where the uninitialised value is USED."""
+    m = _MSAN_ERR.search(stderr)
+    if not m:
+        return None
+    return _program_frame(stderr, m.end(), source_root)
 
 
 def _same_file(report_path: Optional[str], location: Optional[str]) -> bool:
@@ -252,6 +264,29 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
         if shutil.which("strace") is None:
             return Verdict(False, "openat", "strace unavailable: cannot observe the open syscall"), None
         return Verdict(False, "openat", "no out-of-base open() observed on replay"), None
+
+    if hyp.kind == "uninit-read":
+        # no condition is "satisfiable at the site": the proof is MSan reporting the use of an
+        # uninitialised value at this source line, on every replay. Needs the clang MSan build.
+        if target.msan_exe is None:
+            return Verdict(False, "msan", "no MemorySanitizer build available (clang required)"), None
+        agree, last, incidental = 0, None, None
+        for _ in range(REPLAYS):
+            r = replay(target, target.msan_exe, data, env=MSAN_ENV)
+            rep = parse_msan(r.stderr.decode("utf-8", "replace"), target.source_root)
+            if not rep:
+                last = f"no MemorySanitizer report ({r.signal or 'clean exit'})"
+                break
+            func, path, line = rep
+            ok = hyp.line is not None and line == hyp.line and _same_file(path, hyp.location)
+            last = f"use-of-uninitialized-value in {func} at {os.path.basename(path or '?')}:{line}; site line {hyp.line}"
+            if not ok:
+                incidental = ("use-of-uninitialized-value", path, line, func)
+                break
+            agree += 1
+        if agree == REPLAYS:
+            return Verdict(True, "msan", last, hyp.line, agree), None
+        return Verdict(False, "msan", last or "", None, agree), incidental
 
     if target.asan_exe is not None:
         agree, last, incidental = 0, None, None

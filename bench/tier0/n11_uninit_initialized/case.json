@@ -1,0 +1,19 @@
+{
+  "id": "n11_uninit_initialized",
+  "summary": "statusline that initialises `level` to 0 before use: no uninitialised read",
+  "class": "uninit",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [],
+  "intended_exec": []
+}

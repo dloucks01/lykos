@@ -64,9 +64,12 @@ def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
                 log: Callable[[str], None]) -> dict:
     t_end = time.time() + budget
     log(f"solving {target.exe.name} ({target.mode} input, argv {target.argv}) for {int(budget)} s")
+    # uninitialised-memory proposing only earns its cost (extra directing targets) when there is
+    # an MSan build to confirm against; otherwise it can never reach `confirmed`.
+    base_extra = {"uninit": True} if target.msan_exe else {}
     out = engine.run_driver(target.exe, argv=target.argv, input_mode=target.mode,
                             budget=max(MIN_ROUND, budget * 0.7), input_size=input_size,
-                            mem_mb=mem_mb)
+                            mem_mb=mem_mb, extra=dict(base_extra))
     hyps = engine.hypotheses_from(out, target.exe)
     _display(target, hyps)
     stats = [out.get("stats", {})]
@@ -80,7 +83,7 @@ def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
         excl = {h.id: [base64.b64encode(s.data).decode() for s in h.solutions] for h in retry}
         out2 = engine.run_driver(target.exe, argv=target.argv, input_mode=target.mode,
                                  budget=left - 10, input_size=input_size, mem_mb=mem_mb,
-                                 extra={"only": [h.id for h in retry], "exclude": excl})
+                                 extra={**base_extra, "only": [h.id for h in retry], "exclude": excl})
         stats.append(out2.get("stats", {}))
         if out2.get("error"):
             errors.append(out2["error"])
@@ -90,6 +93,7 @@ def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
         _validate_all(target, hyps, incidental, log)
     _drop_known(hyps, incidental)
     return {"binary": str(target.exe), "asan": str(target.asan_exe) if target.asan_exe else None,
+            "msan": str(target.msan_exe) if target.msan_exe else None,
             "argv": target.argv, "mode": target.mode, "stats": stats,
             "error": "; ".join(errors) or None, "hypotheses": hyps, "incidental": incidental}
 
@@ -119,7 +123,7 @@ def hunt(path, *, argv: Optional[list] = None, mode: Optional[str] = None,
             bindir = Path(out_dir) / "bin"
             bindir.mkdir(parents=True, exist_ok=True)
             for r in results:
-                for key in ("binary", "asan"):
+                for key in ("binary", "asan", "msan"):
                     src = r.get(key)
                     if src and Path(src).is_relative_to(prep.workdir):
                         dst = bindir / Path(src).name

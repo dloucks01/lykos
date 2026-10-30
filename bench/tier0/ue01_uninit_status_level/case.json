@@ -1,0 +1,30 @@
+{
+  "id": "ue01_uninit_status_level",
+  "summary": "statusline: on the STATUS command a severity `level` is tested but never assigned (uninitialised read)",
+  "class": "uninit",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-457",
+      "kind": "uninit-read",
+      "line": 16,
+      "function": "main",
+      "oracle": "msan",
+      "note": "`level` is read by `if (level > 3)` with no prior assignment on any path",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

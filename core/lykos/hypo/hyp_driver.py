@@ -102,6 +102,7 @@ CWE = {"stack-write": "CWE-121", "heap-write": "CWE-122", "global-write": "CWE-7
        "stack-read": "CWE-125", "heap-read": "CWE-125", "global-read": "CWE-125",
        "control-flow-hijack": "CWE-121", "format-string": "CWE-134", "cmd-injection": "CWE-78",
        "null-deref": "CWE-476", "div-zero": "CWE-369", "path-traversal": "CWE-22",
+       "uninit-read": "CWE-457",
        "int-overflow-alloc": "CWE-190", "use-after-free": "CWE-416", "double-free": "CWE-415"}
 
 
@@ -935,6 +936,8 @@ class Driver:
             self._propose_stores(f)
             if self.x86:
                 self._propose_divs(f)
+            if self.spec.get("uninit"):
+                self._propose_uninit(f)
         self.call_sites = {h["site"]: h for h in self.hyps.values() if h["callee"]}
 
     def _propose_divs(self, f):
@@ -963,6 +966,58 @@ class Driver:
                     continue
                 self.div_ops[i.address] = desc
                 self._add_hyp("div-zero", i.address, blk_node.addr, f)
+
+    UNINIT_CAP = 32
+
+    def _propose_uninit(self, f):
+        """Frame locals LOADED without ever being STORED in the function: a use of an
+        uninitialised value (CWE-457/908). Tracked against the frame pointer (bp), stable at -O0,
+        negative offsets only (locals, not stack args/return area). This is a static OVER-
+        approximation -- an address-taken local filled by a callee through a pointer looks unstored
+        here -- so MSan is the gate: a confirmed finding needs MSan to report an uninitialised use
+        at the site line on replay. Reaching the load is what the driver solves to an input."""
+        bp = self.p.arch.registers.get("bp", (None,))[0]
+        if bp is None:
+            return
+        self.uninit_reads = getattr(self, "uninit_reads", set())
+        stored, loads = set(), {}      # frame offsets stored; load-ins-addr -> (block, offset)
+
+        def signed(v, bits):
+            return v - (1 << bits) if v >= (1 << (bits - 1)) else v
+
+        for blk_node in f.blocks:
+            try:
+                vex = self.p.factory.block(blk_node.addr, size=blk_node.size).vex
+            except Exception:
+                continue
+            frame, cur = {}, blk_node.addr    # tmp -> frame offset (relative to bp)
+            for stmt in vex.statements:
+                tag = stmt.tag
+                if tag == "Ist_IMark":
+                    cur = stmt.addr
+                elif tag == "Ist_WrTmp":
+                    e = stmt.data
+                    if e.tag == "Iex_Get" and e.offset == bp:
+                        frame[stmt.tmp] = 0
+                    elif e.tag == "Iex_RdTmp" and e.tmp in frame:
+                        frame[stmt.tmp] = frame[e.tmp]
+                    elif e.tag == "Iex_Binop" and e.op.startswith(("Iop_Add", "Iop_Sub")):
+                        a, b = e.args
+                        base = frame.get(a.tmp) if a.tag == "Iex_RdTmp" else None
+                        if base is not None and b.tag == "Iex_Const":
+                            k = signed(b.con.value, b.con.size)
+                            frame[stmt.tmp] = base + (k if "Add" in e.op else -k)
+                    elif e.tag == "Iex_Load" and e.addr.tag == "Iex_RdTmp" and e.addr.tmp in frame:
+                        off = frame[e.addr.tmp]
+                        if off < 0:
+                            loads.setdefault(cur, (blk_node.addr, off))
+                elif tag == "Ist_Store" and stmt.addr.tag == "Iex_RdTmp" and stmt.addr.tmp in frame:
+                    stored.add(frame[stmt.addr.tmp])
+        for ins, (block, off) in loads.items():
+            if off in stored or len(self.uninit_reads) >= self.UNINIT_CAP:
+                continue
+            self._add_hyp("uninit-read", ins, block, f, note=f"frame local at bp{off:+#x}")
+            self.uninit_reads.add(ins)
 
     def _propose_stores(self, f):
         """Indexed / pointer stores (address computed from loaded values, scaled or added) and
@@ -1144,6 +1199,8 @@ class Driver:
         st.inspect.b("mem_read", when=angr.BP_BEFORE, action=self._on_read)
         for addr in getattr(self, "div_ops", {}):
             st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_div)
+        for addr in getattr(self, "uninit_reads", set()):
+            st.inspect.b("instruction", when=angr.BP_BEFORE, instruction=addr, action=self._on_uninit)
         return st
 
     # ------------------------------------------------------------------ DWARF stack objects
@@ -2087,6 +2144,27 @@ class Driver:
             raise
         except self.claripy.errors.ClaripyError:
             self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
+        except Exception:
+            pass
+
+    def _on_uninit(self, s):
+        """At a frame local that is never stored in its function: reaching this load on any path
+        is a use of an uninitialised value. The driver cannot see the uninitialisedness (it zero-
+        fills), so it only solves the path to a REACHING input; MSan decides on replay whether the
+        value was truly uninitialised at this line."""
+        ins = s.scratch.ins_addr
+        h = self.hyps.get(f"uninit-read@{ins:#x}")
+        if h is None or len(h["solutions"]) >= 1:
+            return
+        h["reached"] += 1
+        if h["status"] == "proposed":
+            h["status"] = "reached"
+        try:
+            self.violation(s, "uninit-read", ins,
+                           f"frame local ({h.get('note') or 'local'}) is read before any store "
+                           f"reaches it on this path", extra=[])
+        except Deadline:
+            raise
         except Exception:
             pass
 

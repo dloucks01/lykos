@@ -27,6 +27,7 @@ ENV = dict(os.environ)
 ENV["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=0:symbolize=1:allocator_may_return_null=1"
 ENV["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
 ENV["LC_ALL"] = "C"
+MSAN_ENV = {"MSAN_OPTIONS": "halt_on_error=1:abort_on_error=0:print_stats=0:exitcode=99"}
 
 ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
 UBSAN_ERR = re.compile(r"(\S*prog\.c):(\d+):\d+: runtime error: (.*)$", re.M)
@@ -34,6 +35,17 @@ FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
 EXECVE = re.compile(r'execve\("([^"]*)",.*\)\s*=\s*(-?\d+)')
 OPENPATH = re.compile(r'\bopen(?:at|64|at64)?\([^"]*"((?:[^"\\]|\\.)*)"')
 TRAVERSAL_TAIL = "etc/passwd"
+MSAN_ERR = re.compile(r"MemorySanitizer: use-of-uninitialized-value", re.M)
+MSAN_FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
+
+
+def parse_msan(stderr):
+    """(function, line) of the first in-program frame of an MSan report, or None."""
+    m = MSAN_ERR.search(stderr)
+    if not m:
+        return None
+    fr = MSAN_FRAME.search(stderr, m.end())
+    return (fr.group(1), int(fr.group(3))) if fr else None
 
 
 def ubsan_kind(msg):
@@ -68,7 +80,7 @@ def parse_report(stderr):
     return None
 
 
-def run(binary, case, data, workdir, strace=False):
+def run(binary, case, data, workdir, strace=False, extra_env=None):
     inv = case["invocation"]
     mode = inv["input_mode"]
     argv = [binary]
@@ -96,9 +108,10 @@ def run(binary, case, data, workdir, strace=False):
             os.remove(trace)
         argv = ["strace", "-f", "-qq", "-e", "trace=execve,open,openat,creat", "-o", trace] + argv
     stdin = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
+    env = ENV if not extra_env else {**ENV, **extra_env}
     try:
         p = subprocess.run(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           cwd=workdir, env=ENV, timeout=TIMEOUT)
+                           cwd=workdir, env=env, timeout=TIMEOUT)
     finally:
         if stdin_path:
             stdin.close()
@@ -140,10 +153,34 @@ def check_clean(label, binary, case, data, workdir, expect_rc=None):
         problems.append("unintended exec %s" % bad)
     if case.get("class") == "path-traversal" and traversed(opens):
         problems.append("escaped base via %s" % traversed(opens)[0])
+    if case.get("class") == "uninit":
+        mbin = binary.replace("prog_asan", "prog_msan")
+        if os.path.exists(mbin):
+            _, merr, _, _ = run(mbin, case, data, workdir, extra_env=MSAN_ENV)
+            mr = parse_msan(merr)
+            if mr:
+                problems.append("MSan use-of-uninitialized at prog.c:%d" % mr[1])
     return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
 
 
 def check_bug(binary, case, bug, data, workdir):
+    if bug["oracle"] == "msan":
+        mbin = binary.replace("prog_asan", "prog_msan")
+        if not os.path.exists(mbin):
+            return False, "no prog_msan build (clang required)"
+        _, merr, _, _ = run(mbin, case, data, workdir, extra_env=MSAN_ENV)
+        mr = parse_msan(merr)
+        if not mr:
+            return False, "no MSan report"
+        func, line = mr
+        problems = []
+        if line != bug["line"]:
+            problems.append("line %s != declared %d" % (line, bug["line"]))
+        if func != bug["function"]:
+            problems.append("function %s != declared %s" % (func, bug["function"]))
+        if problems:
+            return False, "; ".join(problems)
+        return True, "use-of-uninitialized-value at prog.c:%d in %s" % (line, func)
     if bug["oracle"] == "exec":
         rc, err, execs, opens = run(binary, case, data, workdir, strace=True)
         bad = unintended(execs, case, binary)

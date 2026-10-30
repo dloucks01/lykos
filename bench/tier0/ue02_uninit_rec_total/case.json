@@ -1,0 +1,32 @@
+{
+  "id": "ue02_uninit_rec_total",
+  "summary": "recordcat: after validating the REC1 header a `total` counter is tested but never assigned (uninitialised read)",
+  "class": "uninit",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "seed_exit": 1,
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-457",
+      "kind": "uninit-read",
+      "line": 22,
+      "function": "main",
+      "oracle": "msan",
+      "note": "`total` is read by `if (total)` with no prior assignment on any path",
+      "file": "prog.c"
+    }
+  ],
+  "intended_exec": []
+}

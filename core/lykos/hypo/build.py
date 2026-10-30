@@ -67,10 +67,14 @@ def _cc(cxx: bool) -> Optional[str]:
 # The validator build: -O0 like the analysis build. At -O1 the optimiser can delete the very UB
 # being validated (and LSan needs -O0); abort-on-error comes from the replay environment.
 _SAN = ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
+# MemorySanitizer (uninitialised reads, CWE-457/908) is a SEPARATE, clang-only build: it cannot
+# coexist with ASan, and needs every frame instrumented -- fine for a single translation unit,
+# since MSan ships its own libc interceptors. track-origins gives the use site a clean frame.
+_MSAN = ["-fsanitize=memory", "-fsanitize-memory-track-origins=2", "-fno-omit-frame-pointer"]
 
 
-def _compile_plain(src: Path, out: Path, extra=()) -> str:
-    cc = _cc(src.suffix.lower() not in (".c",))
+def _compile_plain(src: Path, out: Path, extra=(), cc: Optional[str] = None) -> str:
+    cc = cc or _cc(src.suffix.lower() not in (".c",))
     if not cc:
         raise RuntimeError("no C/C++ compiler found (need gcc or clang)")
     r = subprocess.run([cc, *_PLAIN, *extra, "-o", str(out), str(src), "-lm"], capture_output=True,
@@ -78,6 +82,10 @@ def _compile_plain(src: Path, out: Path, extra=()) -> str:
     if r.returncode != 0 or not out.exists():
         raise RuntimeError(f"plain build failed:\n{r.stderr[-3000:]}")
     return r.stderr
+
+
+def _clang(cxx: bool) -> Optional[str]:
+    return shutil.which("clang++") if cxx else shutil.which("clang")
 
 
 def prepare(path, *, argv: Optional[list] = None, mode: Optional[str] = None,
@@ -98,9 +106,20 @@ def prepare(path, *, argv: Optional[list] = None, mode: Optional[str] = None,
         except RuntimeError as e:   # validation degrades to native crashes
             log += f"\nsanitizer build failed, validating by native crashes: {e}"
             san = None
+        msan = work / (p.stem + "_msan")
+        clang = _clang(p.suffix.lower() not in (".c",))
+        if clang:
+            try:
+                log += _compile_plain(p, msan, extra=_MSAN, cc=clang)
+            except RuntimeError as e:   # uninit validation simply unavailable for this target
+                log += f"\nMSan build failed, uninit validation disabled: {e}"
+                msan = None
+        else:
+            log += "\nclang not found: MSan (uninit) validation disabled"
+            msan = None
         a, m = infer_invocation(plain, argv, mode)
         return Prepared("source-file", [Target(exe=plain, argv=a, mode=m, asan_exe=san,
-                                               source_root=p.parent)], log, work)
+                                               msan_exe=msan, source_root=p.parent)], log, work)
     if p.is_dir():
         from ..analyze.source_project import build_source_project, is_source_project
         if not is_source_project(p):

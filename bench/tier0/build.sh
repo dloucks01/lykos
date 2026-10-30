@@ -15,6 +15,10 @@ mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 CC="${CC:-gcc}"
 ASAN_DEFAULT="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+# MemorySanitizer (uninitialised reads) is a separate clang-only build; only built when a case
+# declares an `msan` oracle (or is a uninit-class negative), since it needs clang.
+MSAN_CC="${MSAN_CC:-clang}"
+MSAN_FLAGS="-O0 -g -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer"
 # Format-string cases are intentional; keep the build log readable.
 QUIET="-Wno-format-security"
 
@@ -42,6 +46,13 @@ for id in "${CASES[@]}"; do
     # shellcheck disable=SC2086
     if ! "$CC" $aflags $QUIET -o "$OUT/$id/prog_asan" "$src"; then
         echo "BUILD FAIL $id (prog_asan)" >&2; fail=1
+    fi
+    needs_msan="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print("1" if c.get("class")=="uninit" or any(b.get("oracle")=="msan" for b in c.get("bugs",[])) else "")' "$manifest")"
+    if [ -n "$needs_msan" ]; then
+        # shellcheck disable=SC2086
+        if ! "$MSAN_CC" $MSAN_FLAGS $QUIET -o "$OUT/$id/prog_msan" "$src"; then
+            echo "BUILD FAIL $id (prog_msan)" >&2; fail=1
+        fi
     fi
 done
 echo "built ${#CASES[@]} case(s) into $OUT"
