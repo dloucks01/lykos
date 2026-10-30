@@ -2249,6 +2249,7 @@ class Driver:
                                                resilience=(Exception,))
         width = int(self.spec.get("width", 24))
         max_states = int(self.spec.get("max_states", 2000))
+        rss_cap = int(self.spec.get("max_rss_mb", 8192))
         deadline = self.t0 + float(self.spec.get("max_seconds", 120))
         sm.stashes.setdefault("deferred", [])
         while time.time() < deadline:
@@ -2310,6 +2311,16 @@ class Driver:
                 pool.sort(key=self.score)
             if len(pool) > max_states:
                 pool = pool[:max_states]
+            # Memory-pressure prune: angr states are heavy (~MBs each); an exploding deferred pool
+            # can reach the RSS cap and get the whole run killed with no result (the o02 OOM). Under
+            # pressure, drop the worst-scoring half (keep the active width + a margin) so the run
+            # stays alive and keeps the states closest to a target. A safety net that guarantees no
+            # case OOMs the driver.
+            if _rss_mb() > 0.75 * rss_cap and len(pool) > width + 16:
+                if self.dmin is None:
+                    pool.sort(key=self.score)
+                pool = pool[:max(width + 16, len(pool) // 2)]
+                self.stats["mem_prunes"] = self.stats.get("mem_prunes", 0) + 1
             # States that can still reach an open hypothesis get the active slots. States that
             # cannot (score >= INF) get at most a sixth of them while any directed state exists:
             # stepping them costs every directed lineage time (a 17-iteration loop bug starved
