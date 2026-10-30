@@ -1,0 +1,32 @@
+{
+  "id": "r04_fnptr_dispatch",
+  "summary": "message processor: handler chosen from a function-pointer table by type byte; STORE handler overflows a 32-byte heap slot",
+  "class": "reach-dispatch",
+  "difficulty": "hard",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-122",
+      "kind": "heap-write",
+      "file": "prog.c",
+      "line": 37,
+      "function": "h_store",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "store slot is calloc(32) but h_store accepts up to 256 bytes; reached only via handlers[3]"
+    }
+  ],
+  "intended_exec": []
+}

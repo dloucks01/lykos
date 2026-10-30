@@ -1,0 +1,32 @@
+{
+  "id": "h02_offbyone_nul",
+  "summary": "media tag reader: comment value duplicated with malloc(strlen) + strcpy (NUL off-by-one)",
+  "class": "heap",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-193",
+      "kind": "heap-write",
+      "file": "prog.c",
+      "line": 29,
+      "function": "copy_comment",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "malloc(strlen(val)) leaves no room for the NUL; any comment tag overflows by one"
+    }
+  ],
+  "intended_exec": []
+}

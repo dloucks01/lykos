@@ -1,0 +1,32 @@
+{
+  "id": "r02_state_machine",
+  "summary": "capture replayer: KEY unlock record, then MODE=raw, then a DATA record copies unclamped into a 48-byte stack buffer",
+  "class": "reach-state",
+  "difficulty": "hard",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 31,
+      "function": "on_data",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "raw mode (only after the 4-byte service key) skips the clamp; len up to 255 into line[48]"
+    }
+  ],
+  "intended_exec": []
+}

@@ -1,0 +1,30 @@
+{
+  "id": "f03_snprintf_puts",
+  "summary": "login banner tool: argv title used as the snprintf format, then puts()",
+  "class": "format-string",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-134",
+      "kind": "format-string",
+      "file": "prog.c",
+      "line": 18,
+      "function": "print_banner",
+      "oracle": "fmt",
+      "asan_kind": "SEGV",
+      "note": "argv title is the snprintf format string"
+    }
+  ],
+  "intended_exec": []
+}

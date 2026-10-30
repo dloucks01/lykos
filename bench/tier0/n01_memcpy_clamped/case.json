@@ -1,0 +1,20 @@
+{
+  "id": "n01_memcpy_clamped",
+  "summary": "TLV descriptor dumper with every copy clamped to its destination and to the remaining input",
+  "class": "negative",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

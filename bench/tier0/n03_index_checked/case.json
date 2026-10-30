@@ -1,0 +1,20 @@
+{
+  "id": "n03_index_checked",
+  "summary": "register preset + sensor batch loader with signed indices checked on both ends and count loops clamped",
+  "class": "negative",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

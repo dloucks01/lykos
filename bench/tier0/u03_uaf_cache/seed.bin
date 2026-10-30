@@ -1,0 +1,6 @@
+add 1 alpha
+add 2 beta
+get 1
+ren 2 gamma
+get 2
+get 5

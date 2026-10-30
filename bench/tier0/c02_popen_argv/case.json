@@ -1,0 +1,31 @@
+{
+  "id": "c02_popen_argv",
+  "summary": "service-port lookup: argv name spliced into a quoted popen() grep command",
+  "class": "cmd-injection",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-78",
+      "kind": "cmd-injection",
+      "file": "prog.c",
+      "line": 11,
+      "function": "lookup",
+      "oracle": "exec",
+      "note": "single-quoted argument can be closed with a quote in argv[1]"
+    }
+  ],
+  "intended_exec": [
+    "grep"
+  ]
+}

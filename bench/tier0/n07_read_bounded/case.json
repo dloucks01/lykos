@@ -1,0 +1,18 @@
+{
+  "id": "n07_read_bounded",
+  "summary": "one-shot RPC server that rejects body lengths larger than its stack buffer before read()",
+  "class": "negative",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fstack-protector-strong",
+    "-no-pie"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

@@ -1,0 +1,32 @@
+{
+  "id": "r01_checksum_gate",
+  "summary": "firmware update applier: additive checksum must match before the section-name memcpy into a 32-byte stack buffer",
+  "class": "reach-checksum",
+  "difficulty": "hard",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 23,
+      "function": "apply_update",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "name_len (<= 255) only checked against the payload length, not sizeof section; gated by checksum"
+    }
+  ],
+  "intended_exec": []
+}

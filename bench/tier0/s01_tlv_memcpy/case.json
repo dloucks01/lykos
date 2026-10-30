@@ -1,0 +1,32 @@
+{
+  "id": "s01_tlv_memcpy",
+  "summary": "TLV device-descriptor dumper: NAME record length copied into a 64-byte stack buffer",
+  "class": "stack",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 20,
+      "function": "handle_name",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "NAME len (u16, only checked against file size) copied into name[64]"
+    }
+  ],
+  "intended_exec": []
+}

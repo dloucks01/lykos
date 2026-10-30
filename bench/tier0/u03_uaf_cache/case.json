@@ -1,0 +1,30 @@
+{
+  "id": "u03_uaf_cache",
+  "summary": "object command shell: DEL frees a node but the lookup cache keeps it; next lookup reads freed memory",
+  "class": "uaf",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-416",
+      "kind": "use-after-free",
+      "file": "prog.c",
+      "line": 21,
+      "function": "lookup",
+      "oracle": "asan",
+      "asan_kind": "heap-use-after-free",
+      "note": "del() never evicts the node from cache[]; any later lookup of the same slot reads the freed node"
+    }
+  ],
+  "intended_exec": []
+}

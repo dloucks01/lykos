@@ -1,0 +1,33 @@
+{
+  "id": "c01_system_job",
+  "summary": "integrity-check job runner: path= field spliced into a system() sha256sum command",
+  "class": "cmd-injection",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-78",
+      "kind": "cmd-injection",
+      "file": "prog.c",
+      "line": 20,
+      "function": "run_check",
+      "oracle": "exec",
+      "note": "path= value is pasted unquoted into a shell command line"
+    }
+  ],
+  "intended_exec": [
+    "sha256sum"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "id": "u01_uaf_error_path",
+  "summary": "session script runner: failed AUTH frees the user but leaves the pointer; SHOW reads it, exit frees it again",
+  "class": "uaf",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-416",
+      "kind": "use-after-free",
+      "file": "prog.c",
+      "line": 46,
+      "function": "cmd_show",
+      "oracle": "asan",
+      "asan_kind": "heap-use-after-free",
+      "note": "cmd_auth failure frees s->user without clearing it; SHOW dereferences it"
+    },
+    {
+      "id": "b2",
+      "cwe": "CWE-415",
+      "kind": "double-free",
+      "file": "prog.c",
+      "line": 75,
+      "function": "main",
+      "oracle": "asan",
+      "asan_kind": "attempting double-free",
+      "note": "same dangling s->user freed again at exit when no SHOW/USER follows the failed AUTH"
+    }
+  ],
+  "intended_exec": []
+}

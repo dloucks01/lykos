@@ -1,0 +1,30 @@
+{
+  "id": "o02_count_loop",
+  "summary": "sensor batch averager: count byte drives a store loop over readings[16] on the stack",
+  "class": "oob-index",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fstack-protector-strong",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-787",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 28,
+      "function": "read_batch",
+      "oracle": "asan",
+      "asan_kind": "ubsan:index-out-of-bounds",
+      "note": "count (u8, up to 255) never clamped to MAX_READINGS"
+    }
+  ],
+  "intended_exec": []
+}

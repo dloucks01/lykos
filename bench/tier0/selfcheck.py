@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Tier-0 corpus self-check (python3 stdlib only).
+
+Builds every case into a temp dir with build.sh, then proves the ground truth:
+  * every bug's ref_poc fires its oracle AT THE DECLARED file:line (and function,
+    and asan_kind when given) on prog_asan;
+  * seed.bin (when present) runs clean: expected exit code, no sanitizer report,
+    no signal, no unintended exec;
+  * negatives (bugs == []) stay clean on the seed and on every hostile_*.bin.
+
+usage: selfcheck.py [--keep DIR] [case-id ...]
+Prints one PASS/FAIL line per bug / seed / negative input; exits 1 on any FAIL.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIMEOUT = 20
+SHELLS = {"sh", "bash", "dash"}
+
+ENV = dict(os.environ)
+ENV["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=0:symbolize=1"
+ENV["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
+ENV["LC_ALL"] = "C"
+
+ASAN_ERR = re.compile(r"ERROR: AddressSanitizer: (.+?)(?: on (?:unknown )?address| on 0x|:? \(|$)", re.M)
+UBSAN_ERR = re.compile(r"(\S*prog\.c):(\d+):\d+: runtime error: (.*)$", re.M)
+FRAME = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (\S+) (\S*prog\.c):(\d+)", re.M)
+EXECVE = re.compile(r'execve\("([^"]*)",.*\)\s*=\s*(-?\d+)')
+
+
+def ubsan_kind(msg):
+    if "out of bounds for type" in msg:
+        return "ubsan:index-out-of-bounds"
+    if "signed integer overflow" in msg:
+        return "ubsan:signed-integer-overflow"
+    if "shift" in msg:
+        return "ubsan:shift"
+    if "null pointer" in msg:
+        return "ubsan:null"
+    return "ubsan:" + msg.split(" ")[0]
+
+
+def parse_report(stderr):
+    """Return (kind, function, line) of the first sanitizer report, or None.
+    function/line come from the first in-program (prog.c) frame."""
+    a = ASAN_ERR.search(stderr)
+    u = UBSAN_ERR.search(stderr)
+    if u and (not a or u.start() < a.start()):
+        fr = FRAME.search(stderr, u.end())
+        func = fr.group(1) if fr else None
+        return ubsan_kind(u.group(3)), func, int(u.group(2))
+    if a:
+        kind = a.group(1).strip()
+        fr = FRAME.search(stderr, a.end())
+        if not fr:
+            return kind, None, None
+        return kind, fr.group(1), int(fr.group(3))
+    if "Sanitizer" in stderr and "SUMMARY" in stderr:
+        return "unknown-sanitizer", None, None
+    return None
+
+
+def run(binary, case, data, workdir, strace=False):
+    inv = case["invocation"]
+    mode = inv["input_mode"]
+    argv = [binary]
+    stdin_path = None
+    inp = os.path.join(workdir, "input.bin")
+    with open(inp, "wb") as fh:
+        fh.write(data)
+    for a in inv["argv"]:
+        if a == "@@":
+            if mode == "file":
+                argv.append(inp)
+            elif mode == "arg":
+                if b"\x00" in data:
+                    raise ValueError("arg-mode input contains NUL")
+                argv.append(data)
+            else:
+                raise ValueError("@@ in stdin mode")
+        else:
+            argv.append(a)
+    if mode == "stdin":
+        stdin_path = inp
+    trace = os.path.join(workdir, "strace.out")
+    if strace:
+        if os.path.exists(trace):
+            os.remove(trace)
+        argv = ["strace", "-f", "-qq", "-e", "trace=execve", "-o", trace] + argv
+    stdin = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
+    try:
+        p = subprocess.run(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           cwd=workdir, env=ENV, timeout=TIMEOUT)
+    finally:
+        if stdin_path:
+            stdin.close()
+    execs = []
+    if strace and os.path.exists(trace):
+        with open(trace, errors="replace") as fh:
+            for ln in fh:
+                m = EXECVE.search(ln)
+                if m and m.group(2) == "0":
+                    execs.append(m.group(1))
+    return p.returncode, p.stderr.decode("utf-8", "replace"), execs
+
+
+def unintended(execs, case, binary):
+    allowed = SHELLS | set(case.get("intended_exec", [])) | {os.path.basename(binary)}
+    return [e for e in execs if os.path.basename(e) not in allowed]
+
+
+def check_clean(label, binary, case, data, workdir, expect_rc=None):
+    rc, err, execs = run(binary, case, data, workdir, strace=True)
+    rep = parse_report(err)
+    bad = unintended(execs, case, binary)
+    problems = []
+    if rep:
+        problems.append("sanitizer report %r at %s:%s" % rep)
+    if rc < 0:
+        problems.append("killed by signal %d" % -rc)
+    if expect_rc is not None and rc != expect_rc:
+        problems.append("exit %d != %d" % (rc, expect_rc))
+    if bad:
+        problems.append("unintended exec %s" % bad)
+    return label, (not problems), "; ".join(problems) or "clean (rc=%d)" % rc
+
+
+def check_bug(binary, case, bug, data, workdir):
+    if bug["oracle"] == "exec":
+        rc, err, execs = run(binary, case, data, workdir, strace=True)
+        bad = unintended(execs, case, binary)
+        if bad:
+            return True, "injected exec %s" % [os.path.basename(b) for b in bad]
+        return False, "no unintended execve (saw %s)" % [os.path.basename(e) for e in execs]
+    rc, err, _ = run(binary, case, data, workdir)
+    rep = parse_report(err)
+    if not rep:
+        return False, "no sanitizer report (rc=%d)" % rc
+    kind, func, line = rep
+    problems = []
+    if line != bug["line"]:
+        problems.append("line %s != declared %d" % (line, bug["line"]))
+    if func is not None and func != bug["function"]:
+        problems.append("function %s != declared %s" % (func, bug["function"]))
+    if bug.get("asan_kind") and kind != bug["asan_kind"]:
+        problems.append("kind %r != declared %r" % (kind, bug["asan_kind"]))
+    if problems:
+        return False, "; ".join(problems)
+    return True, "%s at prog.c:%d in %s" % (kind, line, func)
+
+
+def main():
+    args = sys.argv[1:]
+    keep = None
+    if args[:1] == ["--keep"]:
+        keep, args = args[1], args[2:]
+    ids = args or sorted(d for d in os.listdir(HERE)
+                         if os.path.isfile(os.path.join(HERE, d, "case.json")))
+    tmp = tempfile.mkdtemp(prefix="tier0-")
+    bindir = keep or os.path.join(tmp, "bin")
+    try:
+        b = subprocess.run([os.path.join(HERE, "build.sh"), bindir] + ids,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if b.returncode != 0:
+            sys.stdout.write(b.stdout.decode("utf-8", "replace"))
+            print("FAIL build")
+            return 1
+        failures = total = 0
+
+        def report(ok, what, detail):
+            nonlocal failures, total
+            total += 1
+            failures += 0 if ok else 1
+            print("%s %-28s %-14s %s" % ("PASS" if ok else "FAIL", cid, what, detail))
+
+        for cid in ids:
+            cdir = os.path.join(HERE, cid)
+            with open(os.path.join(cdir, "case.json")) as fh:
+                case = json.load(fh)
+            binary = os.path.join(bindir, cid, "prog_asan")
+            work = os.path.join(tmp, "run", cid)
+            os.makedirs(work, exist_ok=True)
+            bugs = case["bugs"]
+            for bug in bugs:
+                name = "ref_poc.bin" if len(bugs) == 1 else "ref_poc_%s.bin" % bug["id"]
+                path = os.path.join(cdir, name)
+                if not os.path.exists(path):
+                    report(False, bug["id"], "missing " + name)
+                    continue
+                with open(path, "rb") as fh:
+                    ok, detail = check_bug(binary, case, bug, fh.read(), work)
+                report(ok, bug["id"] + "/" + bug["oracle"], detail)
+            seed = os.path.join(cdir, "seed.bin")
+            if os.path.exists(seed):
+                with open(seed, "rb") as fh:
+                    _, ok, detail = check_clean("seed", binary, case, fh.read(), work,
+                                                expect_rc=case.get("seed_exit", 0))
+                report(ok, "seed", detail)
+            elif not bugs:
+                report(False, "seed", "negative case without seed.bin")
+            if not bugs:
+                hostiles = sorted(f for f in os.listdir(cdir) if f.startswith("hostile_"))
+                if not hostiles:
+                    report(False, "hostile", "negative case without hostile_*.bin")
+                for h in hostiles:
+                    with open(os.path.join(cdir, h), "rb") as fh:
+                        _, ok, detail = check_clean(h, binary, case, fh.read(), work)
+                    report(ok, h.replace(".bin", ""), detail)
+        print("%d/%d checks passed" % (total - failures, total))
+        return 1 if failures else 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

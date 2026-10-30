@@ -1,0 +1,30 @@
+{
+  "id": "h03_trusted_header_len",
+  "summary": "chunked message reassembler: header total_len sizes the heap buffer, chunk lengths never checked against it",
+  "class": "heap",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-122",
+      "kind": "heap-write",
+      "file": "prog.c",
+      "line": 31,
+      "function": "reassemble",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "buffer sized by header total_len; sum of chunk lengths is never compared to it"
+    }
+  ],
+  "intended_exec": []
+}

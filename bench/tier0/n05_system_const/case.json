@@ -1,0 +1,20 @@
+{
+  "id": "n05_system_const",
+  "summary": "job runner that only ever calls system() with a constant command line; job fields are just printed",
+  "class": "negative",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [],
+  "intended_exec": [
+    "ls"
+  ]
+}

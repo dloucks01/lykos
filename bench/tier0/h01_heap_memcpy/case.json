@@ -1,0 +1,32 @@
+{
+  "id": "h01_heap_memcpy",
+  "summary": "message-queue spool loader: record length copied into a fixed 128-byte heap body",
+  "class": "heap",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-122",
+      "kind": "heap-write",
+      "file": "prog.c",
+      "line": 25,
+      "function": "msg_new",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "body is malloc(128); record len up to 65535 copied in"
+    }
+  ],
+  "intended_exec": []
+}

@@ -1,0 +1,32 @@
+{
+  "id": "i02_u16_total",
+  "summary": "frame sealer: uint16_t total = len + 16 wraps, payload memcpy overruns the small allocation",
+  "class": "int-overflow",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-190",
+      "kind": "int-overflow-alloc",
+      "file": "prog.c",
+      "line": 27,
+      "function": "seal_frame",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "len >= 65520 makes total wrap to 0..15; memcpy of len bytes overruns"
+    }
+  ],
+  "intended_exec": []
+}

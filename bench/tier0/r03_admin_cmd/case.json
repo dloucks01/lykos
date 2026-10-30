@@ -1,0 +1,30 @@
+{
+  "id": "r03_admin_cmd",
+  "summary": "line-protocol daemon: ADMIN SETMOTD (after AUTH with the hard-coded PIN) strcpy's into a global motd[64]",
+  "class": "reach-magic",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-787",
+      "kind": "global-write",
+      "file": "prog.c",
+      "line": 19,
+      "function": "admin",
+      "oracle": "asan",
+      "asan_kind": "global-buffer-overflow",
+      "note": "SETMOTD text (up to ~490 chars) strcpy'd into motd[64]; needs AUTH 7731 first"
+    }
+  ],
+  "intended_exec": []
+}

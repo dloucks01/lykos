@@ -1,0 +1,20 @@
+{
+  "id": "n04_mul_checked",
+  "summary": "table loader + frame sealer whose size arithmetic is overflow-checked (__builtin_mul_overflow, size_t)",
+  "class": "negative",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

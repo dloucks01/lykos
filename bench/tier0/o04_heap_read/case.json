@@ -1,0 +1,32 @@
+{
+  "id": "o04_heap_read",
+  "summary": "bitmap-font text measurer: glyph index from the text indexes a heap width table of n_glyphs entries",
+  "class": "oob-index",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-125",
+      "kind": "heap-read",
+      "file": "prog.c",
+      "line": 18,
+      "function": "measure",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "glyph index (0..255) never checked against n_glyphs; reads past malloc(n_glyphs)"
+    }
+  ],
+  "intended_exec": []
+}

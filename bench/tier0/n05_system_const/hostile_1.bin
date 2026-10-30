@@ -1,0 +1,3 @@
+title=$(id)
+owner=`id`
+list=yes

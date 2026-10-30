@@ -1,0 +1,30 @@
+{
+  "id": "s05_delim_loop",
+  "summary": "HTTP request-line parser: method token copied byte-by-byte until space into a 16-byte stack buffer",
+  "class": "stack",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fstack-protector-strong",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 20,
+      "function": "parse_request_line",
+      "oracle": "asan",
+      "asan_kind": "ubsan:index-out-of-bounds",
+      "note": "no bound on the method token length; method[16] overrun by the copy loop"
+    }
+  ],
+  "intended_exec": []
+}

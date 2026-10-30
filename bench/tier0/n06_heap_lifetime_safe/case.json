@@ -1,0 +1,20 @@
+{
+  "id": "n06_heap_lifetime_safe",
+  "summary": "tag/session script with correct malloc(strlen+1), replace-then-free, and free+NULL on every error path",
+  "class": "negative",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

@@ -1,0 +1,18 @@
+{
+  "id": "n02_literal_fmt",
+  "summary": "notification relay where every printf-family call uses a literal format string",
+  "class": "negative",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [],
+  "intended_exec": []
+}

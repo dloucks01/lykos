@@ -1,0 +1,4 @@
+USER alice
+AUTH 4711
+NOTE hello
+SHOW

@@ -1,0 +1,30 @@
+{
+  "id": "f01_printf_line",
+  "summary": "notification relay: each stdin line passed to printf as the format",
+  "class": "format-string",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-134",
+      "kind": "format-string",
+      "file": "prog.c",
+      "line": 17,
+      "function": "relay",
+      "oracle": "fmt",
+      "asan_kind": "SEGV",
+      "note": "stdin line used directly as the printf format"
+    }
+  ],
+  "intended_exec": []
+}

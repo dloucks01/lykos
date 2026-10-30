@@ -1,0 +1,32 @@
+{
+  "id": "o01_signed_index",
+  "summary": "register-file config loader: signed slot byte passes `slot < 16` when negative",
+  "class": "oob-index",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-129",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 12,
+      "function": "set_reg",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-underflow",
+      "note": "slot is a signed byte; -128..-1 pass `slot < 16` and write below regs[] (pointer param, so no UBSan bounds check)"
+    }
+  ],
+  "intended_exec": []
+}

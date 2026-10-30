@@ -1,0 +1,30 @@
+{
+  "id": "u02_double_free",
+  "summary": "key/value config loader: duplicate key with an oversized value frees the old value, aborts, cleanup frees it again",
+  "class": "uaf",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-415",
+      "kind": "double-free",
+      "file": "prog.c",
+      "line": 50,
+      "function": "store_free",
+      "oracle": "asan",
+      "asan_kind": "attempting double-free",
+      "note": "duplicate key whose new value is > 64 chars: old value freed, error return leaves it dangling, store_free frees it again"
+    }
+  ],
+  "intended_exec": []
+}

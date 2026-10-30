@@ -1,0 +1,30 @@
+{
+  "id": "i03_signed_len",
+  "summary": "record reader: int len = rec_len - 4 goes negative, passes len < 64, memcpy(size_t)",
+  "class": "int-overflow",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-195",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 14,
+      "function": "handle_record",
+      "oracle": "asan",
+      "asan_kind": "negative-size-param",
+      "note": "rec_len 1..3 makes len negative; it passes len < 64 and converts to a huge size_t"
+    }
+  ],
+  "intended_exec": []
+}

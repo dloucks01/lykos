@@ -1,0 +1,32 @@
+{
+  "id": "f02_log_record_type",
+  "summary": "event-log replayer: DIAG records (type 7) reach fprintf(stderr, msg) in the logging helper",
+  "class": "format-string",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-134",
+      "kind": "format-string",
+      "file": "prog.c",
+      "line": 18,
+      "function": "log_line",
+      "oracle": "fmt",
+      "asan_kind": "SEGV",
+      "note": "log_line is called with literals except for EV_DIAG, whose record text becomes the fprintf format"
+    }
+  ],
+  "intended_exec": []
+}

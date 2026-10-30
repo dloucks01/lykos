@@ -1,0 +1,32 @@
+{
+  "id": "s06_fread_count",
+  "summary": "raw image row checksummer: fread of width bytes into a 256-byte stack row",
+  "class": "stack",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 32,
+      "function": "process_rows",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "width (u16) never checked against sizeof row (256)"
+    }
+  ],
+  "intended_exec": []
+}

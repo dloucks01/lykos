@@ -1,0 +1,28 @@
+{
+  "id": "o05_stack_read",
+  "summary": "base64 decoder: input byte >= 0x80 indexes a 128-entry reverse table on the stack",
+  "class": "oob-index",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O0",
+    "-g"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-125",
+      "kind": "stack-read",
+      "file": "prog.c",
+      "line": 26,
+      "function": "decode",
+      "oracle": "asan",
+      "asan_kind": "ubsan:index-out-of-bounds",
+      "note": "table has 128 entries, input byte is 0..255; non-ASCII bytes read past rev[]"
+    }
+  ],
+  "intended_exec": []
+}

@@ -1,0 +1,4 @@
+name=passwd
+path=/etc/passwd
+name=hosts
+path=/etc/hostname

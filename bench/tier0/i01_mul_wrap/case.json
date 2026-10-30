@@ -1,0 +1,32 @@
+{
+  "id": "i01_mul_wrap",
+  "summary": "table loader: rows*rowsize computed in 32 bits wraps, then the row copy loop overruns the allocation",
+  "class": "int-overflow",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-190",
+      "kind": "int-overflow-alloc",
+      "file": "prog.c",
+      "line": 27,
+      "function": "load_table",
+      "oracle": "asan",
+      "asan_kind": "heap-buffer-overflow",
+      "note": "rows*rowsize wraps in uint32_t (e.g. 0x10000001*16 = 16) so tbl is tiny; loop copies by rows"
+    }
+  ],
+  "intended_exec": []
+}

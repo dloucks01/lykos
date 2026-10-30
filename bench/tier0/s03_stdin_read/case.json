@@ -1,0 +1,30 @@
+{
+  "id": "s03_stdin_read",
+  "summary": "one-shot RPC server: ECHO body read() with header length into a 128-byte stack buffer",
+  "class": "stack",
+  "difficulty": "medium",
+  "invocation": {
+    "argv": [],
+    "input_mode": "stdin"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 28,
+      "function": "handle_echo",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "length checked against MAX_MSG (4096), not sizeof body (128)"
+    }
+  ],
+  "intended_exec": []
+}

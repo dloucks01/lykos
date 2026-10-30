@@ -1,0 +1,32 @@
+{
+  "id": "s02_argv_strcpy",
+  "summary": "netcheck host[:port] validator: strcpy of argv target into a 32-byte stack buffer",
+  "class": "stack",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "arg"
+  },
+  "cflags": [
+    "-O0",
+    "-g",
+    "-fno-stack-protector",
+    "-no-pie"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-121",
+      "kind": "stack-write",
+      "file": "prog.c",
+      "line": 25,
+      "function": "parse_target",
+      "oracle": "asan",
+      "asan_kind": "stack-buffer-overflow",
+      "note": "argv[1] of any length strcpy'd into host[32]"
+    }
+  ],
+  "intended_exec": []
+}

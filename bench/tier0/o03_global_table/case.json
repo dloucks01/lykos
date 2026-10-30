@@ -1,0 +1,32 @@
+{
+  "id": "o03_global_table",
+  "summary": "palette patcher: entry index byte writes the global palette[64] (only the entry count is checked)",
+  "class": "oob-index",
+  "difficulty": "easy",
+  "invocation": {
+    "argv": [
+      "@@"
+    ],
+    "input_mode": "file"
+  },
+  "cflags": [
+    "-O2",
+    "-g",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "bugs": [
+    {
+      "id": "b1",
+      "cwe": "CWE-787",
+      "kind": "global-write",
+      "file": "prog.c",
+      "line": 19,
+      "function": "set_color",
+      "oracle": "asan",
+      "asan_kind": "ubsan:index-out-of-bounds",
+      "note": "entry index (0..255) never checked against NCOLORS; writes past the global palette"
+    }
+  ],
+  "intended_exec": []
+}
