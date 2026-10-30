@@ -21,16 +21,20 @@ function bestPoc(pocs, fid) {
 function Row({ f, pocs, sel, onClick }) {
   const p = bestPoc(pocs, f.id);
   const det = p && (p.provenance === "detonated" || p.verified);
+  const hasPoc = p && p.input_sha;
   return html`<div class=${"row sev-" + (f.severity || "info") + (sel ? " sel" : "")} onClick=${onClick}>
-    <div class="row-main">
-      <span class="row-cwe">${f.cwe || ""}</span>
-      <span class="row-title">${f.title || f.detector}</span>
+    <div class="row-l">
+      <div class="row-title">${f.title || f.detector}</div>
+      <div class="row-sub">
+        <span class="row-cwe">${f.cwe || ""}</span>
+        <span class="row-sep">·</span>
+        <span class=${"row-state st-" + (f.state || "candidate")}>${f.state || "candidate"}</span>
+      </div>
     </div>
-    <div class="row-meta">
-      <span class=${"chip st-" + (f.state || "candidate")}>${f.state || "candidate"}</span>
-      ${p && p.input_sha ? html`<span class=${"chip poc " + (det ? "det" : "con")}>
-        <b>${String(p.level).replace(/^L?/, "L")}</b> ${det ? "detonated" : "constructed"}</span>` : null}
-    </div>
+    ${hasPoc
+      ? html`<span class=${"pbadge " + (det ? "det" : "con")} title=${det ? "detonated — oracle fired" : "constructed — sound"}>
+          ${String(p.level).replace(/^L?/, "L")}</span>`
+      : html`<span class="pbadge none">—</span>`}
   </div>`;
 }
 
@@ -78,7 +82,7 @@ function App() {
       </aside>
       <section class="pane">
         ${s.view === "finding" && sel
-          ? html`<${DetailPane} finding=${sel} pocs=${s.pocs} />`
+          ? html`<${DetailPane} finding=${sel} pocs=${s.pocs} advice=${s.advice} />`
           : html`<${BinaryOverview} target=${s.target} advice=${s.advice} findings=${findings} pocs=${s.pocs} />`}
       </section>
     </div>
