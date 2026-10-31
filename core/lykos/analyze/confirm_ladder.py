@@ -72,6 +72,55 @@ CLASS_PRIMITIVE = {
     "CWE-798": "hard-coded credential -> authentication bypass / credential disclosure",
 }
 
+#: A ceiling is a statement about LYKOS, never about the target. The defect is still there; our
+#: current technique set stopped short of weaponizing it. Every surface that shows a ceiling must
+#: carry this so a reader never reads "weaponization stopped" as "the target is safe" -- that false
+#: clearance is the exact mechanism by which a bug that "passed analysis" becomes a later zero-day.
+#: Mirror of the 0-false-confirmation invariant: a ceiling is a 0-false-CLEARANCE admission.
+CEILING_FRAMING = ("a limit of lykos's CURRENT techniques, not evidence the target is safe -- the "
+                   "defect stands; weaponization stopped here and the gap is a research TODO, not a "
+                   "clearance")
+
+#: Per CWE class, the capability lykos would need to CLIMB PAST the common weaponization ceiling for
+#: that class -- the "what would break this ceiling" answer. A class-level statement (like
+#: CLASS_PRIMITIVE), never a per-instance claim; when an emitter established a MORE specific blocker
+#: it records it inline ("[needs: ...]") and that overrides this default. This is the raw material
+#: of the ceiling ledger / research queue: each distinct blocker here is a capability whose arrival
+#: converts a whole column of ceilings into PoCs (as the fmt->PIE leak did for CWE-134/121 recently).
+BLOCKING_PRIMITIVE = {
+    "CWE-121": "recover the LIVE saved-return stack address under ASLR (a wider/multi-read leak to "
+               "anchor the frame, or a stack-pivot that sidesteps needing it)",
+    "CWE-122": "a heap-layout (grooming) solver to place the overflow adjacent to a target object",
+    "CWE-125": "steer the out-of-bounds read at a chosen secret and recover the disclosed bytes "
+               "through the program's own output path",
+    "CWE-129": "constrain the attacker-controlled index and the write value to land the computed "
+               "write on a live code/function pointer",
+    "CWE-134": "a wider or multi-read format leak to capture the LIVE saved-return (or a writable "
+               "code pointer) through printf's opaque vararg positioning",
+    "CWE-190": "a heap-layout solver to turn the undersized allocation into a controlled overflow "
+               "against a chosen object",
+    "CWE-191": "bound the underflowed length and a reaching driver to steer the oversized access",
+    "CWE-415": "an allocator-state model to turn the double free into a controlled reclaim",
+    "CWE-416": "a reclaim/grooming solver to reoccupy the freed chunk with an attacker-shaped object",
+    "CWE-457": "a path that observes the uninitialised bytes through the program's output",
+    "CWE-787": "a reaching driver plus the write-target layout to steer the OOB write onto a live "
+               "pointer",
+    "CWE-78": "a reaching input channel that carries the injected command unsanitised to the sink",
+    "CWE-94": "a reaching input channel that carries the injected code to the interpreter sink",
+}
+
+
+def blocking_primitive(cwe: Optional[str], ceiling_reason: Optional[str] = None) -> Optional[str]:
+    """The capability that would climb past a ceiling: the SPECIFIC blocker an emitter recorded
+    inline as "[needs: ...]" if present, else the class-level default for `cwe`. Pure."""
+    if ceiling_reason:
+        import re as _re
+        mo = _re.search(r"\[needs:\s*(.+?)\]\s*$", ceiling_reason.strip())
+        if mo:
+            return mo.group(1).strip()
+    return BLOCKING_PRIMITIVE.get(cwe or "")
+
+
 #: How an ENABLED target mitigation stands between the primitive and a full exploit.
 _MIT_GLOSS = {
     "nx": "NX — no executable stack/heap, so a code-reuse chain (ROP/ret2libc) is needed, "
@@ -97,12 +146,18 @@ def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dic
         mi.append("full RELRO/BIND_NOW — the GOT is read-only at runtime")
     elif relro == "partial":
         mi.append("partial RELRO — the GOT is still writable at runtime")
-    ceiling = reason = targets_live = None
+    ceiling = reason = targets_live = blocker = None
     for e in f.get("evidence") or []:
         d = e.get("detail") or "" if isinstance(e, dict) else ""
         mo = re.search(r"weaponization reached (L\d)\b.*?stopped(?: here)?[:]?\s*(.+)", d)
         if mo:
-            ceiling, reason = mo.group(1), mo.group(2).strip().rstrip(".")[:240]
+            ceiling, raw = mo.group(1), mo.group(2).strip().rstrip(".")[:240]
+            # Split off an inline "[needs: ...]" blocker the emitter recorded, so the reason reads
+            # clean and the specific capability is surfaced on its own (overrides the class default).
+            bm = re.search(r"\s*\[needs:\s*(.+?)\]\s*$", raw)
+            if bm:
+                blocker, raw = bm.group(1).strip(), raw[:bm.start()].strip().rstrip(".")
+            reason = raw
         to = re.search(r"[Tt]argets (L\d) if run against the live target", d)
         if to:
             targets_live = to.group(1)
@@ -118,6 +173,12 @@ def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dic
     if ceiling:
         out["ceiling"] = ceiling
         out["ceiling_reason"] = reason
+        # A ceiling is a lykos-limit, never a target clearance -- carry the framing + the specific
+        # capability that would climb it so no surface can present the stop as "safe".
+        out["ceiling_framing"] = CEILING_FRAMING
+        bp = blocker or blocking_primitive(f.get("cwe"))
+        if bp:
+            out["blocking_primitive"] = bp
     if targets_live:
         out["targets_live"] = targets_live
     return out or None
@@ -246,3 +307,61 @@ def prove_out_plan(f: dict, verification: Optional[dict] = None) -> Optional[dic
         f"confirm with {oracle} — this raises the finding to poc-backed",
     ]
     return {"solver": solver, "oracle": oracle, "steps": steps}
+
+
+#: Rank a ceiling'd finding in the research queue: higher = better ROI to push next. Highest
+#: severity first, then CLOSEST to the top (an L2 that stops one rung short of a demonstrated L3 is
+#: a smaller lift than an L1), then by how specific/large the missing capability is handled by order
+#: of filing. Severity/level are the only ordering signals; neither asserts anything not already set.
+_LEDGER_SEV = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+_LEDGER_LEVEL = {"L1": 1, "L2": 2, "L3": 3}
+
+
+def ceiling_ledger(findings: list) -> Optional[dict]:
+    """The surfaced RESEARCH QUEUE: every distinct finding whose weaponization hit a ceiling, with
+    the level reached, the specific capability that would climb it, and the honest framing that a
+    ceiling is a lykos-limit and not a target clearance. Ranked best-ROI-first. Pure -- reads the
+    already-serialized findings (each may carry a precomputed `exploitability`, else it is derived
+    with no mitigation context, which does not affect the ceiling). Deduped by `dedup_key` so a
+    source bug filed once per target that compiles it appears once. None when nothing hit a ceiling.
+
+    This is the mirror of the PoC list: the PoC list is what lykos CAN weaponize today; this ledger
+    is what it CANNOT yet, itemized -- so a 'clean' area is never read as 'no bugs', only as 'no
+    bugs lykos's current reach found', and each entry is a dated capability TODO. Clearing an entry
+    (shipping its blocking primitive) is exactly how lykos grows; the queue IS the roadmap."""
+    seen: dict = {}
+    entries: list[dict] = []
+    for f in findings or []:
+        ex = f.get("exploitability")
+        if ex is None:
+            ex = finding_exploitability(f, None)
+        if not ex or not ex.get("ceiling"):
+            continue
+        key = f.get("dedup_key") or f.get("id") or id(f)
+        if key in seen:
+            continue
+        seen[key] = True
+        entries.append({
+            "cwe": f.get("cwe"),
+            "title": f.get("title"),
+            "site": f.get("site_addr") or f.get("function_addr"),
+            "severity": f.get("severity") or "medium",
+            "reached": ex.get("ceiling"),
+            "would_reach": ex.get("targets_live") or "L3",
+            "blocking_primitive": ex.get("blocking_primitive"),
+            "reason": ex.get("ceiling_reason"),
+            "dedup_key": f.get("dedup_key"),
+        })
+    if not entries:
+        return None
+    entries.sort(key=lambda e: (_LEDGER_SEV.get(e["severity"], 2),
+                                _LEDGER_LEVEL.get(e["reached"], 0)), reverse=True)
+    # Group the queue by the missing capability: each group is one build that unblocks N findings.
+    by_cap: dict = {}
+    for e in entries:
+        by_cap.setdefault(e.get("blocking_primitive") or "(unclassified blocker)", 0)
+        by_cap[e["blocking_primitive"] or "(unclassified blocker)"] += 1
+    capabilities = [{"blocking_primitive": k, "unblocks": v}
+                    for k, v in sorted(by_cap.items(), key=lambda kv: kv[1], reverse=True)]
+    return {"framing": CEILING_FRAMING, "count": len(entries),
+            "entries": entries, "capabilities": capabilities}

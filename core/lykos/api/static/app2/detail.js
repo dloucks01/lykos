@@ -213,8 +213,15 @@ export function DetailPane({ finding, pocs, advice, related }) {
       ${a.to_promote ? html`<div class="promote"><span class="pr-k">To advance</span> ${a.to_promote}</div>` : null}
     </div>` : null}
 
-    ${(x.class_primitive || miw.length) ? html`<div class="sect"><div class="sect-h">Exploitability</div>
+    ${(x.class_primitive || miw.length || x.ceiling) ? html`<div class="sect"><div class="sect-h">Exploitability</div>
       ${x.class_primitive ? html`<div class="prim mono">${x.class_primitive}</div>` : null}
+      ${x.demonstrated_level ? html`<div class="demo">demonstrated: a verified PoC reached ${x.demonstrated_level}</div>` : null}
+      ${x.ceiling ? html`<div class="ceiling">
+        <div class="ceiling-h">Ceiling — lykos reach, not a clearance</div>
+        <div class="ceiling-r">weaponization reached <b>${x.ceiling}</b> and stopped${x.ceiling_reason ? " — " + x.ceiling_reason : ""}</div>
+        ${x.blocking_primitive ? html`<div class="ceiling-b"><span class="pr-k">What would break it</span> ${x.blocking_primitive}</div>` : null}
+        ${x.ceiling_framing ? html`<div class="ceiling-note muted">${x.ceiling_framing}</div>` : null}
+      </div>` : null}
       ${miw.length ? html`<div class="miw-h">mitigations in the way</div>
         <ul class="miw">${miw.map((m) => html`<li>${m}</li>`)}</ul>` : null}
     </div>` : null}

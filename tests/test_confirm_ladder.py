@@ -5,7 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from lykos.analyze.confirm_ladder import (
+    BLOCKING_PRIMITIVE,
+    CEILING_FRAMING,
     attack_surface,
+    ceiling_ledger,
     finding_analysis,
     finding_exploitability,
     finding_verification,
@@ -49,6 +52,57 @@ def test_exploitability_ceiling_and_mitigations():
     # no mitigations known -> still returns the class primitive + ceiling, just no "in the way"
     ex2 = finding_exploitability(f, None)
     assert ex2["class_primitive"] and "mitigations_in_way" not in ex2
+    # a ceiling is a lykos-limit, NOT a clearance: the framing + a class-default blocker are carried
+    assert ex2["ceiling_framing"] == CEILING_FRAMING
+    assert "not evidence the target is safe" in ex2["ceiling_framing"]
+    assert ex2["blocking_primitive"] == BLOCKING_PRIMITIVE["CWE-134"]
+
+
+def test_ceiling_inline_blocker_overrides_class_default():
+    # an emitter that recorded a SPECIFIC "[needs: ...]" blocker surfaces it, and it is split out of
+    # the reason so the reason reads clean.
+    f = {"cwe": "CWE-134", "evidence": [{"channel": "recipe-ceiling",
+         "detail": "weaponization reached L2 and stopped here: narrow read [needs: a 2-link rbp "
+                   "chain in one leak]"}]}
+    ex = finding_exploitability(f, None)
+    assert ex["ceiling"] == "L2"
+    assert ex["blocking_primitive"] == "a 2-link rbp chain in one leak"
+    assert "[needs:" not in ex["ceiling_reason"] and ex["ceiling_reason"] == "narrow read"
+    # a class with no default + no inline blocker still carries the framing, no blocker key
+    f2 = {"cwe": "CWE-999", "evidence": [{"channel": "r",
+          "detail": "weaponization reached L1 and stopped here: unknown"}]}
+    ex2 = finding_exploitability(f2, None)
+    assert ex2["ceiling_framing"] == CEILING_FRAMING and "blocking_primitive" not in ex2
+
+
+def test_ceiling_ledger_ranks_dedups_and_groups():
+    findings = [
+        {"cwe": "CWE-134", "title": "fmt in parse", "severity": "high", "dedup_key": "a",
+         "site_addr": "0x401000", "evidence": [{"channel": "r",
+             "detail": "weaponization reached L2 and stopped here: narrow read [needs: wider leak]"},
+            {"channel": "r2", "detail": "Targets L3 if run against the live target."}]},
+        # same dedup_key filed again (a second target compiling the same source) -> one entry
+        {"cwe": "CWE-134", "title": "fmt in parse", "severity": "high", "dedup_key": "a",
+         "evidence": [{"channel": "r",
+             "detail": "weaponization reached L2 and stopped here: narrow read [needs: wider leak]"}]},
+        {"cwe": "CWE-787", "title": "oob write", "severity": "critical", "dedup_key": "b",
+         "evidence": [{"channel": "r",
+             "detail": "weaponization reached L1 and stopped here: no reaching driver"}]},
+        # not a ceiling -> excluded
+        {"cwe": "CWE-125", "title": "plain", "severity": "low", "dedup_key": "c", "evidence": []},
+    ]
+    led = ceiling_ledger(findings)
+    assert led["count"] == 2                                     # deduped, non-ceiling excluded
+    assert led["framing"] == CEILING_FRAMING
+    # critical ranks above high
+    assert led["entries"][0]["cwe"] == "CWE-787"
+    a = next(e for e in led["entries"] if e["dedup_key"] == "a")
+    assert a["reached"] == "L2" and a["would_reach"] == "L3"
+    assert a["blocking_primitive"] == "wider leak"
+    # capabilities group by blocker
+    caps = {c["blocking_primitive"]: c["unblocks"] for c in led["capabilities"]}
+    assert caps["wider leak"] == 1
+    assert ceiling_ledger([]) is None
 
 
 def test_attack_surface_from_evidence():

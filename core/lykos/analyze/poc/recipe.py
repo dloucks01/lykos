@@ -41,13 +41,20 @@ RECIPE_STATE = "corroborated"
 RECIPE_CONFIDENCE = 0.5
 
 
-def annotate_lead_ceiling(ctx, target, lead, *, target_level: str, why: str) -> None:
+def annotate_lead_ceiling(ctx, target, lead, *, target_level: str, why: str,
+                          blocking_primitive: Optional[str] = None) -> None:
     """Record ON THE LEAD (the L0 detection) how far its weaponization got and why it stopped, in
     the lead's own evidence channel so the detected defect and its recipe are linked and the
     account survives a re-run of whichever detector owns the lead row. Generalised from
-    `chain_primitive._annotate_lead_ceiling`. Best-effort: never fails the caller."""
+    `chain_primitive._annotate_lead_ceiling`. Best-effort: never fails the caller.
+
+    `blocking_primitive`, when a stage knows the SPECIFIC capability that would climb this ceiling
+    (more precise than the per-class default), is recorded inline as "[needs: ...]" -- the confirm
+    ladder parses it back out and the ceiling ledger ranks by it, so a ceiling is never a bare stop
+    but an itemized 'this is what lykos would need next'."""
     if lead is None:
         return
+    needs = f" [needs: {blocking_primitive}]" if blocking_primitive else ""
     try:
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
             "cwe": getattr(lead, "cwe", None), "title": getattr(lead, "title", None),
@@ -56,7 +63,8 @@ def annotate_lead_ceiling(ctx, target, lead, *, target_level: str, why: str) -> 
             "confidence": getattr(lead, "confidence", None),
             "dedup_key": getattr(lead, "dedup_key", None),
             "evidence": [{"channel": "recipe-ceiling",
-                          "detail": f"weaponization reached {target_level} and stopped here: {why}"}]})
+                          "detail": f"weaponization reached {target_level} and stopped here: "
+                                    f"{why}{needs}"}]})
     except Exception:                                    # noqa: BLE001 -- never fail the filing
         observe.absorbed(_log, "leaving the lead alone")
 
@@ -67,7 +75,8 @@ def file_recipe(ctx, target, *, cwe: str, technique: str, target_level: str, sum
                 title: Optional[str] = None, confidence: float = RECIPE_CONFIDENCE,
                 lead=None, extra_evidence: Optional[list] = None,
                 input_bytes: Optional[bytes] = None, input_mode: Optional[str] = None,
-                argv: Optional[list] = None) -> Optional[int]:
+                argv: Optional[list] = None,
+                blocking_primitive: Optional[str] = None) -> Optional[int]:
     """File a NON-EXECUTED exploitation recipe as a `corroborated` candidate finding, and annotate
     its originating lead with the ceiling. Returns the recipe finding's id, or None on failure.
 
@@ -86,6 +95,8 @@ def file_recipe(ctx, target, *, cwe: str, technique: str, target_level: str, sum
                      and never collides with the lead or a verified PoC.
       lead           the originating L0 finding row, annotated with the ceiling when given.
       extra_evidence optional additional evidence dicts (e.g. a stored unverified-input artifact ref).
+      blocking_primitive  the SPECIFIC capability that would climb this ceiling, when the stage knows
+                     it (overrides the per-class default); recorded inline for the ceiling ledger.
     """
     if target_level not in ("L1", "L2", "L3"):
         target_level = "L2"
@@ -123,5 +134,6 @@ def file_recipe(ctx, target, *, cwe: str, technique: str, target_level: str, sum
     except Exception:                                    # noqa: BLE001 -- advisory, never fatal
         observe.absorbed(_log, "recipe not filed")
         return None
-    annotate_lead_ceiling(ctx, target, lead, target_level=target_level, why=why_not_executed)
+    annotate_lead_ceiling(ctx, target, lead, target_level=target_level, why=why_not_executed,
+                          blocking_primitive=blocking_primitive)
     return fid

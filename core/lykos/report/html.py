@@ -190,6 +190,41 @@ _STATE_LEGEND = [
 _STATE_ORDER = [k for k, _ in _STATE_LEGEND]
 
 
+def _ceiling_ledger_html(led: dict[str, Any]) -> str:
+    """The ceiling ledger: the research queue of findings lykos could NOT yet weaponize, each with
+    the capability that would climb it. The mirror of the PoC list -- so a reader never reads a
+    ceiling as a clearance, and each unweaponized bug stays an itemized, dated TODO."""
+    entries = led.get("entries") or []
+    caps = led.get("capabilities") or []
+    p = ['<section class="card ledger ceiling-ledger"><h2>Ceiling ledger '
+         '<span class="muted">— what lykos could not yet weaponize</span></h2>',
+         f'<p class="headline tone-medium">{esc(led.get("framing") or "")}</p>',
+         '<p class="muted">The mirror of the demonstrated-PoC list: these defects are real and '
+         'stand; weaponization stopped short with lykos\'s current techniques. Each row names the '
+         'capability that would climb it — clearing one (shipping that primitive) converts its '
+         'whole column into PoCs. This queue IS the roadmap; a bug here is not a bug that is safe.</p>']
+    if caps:
+        p.append('<div class="evlabel">Capabilities that would unblock the most, first</div>'
+                 '<ul class="ev">')
+        for c in caps:
+            p.append(f'<li><b>{c.get("unblocks")}×</b> — {esc(c.get("blocking_primitive") or "")}</li>')
+        p.append('</ul>')
+    p.append('<table class="verdicts ceiling-tab"><thead><tr><th>CWE</th><th>Reached</th>'
+             '<th>Would reach</th>'
+             '<th>Finding</th><th>What would break it</th></tr></thead><tbody>')
+    for e in entries:
+        p.append('<tr>'
+                 f'<td class="mono">{esc(e.get("cwe") or "")}</td>'
+                 f'<td>{esc(e.get("reached") or "")}</td>'
+                 f'<td>{esc(e.get("would_reach") or "")}</td>'
+                 f'<td>{esc((e.get("title") or "")[:90])}'
+                 f'{" <span class=mono>" + esc(str(e["site"])) + "</span>" if e.get("site") else ""}</td>'
+                 f'<td>{esc(e.get("blocking_primitive") or "—")}</td>'
+                 '</tr>')
+    p.append('</tbody></table></section>')
+    return "".join(p)
+
+
 def _coverage_ledger_html(led: dict[str, Any]) -> str:
     """The coverage ledger: checks run vs available (classes looked for), weaponization reached, code
     exercised, and the gaps worklist -- how close this engagement got to full coverage, as numbers."""
@@ -537,6 +572,11 @@ def to_html(report: dict[str, Any]) -> str:
     led = report.get("coverage_ledger")
     if led:
         parts.append(_coverage_ledger_html(led))
+
+    # ---- ceiling ledger (the research queue: what we could not yet weaponize) ----
+    cled = report.get("ceiling_ledger")
+    if cled and cled.get("entries"):
+        parts.append(_ceiling_ledger_html(cled))
 
     # ---- time & yield per technique ----
     tm = report.get("timing")
@@ -886,8 +926,12 @@ def _finding_html(f: dict) -> str:
             p.append(f'<li><b>Demonstrated:</b> a verified PoC reached {esc(dl)}</li>')
         if ex.get("ceiling"):
             rr = f' — {esc(ex.get("ceiling_reason"))}' if ex.get("ceiling_reason") else ""
-            p.append(f'<li><b>Ceiling:</b> weaponization reached {esc(ex["ceiling"])} and stopped'
-                     f'{rr}</li>')
+            p.append(f'<li><b>Ceiling (lykos reach, not a clearance):</b> weaponization reached '
+                     f'{esc(ex["ceiling"])} and stopped{rr}</li>')
+            if ex.get("blocking_primitive"):
+                p.append(f'<li><b>What would break it:</b> {esc(ex["blocking_primitive"])}</li>')
+            if ex.get("ceiling_framing"):
+                p.append(f'<li class="muted"><b>Note:</b> {esc(ex["ceiling_framing"])}</li>')
         if ex.get("targets_live"):
             p.append(f'<li><b>Against the live target:</b> this recipe targets '
                      f'{esc(ex["targets_live"])}</li>')

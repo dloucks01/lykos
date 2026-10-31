@@ -24,6 +24,7 @@ from ..db.dao import (
     TargetDAO,
 )
 from ..analyze.confirm_ladder import attack_surface as _attack_surface
+from ..analyze.confirm_ladder import ceiling_ledger as _ceiling_ledger
 from ..analyze.confirm_ladder import finding_analysis as _finding_analysis
 from ..analyze.confirm_ladder import finding_exploitability as _finding_exploitability
 from ..analyze.confirm_ladder import finding_verification as _finding_verification
@@ -962,6 +963,12 @@ def build_report(
         # The coverage ledger: what was checked (classes), what was weaponized, how much code was
         # exercised, and the gaps worklist -- the measurement that makes "how close to 100%" a number.
         "coverage_ledger": _safe_ledger(store, case_id),
+        # The ceiling ledger: every finding whose weaponization stopped short, the capability that
+        # would climb it, and the honest framing that a ceiling is a lykos-limit, NOT a clearance --
+        # the surfaced research queue (mirror of the PoC list), so a 'clean' area is never misread
+        # as 'no bugs' and each unweaponized bug stays an itemized, dated TODO.
+        "ceiling_ledger": _ceiling_ledger(
+            [f for t in targets_out for f in t["findings"]]),
         # How long each technique took + the overall analysis time, with yield (findings/crashes)
         # beside the cost -- so a technique that ate the clock for nothing is self-evident.
         "timing": _safe_timing(store, case_id, all_runs),
