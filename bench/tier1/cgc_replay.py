@@ -14,6 +14,7 @@ vuln/patched differential and to confirm the crashable set.
 """
 import os
 import random
+import select
 import signal
 import socket
 import struct
@@ -24,9 +25,20 @@ FATAL = {signal.SIGSEGV, signal.SIGILL, signal.SIGBUS, signal.SIGABRT, signal.SI
 
 
 def _read_all(fd, n, deadline):
+    """Read up to n bytes, never blocking past the deadline. os.read() blocks indefinitely when no
+    data is available, so we gate every read on select() with the remaining time -- otherwise a POV
+    that never negotiates on fd3 would hang the whole replay (the deadline is only meaningful if it
+    is actually enforced at the point we wait)."""
     b = b""
     while len(b) < n:
-        if time.time() > deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return b
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+        except (OSError, ValueError):
+            return b
+        if not ready:
             return b
         try:
             r = os.read(fd, n - len(b))
@@ -103,14 +115,20 @@ def replay(cb_path, pov_path, *, seed="0" * 16, timeout=10.0):
         rc = None
     if cb.poll() is None:
         cb.kill()
+    # reap the POV; kill it first if it is still alive (e.g. blocked on a read of the now-dead CB)
     try:
-        os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError:
+        if os.waitpid(pid, os.WNOHANG) == (0, 0):
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+    except (ChildProcessError, ProcessLookupError, OSError):
         pass
     try:
         cb.wait(timeout=2)
     except Exception:
-        pass
+        try:
+            cb.kill()
+        except Exception:
+            pass
     return (sig is not None), sig, nego["type"]
 
 

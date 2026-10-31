@@ -160,6 +160,10 @@ def synthesize_stage(ctx) -> dict:
                  f"the saved return address (word {word}B, {endian}-endian) to take control of the "
                  f"return address"),
         why_not_executed=why,
+        # The offset + payload are computed; what is missing is reaching the buffer or detonating.
+        missing_technique=("a driver that passes the input gating to reach the buffer "
+                            "(menu/protocol navigation), or a runnable build to detonate -- the "
+                            "overflow offset and the control payload are already computed"),
         lead=lead, input_bytes=rec_payload, input_mode=(modes or ["stdin"])[0], argv=argv_base or None)
     # Emit the standalone exploit SCRIPT (RIP-control PoC) from the computed offset -- the
     # analyst-loop deliverable, static-derived (not run here), honest about its assumptions.
@@ -278,6 +282,9 @@ def _file_ret2win_recipe(ctx, target, target_bytes, exact, lead, why, word, endi
                    f"realigned entry {alt:#x} in place of {int(win[1]):#x}"]
                   + list(exact.get("notes") or []),
             why_not_executed=why, lead=lead, input_bytes=payload, input_mode=mode,
+            missing_technique=("a runnable build to detonate the computed ret2win payload (and, if "
+                                "the sink is gated, a driver past the navigation) -- the &win "
+                                "address and payload bytes are in hand"),
             argv=argv_base or None)
         # The ret2win exploit SCRIPT: return address -> &win, the real redirect (L3 candidate).
         _emit_exploit_script(ctx, target, offset=int(exact["payload_offset"]), delivery=mode,

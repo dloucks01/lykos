@@ -186,6 +186,14 @@ def synthesize_injection_stage(ctx) -> dict:
     # of the recovered frame and image. Compute and file it as concrete payload bytes for each
     # CWE-134 site, whether or not this sandbox could run the target (additive: a demonstrated
     # format exploit from build_exploit suppresses it).
+    # CWE-78 command injection: construct + DETONATE (a shell separator + echo-nonce marker).
+    # Different oracle from the memory-corruption classes; additive and best-effort.
+    try:
+        from . import cmdi_construct
+        cmdi_construct.construct_command_injections(ctx, target)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "command-injection construct skipped")
+
     if "format-string" in applicable:
         fmt_ok = any(c.get("cwe") == "CWE-134" for c in confirmed)
         from . import fmt_recipe
@@ -274,6 +282,9 @@ def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
             summary=(f"the binary imports the {name} sink; candidate payload {shown!r} delivered "
                      f"over {chan} is built to trigger it"),
             why_not_executed=why, lead=leads.get(cwe),
+            missing_technique=(f"a reaching input channel that carries the payload past the "
+                                f"unreached navigation state to the {name} sink, plus a live target "
+                                f"to observe the injected-command runtime marker"),
             input_bytes=pb, input_mode=chan)
 
 

@@ -1,0 +1,350 @@
+"""doc 58: bonus detonation oracles -- run a constructed PoC and confirm, soundly, that it did what
+the construction claims. Used only when the target can execute here (or once the operator supplies
+the deps the pre-flight named); a sound construction never depends on it. x86-64 Linux.
+
+`reaches_address` is the control-flow oracle: it proves a payload transfers control to a chosen
+address (a win function, a one-gadget) by setting an INT3 breakpoint there and delivering the input.
+A SIGTRAP at that address is proof the hijack fired -- stronger and more general than matching a
+program-specific output marker. No PIE only (the address is the file vaddr); a PIE target would need
+the runtime load base, which this does not yet resolve."""
+from __future__ import annotations
+
+import ctypes
+import logging
+import os
+import signal
+import tempfile
+import time
+
+_log = logging.getLogger(__name__)
+
+PTRACE_TRACEME = 0
+PTRACE_PEEKTEXT = 1
+PTRACE_POKETEXT = 4
+PTRACE_CONT = 7
+PTRACE_GETREGS = 12
+
+
+def _prep_delivery(mode, payload, argv, env_name, scratch_dir):
+    """Build (argv, stdin_bytes, env_overrides, tmpfile) for delivering `payload` on `mode`, or
+    None when the combo is unsupported (env with no variable name). One place so every oracle
+    delivers a given channel identically. stdin is fed as bytes; arg appends the payload as an
+    argument; file writes it to a temp file whose path is appended; env sets the named variable.
+    The tmpfile (file mode only) is the caller's to unlink after the run."""
+    argv = [str(a) for a in (argv or [])]
+    if mode == "stdin":
+        return argv, payload, None, None
+    if mode == "arg":
+        return argv + [payload.decode("latin-1")], b"", None, None
+    if mode == "file":
+        fd, path = tempfile.mkstemp(prefix="lykos_poc_", suffix=".bin",
+                                    dir=scratch_dir or None)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        return argv + [path], b"", None, path
+    if mode == "env":
+        if not env_name:
+            return None
+        return argv, b"", {str(env_name): payload.decode("latin-1")}, None
+    return None
+
+
+def _libc():
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.ptrace.restype = ctypes.c_long
+    libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+    return libc
+
+
+class _Regs(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulonglong) for n in (
+        "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8",
+        "rax", "rcx", "rdx", "rsi", "rdi", "orig_rax", "rip", "cs", "eflags",
+        "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs")]
+
+
+def reaches_address(exe: str, payload: bytes, vaddr: int, *, input_mode: str = "stdin",
+                    argv=None, env_name=None, scratch_dir=None, timeout: float = 8.0) -> bool:
+    """True if delivering `payload` makes control reach `vaddr` (INT3 breakpoint hit there).
+
+    `input_mode` picks the channel the payload is delivered on (stdin | arg | file | env); `argv`
+    is the base argument vector the channel extends, `env_name` the variable for env mode. Sound: a
+    SIGTRAP whose RIP is vaddr+1 means the CPU executed our planted 0xCC at vaddr, i.e. control was
+    transferred there. False on any other outcome (timeout, clean exit, crash elsewhere).
+    Best-effort: never raises."""
+    tmp = None
+    try:
+        prep = _prep_delivery(input_mode, payload, argv, env_name, scratch_dir)
+        if prep is None:
+            return False
+        argv2, stdin_bytes, env_over, tmp = prep
+        return _reaches(exe, stdin_bytes, vaddr, argv2, env_over, timeout)
+    except Exception:                                    # noqa: BLE001
+        _log.debug("reaches_address failed", exc_info=True)
+        return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _reaches(exe, stdin_bytes, vaddr, argv, env_over, timeout) -> bool:
+    r0, w0 = os.pipe()                                   # payload -> child stdin (EOF when empty)
+    pid = os.fork()
+    if pid == 0:                                         # ---- child ----
+        try:
+            libc = _libc()
+            libc.ptrace(PTRACE_TRACEME, 0, None, None)
+            os.dup2(r0, 0)                               # always: a non-stdin channel's target that
+            os.close(r0); os.close(w0)                   # strays into read() gets clean EOF, not a block
+            dn = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(dn, 1); os.dup2(dn, 2)
+            if env_over:
+                env = dict(os.environ); env.update(env_over)
+                os.execve(exe, [exe] + [str(a) for a in argv], env)
+            else:
+                os.execv(exe, [exe] + [str(a) for a in argv])
+        except Exception:
+            pass
+        os._exit(127)
+    # ---- parent ----
+    os.close(r0)
+    libc = _libc()
+    reached = False
+    try:
+        _, status = os.waitpid(pid, 0)                   # stop at execv (SIGTRAP)
+        if not os.WIFSTOPPED(status):
+            return False
+        # plant INT3 at vaddr
+        orig = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(vaddr), None)
+        if orig == -1 and ctypes.get_errno() != 0:
+            return False
+        orig &= (1 << 64) - 1
+        bp = (orig & ~0xff) | 0xCC
+        libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(vaddr), ctypes.c_void_p(bp))
+        libc.ptrace(PTRACE_CONT, pid, None, None)
+        try:
+            if stdin_bytes:
+                os.write(w0, stdin_bytes)
+        except OSError:
+            pass
+        finally:
+            os.close(w0)
+        # watch for the breakpoint, honouring a wall-clock deadline. Poll with WNOHANG rather than
+        # SIGALRM: analyze stages run in worker THREADS, where signal.signal/setitimer raise
+        # ValueError ("signal only works in main thread") -- which silently killed detonation.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+            if wpid == 0:
+                time.sleep(0.002)
+                continue
+            if os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP:
+                regs = _Regs()
+                if libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(regs)) == 0:
+                    if regs.rip == (vaddr + 1) & ((1 << 64) - 1):
+                        reached = True
+                        break
+                # not our breakpoint: continue
+                libc.ptrace(PTRACE_CONT, pid, None, None)
+                continue
+            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                break
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    return reached
+
+
+def reaches_runtime_address(exe: str, *, win_off: int, target_bytes: bytes, make_payload,
+                            argv=None, leak_timeout: float = 3.0, timeout: float = 8.0):
+    """PIE two-stage control-flow oracle: defeat ASLR with the pointer the target DISCLOSES, then
+    confirm control reaches an in-image address at its RUNTIME location.
+
+    Stage 1 -- run the target and read what it prints BEFORE it first blocks for input; recover the
+    PIE load base from those pointers with `exploit.recover_pie_base` (page-offset matching against
+    the image's own symbols -- no ASLR-off oracle, so the base is an honest defeat). Stage 2 --
+    `win_rt = base + win_off`; plant an INT3 there and deliver `make_payload(base, win_rt)` on stdin
+    (the leak and the write are sequential reads on the same interactive channel -- the only channel
+    a single process can carry a post-leak second input on). A SIGTRAP whose RIP is win_rt+1 proves
+    control was transferred to win at runtime. Returns (reached: bool, pie_base: int|None).
+    Best-effort; never raises. Sound only with a caller-side negative control (a wrong value must
+    NOT reach), exactly as `reaches_address`."""
+    try:
+        from . import exploit as _exploit
+        return _reaches_rt(exe, int(win_off), target_bytes, make_payload, argv or [],
+                           leak_timeout, timeout, _exploit)
+    except Exception:                                    # noqa: BLE001
+        _log.debug("reaches_runtime_address failed", exc_info=True)
+        return (False, None)
+
+
+def _reaches_rt(exe, win_off, tb, make_payload, argv, leak_timeout, timeout, _exploit):
+    import re
+    import select
+    r_in, w_in = os.pipe()                               # parent -> child stdin
+    r_out, w_out = os.pipe()                             # child stdout/stderr -> parent (read leak)
+    pid = os.fork()
+    if pid == 0:                                         # ---- child ----
+        try:
+            libc = _libc()
+            libc.ptrace(PTRACE_TRACEME, 0, None, None)
+            os.dup2(r_in, 0); os.dup2(w_out, 1); os.dup2(w_out, 2)
+            for fd in (r_in, w_in, r_out, w_out):
+                os.close(fd)
+            os.execv(exe, [exe] + [str(a) for a in argv])
+        except Exception:
+            pass
+        os._exit(127)
+    # ---- parent ----
+    os.close(r_in); os.close(w_out)
+    libc = _libc()
+    reached = False
+    pie_base = None
+    w_open = True
+    try:
+        _, status = os.waitpid(pid, 0)                   # stop at execv (SIGTRAP)
+        if not os.WIFSTOPPED(status):
+            return (False, None)
+        libc.ptrace(PTRACE_CONT, pid, None, None)        # run to the disclosure + first input read
+        # Stage 1: collect the pointers the target prints before it blocks for input.
+        buf = b""
+        dl = time.monotonic() + leak_timeout
+        while time.monotonic() < dl:
+            rl, _, _ = select.select([r_out], [], [], 0.05)
+            if rl:
+                try:
+                    chunk = os.read(r_out, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+            elif re.search(rb"0x[0-9a-fA-F]{6,}", buf):
+                break                                    # have a pointer and output has gone quiet
+        vals = [int(m, 16) for m in re.findall(rb"0x[0-9a-fA-F]+", buf)]
+        pie_base = _exploit.recover_pie_base(vals, tb, allow_single=True)
+        if pie_base is None:
+            return (False, None)
+        win_rt = (pie_base + win_off) & ((1 << 64) - 1)
+        # Stage 2: stop the child (blocked in its input read), plant INT3 at the runtime win addr.
+        os.kill(pid, signal.SIGSTOP)
+        os.waitpid(pid, 0)
+        orig = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(win_rt), None)
+        if orig == -1 and ctypes.get_errno() != 0:
+            return (False, pie_base)
+        orig &= (1 << 64) - 1
+        bp = (orig & ~0xff) | 0xCC
+        libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(win_rt), ctypes.c_void_p(bp))
+        libc.ptrace(PTRACE_CONT, pid, None, None)        # resume (SIGSTOP suppressed)
+        try:
+            os.write(w_in, make_payload(pie_base, win_rt))
+        except OSError:
+            pass
+        finally:
+            os.close(w_in); w_open = False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+            if wpid == 0:
+                time.sleep(0.002)
+                continue
+            if os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP:
+                regs = _Regs()
+                if libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(regs)) == 0:
+                    if regs.rip == (win_rt + 1) & ((1 << 64) - 1):
+                        reached = True
+                        break
+                libc.ptrace(PTRACE_CONT, pid, None, None)
+                continue
+            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                break
+    finally:
+        try:
+            if w_open:
+                os.close(w_in)
+        except OSError:
+            pass
+        try:
+            os.close(r_out)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    return (reached, pie_base)
+
+
+def runs_injected_command(exe: str, payload: bytes, marker: bytes = b"", *, proof=None,
+                          input_mode: str = "stdin", argv=None, env_name=None, scratch_dir=None,
+                          timeout: float = 6.0) -> bool:
+    """CWE-78 oracle: True if delivering `payload` makes the injected command RUN.
+
+    `proof` (preferred) is a callable grading the target's output: use a FORGERY-PROOF challenge
+    (attribution.CodeMarkers.proves -- solved arithmetic present AND the raw command text absent) so
+    a target that merely ECHOES its input (printf(buf), cat, a reflecting server) cannot fake the
+    signal. The bare `marker in output` path is kept for callers that pass a marker, but it is unsound
+    against an echoing target and should not be used for new code. Delivered on `input_mode`
+    (stdin | arg | file | env); sound when paired with a benign negative control."""
+    import subprocess
+    tmp = None
+    try:
+        prep = _prep_delivery(input_mode, payload, argv, env_name, scratch_dir)
+        if prep is None:
+            return False
+        argv2, stdin_bytes, env_over, tmp = prep
+        env = None
+        if env_over:
+            env = dict(os.environ); env.update(env_over)
+        r = subprocess.run([exe] + argv2, input=stdin_bytes, capture_output=True,
+                           timeout=timeout, env=env)
+        out = (r.stdout or b"") + (r.stderr or b"")
+        if proof is not None:
+            return bool(proof(out))
+        return bool(marker) and marker in out
+    except Exception:                                    # noqa: BLE001
+        return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def probe_fmt_offset(exe: str, *, input_mode: str = "stdin", argv=None, env_name=None,
+                     scratch_dir=None, timeout: float = 6.0):
+    """Recover the printf-varargs arg offset of a format-string sink by delivering the %p probe and
+    scanning the output -- the dynamic fallback when the static frame recovery can't place the
+    buffer (e.g. the decompiler symbolized the stack local). Delivered on `input_mode`
+    (stdin | arg | file | env). None if the target cannot run or the marker is not seen."""
+    import subprocess
+    from .fmt import probe_payload, find_fmt_offset
+    probe = probe_payload(count=40)
+    tmp = None
+    try:
+        prep = _prep_delivery(input_mode, probe, argv, env_name, scratch_dir)
+        if prep is None:
+            return None
+        argv2, stdin_bytes, env_over, tmp = prep
+        env = None
+        if env_over:
+            env = dict(os.environ); env.update(env_over)
+        p = subprocess.run([exe] + argv2, input=stdin_bytes, capture_output=True,
+                           timeout=timeout, env=env)
+        return find_fmt_offset(p.stdout, marker=0x4141414141414141)
+    except Exception:                                    # noqa: BLE001
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass

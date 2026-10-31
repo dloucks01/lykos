@@ -190,6 +190,42 @@ _STATE_LEGEND = [
 _STATE_ORDER = [k for k, _ in _STATE_LEGEND]
 
 
+def _ceiling_ledger_html(led: dict[str, Any]) -> str:
+    """The weaponization backlog: findings lykos hasn't yet carried to a validated PoC, each with
+    the technique to build next. The mirror of the PoC list -- so a 'clean' area is never read as a
+    clearance, and every such finding stays a named build task, never a wall."""
+    entries = led.get("entries") or []
+    techs = led.get("techniques") or []
+    p = ['<section class="card ledger ceiling-ledger"><h2>Weaponization backlog '
+         '<span class="muted">— techniques to build next</span></h2>',
+         f'<p class="headline tone-medium">{esc(led.get("framing") or "")}</p>',
+         '<p class="muted">The mirror of the demonstrated-PoC list: these defects are real and '
+         'stand. lykos hasn\'t implemented the technique to carry them further yet — each row names '
+         'what to build next. Shipping one technique advances every finding in its group toward a '
+         'PoC. This backlog IS the roadmap; a finding here is not a finding that is safe, and not '
+         'one that is walled off — just one whose technique isn\'t built yet.</p>']
+    if techs:
+        p.append('<div class="evlabel">Techniques to build, by how many findings each advances</div>'
+                 '<ul class="ev">')
+        for c in techs:
+            p.append(f'<li><b>+{c.get("advances")} findings</b> — {esc(c.get("missing_technique") or "")}</li>')
+        p.append('</ul>')
+    p.append('<table class="verdicts ceiling-tab"><thead><tr><th>CWE</th><th>Reach today</th>'
+             '<th>Target</th>'
+             '<th>Finding</th><th>Technique to build next</th></tr></thead><tbody>')
+    for e in entries:
+        p.append('<tr>'
+                 f'<td class="mono">{esc(e.get("cwe") or "")}</td>'
+                 f'<td>{esc(e.get("reached") or "")}</td>'
+                 f'<td>{esc(e.get("would_reach") or "")}</td>'
+                 f'<td>{esc((e.get("title") or "")[:90])}'
+                 f'{" <span class=mono>" + esc(str(e["site"])) + "</span>" if e.get("site") else ""}</td>'
+                 f'<td>{esc(e.get("missing_technique") or "—")}</td>'
+                 '</tr>')
+    p.append('</tbody></table></section>')
+    return "".join(p)
+
+
 def _coverage_ledger_html(led: dict[str, Any]) -> str:
     """The coverage ledger: checks run vs available (classes looked for), weaponization reached, code
     exercised, and the gaps worklist -- how close this engagement got to full coverage, as numbers."""
@@ -537,6 +573,11 @@ def to_html(report: dict[str, Any]) -> str:
     led = report.get("coverage_ledger")
     if led:
         parts.append(_coverage_ledger_html(led))
+
+    # ---- ceiling ledger (the research queue: what we could not yet weaponize) ----
+    cled = report.get("ceiling_ledger")
+    if cled and cled.get("entries"):
+        parts.append(_ceiling_ledger_html(cled))
 
     # ---- time & yield per technique ----
     tm = report.get("timing")
@@ -886,8 +927,12 @@ def _finding_html(f: dict) -> str:
             p.append(f'<li><b>Demonstrated:</b> a verified PoC reached {esc(dl)}</li>')
         if ex.get("ceiling"):
             rr = f' — {esc(ex.get("ceiling_reason"))}' if ex.get("ceiling_reason") else ""
-            p.append(f'<li><b>Ceiling:</b> weaponization reached {esc(ex["ceiling"])} and stopped'
-                     f'{rr}</li>')
+            p.append(f'<li><b>Reach today (lykos\'s tooling, not the target):</b> weaponized to '
+                     f'{esc(ex["ceiling"])} so far{rr}</li>')
+            if ex.get("missing_technique"):
+                p.append(f'<li><b>Technique to build next:</b> {esc(ex["missing_technique"])}</li>')
+            if ex.get("ceiling_framing"):
+                p.append(f'<li class="muted"><b>Note:</b> {esc(ex["ceiling_framing"])}</li>')
         if ex.get("targets_live"):
             p.append(f'<li><b>Against the live target:</b> this recipe targets '
                      f'{esc(ex["targets_live"])}</li>')
@@ -987,7 +1032,12 @@ def _finding_html(f: dict) -> str:
         p.append('<div class="evlabel">Proof-of-Concept</div><div class="pocs">')
         for pc in pocs:
             lvl = pc.get("level") or "?"
-            ok = "verified" if pc.get("verified") else "unverified"
+            # doc 58: a PoC's provenance is the honest signal -- a detonation fired the oracle; a
+            # sound construction stands on its reach+trigger argument (no execution needed).
+            prov = pc.get("provenance")
+            ok = ({"detonated": "detonated — oracle fired",
+                   "constructed": "constructed — sound, not run here"}.get(prov)
+                  or ("verified" if pc.get("verified") else "unverified"))
             dl = ""
             if pc.get("bundle_b64"):
                 fn = f'poc-{(pc.get("bundle_sha") or lvl)[:12]}.tar.gz'
@@ -1006,21 +1056,33 @@ def _finding_html(f: dict) -> str:
                     dl += (f' <span class="muted">not embedded — fetch from '
                            f'<span class="mono">{esc(where)}</span> on the analysis server'
                            f'</span>')
+            elif pc.get("input_sha"):
+                # doc 58 lightweight PoC: the payload bytes are the deliverable (no package).
+                dl = (f' <span class="muted mono">payload {esc(pc["input_sha"][:16])}…</span>'
+                      ' <span class="muted">— the few-line repro is below</span>')
             p.append(f'<div class="poc">{_badge(lvl, "#8e4ec6")} '
                      f'<span class="mono">{esc(pc.get("signal") or "")}</span> '
                      f'<span class="muted">{ok}</span>{dl}</div>')
         p.append('</div>')
     # How to reproduce: the concrete recipe a reader re-runs -- the channel, the crashing input
     # hash, and the PoC bundle. Anchored to hashes so it is deterministic.
-    crashes = f.get("crashes", [])
-    repro = crashes[0] if crashes else None
-    if repro:
-        chan = esc(repro.get("input_mode") or "stdin")
-        ish = esc((repro.get("input_sha") or "")[:16])
+    # doc 58: prefer the constructed PoC's own few-line repro (payload + one command) when present.
+    repro_ev = next((e.get("detail") for e in (f.get("evidence") or [])
+                     if isinstance(e, dict) and e.get("channel") == "reproduce"), None)
+    if repro_ev:
+        body = "<br>".join(esc(ln) for ln in repro_ev.strip().splitlines())
         p.append('<div class="evlabel">Reproduction</div>'
-                 f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
-                 f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
-                 'carries the exact bytes and the invocation.</div>')
+                 f'<div class="repro mono">{body}</div>')
+    else:
+        crashes = f.get("crashes", [])
+        repro = crashes[0] if crashes else None
+        if repro:
+            chan = esc(repro.get("input_mode") or "stdin")
+            ish = esc((repro.get("input_sha") or "")[:16])
+            p.append('<div class="evlabel">Reproduction</div>'
+                     f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
+                     f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
+                     'carries the exact bytes and the invocation.</div>')
     # Remediation: every finding ends with what to DO about it -- the report is a fix list, not
     # just an inventory.
     p.append('<div class="evlabel">Remediation</div>'

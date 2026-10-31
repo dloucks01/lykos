@@ -1,0 +1,99 @@
+// Thin state layer over the (unchanged) api.js parity client: load a case, its targets, and the
+// per-target findings + pocs the spine renders. No framework state magic -- a plain object + a
+// subscribe callback the shell re-renders on.
+import { api } from "../app/api.js";
+
+export const store = {
+  cases: [], caseId: null, targets: [], targetId: null,
+  target: null,                 // full target detail (mitigations, arch, hashes…)
+  advice: null,                 // invocation shape, decompiled count, headline
+  functions: [],                // function list (addr -> id mapping for code lookup)
+  findings: [], pocs: [], selectedId: null,
+  backlog: null,                // case-wide weaponization backlog (techniques to build next)
+  view: "overview",             // "overview" (binary) | "finding" | "backlog"
+  filter: "all",                // findings filter
+  loading: false, error: null,
+  _subs: new Set(),
+};
+
+export function setView(v) { store.view = v; emit(); }
+export function setFilter(f) { store.filter = f; emit(); }
+
+export function selectFinding(id) { store.selectedId = id; store.view = "finding"; emit(); }
+
+export function subscribe(fn) { store._subs.add(fn); return () => store._subs.delete(fn); }
+function emit() { for (const fn of store._subs) fn(); }
+
+export async function loadCases() {
+  try {
+    const cases = await api.listCases();
+    store.cases = Array.isArray(cases) ? cases : (cases.cases || []);
+    if (!store.caseId && store.cases[0]) await selectCase(store.cases[0].id);
+    else emit();
+  } catch (e) { store.error = String(e); emit(); }
+}
+
+export async function selectCase(caseId) {
+  store.caseId = caseId; store.targets = []; store.targetId = null;
+  store.findings = []; store.pocs = []; store.backlog = null; emit();
+  // The backlog is case-wide (spans every target) -- load it alongside the target list, not per
+  // target. Best-effort: a case with no backlog endpoint still renders the rest of the workbench.
+  api.backlog(caseId).then((b) => { store.backlog = b; emit(); }).catch(() => {});
+  try {
+    const targets = await api.listTargets(caseId);
+    store.targets = Array.isArray(targets) ? targets : (targets.targets || []);
+    if (store.targets[0]) await selectTarget(store.targets[0].id);
+    else emit();
+  } catch (e) { store.error = String(e); emit(); }
+}
+
+export async function selectTarget(targetId) {
+  store.targetId = targetId; store.loading = true; store.error = null;
+  store.target = null; store.advice = null; store.selectedId = null; store.view = "overview"; emit();
+  try {
+    const [target, advice, functions, findings, pocs] = await Promise.all([
+      api.getTarget(targetId).catch(() => null),
+      api.advice(targetId).catch(() => null),
+      api.functions(targetId).catch(() => []),
+      api.targetFindings(targetId).catch(() => []),
+      api.pocs(targetId).catch(() => []),
+    ]);
+    store.target = target;
+    store.advice = advice;
+    store.functions = Array.isArray(functions) ? functions : (functions.functions || []);
+    store.findings = Array.isArray(findings) ? findings : (findings.findings || []);
+    store.pocs = Array.isArray(pocs) ? pocs : (pocs.pocs || []);
+    store.selectedId = store.findings[0] ? store.findings[0].id : null;
+  } catch (e) { store.error = String(e); }
+  store.loading = false; emit();
+}
+
+export function artifactUrl(sha) { return `/artifacts/${sha}`; }
+
+const _norm = (a) => (a == null ? null : (typeof a === "string" ? parseInt(a, 16) : a));
+
+// Fetch the full function detail (disasm ir, stack frame, callees/callers) for a code address.
+const _fnCache = new Map();
+export async function fetchFunctionAt(addr) {
+  const want = _norm(addr);
+  if (want == null) return null;
+  const fn = (store.functions || []).find((f) => _norm(f.addr) === want);
+  if (!fn) return null;
+  if (_fnCache.has(fn.id)) return _fnCache.get(fn.id);
+  try { const d = await api.getFunction(fn.id); _fnCache.set(fn.id, d); return d; }
+  catch (e) { return null; }
+}
+
+// Fetch raw artifact bytes (a PoC payload) for the hexdump, cached by sha.
+const _bytesCache = new Map();
+export async function fetchBytes(sha) {
+  if (!sha) return null;
+  if (_bytesCache.has(sha)) return _bytesCache.get(sha);
+  try {
+    const r = await fetch(artifactUrl(sha));
+    if (!r.ok) return null;
+    const b = new Uint8Array(await r.arrayBuffer());
+    _bytesCache.set(sha, b);
+    return b;
+  } catch (e) { return null; }
+}

