@@ -194,6 +194,48 @@ def _bfs_reach(exe, opts, sinks, *, depth=3, cap=140, should_cancel=lambda: Fals
     return navs
 
 
+def _image_sink_offsets(exe, sink_names):
+    """Image OFFSETS of the probe's sink call-sites. On a PIE the objdump address IS the image
+    offset (link base 0), so the same disassembly scrape that `_sink_call_sites` uses for a non-PIE
+    fixed vaddr gives the offset a runtime breakpoint needs once the base is leaked."""
+    return _sink_call_sites(exe, sink_names)
+
+
+def directed_reach_pie(exe, opts, sink_offsets, target_bytes, *, depth=3, cap=48,
+                       should_cancel=lambda: False, want=3):
+    """Directed deep-reach to a NON-INJECTION sink in a PIE, confirmed by the two-stage runtime
+    oracle. A non-injection sink (a dangerous call, a memory-corruption site) has NO side-effect
+    marker, so the injection PIE path (enumerate + marker-confirm) cannot serve it; and the non-PIE
+    `_bfs_reach` breakpoint needs a fixed address ASLR denies. `detonate.reaches_runtime_address`
+    closes both: it leaks the PIE base from a pointer the target discloses (page-offset matched by
+    `exploit.recover_pie_base`), then plants an INT3 at base+offset and delivers the nav preamble --
+    a SIGTRAP at that runtime address proves control reached the sink under that preamble. `opts`
+    are menu-option tokens, `sink_offsets` the sink call-site image offsets (`_image_sink_offsets`).
+    Returns reaching option-sequence prefixes, shortest first (the leak must be disclosed BEFORE the
+    target first blocks for input -- the common startup-leak case; a leak that only appears mid-nav
+    is not yet covered). Sound exactly as `_bfs_reach`: a reach that is not the vulnerable call is a
+    search guide, not a confirmation, and a preamble that does not drive to the sink never trips the
+    breakpoint (the caller still supplies the negative control)."""
+    from . import detonate
+    navs, runs = [], 0
+    for pre in _nav_variants(opts, depth=depth, cap=cap):
+        if should_cancel() or runs >= cap:
+            return navs
+        for off in sink_offsets:
+            runs += 1
+            # `x\n` is a benign placeholder for the sink option's own read -- just enough to drive
+            # control to the call. The nav preamble rides stage 2 (post-leak) via make_payload.
+            reached, _base = detonate.reaches_runtime_address(
+                exe, win_off=off, target_bytes=target_bytes,
+                make_payload=lambda _b, _rt, _p=pre: _p + b"x\n")
+            if reached:
+                navs.append(pre)
+                break
+        if len(navs) >= want:
+            return navs
+    return navs
+
+
 def synthesize_injection_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
