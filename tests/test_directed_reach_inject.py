@@ -73,19 +73,45 @@ def test_bfs_reach_finds_multistep_prefix(tmp_path):
     assert b"2\n" not in [n for n in navs if n == b"2\n"]      # not the bare single-step nav
 
 
+def _build_pie(tmp_path):
+    src = tmp_path / "deep.c"
+    src.write_text(_FIXTURE)
+    exe = tmp_path / "deeppie"
+    r = subprocess.run(["gcc", "-fPIE", "-pie", "-fno-stack-protector", "-O0", "-w", "-o", str(exe),
+                        str(src)], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"PIE fixture build failed: {r.stderr[:200]}")
+    exe.chmod(0o755)
+    return exe
+
+
+def _reach_and_inject(exe, navs):
+    """Try the directed navs x cmdi payloads, confirm the injected command RAN (forgery-proof)."""
+    marker = "MK" + re.sub(r"\D", "", str(abs(hash(str(exe)))))[:6]
+    for nav in navs:
+        for payload in injection.cmdi_payloads(marker):
+            pl = payload if isinstance(payload, bytes) else payload.encode()
+            res = sandbox.run(str(exe), argv=[], stdin=nav + pl + b"\n", timeout=5)
+            out = (res.stdout or b"") + b"\n" + (res.stderr or b"")
+            if injection.cmdi_confirm(out, pl.decode("latin-1"), marker):
+                return nav, pl
+    return None
+
+
 @pytest.mark.skipif(not (shutil.which("gcc") and shutil.which("objdump")), reason="needs gcc + objdump")
 def test_directed_reach_injection_confirms(tmp_path):
     exe = _build(tmp_path)
     sinks = _system_call_sites(exe)
-    nav = inject_stage._bfs_reach(str(exe), [b"1", b"2", b"3"], sinks, depth=3, cap=120)[0]
+    navs = inject_stage._bfs_reach(str(exe), [b"1", b"2", b"3"], sinks, depth=3, cap=120)
+    assert _reach_and_inject(exe, navs), "non-PIE deep-sink injection did not confirm"
 
-    marker = "MK" + re.sub(r"\D", "", str(abs(hash(str(exe)))))[:6]
-    confirmed = False
-    for payload in injection.cmdi_payloads(marker):
-        pl = payload if isinstance(payload, bytes) else payload.encode()
-        res = sandbox.run(str(exe), argv=[], stdin=nav + pl + b"\n", timeout=5)
-        out = (res.stdout or b"") + b"\n" + (res.stderr or b"")
-        if injection.cmdi_confirm(out, pl.decode("latin-1"), marker):
-            confirmed = True
-            break
-    assert confirmed, "the injected command did not run at the deep sink (forgery-proof marker)"
+
+@pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
+def test_directed_reach_pie_marker_bfs(tmp_path):
+    # PIE: no fixed call-site address, so the breakpoint prune is unavailable; the bounded option
+    # sequences are confirmed by the injection's own forgery-proof marker (ASLR-independent).
+    exe = _build_pie(tmp_path)
+    navs = inject_stage._bfs_sequences([b"1", b"2", b"3"], depth=2, cap=24)
+    assert any(n == b"1\n2\n" for n in navs), "BFS did not enumerate the 1->2 sequence"
+    hit = _reach_and_inject(exe, navs)
+    assert hit and hit[0] == b"1\n2\n", f"PIE deep-sink injection did not confirm: {hit}"

@@ -104,12 +104,33 @@ def _directed_navs(ctx, target, target_bytes, exe, sink_names, *, depth=3, cap=1
     the injection's own forgery-proof marker still gates confirmation -- so a reach that is not the
     vulnerable call simply fails to confirm. Non-PIE only (the breakpoint needs a fixed call-site
     address). Returns up to a few reaching option-sequence prefixes, cheapest (shortest) first."""
-    import subprocess
-
     from ...db.dao import StringDAO
     from .. import interaction
-    if (target.mitigations or {}).get("pie") == "on":
+    try:
+        strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id)]
+        model = interaction.build_model(target_bytes, strings=strings)
+    except Exception:                                    # noqa: BLE001
         return []
+    opts = [str(o).encode() for o in (model.menu_opts or [])][:6]
+    if not opts:
+        return []
+    pie = (target.mitigations or {}).get("pie") == "on"
+    sinks = [] if pie else _sink_call_sites(exe, sink_names)
+    if sinks:
+        # NON-PIE: a fixed sink address lets a cheap breakpoint PRUNE the search -- confirm which
+        # option sequence drives to the sink before paying for an injection attempt.
+        return _bfs_reach(str(exe), opts, sinks, depth=depth, cap=cap,
+                          should_cancel=ctx.should_cancel)
+    # PIE (no fixed sink address) or a sink with no discrete call-site: enumerate bounded option
+    # sequences and let the inject loop's own forgery-proof marker confirm the reach -- the sink's
+    # side effect is the oracle, which is ASLR-independent, so no breakpoint is needed.
+    return _bfs_sequences(opts, depth=min(depth, 2), cap=24)
+
+
+def _sink_call_sites(exe, sink_names):
+    """Fixed call-site vaddrs of the probe's sinks (non-PIE), from the disassembly, for the
+    breakpoint-pruned reach."""
+    import subprocess
     try:
         dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-M", "intel", str(exe)],
                              capture_output=True, text=True, timeout=60).stdout
@@ -122,19 +143,21 @@ def _directed_navs(ctx, target, target_bytes, exe, sink_names, *, depth=3, cap=1
                 sinks.append(int(ln.split(":", 1)[0].strip(), 16))
             except ValueError:
                 pass
-    sinks = sinks[:3]
-    if not sinks:
-        return []
-    try:
-        strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id)]
-        model = interaction.build_model(target_bytes, strings=strings)
-    except Exception:                                    # noqa: BLE001
-        return []
-    opts = [str(o).encode() for o in (model.menu_opts or [])][:6]
-    if not opts:
-        return []
-    return _bfs_reach(str(exe), opts, sinks, depth=depth, cap=cap,
-                      should_cancel=ctx.should_cancel)
+    return sinks[:3]
+
+
+def _bfs_sequences(opts, *, depth=2, cap=24):
+    """All menu-option stdin sequences up to `depth`, shortest first, capped -- the ASLR-independent
+    reach candidates the inject loop confirms by its own marker (used where a breakpoint cannot:
+    PIE, or a sink with no discrete call-site)."""
+    from itertools import product
+    out = []
+    for d in range(1, depth + 1):
+        for seq in product(opts, repeat=d):
+            out.append(b"".join(o + b"\n" for o in seq))
+            if len(out) >= cap:
+                return out
+    return out
 
 
 def _bfs_reach(exe, opts, sinks, *, depth=3, cap=140, should_cancel=lambda: False, want=3):
