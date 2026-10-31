@@ -234,6 +234,7 @@ def synthesize_injection_stage(ctx) -> dict:
     ctx.emit("inject.start", payload={"probes": sorted(applicable), "channels": channels})
     confirmed = []
     navs = None                                      # built lazily: only a failing probe needs it
+    concolic_out = None                              # angr solve, run at most once across probes
     for name, spec in applicable.items():
         marker = _marker()
         payloads = spec["payloads"](marker)
@@ -279,6 +280,15 @@ def synthesize_injection_stage(ctx) -> dict:
                         break
                 if hit:
                     break
+        if hit is None and spec.get("cwe") in ("CWE-78", "CWE-134"):   # 4. CONCOLIC value-guard reach
+            # A sink behind a VALUE GUARD (a magic number / byte compare) that no option sequence
+            # passes: symbolically solve a stdin that reaches it (angr hypo driver, scoped under
+            # MemoryMax), then substitute our forgery-proof payload into the solved sink argument.
+            if concolic_out is None:
+                concolic_out = _run_concolic(ctx, target, target_bytes, exe)
+            if concolic_out:
+                ctx.progress(msg=f"probing {name} (concolic value-guard reach)")
+                hit = _concolic_consume(concolic_out, spec, payloads, marker, exe, target, timeout)
         if hit:
             confirmed.append({"probe": name, **_finalize(ctx, target, target_bytes, spec, hit)})
 
@@ -576,6 +586,61 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha, bases=None):
                  "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha}}]
         title = "Information disclosure (demonstrated): path traversal"
     return (None, title, {"channel": "effects", "detail": json.dumps(effs)})
+
+
+#: The marker payloads the angr hypo driver embeds at a reached injection sink (hyp_driver
+#: CMD_PAYLOADS + FMT_PAYLOADS). We locate one in a solved input to find the sink-argument slot,
+#: then substitute OUR forgery-proof payload there -- the bytes BEFORE it are the value-guard-passing
+#: prefix the solver found, which we keep verbatim.
+_HYPO_INJECT_PAYLOADS = [b";id>&2;#", b"|id>&2|", b"$(id>&2)", b"`id>&2`", b"\nid>&2\n", b";id>&2",
+                         b"%n%n%n%n", b"%s%s%s%s%s%s", b"%n%n", b"%x%n"]
+
+
+def _run_concolic(ctx, target, target_bytes, exe):
+    """Run the angr hypo driver ONCE over the target to solve inputs reaching its injection sinks,
+    scoped under MemoryMax so a runaway solve kills only the driver. Returns the out.json dict or
+    None (angr absent, image too large, or nothing solved). Shared across probes."""
+    try:
+        from ...hypo import engine
+    except Exception:                                    # noqa: BLE001
+        return None
+    if engine.angr_python() is None or len(target_bytes) > 8_000_000:
+        return None
+    budget = float((ctx.params or {}).get("concolic_budget", 60))
+    try:
+        out = engine.run_driver(str(exe), argv=["@@"], input_mode="stdin", budget=budget,
+                                input_size=200)
+    except Exception:                                    # noqa: BLE001
+        return None
+    return out if out.get("hypotheses") else None
+
+
+def _concolic_consume(out, spec, payloads, marker, exe, target, timeout):
+    """Turn the angr hypo driver's solved reaching inputs into a CONFIRMED injection: for each
+    solution that reaches THIS probe's sink (matched by cwe), the bytes before the solver's embedded
+    marker payload are the value-guard-passing prefix; substitute our own forgery-proof payload into
+    that slot and confirm by effect (the injected command RUNS, not echoes). This is what carries a
+    payload past a value guard (a magic number / byte compare) that enumeration cannot pass. Returns
+    a `_finalize`-shaped hit or None."""
+    import base64
+    sols = [base64.b64decode(s["input_b64"])
+            for h in (out.get("hypotheses") or []) if h.get("cwe") == spec.get("cwe")
+            for s in (h.get("solutions") or []) if s.get("input_b64")]
+    for inp in sols[:5]:
+        hp = next((p for p in _HYPO_INJECT_PAYLOADS if p in inp), None)
+        if hp is None:
+            continue
+        guard = inp[:inp.find(hp)]                        # the solver's value-guard-passing prefix
+        for payload in payloads:
+            pb = payload if isinstance(payload, bytes) else payload.encode()
+            stdin = inp.replace(hp, pb, 1)
+            res = sandbox.run(exe, argv=[], stdin=stdin, timeout=timeout, arch=target.arch,
+                              endianness=target.endianness, bits=target.bits)
+            o = (res.stdout or b"") + b"\n" + (res.stderr or b"")
+            if spec["confirm"](o, payload, marker):
+                return {"payload": payload, "mode": "stdin", "signal": res.signal_name, "out": o,
+                        "marker": marker, "argv_base": [], "nav": guard, "stdin": stdin}
+    return None
 
 
 def _finalize(ctx, target, target_bytes, spec, hit):
