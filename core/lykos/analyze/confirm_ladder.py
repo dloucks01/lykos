@@ -72,22 +72,25 @@ CLASS_PRIMITIVE = {
     "CWE-798": "hard-coded credential -> authentication bypass / credential disclosure",
 }
 
-#: A ceiling is a statement about LYKOS, never about the target. The defect is still there; our
-#: current technique set stopped short of weaponizing it. Every surface that shows a ceiling must
-#: carry this so a reader never reads "weaponization stopped" as "the target is safe" -- that false
-#: clearance is the exact mechanism by which a bug that "passed analysis" becomes a later zero-day.
-#: Mirror of the 0-false-confirmation invariant: a ceiling is a 0-false-CLEARANCE admission.
-CEILING_FRAMING = ("a limit of lykos's CURRENT techniques, not evidence the target is safe -- the "
-                   "defect stands; weaponization stopped here and the gap is a research TODO, not a "
-                   "clearance")
+#: How far lykos's CURRENT techniques reach is a fact about LYKOS, never about the target. The
+#: defect is still there; lykos just hasn't implemented the technique to carry it further YET.
+#: Every surface that shows this must carry the framing so a reader never reads "lykos reached L2"
+#: as "the target is safe" -- that false clearance is the exact mechanism by which a bug that
+#: "passed analysis" becomes a later zero-day. Mirror of the 0-false-confirmation invariant: a
+#: 0-false-CLEARANCE admission. It is never "blocked" -- there is no wall, only a technique we have
+#: not built yet.
+CEILING_FRAMING = ("not a limit of the target -- lykos hasn't implemented the technique to carry "
+                   "this further yet. The defect stands; this is the next thing to build, not a "
+                   "clearance and not a wall.")
 
-#: Per CWE class, the capability lykos would need to CLIMB PAST the common weaponization ceiling for
-#: that class -- the "what would break this ceiling" answer. A class-level statement (like
-#: CLASS_PRIMITIVE), never a per-instance claim; when an emitter established a MORE specific blocker
-#: it records it inline ("[needs: ...]") and that overrides this default. This is the raw material
-#: of the ceiling ledger / research queue: each distinct blocker here is a capability whose arrival
-#: converts a whole column of ceilings into PoCs (as the fmt->PIE leak did for CWE-134/121 recently).
-BLOCKING_PRIMITIVE = {
+#: Per CWE class, the technique lykos WOULD BUILD NEXT to carry weaponization further for that class
+#: -- the "what to implement next" answer, never "what blocks us" (there is no wall, only unbuilt
+#: technique). A class-level statement (like CLASS_PRIMITIVE), never a per-instance claim; when an
+#: emitter named a MORE specific technique it records it inline ("[needs: ...]") and that overrides
+#: this default. This is the raw material of the weaponization backlog: each distinct technique here
+#: is one build that advances a whole column of findings to PoCs (as the fmt->PIE leak just did for
+#: CWE-134/121 -- last week's "ceiling", this week's PoC).
+MISSING_TECHNIQUE = {
     "CWE-121": "recover the LIVE saved-return stack address under ASLR (a wider/multi-read leak to "
                "anchor the frame, or a stack-pivot that sidesteps needing it)",
     "CWE-122": "a heap-layout (grooming) solver to place the overflow adjacent to a target object",
@@ -107,18 +110,21 @@ BLOCKING_PRIMITIVE = {
                "pointer",
     "CWE-78": "a reaching input channel that carries the injected command unsanitised to the sink",
     "CWE-94": "a reaching input channel that carries the injected code to the interpreter sink",
+    "CWE-22": "a reaching input channel that carries the path-traversal payload to the filesystem "
+              "sink, plus a runnable target to confirm a read/write outside the intended directory",
 }
 
 
-def blocking_primitive(cwe: Optional[str], ceiling_reason: Optional[str] = None) -> Optional[str]:
-    """The capability that would climb past a ceiling: the SPECIFIC blocker an emitter recorded
-    inline as "[needs: ...]" if present, else the class-level default for `cwe`. Pure."""
+def missing_technique(cwe: Optional[str], ceiling_reason: Optional[str] = None) -> Optional[str]:
+    """The technique lykos would build next to carry weaponization further: the SPECIFIC one an
+    emitter named inline as "[needs: ...]" if present, else the class-level default for `cwe`.
+    Never a wall -- an unbuilt technique. Pure."""
     if ceiling_reason:
         import re as _re
         mo = _re.search(r"\[needs:\s*(.+?)\]\s*$", ceiling_reason.strip())
         if mo:
             return mo.group(1).strip()
-    return BLOCKING_PRIMITIVE.get(cwe or "")
+    return MISSING_TECHNIQUE.get(cwe or "")
 
 
 #: How an ENABLED target mitigation stands between the primitive and a full exploit.
@@ -146,17 +152,19 @@ def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dic
         mi.append("full RELRO/BIND_NOW — the GOT is read-only at runtime")
     elif relro == "partial":
         mi.append("partial RELRO — the GOT is still writable at runtime")
-    ceiling = reason = targets_live = blocker = None
+    ceiling = reason = targets_live = inline_tech = None
     for e in f.get("evidence") or []:
         d = e.get("detail") or "" if isinstance(e, dict) else ""
-        mo = re.search(r"weaponization reached (L\d)\b.*?stopped(?: here)?[:]?\s*(.+)", d)
+        # Tolerant of both the forward wording ("lykos reached L2 here; next technique ...: X") and
+        # the legacy marker ("weaponization reached L2 and stopped here: X") in older stored cases.
+        mo = re.search(r"(?:weaponization reached|lykos reached) (L\d)\b[^:]*:\s*(.+)", d)
         if mo:
             ceiling, raw = mo.group(1), mo.group(2).strip().rstrip(".")[:240]
-            # Split off an inline "[needs: ...]" blocker the emitter recorded, so the reason reads
-            # clean and the specific capability is surfaced on its own (overrides the class default).
+            # Split off an inline "[needs: ...]" the emitter recorded -- the specific technique to
+            # build next -- so the reason reads clean and the technique overrides the class default.
             bm = re.search(r"\s*\[needs:\s*(.+?)\]\s*$", raw)
             if bm:
-                blocker, raw = bm.group(1).strip(), raw[:bm.start()].strip().rstrip(".")
+                inline_tech, raw = bm.group(1).strip(), raw[:bm.start()].strip().rstrip(".")
             reason = raw
         to = re.search(r"[Tt]argets (L\d) if run against the live target", d)
         if to:
@@ -173,12 +181,12 @@ def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dic
     if ceiling:
         out["ceiling"] = ceiling
         out["ceiling_reason"] = reason
-        # A ceiling is a lykos-limit, never a target clearance -- carry the framing + the specific
-        # capability that would climb it so no surface can present the stop as "safe".
+        # lykos's current reach, never a target clearance -- carry the framing + the specific
+        # technique to build next so no surface can present it as "safe" or as a wall.
         out["ceiling_framing"] = CEILING_FRAMING
-        bp = blocker or blocking_primitive(f.get("cwe"))
+        bp = inline_tech or missing_technique(f.get("cwe"))
         if bp:
-            out["blocking_primitive"] = bp
+            out["missing_technique"] = bp
     if targets_live:
         out["targets_live"] = targets_live
     return out or None
@@ -309,26 +317,26 @@ def prove_out_plan(f: dict, verification: Optional[dict] = None) -> Optional[dic
     return {"solver": solver, "oracle": oracle, "steps": steps}
 
 
-#: Rank a ceiling'd finding in the research queue: higher = better ROI to push next. Highest
-#: severity first, then CLOSEST to the top (an L2 that stops one rung short of a demonstrated L3 is
-#: a smaller lift than an L1), then by how specific/large the missing capability is handled by order
-#: of filing. Severity/level are the only ordering signals; neither asserts anything not already set.
+#: Rank a finding in the weaponization backlog: higher = better ROI to build next. Highest severity
+#: first, then CLOSEST to a demonstrated PoC (an L2 one rung short of L3 is a smaller build than an
+#: L1). Severity/level are the only ordering signals; neither asserts anything not already set.
 _LEDGER_SEV = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _LEDGER_LEVEL = {"L1": 1, "L2": 2, "L3": 3}
 
 
 def ceiling_ledger(findings: list) -> Optional[dict]:
-    """The surfaced RESEARCH QUEUE: every distinct finding whose weaponization hit a ceiling, with
-    the level reached, the specific capability that would climb it, and the honest framing that a
-    ceiling is a lykos-limit and not a target clearance. Ranked best-ROI-first. Pure -- reads the
-    already-serialized findings (each may carry a precomputed `exploitability`, else it is derived
-    with no mitigation context, which does not affect the ceiling). Deduped by `dedup_key` so a
-    source bug filed once per target that compiles it appears once. None when nothing hit a ceiling.
+    """The WEAPONIZATION BACKLOG: every distinct finding lykos hasn't yet carried to a validated
+    PoC, with the level its current techniques reach, the specific technique to BUILD NEXT, and the
+    framing that this is lykos's reach -- never a wall, never a target clearance. Ranked
+    best-ROI-first. Pure -- reads the already-serialized findings (each may carry a precomputed
+    `exploitability`, else it is derived with no mitigation context, which does not affect the
+    reach). Deduped by `dedup_key` so a source bug filed once per target that compiles it appears
+    once. None when there is nothing in the backlog.
 
-    This is the mirror of the PoC list: the PoC list is what lykos CAN weaponize today; this ledger
-    is what it CANNOT yet, itemized -- so a 'clean' area is never read as 'no bugs', only as 'no
-    bugs lykos's current reach found', and each entry is a dated capability TODO. Clearing an entry
-    (shipping its blocking primitive) is exactly how lykos grows; the queue IS the roadmap."""
+    This is the mirror of the PoC list: the PoC list is what lykos weaponizes TODAY; this is what it
+    hasn't built the technique for YET, itemized -- so a 'clean' area is never read as 'no bugs',
+    only as 'no bugs lykos's current reach found', and each entry is a build task. Shipping an
+    entry's technique is exactly how lykos grows; the backlog IS the roadmap."""
     seen: dict = {}
     entries: list[dict] = []
     for f in findings or []:
@@ -348,7 +356,7 @@ def ceiling_ledger(findings: list) -> Optional[dict]:
             "severity": f.get("severity") or "medium",
             "reached": ex.get("ceiling"),
             "would_reach": ex.get("targets_live") or "L3",
-            "blocking_primitive": ex.get("blocking_primitive"),
+            "missing_technique": ex.get("missing_technique"),
             "reason": ex.get("ceiling_reason"),
             "dedup_key": f.get("dedup_key"),
         })
@@ -356,12 +364,13 @@ def ceiling_ledger(findings: list) -> Optional[dict]:
         return None
     entries.sort(key=lambda e: (_LEDGER_SEV.get(e["severity"], 2),
                                 _LEDGER_LEVEL.get(e["reached"], 0)), reverse=True)
-    # Group the queue by the missing capability: each group is one build that unblocks N findings.
+    # Group the backlog by the technique to build: each one is a single build that advances N
+    # findings toward a PoC -- the highest-leverage thing to implement next.
     by_cap: dict = {}
     for e in entries:
-        by_cap.setdefault(e.get("blocking_primitive") or "(unclassified blocker)", 0)
-        by_cap[e["blocking_primitive"] or "(unclassified blocker)"] += 1
-    capabilities = [{"blocking_primitive": k, "unblocks": v}
-                    for k, v in sorted(by_cap.items(), key=lambda kv: kv[1], reverse=True)]
+        by_cap.setdefault(e.get("missing_technique") or "(technique not yet classified)", 0)
+        by_cap[e["missing_technique"] or "(technique not yet classified)"] += 1
+    techniques = [{"missing_technique": k, "advances": v}
+                  for k, v in sorted(by_cap.items(), key=lambda kv: kv[1], reverse=True)]
     return {"framing": CEILING_FRAMING, "count": len(entries),
-            "entries": entries, "capabilities": capabilities}
+            "entries": entries, "techniques": techniques}

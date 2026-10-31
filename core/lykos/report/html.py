@@ -191,27 +191,28 @@ _STATE_ORDER = [k for k, _ in _STATE_LEGEND]
 
 
 def _ceiling_ledger_html(led: dict[str, Any]) -> str:
-    """The ceiling ledger: the research queue of findings lykos could NOT yet weaponize, each with
-    the capability that would climb it. The mirror of the PoC list -- so a reader never reads a
-    ceiling as a clearance, and each unweaponized bug stays an itemized, dated TODO."""
+    """The weaponization backlog: findings lykos hasn't yet carried to a validated PoC, each with
+    the technique to build next. The mirror of the PoC list -- so a 'clean' area is never read as a
+    clearance, and every such finding stays a named build task, never a wall."""
     entries = led.get("entries") or []
-    caps = led.get("capabilities") or []
-    p = ['<section class="card ledger ceiling-ledger"><h2>Ceiling ledger '
-         '<span class="muted">— what lykos could not yet weaponize</span></h2>',
+    techs = led.get("techniques") or []
+    p = ['<section class="card ledger ceiling-ledger"><h2>Weaponization backlog '
+         '<span class="muted">— techniques to build next</span></h2>',
          f'<p class="headline tone-medium">{esc(led.get("framing") or "")}</p>',
          '<p class="muted">The mirror of the demonstrated-PoC list: these defects are real and '
-         'stand; weaponization stopped short with lykos\'s current techniques. Each row names the '
-         'capability that would climb it — clearing one (shipping that primitive) converts its '
-         'whole column into PoCs. This queue IS the roadmap; a bug here is not a bug that is safe.</p>']
-    if caps:
-        p.append('<div class="evlabel">Capabilities that would unblock the most, first</div>'
+         'stand. lykos hasn\'t implemented the technique to carry them further yet — each row names '
+         'what to build next. Shipping one technique advances every finding in its group toward a '
+         'PoC. This backlog IS the roadmap; a finding here is not a finding that is safe, and not '
+         'one that is walled off — just one whose technique isn\'t built yet.</p>']
+    if techs:
+        p.append('<div class="evlabel">Techniques to build, by how many findings each advances</div>'
                  '<ul class="ev">')
-        for c in caps:
-            p.append(f'<li><b>{c.get("unblocks")}×</b> — {esc(c.get("blocking_primitive") or "")}</li>')
+        for c in techs:
+            p.append(f'<li><b>+{c.get("advances")} findings</b> — {esc(c.get("missing_technique") or "")}</li>')
         p.append('</ul>')
-    p.append('<table class="verdicts ceiling-tab"><thead><tr><th>CWE</th><th>Reached</th>'
-             '<th>Would reach</th>'
-             '<th>Finding</th><th>What would break it</th></tr></thead><tbody>')
+    p.append('<table class="verdicts ceiling-tab"><thead><tr><th>CWE</th><th>Reach today</th>'
+             '<th>Target</th>'
+             '<th>Finding</th><th>Technique to build next</th></tr></thead><tbody>')
     for e in entries:
         p.append('<tr>'
                  f'<td class="mono">{esc(e.get("cwe") or "")}</td>'
@@ -219,7 +220,7 @@ def _ceiling_ledger_html(led: dict[str, Any]) -> str:
                  f'<td>{esc(e.get("would_reach") or "")}</td>'
                  f'<td>{esc((e.get("title") or "")[:90])}'
                  f'{" <span class=mono>" + esc(str(e["site"])) + "</span>" if e.get("site") else ""}</td>'
-                 f'<td>{esc(e.get("blocking_primitive") or "—")}</td>'
+                 f'<td>{esc(e.get("missing_technique") or "—")}</td>'
                  '</tr>')
     p.append('</tbody></table></section>')
     return "".join(p)
@@ -926,10 +927,10 @@ def _finding_html(f: dict) -> str:
             p.append(f'<li><b>Demonstrated:</b> a verified PoC reached {esc(dl)}</li>')
         if ex.get("ceiling"):
             rr = f' — {esc(ex.get("ceiling_reason"))}' if ex.get("ceiling_reason") else ""
-            p.append(f'<li><b>Ceiling (lykos reach, not a clearance):</b> weaponization reached '
-                     f'{esc(ex["ceiling"])} and stopped{rr}</li>')
-            if ex.get("blocking_primitive"):
-                p.append(f'<li><b>What would break it:</b> {esc(ex["blocking_primitive"])}</li>')
+            p.append(f'<li><b>Reach today (lykos\'s tooling, not the target):</b> weaponized to '
+                     f'{esc(ex["ceiling"])} so far{rr}</li>')
+            if ex.get("missing_technique"):
+                p.append(f'<li><b>Technique to build next:</b> {esc(ex["missing_technique"])}</li>')
             if ex.get("ceiling_framing"):
                 p.append(f'<li class="muted"><b>Note:</b> {esc(ex["ceiling_framing"])}</li>')
         if ex.get("targets_live"):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from lykos.analyze.confirm_ladder import (
-    BLOCKING_PRIMITIVE,
+    MISSING_TECHNIQUE,
     CEILING_FRAMING,
     attack_surface,
     ceiling_ledger,
@@ -52,27 +52,27 @@ def test_exploitability_ceiling_and_mitigations():
     # no mitigations known -> still returns the class primitive + ceiling, just no "in the way"
     ex2 = finding_exploitability(f, None)
     assert ex2["class_primitive"] and "mitigations_in_way" not in ex2
-    # a ceiling is a lykos-limit, NOT a clearance: the framing + a class-default blocker are carried
+    # lykos's reach, NOT a clearance: the framing + a class-default next-technique are carried
     assert ex2["ceiling_framing"] == CEILING_FRAMING
-    assert "not evidence the target is safe" in ex2["ceiling_framing"]
-    assert ex2["blocking_primitive"] == BLOCKING_PRIMITIVE["CWE-134"]
+    assert "not a limit of the target" in ex2["ceiling_framing"]
+    assert ex2["missing_technique"] == MISSING_TECHNIQUE["CWE-134"]
 
 
-def test_ceiling_inline_blocker_overrides_class_default():
-    # an emitter that recorded a SPECIFIC "[needs: ...]" blocker surfaces it, and it is split out of
+def test_ceiling_inline_technique_overrides_class_default():
+    # an emitter that named a SPECIFIC "[needs: ...]" technique surfaces it, and it is split out of
     # the reason so the reason reads clean.
     f = {"cwe": "CWE-134", "evidence": [{"channel": "recipe-ceiling",
          "detail": "weaponization reached L2 and stopped here: narrow read [needs: a 2-link rbp "
                    "chain in one leak]"}]}
     ex = finding_exploitability(f, None)
     assert ex["ceiling"] == "L2"
-    assert ex["blocking_primitive"] == "a 2-link rbp chain in one leak"
+    assert ex["missing_technique"] == "a 2-link rbp chain in one leak"
     assert "[needs:" not in ex["ceiling_reason"] and ex["ceiling_reason"] == "narrow read"
-    # a class with no default + no inline blocker still carries the framing, no blocker key
+    # a class with no default + no inline technique still carries the framing, no technique key
     f2 = {"cwe": "CWE-999", "evidence": [{"channel": "r",
           "detail": "weaponization reached L1 and stopped here: unknown"}]}
     ex2 = finding_exploitability(f2, None)
-    assert ex2["ceiling_framing"] == CEILING_FRAMING and "blocking_primitive" not in ex2
+    assert ex2["ceiling_framing"] == CEILING_FRAMING and "missing_technique" not in ex2
 
 
 def test_ceiling_ledger_ranks_dedups_and_groups():
@@ -98,9 +98,9 @@ def test_ceiling_ledger_ranks_dedups_and_groups():
     assert led["entries"][0]["cwe"] == "CWE-787"
     a = next(e for e in led["entries"] if e["dedup_key"] == "a")
     assert a["reached"] == "L2" and a["would_reach"] == "L3"
-    assert a["blocking_primitive"] == "wider leak"
-    # capabilities group by blocker
-    caps = {c["blocking_primitive"]: c["unblocks"] for c in led["capabilities"]}
+    assert a["missing_technique"] == "wider leak"
+    # techniques to build group by the technique, with how many findings each advances
+    caps = {c["missing_technique"]: c["advances"] for c in led["techniques"]}
     assert caps["wider leak"] == 1
     assert ceiling_ledger([]) is None
 

@@ -693,29 +693,29 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                 extra.append({"channel": "recipe-plan", "detail": (
                     f"arg_offset={layout.get('arg_offset')} pad={layout.get('pad')} writes="
                     + ", ".join(f"{a:#x}<-{v:#x}" for a, v in plan["writes"].items()))})
-            # The precise capability that would climb THIS plan's ceiling -- the specific blocker,
-            # not the generic per-class default. The single-shot case is the fmtpie narrow-read
-            # wall (the sink runs once, so a %p leak cannot precede the %hhn write in one run); the
-            # two-stage/probe plans are computed and only need detonation / offset recovery.
+            # The precise technique to build next for THIS plan -- more specific than the per-class
+            # default. The single-shot case is the fmtpie narrow-read wall (the sink runs once, so a
+            # %p leak cannot precede the %hhn write in one run); the two-stage/probe plans are
+            # computed and only need detonation / offset recovery.
             stage = plan.get("stage")
             if stage == "offset-only":
-                _blocker = ("a format sink reached MORE THAN ONCE (a looping/menu sink) so a %p "
-                            "leak can precede the %hhn write -- a single-shot sink cannot leak-"
-                            "then-write in one run, and under PIE the write target needs the leak")
+                _tech = ("a format sink reached MORE THAN ONCE (a looping/menu sink) so a %p "
+                         "leak can precede the %hhn write -- a single-shot sink cannot leak-"
+                         "then-write in one run, and under PIE the write target needs the leak")
             elif stage == "two-stage":
-                _blocker = ("a runnable target to detonate the two-stage %p-leak-then-%hhn plan "
-                            "(the leak indices and the saved-return write are computed) -- or, for "
-                            "a narrow-read sink, a wider/multi-read leak to anchor the live frame")
+                _tech = ("a runnable target to detonate the two-stage %p-leak-then-%hhn plan "
+                         "(the leak indices and the saved-return write are computed) -- or, for "
+                         "a narrow-read sink, a wider/multi-read leak to anchor the live frame")
             else:                                        # probe / other
-                _blocker = ("a runnable target to recover the format-arg offset by %p probe -- the "
-                            "GOT write target and value are already computed")
+                _tech = ("a runnable target to recover the format-arg offset by %p probe -- the "
+                         "GOT write target and value are already computed")
             fid = recipe.file_recipe(
                 ctx, target, cwe="CWE-134", technique=plan["technique"],
                 target_level=plan["target_level"], severity="high", detector="fmt_recipe",
                 dedup_key=f"recipe:CWE-134:fmt-write:{site}:{target.id}",
                 title=f"Exploitation recipe: {plan['technique']} at {site}",
                 summary=plan["summary"], steps=plan["steps"], why_not_executed=why,
-                lead=lead, extra_evidence=extra, blocking_primitive=_blocker,
+                lead=lead, extra_evidence=extra, missing_technique=_tech,
                 input_bytes=plan["input"] or None, input_mode="stdin")
             if fid:
                 fids.append(fid)

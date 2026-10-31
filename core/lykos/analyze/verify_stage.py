@@ -198,7 +198,7 @@ def _emit_recipe(ctx, target, f, technique: str, level: str) -> bool:
                      f"from a build of the target."),
             why_not_executed="source-level finding; no build was executed in this environment",
             severity="high", detector="confirm", lead=f,
-            blocking_primitive=("a build of the target to recover the concrete stack frame (the "
+            missing_technique=("a build of the target to recover the concrete stack frame (the "
                                 "exact offset / payload) and detonate -- this is a source finding "
                                 "with no binary to measure"),
             dedup_key=f"recipe:{f.cwe}:{technique}:{f.dedup_key}")

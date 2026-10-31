@@ -1397,9 +1397,9 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
                         "exploit": "www-fsop"}}
 
 
-#: The capability that would climb a chain's L2 ceiling, by primitive class -- the specific blocker
-#: the ceiling ledger ranks by (more precise than the generic per-CWE default).
-_CHAIN_BLOCKER = {
+#: The technique to build next to carry a chain past L2, by primitive class -- more specific than
+#: the generic per-CWE default; the weaponization backlog ranks by it.
+_CHAIN_TECHNIQUE = {
     "oob_write": ("constrain the attacker-controlled index + value to land the computed write on a "
                   "LIVE code/function pointer, plus a runnable build to detonate the redirect"),
     "heap_overflow": ("a heap-layout (grooming) solver to place the overflow adjacent to a chosen "
@@ -1411,7 +1411,7 @@ _CHAIN_BLOCKER = {
 }
 
 
-def _annotate_lead_ceiling(ctx, target, lead, *, level, why, blocking_primitive=None) -> None:
+def _annotate_lead_ceiling(ctx, target, lead, *, level, why, missing_technique=None) -> None:
     """Record on the LEAD how far its chain got and why it stopped.
 
     `_file_recipe` writes a second row ("Exploitation recipe: ...") and leaves the lead untouched,
@@ -1421,14 +1421,15 @@ def _annotate_lead_ceiling(ctx, target, lead, *, level, why, blocking_primitive=
     account of what was tried. The ceiling goes on the lead, in its own channel, so it survives
     the next re-run of whichever detector owns the row."""
     from ...db.dao import FindingDAO
-    needs = f" [needs: {blocking_primitive}]" if blocking_primitive else ""
+    needs = f" [needs: {missing_technique}]" if missing_technique else ""
     try:
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
             "cwe": lead.cwe, "title": lead.title, "severity": lead.severity,
             "detector": lead.detector, "state": lead.state, "confidence": lead.confidence,
             "dedup_key": lead.dedup_key,
             "evidence": [{"channel": "chain-ceiling",
-                          "detail": f"weaponization reached {level} and stopped: {why}{needs}"}]})
+                          "detail": f"lykos reached {level} here; next technique to carry it "
+                                    f"further: {why}{needs}"}]})
     except Exception:                                    # noqa: BLE001 -- never fail the filing
         observe.absorbed(_log, "leaving the lead alone")
 
@@ -1470,7 +1471,7 @@ def _file_recipe(ctx, target, lead, vclass, win, recipe, why, seq_for=None) -> N
         "site_detail": tech,
         "evidence": [{"channel": "chain", "detail": detail}]})
     _annotate_lead_ceiling(ctx, target, lead, level="L2", why=why,
-                           blocking_primitive=_CHAIN_BLOCKER.get(vclass))
+                           missing_technique=_CHAIN_TECHNIQUE.get(vclass))
 
 def register() -> None:
     register_stage(CHAIN_STAGE, chain_primitive_stage, resource_class="cpu",

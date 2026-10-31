@@ -57,7 +57,8 @@ function Disclosure({ finding }) {
 const CH_LABEL = {
   "root-cause": "Root cause", exploitability: "Exploitability", dataflow: "Dataflow",
   recipe: "Exploitation recipe", "recipe-input": "Computed input", "recipe-plan": "Write plan",
-  "recipe-assumptions": "Assumptions", "recipe-ceiling": "Ceiling", dynamic: "Reached / how found",
+  "recipe-assumptions": "Assumptions", "recipe-ceiling": "Reach so far", "chain-ceiling": "Reach so far",
+  dynamic: "Reached / how found",
   effects: "Effects", poc: "Proof", detonation: "Detonation", chain: "Primitive chain",
 };
 const IN_POC = new Set(["soundness", "reproduce", "poc-input", "customize",
@@ -217,9 +218,9 @@ export function DetailPane({ finding, pocs, advice, related }) {
       ${x.class_primitive ? html`<div class="prim mono">${x.class_primitive}</div>` : null}
       ${x.demonstrated_level ? html`<div class="demo">demonstrated: a verified PoC reached ${x.demonstrated_level}</div>` : null}
       ${x.ceiling ? html`<div class="ceiling">
-        <div class="ceiling-h">Ceiling — lykos reach, not a clearance</div>
-        <div class="ceiling-r">weaponization reached <b>${x.ceiling}</b> and stopped${x.ceiling_reason ? " — " + x.ceiling_reason : ""}</div>
-        ${x.blocking_primitive ? html`<div class="ceiling-b"><span class="pr-k">What would break it</span> ${x.blocking_primitive}</div>` : null}
+        <div class="ceiling-h">Reach today — lykos's tooling, not the target</div>
+        <div class="ceiling-r">weaponized to <b>${x.ceiling}</b> so far${x.ceiling_reason ? " — " + x.ceiling_reason : ""}</div>
+        ${x.missing_technique ? html`<div class="ceiling-b"><span class="pr-k">Technique to build next</span> ${x.missing_technique}</div>` : null}
         ${x.ceiling_framing ? html`<div class="ceiling-note muted">${x.ceiling_framing}</div>` : null}
       </div>` : null}
       ${miw.length ? html`<div class="miw-h">mitigations in the way</div>
