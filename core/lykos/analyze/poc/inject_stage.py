@@ -95,6 +95,75 @@ def _nav_preambles(ctx, target, target_bytes):
     return uniq[:10]
 
 
+def _directed_navs(ctx, target, target_bytes, exe, sink_names, *, depth=3, cap=140):
+    """Multi-step stdin preambles that DRIVE execution to a sink behind MULTI-STEP STATE -- a gate
+    that single-menu-nav (`_nav_preambles`) cannot pass, e.g. `system(buf)` reachable only after an
+    earlier option sets `unlocked=1`. Found by breakpointing the sink's call site and searching
+    menu-option SEQUENCES (depth-limited BFS) until one reaches it: a `reaches_address` hit means
+    control actually arrived at the sink under that preamble. The preamble is only a search guide --
+    the injection's own forgery-proof marker still gates confirmation -- so a reach that is not the
+    vulnerable call simply fails to confirm. Non-PIE only (the breakpoint needs a fixed call-site
+    address). Returns up to a few reaching option-sequence prefixes, cheapest (shortest) first."""
+    import subprocess
+
+    from ...db.dao import StringDAO
+    from .. import interaction
+    if (target.mitigations or {}).get("pie") == "on":
+        return []
+    try:
+        dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-M", "intel", str(exe)],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    sinks = []
+    for ln in dis.splitlines():
+        if "call" in ln and any(f"<{s}" in ln for s in sink_names):
+            try:
+                sinks.append(int(ln.split(":", 1)[0].strip(), 16))
+            except ValueError:
+                pass
+    sinks = sinks[:3]
+    if not sinks:
+        return []
+    try:
+        strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id)]
+        model = interaction.build_model(target_bytes, strings=strings)
+    except Exception:                                    # noqa: BLE001
+        return []
+    opts = [str(o).encode() for o in (model.menu_opts or [])][:6]
+    if not opts:
+        return []
+    return _bfs_reach(str(exe), opts, sinks, depth=depth, cap=cap,
+                      should_cancel=ctx.should_cancel)
+
+
+def _bfs_reach(exe, opts, sinks, *, depth=3, cap=140, should_cancel=lambda: False, want=3):
+    """Breadth-first over menu-option SEQUENCES (shortest first): return the option-sequence stdin
+    prefixes that DRIVE execution to any sink call-site, each confirmed by a `reaches_address`
+    breakpoint. `opts` are option tokens (bytes), `sinks` are call-site vaddrs. Bounded by `cap`
+    breakpoint runs; stops at `want` reaching prefixes. The core of the directed deep-sink reach."""
+    from itertools import product
+
+    from . import detonate
+    navs, runs = [], 0
+    for d in range(1, depth + 1):
+        for seq in product(opts, repeat=d):
+            if should_cancel() or runs >= cap:
+                return navs
+            pre = b"".join(o + b"\n" for o in seq)
+            for s in sinks:
+                runs += 1
+                # `x\n` is a benign placeholder for the sink option's own read -- just enough to
+                # drive it to the call; the real payload replaces it when `_attempt` sends
+                # `nav + payload`.
+                if detonate.reaches_address(exe, pre + b"x\n", s, input_mode="stdin", timeout=5):
+                    navs.append(pre)
+                    break
+            if len(navs) >= want:
+                return navs
+    return navs
+
+
 def synthesize_injection_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -164,6 +233,17 @@ def synthesize_injection_stage(ctx) -> dict:
             for nav in navs:
                 for payload in payloads:
                     ctx.progress(msg=f"probing {name} (stdin after {nav[:8]!r})")
+                    hit = _attempt(payload, "stdin", nav)
+                    if hit:
+                        break
+                if hit:
+                    break
+        if hit is None:                              # 3. DIRECTED multi-step reach to a DEEP sink
+            # The sink sits behind multi-step state single-nav cannot pass: breakpoint it and search
+            # option sequences that drive execution to it, then inject + confirm on each.
+            for nav in _directed_navs(ctx, target, target_bytes, exe, spec["sinks"]):
+                for payload in payloads:
+                    ctx.progress(msg=f"probing {name} (directed reach after {nav!r})")
                     hit = _attempt(payload, "stdin", nav)
                     if hit:
                         break
