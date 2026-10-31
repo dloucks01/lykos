@@ -13,6 +13,7 @@ import ctypes
 import logging
 import os
 import signal
+import tempfile
 import time
 
 _log = logging.getLogger(__name__)
@@ -22,6 +23,30 @@ PTRACE_PEEKTEXT = 1
 PTRACE_POKETEXT = 4
 PTRACE_CONT = 7
 PTRACE_GETREGS = 12
+
+
+def _prep_delivery(mode, payload, argv, env_name, scratch_dir):
+    """Build (argv, stdin_bytes, env_overrides, tmpfile) for delivering `payload` on `mode`, or
+    None when the combo is unsupported (env with no variable name). One place so every oracle
+    delivers a given channel identically. stdin is fed as bytes; arg appends the payload as an
+    argument; file writes it to a temp file whose path is appended; env sets the named variable.
+    The tmpfile (file mode only) is the caller's to unlink after the run."""
+    argv = [str(a) for a in (argv or [])]
+    if mode == "stdin":
+        return argv, payload, None, None
+    if mode == "arg":
+        return argv + [payload.decode("latin-1")], b"", None, None
+    if mode == "file":
+        fd, path = tempfile.mkstemp(prefix="lykos_poc_", suffix=".bin",
+                                    dir=scratch_dir or None)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        return argv + [path], b"", None, path
+    if mode == "env":
+        if not env_name:
+            return None
+        return argv, b"", {str(env_name): payload.decode("latin-1")}, None
+    return None
 
 
 def _libc():
@@ -39,32 +64,48 @@ class _Regs(ctypes.Structure):
 
 
 def reaches_address(exe: str, payload: bytes, vaddr: int, *, input_mode: str = "stdin",
-                    argv=None, timeout: float = 8.0) -> bool:
+                    argv=None, env_name=None, scratch_dir=None, timeout: float = 8.0) -> bool:
     """True if delivering `payload` makes control reach `vaddr` (INT3 breakpoint hit there).
 
-    Sound: a SIGTRAP whose RIP is vaddr+1 means the CPU executed our planted 0xCC at vaddr, i.e.
-    control was transferred there. False on any other outcome (timeout, clean exit, crash
-    elsewhere). Best-effort: never raises."""
+    `input_mode` picks the channel the payload is delivered on (stdin | arg | file | env); `argv`
+    is the base argument vector the channel extends, `env_name` the variable for env mode. Sound: a
+    SIGTRAP whose RIP is vaddr+1 means the CPU executed our planted 0xCC at vaddr, i.e. control was
+    transferred there. False on any other outcome (timeout, clean exit, crash elsewhere).
+    Best-effort: never raises."""
+    tmp = None
     try:
-        return _reaches(exe, payload, vaddr, input_mode, argv or [], timeout)
+        prep = _prep_delivery(input_mode, payload, argv, env_name, scratch_dir)
+        if prep is None:
+            return False
+        argv2, stdin_bytes, env_over, tmp = prep
+        return _reaches(exe, stdin_bytes, vaddr, argv2, env_over, timeout)
     except Exception:                                    # noqa: BLE001
         _log.debug("reaches_address failed", exc_info=True)
         return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
-def _reaches(exe, payload, vaddr, input_mode, argv, timeout) -> bool:
-    r0, w0 = os.pipe()                                   # payload -> child stdin
+def _reaches(exe, stdin_bytes, vaddr, argv, env_over, timeout) -> bool:
+    r0, w0 = os.pipe()                                   # payload -> child stdin (EOF when empty)
     pid = os.fork()
     if pid == 0:                                         # ---- child ----
         try:
             libc = _libc()
             libc.ptrace(PTRACE_TRACEME, 0, None, None)
-            if input_mode == "stdin":
-                os.dup2(r0, 0)
-            os.close(r0); os.close(w0)
+            os.dup2(r0, 0)                               # always: a non-stdin channel's target that
+            os.close(r0); os.close(w0)                   # strays into read() gets clean EOF, not a block
             dn = os.open(os.devnull, os.O_WRONLY)
             os.dup2(dn, 1); os.dup2(dn, 2)
-            os.execv(exe, [exe] + [str(a) for a in argv])
+            if env_over:
+                env = dict(os.environ); env.update(env_over)
+                os.execve(exe, [exe] + [str(a) for a in argv], env)
+            else:
+                os.execv(exe, [exe] + [str(a) for a in argv])
         except Exception:
             pass
         os._exit(127)
@@ -85,8 +126,8 @@ def _reaches(exe, payload, vaddr, input_mode, argv, timeout) -> bool:
         libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(vaddr), ctypes.c_void_p(bp))
         libc.ptrace(PTRACE_CONT, pid, None, None)
         try:
-            if input_mode == "stdin":
-                os.write(w0, payload)
+            if stdin_bytes:
+                os.write(w0, stdin_bytes)
         except OSError:
             pass
         finally:
@@ -121,39 +162,60 @@ def _reaches(exe, payload, vaddr, input_mode, argv, timeout) -> bool:
 
 
 def runs_injected_command(exe: str, payload: bytes, marker: bytes, *, input_mode: str = "stdin",
-                          argv=None, timeout: float = 6.0) -> bool:
+                          argv=None, env_name=None, scratch_dir=None, timeout: float = 6.0) -> bool:
     """CWE-78 oracle: True if delivering `payload` makes the injected marker command RUN -- i.e.
     `marker` appears in the target's output. The payload injects `echo <marker>`; its appearance is
-    proof of arbitrary command execution (sound when paired with a benign negative control)."""
+    proof of arbitrary command execution (sound when paired with a benign negative control).
+    Delivered on `input_mode` (stdin | arg | file | env)."""
     import subprocess
+    tmp = None
     try:
-        if input_mode == "stdin":
-            r = subprocess.run([exe] + [str(a) for a in (argv or [])], input=payload,
-                               capture_output=True, timeout=timeout)
-        elif input_mode == "arg":
-            r = subprocess.run([exe] + [str(a) for a in (argv or [])] + [payload.decode("latin1")],
-                               capture_output=True, timeout=timeout)
-        else:
+        prep = _prep_delivery(input_mode, payload, argv, env_name, scratch_dir)
+        if prep is None:
             return False
+        argv2, stdin_bytes, env_over, tmp = prep
+        env = None
+        if env_over:
+            env = dict(os.environ); env.update(env_over)
+        r = subprocess.run([exe] + argv2, input=stdin_bytes, capture_output=True,
+                           timeout=timeout, env=env)
         return marker in ((r.stdout or b"") + (r.stderr or b""))
     except Exception:                                    # noqa: BLE001
         return False
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
-def probe_fmt_offset(exe: str, *, input_mode: str = "stdin", argv=None, timeout: float = 6.0):
+def probe_fmt_offset(exe: str, *, input_mode: str = "stdin", argv=None, env_name=None,
+                     scratch_dir=None, timeout: float = 6.0):
     """Recover the printf-varargs arg offset of a format-string sink by delivering the %p probe and
     scanning the output -- the dynamic fallback when the static frame recovery can't place the
-    buffer (e.g. the decompiler symbolized the stack local). None if the target cannot run or the
-    marker is not seen."""
+    buffer (e.g. the decompiler symbolized the stack local). Delivered on `input_mode`
+    (stdin | arg | file | env). None if the target cannot run or the marker is not seen."""
     import subprocess
     from .fmt import probe_payload, find_fmt_offset
     probe = probe_payload(count=40)
+    tmp = None
     try:
-        if input_mode == "stdin":
-            p = subprocess.run([exe] + [str(a) for a in (argv or [])], input=probe,
-                               capture_output=True, timeout=timeout)
-        else:
+        prep = _prep_delivery(input_mode, probe, argv, env_name, scratch_dir)
+        if prep is None:
             return None
+        argv2, stdin_bytes, env_over, tmp = prep
+        env = None
+        if env_over:
+            env = dict(os.environ); env.update(env_over)
+        p = subprocess.run([exe] + argv2, input=stdin_bytes, capture_output=True,
+                           timeout=timeout, env=env)
         return find_fmt_offset(p.stdout, marker=0x4141414141414141)
     except Exception:                                    # noqa: BLE001
         return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass

