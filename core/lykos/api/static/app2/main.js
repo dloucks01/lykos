@@ -68,6 +68,51 @@ function Row({ f, pocs, sel, onClick, members = 0 }) {
   </div>`;
 }
 
+// The weaponization backlog: the research queue of findings lykos hasn't yet carried to a validated
+// PoC, and the SPECIFIC technique to build next for each -- grouped so the highest-leverage build
+// (advances N findings) is first. The live mirror of the report's backlog section. This is a
+// lykos-reach statement, never a target clearance and never a wall: every row is a build task.
+function BacklogPane({ backlog }) {
+  if (!backlog) return html`<div class="pane-pad muted">loading backlog…</div>`;
+  const techs = backlog.techniques || [];
+  const entries = backlog.entries || [];
+  if (!entries.length) return html`<div class="pane-pad">
+    <div class="sect-h">Weaponization backlog</div>
+    <div class="why">Nothing in the backlog: every finding lykos's current techniques reached is
+      already carried to a validated PoC, or there are no findings yet. This is lykos's reach, not a
+      clearance of the target.</div></div>`;
+  return html`<div class="bk">
+    <div class="sect">
+      <div class="sect-h">Weaponization backlog — techniques to build next</div>
+      <div class="why">${backlog.framing}</div>
+      <div class="bk-sum"><b>${backlog.count}</b> finding${backlog.count === 1 ? "" : "s"} not yet at
+        a validated PoC · <b>${techs.length}</b> technique${techs.length === 1 ? "" : "s"} to build.
+        The mirror of the PoC list: shipping a technique below is how lykos grows — the backlog
+        is the roadmap.</div>
+    </div>
+    <div class="sect">
+      <div class="sect-h">Techniques to build (highest leverage first)</div>
+      <div class="bk-techs">${techs.map((t) => html`<div class="bk-tech">
+        <span class="bk-adv" title=${t.advances + " finding(s) advance when this is built"}>+${t.advances}</span>
+        <span class="bk-tech-txt">${t.missing_technique}</span></div>`)}</div>
+    </div>
+    <div class="sect">
+      <div class="sect-h">Findings in the backlog</div>
+      <div class="bk-tbl">
+        <div class="bk-row bk-head">
+          <span>CWE</span><span>Reach today</span><span>Target</span>
+          <span>Finding</span><span>Technique to build next</span></div>
+        ${entries.map((e) => html`<div class="bk-row">
+          <span class="row-cwe">${e.cwe || "—"}</span>
+          <span class="bk-reach" title="lykos's tooling, not the target">${e.reached || "—"}</span>
+          <span class="bk-reach bk-would">${e.would_reach || "L3"}</span>
+          <span class="bk-fn" title=${e.title || ""}>${e.title || "(untitled)"}</span>
+          <span class="bk-tech-txt">${e.missing_technique || "(not yet classified)"}</span>
+        </div>`)}</div>
+    </div>
+  </div>`;
+}
+
 function App() {
   const [, force] = useState(0);
   useEffect(() => { const u = subscribe(() => force((n) => n + 1)); loadCases(); return u; }, []);
@@ -102,6 +147,8 @@ function App() {
       <div class="tabs">
         <button class=${"tab" + (s.view === "overview" ? " on" : "")} onClick=${() => setView("overview")}>Binary</button>
         <button class=${"tab" + (s.view === "finding" ? " on" : "")} onClick=${() => setView("finding")} disabled=${!sel}>Finding</button>
+        <button class=${"tab" + (s.view === "backlog" ? " on" : "")} onClick=${() => setView("backlog")}
+          title="findings not yet at a validated PoC + the technique to build next">Backlog${s.backlog && s.backlog.count ? html` <span class="tab-badge">${s.backlog.count}</span>` : null}</button>
       </div>
     </header>
     ${s.error ? html`<div class="err">${s.error}</div>` : null}
@@ -116,7 +163,9 @@ function App() {
           : html`<div class="pane-pad muted">no findings match</div>`}</div>
       </aside>
       <section class="pane">
-        ${s.view === "finding" && sel
+        ${s.view === "backlog"
+          ? html`<${BacklogPane} backlog=${s.backlog} />`
+          : s.view === "finding" && sel
           ? html`<${DetailPane} finding=${sel} pocs=${s.pocs} advice=${s.advice} related=${selC ? selC.members : []} />`
           : html`<${BinaryOverview} target=${s.target} advice=${s.advice} findings=${findings} pocs=${s.pocs} />`}
       </section>

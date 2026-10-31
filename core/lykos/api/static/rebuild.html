@@ -94,6 +94,28 @@
   .sect-h { font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase;
             color:var(--tx3); margin-bottom:14px; }
   .sect-h.mt { margin-top:30px; }
+  /* ---- weaponization backlog (doc 58) ---- */
+  .bk { padding:28px 32px; }
+  .tab-badge { display:inline-block; min-width:16px; padding:0 5px; margin-left:2px; border-radius:9px;
+               font-size:10.5px; font-weight:700; line-height:16px; text-align:center;
+               background:var(--accent-soft); color:var(--accent-tx); }
+  .bk-sum { font-size:12.5px; color:var(--tx2); margin-top:8px; line-height:1.6; }
+  .bk-techs { display:flex; flex-direction:column; gap:7px; }
+  .bk-tech { display:flex; align-items:flex-start; gap:11px; background:var(--raised);
+             border:1px solid var(--border-2); border-radius:var(--r-sm); padding:10px 13px; }
+  .bk-adv { flex:none; min-width:34px; height:22px; line-height:22px; text-align:center; border-radius:6px;
+            background:var(--accent-soft); color:var(--accent-tx); font-weight:700; font-size:12px; }
+  .bk-tech-txt { font-size:13px; color:var(--tx); line-height:1.5; }
+  .bk-tbl { display:flex; flex-direction:column; border:1px solid var(--border); border-radius:var(--r-sm); overflow:hidden; }
+  .bk-row { display:grid; grid-template-columns:72px 92px 54px minmax(160px,1.1fr) minmax(200px,1.6fr);
+            gap:12px; padding:9px 13px; border-top:1px solid var(--border); font-size:12.5px; align-items:start; }
+  .bk-row:first-child { border-top:none; }
+  .bk-head { background:var(--surface); color:var(--tx3); font-size:10.5px; font-weight:600;
+             letter-spacing:.06em; text-transform:uppercase; }
+  .bk-reach { font-family:var(--mono); color:var(--orange); font-weight:600; }
+  .bk-would { color:var(--green); }
+  .bk-fn { color:var(--tx); overflow:hidden; text-overflow:ellipsis; }
+  .bk-tech-txt, .bk-fn { word-break:break-word; }
 
   /* ---- binary overview ---- */
   .overview { padding:30px 36px; max-width:1000px; }

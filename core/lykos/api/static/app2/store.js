@@ -9,7 +9,8 @@ export const store = {
   advice: null,                 // invocation shape, decompiled count, headline
   functions: [],                // function list (addr -> id mapping for code lookup)
   findings: [], pocs: [], selectedId: null,
-  view: "overview",             // "overview" (binary) | "finding"
+  backlog: null,                // case-wide weaponization backlog (techniques to build next)
+  view: "overview",             // "overview" (binary) | "finding" | "backlog"
   filter: "all",                // findings filter
   loading: false, error: null,
   _subs: new Set(),
@@ -34,7 +35,10 @@ export async function loadCases() {
 
 export async function selectCase(caseId) {
   store.caseId = caseId; store.targets = []; store.targetId = null;
-  store.findings = []; store.pocs = []; emit();
+  store.findings = []; store.pocs = []; store.backlog = null; emit();
+  // The backlog is case-wide (spans every target) -- load it alongside the target list, not per
+  // target. Best-effort: a case with no backlog endpoint still renders the rest of the workbench.
+  api.backlog(caseId).then((b) => { store.backlog = b; emit(); }).catch(() => {});
   try {
     const targets = await api.listTargets(caseId);
     store.targets = Array.isArray(targets) ? targets : (targets.targets || []);
