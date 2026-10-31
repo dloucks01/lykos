@@ -117,6 +117,38 @@ def test_heap_leak_run_defeats_aslr(tmp_path):
     assert b"pwned{tcache-safelink-leak}" not in neg
 
 
+# A variant whose view uses printf("%s") -- the leak truncates at the first NUL, so only the key's
+# low bytes print. The robust parser must still recover the key end-to-end.
+_FIXTURE_SPRINTF = _FIXTURE.replace(
+    'else if (c == 3) { long i = rdl(); write(1, slots[i], 16); putchar(\'\\n\'); }',
+    'else if (c == 3) { long i = rdl(); printf("%s\\n", (char *)slots[i]); }')
+
+
+@pytest.mark.skipif(not shutil.which("gcc") or not shutil.which("nm"),
+                    reason="needs gcc + nm to build the fixture")
+def test_heap_leak_run_consumes_sprintf_view(tmp_path):
+    # A %s view discloses only the key's low bytes (NUL-truncated); the robust parser recovers it.
+    src = tmp_path / "menu.c"
+    src.write_text(_FIXTURE_SPRINTF)
+    exe = tmp_path / "menu"
+    r = subprocess.run(["gcc", "-no-pie", "-fno-stack-protector", "-O0", "-o", str(exe), str(src)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"fixture build failed: {r.stderr[:200]}")
+    exe.chmod(0o755)
+    win, tgt = _sym(exe, "win"), _sym(exe, "g_handler")
+    spawn = _plain_spawn(exe)
+    # ASLR varies the key; a key with an interior NUL byte would truncate early, so require the %s
+    # path to win on at least one of several runs (the common no-interior-NUL key shape).
+    won = 0
+    for _ in range(8):
+        _, out = chain_primitive._heap_leak_run(spawn, None, _ROLES, "5", tgt, win, _MODEL,
+                                                safe=True, corrupt=False)
+        if b"pwned{tcache-safelink-leak}" in out:
+            won += 1
+    assert won >= 1, "the %s-view leak was never consumed into a working poison"
+
+
 @pytest.mark.skipif(not shutil.which("gcc") or not shutil.which("nm"),
                     reason="needs gcc + nm to build the fixture")
 def test_shipped_repro_script_wins(tmp_path):

@@ -140,6 +140,53 @@ def test_fastbin_dup_defeats_aslr(tmp_path):
     assert b"pwned{fastbin-dup}" not in neg                 # negative control must not win
 
 
+# A variant whose fake size is set at RUNTIME (so g lands in .bss -> the static image shows zeros):
+# the finder must still surface the target (as a runtime/unknown candidate) and the dup must still
+# win via the common-size-class search.
+_FIXTURE_RUNTIME = _FIXTURE.replace(
+    "struct { size_t a; size_t size; void (*fp)(void); } g __attribute__((aligned(16)))\n"
+    "    = {0, 0x21, defh};",
+    "struct { size_t a; size_t size; void (*fp)(void); } g __attribute__((aligned(16)));").replace(
+    "    setvbuf(stdin, NULL, _IONBF, 0);",
+    "    setvbuf(stdin, NULL, _IONBF, 0);\n    g.size = 0x21; g.fp = defh;  /* runtime fake size */")
+
+
+def _build_src(tmp_path, source):
+    ver, libc, ld = _OLD
+    src = tmp_path / "menu.c"
+    src.write_text(source)
+    exe = tmp_path / "menu"
+    r = subprocess.run(["gcc", "-no-pie", "-fno-stack-protector", "-O0", "-o", str(exe), str(src)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"fixture build failed: {r.stderr[:200]}")
+    libdir = str(__import__("pathlib").Path(libc).parent)
+    pr = subprocess.run(["patchelf", "--set-interpreter", ld, "--set-rpath", libdir, str(exe)],
+                        capture_output=True, text=True)
+    if pr.returncode != 0:
+        pytest.skip(f"patchelf failed: {pr.stderr[:200]}")
+    exe.chmod(0o755)
+    return exe
+
+
+@pytest.mark.skipif(not _HAVE, reason="needs gcc/nm/patchelf and an old glibc (<=2.42) with fastbins")
+def test_fastbin_dup_runtime_fake_size(tmp_path):
+    # The size field is .bss (set at run time), so the static finder can't confirm it -> the target
+    # is surfaced as an UNKNOWN (runtime) candidate, and the dup finds the right class via the oracle.
+    exe = _build_src(tmp_path, _FIXTURE_RUNTIME)
+    tgt = _sym(exe, "g") + 16
+    found = chain_primitive._fastbin_fake_targets(exe, exe.read_bytes())
+    # Not a static hit (image is zero there), but present as a runtime (size=None) candidate.
+    assert (tgt, None) in found, f"runtime target not surfaced: {[(hex(t), s) for t, s in found]}"
+    assert (tgt, 0x20) not in found
+    # The dup still wins with the matching request class (0x18 -> chunk 0x20), oracle-confirmed.
+    win = _sym(exe, "win")
+    spawn = _plain_spawn(exe)
+    key, out = chain_primitive._fastbin_dup_run(spawn, None, _ROLES, "5", tgt, 0x18, win, _MODEL,
+                                                safe=True, corrupt=False)
+    assert key is not None and b"pwned{fastbin-dup}" in out
+
+
 @pytest.mark.skipif(not _HAVE, reason="needs gcc/nm/patchelf and an old glibc (<=2.42) with fastbins")
 def test_fastbin_dup_repro_script_wins(tmp_path):
     exe = _build(tmp_path)

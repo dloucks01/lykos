@@ -17,6 +17,26 @@ from lykos.analyze.poc.heap import request2size
 _p64 = lambda v: struct.pack("<Q", v)
 
 
+# ----------------------------------------------------------------- robust heap-key leak parsing
+def test_parse_heap_key_handles_every_leak_shape():
+    key = 0x1dd8f                                          # a plausible brk-heap safe-linking key
+    # %p / %lx view: a hex pointer in the output.
+    assert heap_groom.parse_heap_key(b"fd: 0x1dd8f\n") == key
+    # fixed-width raw dump: the fd is a full little-endian word (write(fd, chunk, n)).
+    assert heap_groom.parse_heap_key(_p64(key) + b"\n") == key
+    # %s view: the raw bytes stop at the first NUL, so only the key's low bytes are printed; the
+    # dropped high bytes are zero, so the per-line little-endian read reconstructs the key.
+    truncated = key.to_bytes(8, "little").rstrip(b"\x00")  # what %s would emit: b"\x8f\xdd\x01"
+    assert b"\x00" not in truncated
+    assert heap_groom.parse_heap_key(truncated + b"\n") == key
+    # a 5-significant-byte PIE-style key through %s (no interior NUL).
+    pie = 0x555555559
+    assert heap_groom.parse_heap_key(pie.to_bytes(8, "little").rstrip(b"\x00") + b"\n") == pie
+    # nothing recoverable -> None (a full address is > 2**36 and rejected, not mistaken for a key).
+    assert heap_groom.parse_heap_key(b"no pointer here\n") is None
+    assert heap_groom.parse_heap_key(b"") is None
+
+
 # ----------------------------------------------------------------- pure solver (no toolchain)
 def test_adjacent_overflow_distance_is_the_buffer_chunk_size():
     # malloc(24) -> chunk 0x20; the victim's fp (offset 0) sits exactly one chunk later.

