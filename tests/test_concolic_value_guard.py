@@ -177,3 +177,50 @@ def test_concolic_solves_value_guarded_cmdi(tmp_path):
     assert hit["stdin"].startswith(b"\xde\xad\xbe\xef"), f"guard prefix missing: {hit['stdin'][:8]!r}"
     assert hit["nav"] == b"\xde\xad\xbe\xef"                 # the value-guard-passing prefix
     assert spec["confirm"](hit["out"], hit["payload"], marker)
+
+
+# A cmdi sink behind a NON-MENU multi-step STATE gate: an earlier line sets the "mode", and the sink
+# is reachable only when that line == "admin". Menu enumeration tries option tokens (1/2/3), never
+# an arbitrary string like "admin", so only a solver passes this. The line models (line_fgets +
+# precise_strcspn) make the earlier fg()-read line both solvable and run-reproducible.
+_FIXTURE_STATE = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){
+    char mode[64], buf[128];
+    if (!fgets(mode, sizeof mode, stdin)) return 0;
+    mode[strcspn(mode, "\n")] = 0;
+    if (strcmp(mode, "admin") == 0) {                /* non-menu state gate set by an earlier line */
+        if (!fgets(buf, sizeof buf, stdin)) return 0;
+        buf[strcspn(buf, "\n")] = 0;
+        system(buf);                                 /* cmdi behind the state gate */
+    }
+    return 0;
+}
+"""
+
+
+@pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
+def test_concolic_solves_nonmenu_line_state_gate(tmp_path):
+    # The concolic fallback enables the driver's line models (line_fgets KLEE-forks fgets per
+    # concrete line length; precise_strcspn keeps `s[strcspn(s,"\n")]=0` from pinning the line at
+    # its max length), so a sink gated by an EARLIER line's value is solved AND run-reproduces --
+    # the gate enumeration (menu tokens) cannot pass. End-to-end: the injected command RUNS.
+    if not _have_angr():
+        pytest.skip("needs the vendored angr venv + a usable systemd --user scope")
+    exe = _build_src(tmp_path, _FIXTURE_STATE, "vstate")
+    ctx, target = _Ctx(), _Target()
+    out = inject_stage._run_concolic(ctx, target, exe.read_bytes(), exe)
+    assert out and out.get("hypotheses"), "angr driver returned no hypotheses"
+
+    spec = injection.PROBES["command-injection"]
+    marker = "MKst"
+    hit = inject_stage._concolic_consume(out, spec, spec["payloads"](marker), marker, exe, target,
+                                         timeout=8)
+    assert hit is not None, "the non-menu line state gate was not solved + run-reproduced"
+    # The guard-passing prefix is the earlier line that sets the mode; the payload follows on its
+    # own line (the second fgets).
+    assert hit["nav"] == b"admin\n", f"state-gate prefix was not the mode line: {hit['nav']!r}"
+    assert hit["stdin"].startswith(b"admin\n"), f"solved stdin missing the mode line: {hit['stdin'][:8]!r}"
+    assert spec["confirm"](hit["out"], hit["payload"], marker)

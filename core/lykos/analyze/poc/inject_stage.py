@@ -608,12 +608,22 @@ def _run_concolic(ctx, target, target_bytes, exe):
         return None
     budget = float((ctx.params or {}).get("concolic_budget", 60))
     try:
-        # fork_scanf: the driver forks scanf-from-stdin on concrete consumed-lengths so `_read_pos`
-        # stays concrete and the solved input RUN-reproduces (the digits scanf ate are a fixed-length
-        # prefix, the payload after them lands in the sink's next read verbatim). The run-confirm gate
-        # below still has the final say -- forking just makes a scanf-guarded solution replayable.
+        # The driver's precise stdin models, all opt-in so the Tier-0 corpus can't regress, enabled
+        # here because the concolic fallback's whole job is to SOLVE a non-menu state gate and then
+        # RUN-reproduce it:
+        #   fork_scanf     -- fork scanf-from-stdin on concrete consumed-lengths (positions stay
+        #                     concrete, so a scanf("%u") numeric guard replays).
+        #   line_fgets     -- KLEE-fork fgets per concrete line length, so a gate whose earlier state
+        #                     is set by a line read (e.g. a "mode"/"key" line tested before the sink)
+        #                     is REACHABLE and the offsets stay concrete so it replays.
+        #   precise_strcspn-- exact strcspn/strspn, so `s[strcspn(s,"\n")]=0` does not pin a line at
+        #                     its max length (write-concretization) and lose the real line bytes.
+        # The run-confirm gate below still has the final say -- these just make a solved reaching
+        # input replayable.
         out = engine.run_driver(str(exe), argv=["@@"], input_mode="stdin", budget=budget,
-                                input_size=200, extra={"fork_scanf": True})
+                                input_size=200,
+                                extra={"fork_scanf": True, "line_fgets": True,
+                                       "precise_strcspn": True})
     except Exception:                                    # noqa: BLE001
         return None
     return out if out.get("hypotheses") else None
