@@ -282,12 +282,17 @@ def _reaches_rt(exe, win_off, tb, make_payload, argv, leak_timeout, timeout, _ex
     return (reached, pie_base)
 
 
-def runs_injected_command(exe: str, payload: bytes, marker: bytes, *, input_mode: str = "stdin",
-                          argv=None, env_name=None, scratch_dir=None, timeout: float = 6.0) -> bool:
-    """CWE-78 oracle: True if delivering `payload` makes the injected marker command RUN -- i.e.
-    `marker` appears in the target's output. The payload injects `echo <marker>`; its appearance is
-    proof of arbitrary command execution (sound when paired with a benign negative control).
-    Delivered on `input_mode` (stdin | arg | file | env)."""
+def runs_injected_command(exe: str, payload: bytes, marker: bytes = b"", *, proof=None,
+                          input_mode: str = "stdin", argv=None, env_name=None, scratch_dir=None,
+                          timeout: float = 6.0) -> bool:
+    """CWE-78 oracle: True if delivering `payload` makes the injected command RUN.
+
+    `proof` (preferred) is a callable grading the target's output: use a FORGERY-PROOF challenge
+    (attribution.CodeMarkers.proves -- solved arithmetic present AND the raw command text absent) so
+    a target that merely ECHOES its input (printf(buf), cat, a reflecting server) cannot fake the
+    signal. The bare `marker in output` path is kept for callers that pass a marker, but it is unsound
+    against an echoing target and should not be used for new code. Delivered on `input_mode`
+    (stdin | arg | file | env); sound when paired with a benign negative control."""
     import subprocess
     tmp = None
     try:
@@ -300,7 +305,10 @@ def runs_injected_command(exe: str, payload: bytes, marker: bytes, *, input_mode
             env = dict(os.environ); env.update(env_over)
         r = subprocess.run([exe] + argv2, input=stdin_bytes, capture_output=True,
                            timeout=timeout, env=env)
-        return marker in ((r.stdout or b"") + (r.stderr or b""))
+        out = (r.stdout or b"") + (r.stderr or b"")
+        if proof is not None:
+            return bool(proof(out))
+        return bool(marker) and marker in out
     except Exception:                                    # noqa: BLE001
         return False
     finally:

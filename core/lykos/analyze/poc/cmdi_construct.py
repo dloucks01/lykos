@@ -10,7 +10,6 @@ honest recipe stands.
 from __future__ import annotations
 
 import logging
-import os
 
 from ... import observe
 
@@ -25,7 +24,7 @@ def construct_command_injections(ctx, target) -> list:
     """For each CWE-78 sink, construct + DETONATE a command-injection PoC -> a poc-backed L3 (arbitrary
     command execution). Returns the filed finding ids."""
     from ...db.dao import FindingDAO
-    from . import channels, construct, detonate
+    from . import attribution, channels, construct, detonate
     fids = []
     try:
         fd = FindingDAO(ctx.conn)
@@ -44,7 +43,6 @@ def construct_command_injections(ctx, target) -> list:
         # the channels the program actually reads, highest-signal first: the tainted input is not
         # always on stdin (argv / a file argument / an env var are common on pulled binaries).
         specs = channels.delivery_specs(ctx, target)
-        marker = b"LYKOS_" + os.urandom(5).hex().encode()
         done = set()
         for lead in leads:
             fa = lead.function_addr
@@ -54,13 +52,20 @@ def construct_command_injections(ctx, target) -> list:
             hit = None
             for mode, env_name in specs:
                 for pre, post in _SEPS:
-                    payload = (pre.encode() + b"echo " + marker + post.encode() + b"\n")
-                    if not detonate.runs_injected_command(exe, payload, marker, input_mode=mode,
-                                                           env_name=env_name, scratch_dir=scratch_dir):
+                    # FORGERY-PROOF marker: inject a command whose output (solved arithmetic) differs
+                    # from its source text, so a target that merely ECHOES the input (printf(buf),
+                    # cat, a reflecting server) cannot fake the signal -- `proves` requires the solved
+                    # form present AND the raw command text absent. A fresh challenge per attempt.
+                    markers = attribution.make_code_markers()
+                    payload = (pre.encode() + markers.command + post.encode() + b"\n")
+                    if not detonate.runs_injected_command(exe, payload, proof=markers.proves,
+                                                          input_mode=mode, env_name=env_name,
+                                                          scratch_dir=scratch_dir):
                         continue
-                    # negative control: a benign input on the SAME channel must NOT produce the marker
-                    if detonate.runs_injected_command(exe, b"benign-input\n", marker, input_mode=mode,
-                                                       env_name=env_name, scratch_dir=scratch_dir):
+                    # negative control: a benign input on the SAME channel must NOT prove execution
+                    if detonate.runs_injected_command(exe, b"benign-input\n", proof=markers.proves,
+                                                      input_mode=mode, env_name=env_name,
+                                                      scratch_dir=scratch_dir):
                         continue
                     hit = (mode, env_name, pre, post, payload)
                     break
@@ -77,9 +82,10 @@ def construct_command_injections(ctx, target) -> list:
                 f"unsanitized input (from {where}) reaches a shell command (system/popen) -- the "
                 "input is concatenated into the command string (the CWE-78 site)",
                 f"the separator {sep_disp} ends the intended command and starts the attacker's",
-                "DETONATED: the injected `echo <nonce>` ran -- the unique marker appeared in the "
-                "output; a benign input does NOT produce it (so the injection, not the program, "
-                "emitted it)",
+                "DETONATED: the injected command was EVALUATED by a shell -- an arithmetic challenge "
+                "in the payload appears SOLVED in the output while its raw source text does not, so a "
+                "program that merely ECHOES the input cannot fake the signal; a benign input does not "
+                "produce the solved form",
             ]
             reproduce = (
                 "# CWE-78 command injection\n"
