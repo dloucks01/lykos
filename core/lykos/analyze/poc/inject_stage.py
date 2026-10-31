@@ -124,7 +124,7 @@ def _directed_navs(ctx, target, target_bytes, exe, sink_names, *, depth=3, cap=1
     # PIE (no fixed sink address) or a sink with no discrete call-site: enumerate bounded option
     # sequences and let the inject loop's own forgery-proof marker confirm the reach -- the sink's
     # side effect is the oracle, which is ASLR-independent, so no breakpoint is needed.
-    return _bfs_sequences(opts, depth=min(depth, 2), cap=24)
+    return _nav_variants(opts, depth=min(depth, 2), cap=36)
 
 
 def _sink_call_sites(exe, sink_names):
@@ -146,17 +146,29 @@ def _sink_call_sites(exe, sink_names):
     return sinks[:3]
 
 
-def _bfs_sequences(opts, *, depth=2, cap=24):
-    """All menu-option stdin sequences up to `depth`, shortest first, capped -- the ASLR-independent
-    reach candidates the inject loop confirms by its own marker (used where a breakpoint cannot:
-    PIE, or a sink with no discrete call-site)."""
+def _nav_variants(opts, *, depth=3, cap=40, data=b"A"):
+    """Menu-option stdin prefixes up to `depth`, shortest first, capped. For EACH option sequence
+    two variants: bare option lines, and one with a benign data line after every NON-final option --
+    which is what lets the reach pass an INTERMEDIATE option that reads its own data (a "set name"
+    before "run"), where a bare option line desyncs (the data read eats the next option). The final
+    option gets no data line: its read is where the payload lands when `_attempt` appends it. A menu
+    that tolerates an unknown choice simply ignores a spurious data line, so trying both is safe."""
     from itertools import product
-    out = []
+    seen, out = set(), []
     for d in range(1, depth + 1):
         for seq in product(opts, repeat=d):
-            out.append(b"".join(o + b"\n" for o in seq))
-            if len(out) >= cap:
-                return out
+            for withdata in (False, True):
+                parts = []
+                for i, o in enumerate(seq):
+                    parts.append(o + b"\n")
+                    if withdata and i < len(seq) - 1:
+                        parts.append(data + b"\n")
+                nav = b"".join(parts)
+                if nav not in seen:
+                    seen.add(nav)
+                    out.append(nav)
+                    if len(out) >= cap:
+                        return out
     return out
 
 
@@ -165,25 +177,20 @@ def _bfs_reach(exe, opts, sinks, *, depth=3, cap=140, should_cancel=lambda: Fals
     prefixes that DRIVE execution to any sink call-site, each confirmed by a `reaches_address`
     breakpoint. `opts` are option tokens (bytes), `sinks` are call-site vaddrs. Bounded by `cap`
     breakpoint runs; stops at `want` reaching prefixes. The core of the directed deep-sink reach."""
-    from itertools import product
-
     from . import detonate
     navs, runs = [], 0
-    for d in range(1, depth + 1):
-        for seq in product(opts, repeat=d):
-            if should_cancel() or runs >= cap:
-                return navs
-            pre = b"".join(o + b"\n" for o in seq)
-            for s in sinks:
-                runs += 1
-                # `x\n` is a benign placeholder for the sink option's own read -- just enough to
-                # drive it to the call; the real payload replaces it when `_attempt` sends
-                # `nav + payload`.
-                if detonate.reaches_address(exe, pre + b"x\n", s, input_mode="stdin", timeout=5):
-                    navs.append(pre)
-                    break
-            if len(navs) >= want:
-                return navs
+    for pre in _nav_variants(opts, depth=depth, cap=cap):   # bare + data-after-intermediate variants
+        if should_cancel() or runs >= cap:
+            return navs
+        for s in sinks:
+            runs += 1
+            # `x\n` is a benign placeholder for the sink option's own read -- just enough to drive
+            # it to the call; the real payload replaces it when `_attempt` sends `nav + payload`.
+            if detonate.reaches_address(exe, pre + b"x\n", s, input_mode="stdin", timeout=5):
+                navs.append(pre)
+                break
+        if len(navs) >= want:
+            return navs
     return navs
 
 

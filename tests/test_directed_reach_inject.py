@@ -111,7 +111,52 @@ def test_directed_reach_pie_marker_bfs(tmp_path):
     # PIE: no fixed call-site address, so the breakpoint prune is unavailable; the bounded option
     # sequences are confirmed by the injection's own forgery-proof marker (ASLR-independent).
     exe = _build_pie(tmp_path)
-    navs = inject_stage._bfs_sequences([b"1", b"2", b"3"], depth=2, cap=24)
+    navs = inject_stage._nav_variants([b"1", b"2", b"3"], depth=2, cap=36)
     assert any(n == b"1\n2\n" for n in navs), "BFS did not enumerate the 1->2 sequence"
     hit = _reach_and_inject(exe, navs)
     assert hit and hit[0] == b"1\n2\n", f"PIE deep-sink injection did not confirm: {hit}"
+
+
+# A sink behind a DATA-READING intermediate option: option 1 reads a name (then sets ready), option
+# 2 reads a line and (if ready) runs system() on it. Bare option lines desync -- option 1 eats the
+# "2" as its name -- so the reach must feed option 1's own data line first.
+_FIXTURE_DATA = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int ready = 0;
+static void rdl(char *b, int n){ if (!fgets(b, n, stdin)) exit(0); b[strcspn(b, "\n")] = 0; }
+int main(void){
+    char cmd[64], name[64], buf[128];
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+    for (;;) {
+        if (!fgets(cmd, sizeof cmd, stdin)) break;
+        int c = atoi(cmd);
+        if (c == 1) { rdl(name, sizeof name); ready = 1; printf("hi %s\n", name); }
+        else if (c == 2) { rdl(buf, sizeof buf); if (ready) system(buf); else puts("not ready"); }
+        else if (c == 3) return 0;
+    }
+    return 0;
+}
+"""
+
+
+@pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
+def test_directed_reach_through_data_reading_option(tmp_path):
+    src = tmp_path / "dd.c"
+    src.write_text(_FIXTURE_DATA)
+    exe = tmp_path / "dd"
+    r = subprocess.run(["gcc", "-no-pie", "-fno-stack-protector", "-O0", "-w", "-o", str(exe),
+                        str(src)], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"build failed: {r.stderr[:200]}")
+    exe.chmod(0o755)
+
+    navs = inject_stage._nav_variants([b"1", b"2", b"3"], depth=2, cap=36)
+    # The data-feeding variant (option 1 followed by a data line, then option 2) must be present.
+    assert b"1\nA\n2\n" in navs, "no data-after-intermediate variant was enumerated"
+    hit = _reach_and_inject(exe, navs)
+    assert hit, "did not reach the sink behind a data-reading intermediate option"
+    # The winning nav must feed option 1's data (the bare 1\n2\n cannot reach the sink here).
+    assert b"1\nA\n2\n" == hit[0] or b"\nA\n" in hit[0], f"reached without feeding the data: {hit}"
