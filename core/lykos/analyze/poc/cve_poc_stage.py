@@ -201,6 +201,9 @@ def _file_cve_recipes(ctx, target, tried, faulted_groups, matched) -> None:
                      f"{trig.channel}); {getattr(trig, 'note', '') or 'feed it to reproduce the CVE'}"),
             why_not_executed=("the trigger did not fault here -- the target may be patched/unaffected "
                               "or could not be executed in this environment"),
+            blocking_primitive=("a runnable build of the affected version to detonate the trigger "
+                                "and confirm the target is the vulnerable version -- the trigger "
+                                "bytes are already built"),
             lead=lead, input_bytes=data, input_mode=trig.channel)
         filed += 1
 

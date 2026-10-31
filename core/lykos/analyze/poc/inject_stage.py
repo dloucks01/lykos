@@ -282,6 +282,9 @@ def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
             summary=(f"the binary imports the {name} sink; candidate payload {shown!r} delivered "
                      f"over {chan} is built to trigger it"),
             why_not_executed=why, lead=leads.get(cwe),
+            blocking_primitive=(f"a reaching input channel that carries the payload past the "
+                                f"unreached navigation state to the {name} sink, plus a live target "
+                                f"to observe the injected-command runtime marker"),
             input_bytes=pb, input_mode=chan)
 
 

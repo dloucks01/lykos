@@ -1397,7 +1397,21 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
                         "exploit": "www-fsop"}}
 
 
-def _annotate_lead_ceiling(ctx, target, lead, *, level, why) -> None:
+#: The capability that would climb a chain's L2 ceiling, by primitive class -- the specific blocker
+#: the ceiling ledger ranks by (more precise than the generic per-CWE default).
+_CHAIN_BLOCKER = {
+    "oob_write": ("constrain the attacker-controlled index + value to land the computed write on a "
+                  "LIVE code/function pointer, plus a runnable build to detonate the redirect"),
+    "heap_overflow": ("a heap-layout (grooming) solver to place the overflow adjacent to a chosen "
+                      "target object, plus a runnable build to detonate the corruption"),
+    "uaf": ("a reclaim/grooming solver to reoccupy the freed chunk with an attacker-shaped object, "
+            "plus a runnable build to detonate the controlled use"),
+    "double_free": ("an allocator-state model to turn the double free into a controlled reclaim, "
+                    "plus a runnable build to detonate it"),
+}
+
+
+def _annotate_lead_ceiling(ctx, target, lead, *, level, why, blocking_primitive=None) -> None:
     """Record on the LEAD how far its chain got and why it stopped.
 
     `_file_recipe` writes a second row ("Exploitation recipe: ...") and leaves the lead untouched,
@@ -1407,13 +1421,14 @@ def _annotate_lead_ceiling(ctx, target, lead, *, level, why) -> None:
     account of what was tried. The ceiling goes on the lead, in its own channel, so it survives
     the next re-run of whichever detector owns the row."""
     from ...db.dao import FindingDAO
+    needs = f" [needs: {blocking_primitive}]" if blocking_primitive else ""
     try:
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
             "cwe": lead.cwe, "title": lead.title, "severity": lead.severity,
             "detector": lead.detector, "state": lead.state, "confidence": lead.confidence,
             "dedup_key": lead.dedup_key,
             "evidence": [{"channel": "chain-ceiling",
-                          "detail": f"weaponization reached {level} and stopped: {why}"}]})
+                          "detail": f"weaponization reached {level} and stopped: {why}{needs}"}]})
     except Exception:                                    # noqa: BLE001 -- never fail the filing
         observe.absorbed(_log, "leaving the lead alone")
 
@@ -1454,7 +1469,8 @@ def _file_recipe(ctx, target, lead, vclass, win, recipe, why, seq_for=None) -> N
         "confidence": 0.5, "dedup_key": f"chain-recipe:{vclass}:{target.id}",
         "site_detail": tech,
         "evidence": [{"channel": "chain", "detail": detail}]})
-    _annotate_lead_ceiling(ctx, target, lead, level="L2", why=why)
+    _annotate_lead_ceiling(ctx, target, lead, level="L2", why=why,
+                           blocking_primitive=_CHAIN_BLOCKER.get(vclass))
 
 def register() -> None:
     register_stage(CHAIN_STAGE, chain_primitive_stage, resource_class="cpu",
