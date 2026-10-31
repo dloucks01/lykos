@@ -77,6 +77,57 @@ def _build(tmp_path):
     return exe
 
 
+# A cmdi sink behind a NUMERIC guard read via scanf("%u") -- the common menu pattern. angr's own
+# scanf crashes on a symbolic stream position; the driver's PreciseScanf must solve the guard.
+_FIXTURE_SCANF = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+int main(void){
+    unsigned key; char buf[128];
+    if (scanf("%u", &key) != 1) return 0;
+    if (key == 31337) {
+        int n = read(0, buf, sizeof buf - 1); if (n <= 0) return 0; buf[n] = 0;
+        buf[strcspn(buf, "\n")] = 0;
+        system(buf);
+    }
+    return 0;
+}
+"""
+
+
+def _build_src(tmp_path, src_text, name):
+    src = tmp_path / (name + ".c")
+    src.write_text(src_text)
+    exe = tmp_path / name
+    r = subprocess.run(["gcc", "-no-pie", "-fno-stack-protector", "-O0", "-w", "-o", str(exe),
+                        str(src)], capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"build failed: {r.stderr[:200]}")
+    exe.chmod(0o755)
+    return exe
+
+
+@pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
+def test_preprocess_scanf_numeric_guard_is_reached(tmp_path):
+    # PreciseScanf fixes angr's scanf CRASH (a symbolic stream position used to raise in
+    # format_parser), so a cmdi sink behind a scanf("%u") numeric guard is now REACHED and solved
+    # symbolically -- angr finds input making the scanned key == 31337. (Run-reproducing the solved
+    # input for a scanf target needs a consumed-length forking model; until then the inject_stage
+    # concolic fallback's run-confirm gate rejects the imprecise solution -- no false PoC.)
+    if not _have_angr():
+        pytest.skip("needs the vendored angr venv + a usable systemd --user scope")
+    exe = _build_src(tmp_path, _FIXTURE_SCANF, "vscanf")
+    ctx, target = _Ctx(), _Target()
+    out = inject_stage._run_concolic(ctx, target, exe.read_bytes(), exe)
+    assert out, "angr driver returned nothing (scanf path would have crashed before the fix)"
+    cmdi = [h for h in out.get("hypotheses", []) if h.get("cwe") == "CWE-78"]
+    assert cmdi, "no command-injection hypothesis proposed"
+    assert any(h.get("reached") for h in cmdi), \
+        "the scanf('%u') value guard was not passed (PreciseScanf did not model the numeric read)"
+
+
 @pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
 def test_concolic_solves_value_guarded_cmdi(tmp_path):
     if not _have_angr():
