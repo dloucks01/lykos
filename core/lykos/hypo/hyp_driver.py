@@ -940,7 +940,14 @@ class Driver:
         """scanf/fscanf from a STREAM: stage a chunk of the stream into scratch, run the precise
         sscanf model on it, then advance the stream by exactly the bytes consumed (leaving the
         delimiter for the next read). Replaces angr's scanf, which crashes on a symbolic stream
-        position. Returns the matched-conversion count."""
+        position. Returns the matched-conversion count.
+
+        Two advance modes. DEFAULT: set `_read_pos = p0 + consumed` (symbolic consumed -> symbolic
+        position; reaches guards, but a later read starts at a symbolic offset so the solve does not
+        reliably RUN-reproduce). `fork_scanf`: fork one successor per feasible concrete consumed-
+        length with `_read_pos` concrete, so the next read is at a fixed offset and the solved stdin
+        replays byte-for-byte -- the run-reproducible PoC path (used by the inject_stage concolic
+        fallback)."""
         claripy, st = self.claripy, proc.state
         if stream is None:
             fd = 0
@@ -975,13 +982,82 @@ class Driver:
         out = {}
         ret = self._sscanf(proc, scratch, fmt, va_start, out=out)
         consumed = out.get("consumed")
-        if consumed is not None and p0 is not None:        # advance to EXACTLY what was consumed
+        if consumed is None or p0 is None:                 # couldn't track -> leave the M-advance
+            return ret
+        cons64 = consumed if consumed.size() >= 64 else consumed.zero_extend(64 - consumed.size())
+        # p0 must be CONCRETE for a concrete rewind / fork to mean anything.
+        if isinstance(p0, int):
+            p0c = p0
+        elif not st.solver.symbolic(p0):
+            p0c = st.solver.eval(p0)
+        else:
+            p0c = None
+
+        def set_read_pos(sfd, newpos):
+            """Rewind the read stream to `newpos`. The duplex's `_read_pos` is only a mirror --
+            SimFileStream.read() IGNORES the position it is handed and advances its OWN `self.pos`
+            (stream semantics), so the stream object (read_storage()) is what the NEXT read actually
+            uses. Setting only `_read_pos` (as the first cut did) left the stream at p0+M, so the
+            sink's read started M bytes too far and the solve never run-reproduced."""
             try:
-                w = consumed if consumed.size() >= 64 else consumed.zero_extend(64 - consumed.size())
-                simfd._read_pos = (p0 if not isinstance(p0, int) else claripy.BVV(p0, 64)) + w
+                rf = sfd.read_storage()
+            except Exception:
+                rf = getattr(sfd, "_read_file", None)
+            if rf is not None and hasattr(rf, "pos"):
+                rf.pos = newpos
+            try:
+                sfd._read_pos = newpos
+            except Exception:
+                pass
+
+        # DEFAULT (non-forking): set the mirror `_read_pos` only, exactly as shipped -- the stream
+        # itself stays at p0+M (SimFileStream.read uses its own pos), so a later read over-reads by
+        # the peek amount. This REACHES a value guard (confirmed by effect for Tier-0) but does not
+        # reliably RUN-reproduce. Left untouched so the Tier-0 corpus cannot regress; the run-
+        # reproducible rewind is the opt-in forking path below, used by the concolic PoC fallback.
+        if not self.spec.get("fork_scanf") or p0c is None or not st.solver.symbolic(cons64):
+            try:
+                base = claripy.BVV(p0c, 64) if p0c is not None else \
+                    (p0 if not isinstance(p0, int) else claripy.BVV(p0, 64))
+                simfd._read_pos = base + cons64
             except Exception:
                 pass                                       # leave the M-byte advance (over-read)
-        return ret
+            return ret
+
+        # FORKING (opt-in `fork_scanf`, the run-reproducible path): one successor per feasible
+        # concrete consumed-length, each with the stream position CONCRETE (= p0 + c). The program's
+        # later read then starts at a concrete offset, so the digits scanf ate stay a fixed-length
+        # prefix of the solved stdin and the bytes after them land in the next read verbatim -- the
+        # PoC replays. Mirrors LineFgets' KLEE-style length forking (an under-approximation: every
+        # forked path is a real execution; we only enumerate a bounded, small set of lengths).
+        cap = max(1, int(self.spec.get("scanf_fork_cap", 12)))
+        cands, c = [], 0
+        while c <= M and len(cands) < cap:
+            if st.solver.satisfiable(extra_constraints=[cons64 == c]):
+                cands.append(c)
+            c += 1
+        if not cands:                                      # nothing feasible -> leave the M-advance
+            return ret
+        # `self` is the Driver; the callsite-teardown / successor machinery lives on the SimProcedure
+        # (`proc`), as it does for LineFgets where the SimProcedure is `self`.
+        proc.inhibit_autoret = True
+        added = 0
+        for c in cands:
+            s2 = st.copy()
+            s2.add_constraints(cons64 == c)
+            if not s2.satisfiable():
+                continue
+            try:
+                set_read_pos(s2.posix.get_fd(fd), claripy.BVV(p0c + c, 64))
+                ret_addr = proc.cc.teardown_callsite(s2, return_val=ret, prototype=proc.prototype)
+                proc.successors.add_successor(s2, ret_addr, claripy.true(), "Ijk_Ret")
+                added += 1
+            except Exception:
+                continue
+        if not added:                                      # forking failed -> fall back to M-advance
+            proc.inhibit_autoret = False
+            return ret
+        return None
 
     def _fallback_fmt(self, proc, dst, size, fmt, va_start):
         from angr.procedures.libc.snprintf import snprintf as _sn

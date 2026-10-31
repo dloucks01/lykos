@@ -608,8 +608,12 @@ def _run_concolic(ctx, target, target_bytes, exe):
         return None
     budget = float((ctx.params or {}).get("concolic_budget", 60))
     try:
+        # fork_scanf: the driver forks scanf-from-stdin on concrete consumed-lengths so `_read_pos`
+        # stays concrete and the solved input RUN-reproduces (the digits scanf ate are a fixed-length
+        # prefix, the payload after them lands in the sink's next read verbatim). The run-confirm gate
+        # below still has the final say -- forking just makes a scanf-guarded solution replayable.
         out = engine.run_driver(str(exe), argv=["@@"], input_mode="stdin", budget=budget,
-                                input_size=200)
+                                input_size=200, extra={"fork_scanf": True})
     except Exception:                                    # noqa: BLE001
         return None
     return out if out.get("hypotheses") else None

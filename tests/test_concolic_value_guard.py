@@ -78,7 +78,10 @@ def _build(tmp_path):
 
 
 # A cmdi sink behind a NUMERIC guard read via scanf("%u") -- the common menu pattern. angr's own
-# scanf crashes on a symbolic stream position; the driver's PreciseScanf must solve the guard.
+# scanf crashes on a symbolic stream position; the driver's PreciseScanf must solve the guard. The
+# stdin is unbuffered (setvbuf _IONBF) -- the standard CTF pattern that lets scanf and a later raw
+# read() mix (with a buffered FILE, scanf slurps the whole pipe and read(0) gets nothing, so the
+# sink would be unreachable at runtime for ANY input regardless of the solver).
 _FIXTURE_SCANF = r"""
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +89,7 @@ _FIXTURE_SCANF = r"""
 #include <string.h>
 int main(void){
     unsigned key; char buf[128];
+    setvbuf(stdin, NULL, _IONBF, 0);
     if (scanf("%u", &key) != 1) return 0;
     if (key == 31337) {
         int n = read(0, buf, sizeof buf - 1); if (n <= 0) return 0; buf[n] = 0;
@@ -112,10 +116,8 @@ def _build_src(tmp_path, src_text, name):
 @pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
 def test_preprocess_scanf_numeric_guard_is_reached(tmp_path):
     # PreciseScanf fixes angr's scanf CRASH (a symbolic stream position used to raise in
-    # format_parser), so a cmdi sink behind a scanf("%u") numeric guard is now REACHED and solved
-    # symbolically -- angr finds input making the scanned key == 31337. (Run-reproducing the solved
-    # input for a scanf target needs a consumed-length forking model; until then the inject_stage
-    # concolic fallback's run-confirm gate rejects the imprecise solution -- no false PoC.)
+    # format_parser), so a cmdi sink behind a scanf("%u") numeric guard is REACHED and solved
+    # symbolically -- angr finds input making the scanned key == 31337.
     if not _have_angr():
         pytest.skip("needs the vendored angr venv + a usable systemd --user scope")
     exe = _build_src(tmp_path, _FIXTURE_SCANF, "vscanf")
@@ -126,6 +128,33 @@ def test_preprocess_scanf_numeric_guard_is_reached(tmp_path):
     assert cmdi, "no command-injection hypothesis proposed"
     assert any(h.get("reached") for h in cmdi), \
         "the scanf('%u') value guard was not passed (PreciseScanf did not model the numeric read)"
+
+
+@pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
+def test_scanf_numeric_guard_run_reproduces(tmp_path):
+    # The consumed-length FORKING model (fork_scanf) forks the scanf read on each feasible concrete
+    # consumed-length, so the stream position stays CONCRETE and the sink's later read lands at a
+    # fixed offset. The digits scanf ate ("31337") become a fixed-length prefix of the solved stdin
+    # and our payload lands in the next read verbatim -- so the solution RUN-reproduces end-to-end
+    # (the injected `echo` RUNS, proven by the forgery-proof marker), not just reaches. This is what
+    # the earlier honest-limit note scoped as future work; the stream-position fix (SimFileStream
+    # advances its OWN pos, not the duplex mirror) is what makes the rewind actually take effect.
+    if not _have_angr():
+        pytest.skip("needs the vendored angr venv + a usable systemd --user scope")
+    exe = _build_src(tmp_path, _FIXTURE_SCANF, "vscanf")
+    ctx, target = _Ctx(), _Target()
+    out = inject_stage._run_concolic(ctx, target, exe.read_bytes(), exe)
+    assert out and out.get("hypotheses"), "angr driver returned no hypotheses"
+
+    spec = injection.PROBES["command-injection"]
+    marker = "MKsc"
+    payloads = spec["payloads"](marker)
+    hit = inject_stage._concolic_consume(out, spec, payloads, marker, exe, target, timeout=8)
+    assert hit is not None, "the scanf-guarded injection did not RUN-reproduce (forking model)"
+    # The scanned number is the fixed-length guard prefix; the payload follows it immediately.
+    assert hit["nav"] == b"31337", f"guard prefix was not the scanned number: {hit['nav']!r}"
+    assert hit["stdin"].startswith(b"31337"), f"solved stdin missing the guard digits: {hit['stdin'][:8]!r}"
+    assert spec["confirm"](hit["out"], hit["payload"], marker)
 
 
 @pytest.mark.skipif(not shutil.which("gcc"), reason="needs gcc")
