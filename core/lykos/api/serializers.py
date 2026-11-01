@@ -51,7 +51,7 @@ def _poc(x):
     # which finding a bundle belongs to and would offer the same download on every card.
     return {"id": x.id, "finding_id": x.finding_id, "level": x.level, "verified": x.verified,
             "signal": x.signal_name, "input_sha": x.input_sha, "bundle_sha": x.bundle_sha,
-            "created_at": x.created_at}
+            "created_at": x.created_at, "provenance": getattr(x, "provenance", None)}
 
 
 def _dynresult(d):

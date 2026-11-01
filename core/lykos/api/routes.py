@@ -33,6 +33,9 @@ _TARGET_STR = re.compile(r"^/targets/([^/]+)/strings$")
 _TARGET_FIND = re.compile(r"^/targets/([^/]+)/findings$")
 _CASE_FIND = re.compile(r"^/cases/([^/]+)/findings$")
 _CASE_COVERAGE = re.compile(r"^/cases/([^/]+)/coverage$")
+# The weaponization backlog: the research queue of findings not yet at a validated PoC + the
+# technique to build next for each (doc 58). The live mirror of the report's backlog section.
+_CASE_BACKLOG = re.compile(r"^/cases/([^/]+)/backlog$")
 _CASE_TIMING = re.compile(r"^/cases/([^/]+)/timing$")
 _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 # Operator curation (doc 47 P3): the per-finding verdict + note, and the case-wide map.
@@ -61,7 +64,7 @@ _CASE_SEED_ID = re.compile(r"^/cases/([^/]+)/seeds/([0-9a-fA-F]{64})$")
 # subtrees are served, and only plain web asset types -- nothing else under the package is
 # reachable, and a name with `..` or a leading slash never resolves.
 _STATIC_ASSET = re.compile(
-    r"^/((?:app|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
+    r"^/((?:app|app2|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
 _ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".mjs": "text/javascript; charset=utf-8",

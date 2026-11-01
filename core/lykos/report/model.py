@@ -24,6 +24,7 @@ from ..db.dao import (
     TargetDAO,
 )
 from ..analyze.confirm_ladder import attack_surface as _attack_surface
+from ..analyze.confirm_ladder import ceiling_ledger as _ceiling_ledger
 from ..analyze.confirm_ladder import finding_analysis as _finding_analysis
 from ..analyze.confirm_ladder import finding_exploitability as _finding_exploitability
 from ..analyze.confirm_ladder import finding_verification as _finding_verification
@@ -731,6 +732,7 @@ def build_report(
                     "id": p.id, "level": p.level, "verified": p.verified,
                     "signal": p.signal_name, "input_sha": p.input_sha,
                     "bundle_sha": p.bundle_sha, "created_at": _iso(p.created_at),
+                    "provenance": getattr(p, "provenance", None),
                 }
                 if p.bundle_sha:
                     # Where to get it, in every mode. With embedding off the report showed a
@@ -961,6 +963,12 @@ def build_report(
         # The coverage ledger: what was checked (classes), what was weaponized, how much code was
         # exercised, and the gaps worklist -- the measurement that makes "how close to 100%" a number.
         "coverage_ledger": _safe_ledger(store, case_id),
+        # The weaponization backlog: every finding lykos hasn't yet carried to a validated PoC, the
+        # technique to build next, and the framing that this is lykos's reach -- never a wall, never
+        # a target clearance. The mirror of the PoC list, so a 'clean' area is never misread as 'no
+        # bugs' and each such finding stays a named build task.
+        "ceiling_ledger": _ceiling_ledger(
+            [f for t in targets_out for f in t["findings"]]),
         # How long each technique took + the overall analysis time, with yield (findings/crashes)
         # beside the cost -- so a technique that ate the clock for nothing is self-evident.
         "timing": _safe_timing(store, case_id, all_runs),

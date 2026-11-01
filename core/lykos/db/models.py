@@ -278,6 +278,9 @@ class Poc:
     signal_name: Optional[str] = None
     input_sha: Optional[str] = None
     bundle_sha: Optional[str] = None
+    #: doc 58: "constructed" (sound payload computed from the program, not run here) | "detonated"
+    #: (an execution fired the oracle). NULL for legacy rows; a verified row is a detonation.
+    provenance: Optional[str] = None
 
 
 @dataclass

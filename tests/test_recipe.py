@@ -80,6 +80,49 @@ def test_recipe_annotates_the_lead_ceiling_without_regressing_it(store, case):
     assert lead2.state in ("candidate", "corroborated", "confirmed", "poc-backed")
 
 
+def test_recipe_records_specific_next_technique_end_to_end(store, case):
+    """A specific `missing_technique` an emitter passes is written inline on the lead, parsed back
+    by the confirm ladder (overriding the class default), and surfaced in the weaponization backlog
+    -- the full emitter -> store -> report path, not just the parse in isolation."""
+    from lykos.analyze.confirm_ladder import ceiling_ledger, finding_exploitability
+    t = _target(store, case)
+    ctx = _FakeCtx(store.conn)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, t.case_id, {
+        "cwe": "CWE-134", "title": "Format string in parser", "severity": "high",
+        "detector": "format_string", "state": "candidate", "confidence": 0.55,
+        "dedup_key": "lead-134", "site_addr": "0x401abc",
+        "evidence": [{"channel": "static", "detail": "printf(user)"}]})
+    lead = next(f for f in fd.list_by_target(t.id) if f.dedup_key == "lead-134")
+    want_tech = ("a format sink reached MORE THAN ONCE so a %p leak can precede the %hhn write -- a "
+                 "single-shot sink cannot leak-then-write in one run")
+    recipe.file_recipe(
+        ctx, t, cwe="CWE-134", technique="format-string %n write-what-where", target_level="L2",
+        summary="write-what-where via %hhn", why_not_executed="the sink runs once",
+        lead=lead, missing_technique=want_tech)
+
+    # The lead now carries the inline [needs: ...] marker.
+    lead2 = next(f for f in fd.list_by_target(t.id) if f.dedup_key == "lead-134")
+    ev = " ".join(str(e.get("detail", "")) for e in (lead2.evidence or []))
+    assert "[needs:" in ev and "reached MORE THAN ONCE" in ev
+
+    # The confirm ladder parses the SPECIFIC technique (not the generic class default) + framing.
+    lf = {"cwe": lead2.cwe, "severity": lead2.severity, "site_addr": "0x401abc",
+          "title": lead2.title, "dedup_key": lead2.dedup_key,
+          "evidence": [{"channel": e.get("channel"), "detail": e.get("detail")}
+                       for e in (lead2.evidence or [])]}
+    ex = finding_exploitability(lf, None)
+    assert ex["missing_technique"] == want_tech
+    assert "not a limit of the target" in ex["ceiling_framing"]
+
+    # ...and the backlog surfaces it as an entry grouped by the technique to build.
+    lf["exploitability"] = ex
+    led = ceiling_ledger([lf])
+    assert led and led["count"] == 1
+    assert led["entries"][0]["missing_technique"] == want_tech
+    assert led["techniques"][0]["missing_technique"] == want_tech
+
+
 def test_recipe_filing_never_raises_on_a_bad_artifact_sink(store, case):
     """The prose recipe must still be filed even if storing the bytes fails."""
     t = _target(store, case)

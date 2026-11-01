@@ -242,27 +242,66 @@ def _tick_plan(status: dict, seen: dict) -> None:
 
 
 def _export_pocs(store, target, out_dir) -> None:
-    """Write every verified PoC bundle to disk and say how to run it."""
-    from .db.dao import PocDAO
+    """Write every PoC to disk and say how to run it. doc 58: a CONSTRUCTED/DETONATED PoC is the
+    lightweight deliverable -- the payload bytes + a few-line repro (no package); a legacy bundle PoC
+    is its tarball. Both are exported."""
+    from .db.dao import PocDAO, FindingDAO
     try:
         pocs = [p for p in PocDAO(store.conn).list_by_target(target.id)
-                if getattr(p, "verified", False) and getattr(p, "bundle_sha", None)]
+                if getattr(p, "level", None)
+                and (getattr(p, "bundle_sha", None) or getattr(p, "input_sha", None))]
     except Exception:                                    # noqa: BLE001 -- advisory
         return
     if not pocs:
         return
+    # the lightweight repro line(s) per finding, for payload PoCs that carry one
+    repro_by_fid = {}
+    try:
+        for f in FindingDAO(store.conn).list_by_target(target.id):
+            for e in (f.evidence or []):
+                if isinstance(e, dict) and e.get("channel") == "reproduce":
+                    repro_by_fid[f.id] = e.get("detail", "")
+    except Exception:                                    # noqa: BLE001
+        pass
     out_dir.mkdir(parents=True, exist_ok=True)
     print("\n-- proof of concept " + "-" * 57)
-    for p in sorted(pocs, key=lambda x: str(x.level), reverse=True)[:6]:
-        name = f"{target.filename}-{p.level}-{str(p.bundle_sha)[:8]}.tar.gz"
-        dest = out_dir / name
-        try:
-            dest.write_bytes(store.content.get_bytes(p.bundle_sha))
-        except Exception:                                # noqa: BLE001 -- one bad artifact
+    # highest level first; within a level, a detonated PoC outranks a merely-constructed one
+    _rank = {"detonated": 2, "constructed": 1}
+    seen_art = set()
+    for p in sorted(pocs, key=lambda x: (str(x.level), _rank.get(getattr(x, "provenance", None), 0)),
+                    reverse=True)[:8]:
+        art = getattr(p, "bundle_sha", None) or getattr(p, "input_sha", None)
+        if art in seen_art:                              # same artifact filed by two callers
             continue
-        print(f"  {p.level}  {dest}")
-        print(f"      tar xzf {name} && sh poc/runner.sh   # prints what it proves, exits "
-              f"non-zero on the fault")
+        seen_art.add(art)
+        if getattr(p, "bundle_sha", None):
+            name = f"{target.filename}-{p.level}-{str(p.bundle_sha)[:8]}.tar.gz"
+            dest = out_dir / name
+            try:
+                dest.write_bytes(store.content.get_bytes(p.bundle_sha))
+            except Exception:                            # noqa: BLE001 -- one bad artifact
+                continue
+            print(f"  {p.level}  {dest}")
+            print(f"      tar xzf {name} && sh poc/runner.sh   # prints what it proves, exits "
+                  f"non-zero on the fault")
+        elif getattr(p, "input_sha", None):
+            name = f"{target.filename}-{p.level}-{str(p.input_sha)[:8]}.bin"
+            dest = out_dir / name
+            try:
+                dest.write_bytes(store.content.get_bytes(p.input_sha))
+            except Exception:                            # noqa: BLE001 -- one bad artifact
+                continue
+            prov = getattr(p, "provenance", None)
+            mark = {"detonated": "[detonated: oracle fired]",
+                    "constructed": "[constructed: sound, not run here]"}.get(prov, "")
+            sig = f" {p.signal_name}" if getattr(p, "signal_name", None) else ""
+            print(f"  {p.level}  {dest}   {mark}{sig}")
+            repro = repro_by_fid.get(p.finding_id)
+            if repro:
+                for ln in repro.strip().splitlines():
+                    print(f"      {ln}")
+            else:
+                print(f"      {target.filename} < {dest.name}   # deliver the payload to the target")
     print("  RUN IN A SANDBOX OR VM: a PoC executes an untrusted binary. Authorized use only.")
 
 

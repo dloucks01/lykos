@@ -374,4 +374,13 @@ CREATE INDEX IF NOT EXISTS ix_run_artifact_sha ON run_artifact(artifact_sha256);
 -- provenance we do not know is left blank, never guessed.
 ALTER TABLE finding ADD COLUMN stage TEXT;
 """),
+    Migration(version=20, name="poc_provenance", sql=r"""
+-- doc 58: how a PoC was established, so the ladder can distinguish a SOUNDLY-CONSTRUCTED PoC
+-- (concrete payload computed from the recovered program with a complete reach+trigger argument --
+-- a first-class 'confirmed' result that needs NO execution, for the many targets that cannot run
+-- here) from a DETONATED one (an execution actually fired the oracle -> 'poc-backed'). NULL =
+-- legacy/unknown; a verified=1 row is implicitly a detonation. This is what retires "candidates and
+-- corroborations, no PoCs": a sound construction is a PoC, not a recipe.
+ALTER TABLE poc ADD COLUMN provenance TEXT;
+"""),
 ]

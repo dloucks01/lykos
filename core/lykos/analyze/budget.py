@@ -63,6 +63,15 @@ MAX_SINGLE_SHARE = 0.5
 SAMPLER_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz",
                             "boundary_fuzz", "libfuzzer"})
 
+#: doc 58: the deterministic PoC-CONSTRUCTION stages. They produce the primary deliverable --
+#: constructed/detonated PoCs -- in seconds, from the recovered program, not a search. They must
+#: NEVER be starved by samplers or heavy recover-phase work: when their phase budget is already
+#: spent, they still get a bounded ESSENTIAL_MIN_SECONDS from whatever TOTAL budget remains (which,
+#: thanks to the later-phase reserve, is normally ample). Non-fuzzing construction is primary;
+#: fuzzing is additive, so the constructors win the few seconds they need.
+ESSENTIAL_STAGES = frozenset({"synthesize_injection", "chain_primitive"})
+ESSENTIAL_MIN_SECONDS = 45.0
+
 #: The stages the reserve exists FOR. Releasing it on ANY non-sampler was wrong and measurably
 #: so: `build_exploit`, `mem_oracle`, `chain_primitive` and `synthesize_poc` all run in the
 #: search phase BEFORE the campaigns, so the reserve was released before `fuzz` even started and
@@ -305,6 +314,13 @@ class CaseBudget:
                 and not self._solver_served):
             avail = max(0.0, avail - self.total * SOLVER_RESERVE)
         if avail < FLOOR_SECONDS:
+            # doc 58: the deterministic PoC-construction stages are the primary deliverable and are
+            # cheap -- fuzzing / heavy recover work must never starve them. When their phase budget
+            # is spent, give them a bounded minimum slice from whatever TOTAL budget remains rather
+            # than skipping (the later-phase reserve keeps `remaining` ample at that point).
+            rem = self.remaining()
+            if stage in ESSENTIAL_STAGES and rem >= FLOOR_SECONDS:
+                return min(ESSENTIAL_MIN_SECONDS, rem)
             return 0.0
         cap = max(FLOOR_SECONDS, avail * MAX_SINGLE_SHARE)
         if want_execs is not None:

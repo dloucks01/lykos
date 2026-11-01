@@ -147,6 +147,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_AUTOPILOT_CANCEL,
     _CASE_AUTOPILOT_PAUSE,
     _CASE_AUTOPILOT_RESUME,
+    _CASE_BACKLOG,
     _CASE_COVERAGE,
     _CASE_CURATION,
     _CASE_EVENTS,
@@ -414,6 +415,8 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._static()
             if path == "/classic.html":       # the preserved single-file UI, linked from the app
                 return self._static_asset("classic.html")
+            if path == "/rebuild.html":        # doc 59 ground-up GUI rebuild (dev entry; old app stays)
+                return self._static_asset("rebuild.html")
             m = _STATIC_ASSET.match(path)
             if m:
                 return self._static_asset(m.group(1))
@@ -524,6 +527,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_COVERAGE.match(path)
             if m:
                 return self._get_coverage(m.group(1))
+            m = _CASE_BACKLOG.match(path)
+            if m:
+                return self._get_backlog(m.group(1))
             m = _CASE_TIMING.match(path)
             if m:
                 return self._get_timing(m.group(1))

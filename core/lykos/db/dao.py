@@ -1036,13 +1036,17 @@ class PocDAO(BaseDAO):
     def insert(self, target_id: str, case_id: str, *, finding_id: Optional[str] = None,
                level: Optional[str] = None, verified: bool = False,
                signal_name: Optional[str] = None, input_sha: Optional[str] = None,
-               bundle_sha: Optional[str] = None) -> str:
+               bundle_sha: Optional[str] = None, provenance: Optional[str] = None) -> str:
+        # doc 58: a verified PoC is, by definition, one an execution confirmed -> "detonated";
+        # default the provenance accordingly so existing detonation call-sites need no change.
+        if provenance is None and verified:
+            provenance = "detonated"
         rid = new_id()
         self.conn.execute(
             "INSERT INTO poc(id,target_id,case_id,finding_id,level,verified,signal_name,"
-            "input_sha,bundle_sha,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "input_sha,bundle_sha,created_at,provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (rid, target_id, case_id, finding_id, level, as_int_bool(verified),
-             signal_name, input_sha, bundle_sha, _now()))
+             signal_name, input_sha, bundle_sha, _now(), provenance))
         return rid
 
     def set_finding(self, poc_id: str, finding_id: str) -> None:
@@ -1064,7 +1068,8 @@ class PocDAO(BaseDAO):
         return Poc(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                    created_at=r["created_at"], finding_id=r["finding_id"], level=r["level"],
                    verified=as_flag(r["verified"]), signal_name=r["signal_name"],
-                   input_sha=r["input_sha"], bundle_sha=r["bundle_sha"])
+                   input_sha=r["input_sha"], bundle_sha=r["bundle_sha"],
+                   provenance=(r["provenance"] if "provenance" in r.keys() else None))
 
 
 # ------------------------------------------------------------ ComponentEdge (Phase 8)
