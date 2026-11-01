@@ -37,6 +37,28 @@ def test_bounded_variant_and_literal_and_untainted_are_not_flagged(tmp_path):
     assert _scan(tmp_path, "char *c(void);\nvoid f(void){ char b[16]; strcpy(b, c()); }") == []
 
 
+def test_wire_length_into_fixed_buffer_is_cwe787(tmp_path):
+    # The dominant protocol-parser overflow: an untrusted length read off a wStream drives a copy
+    # into a FIXED-size buffer. Stream_Read* is recognised as an input-reader (the wire), so `len`
+    # is strongly untrusted; the destination `name[64]` is fixed -> CWE-787 OOB write.
+    f = _scan(tmp_path,
+              "int p(wStream* s){ char name[64]; UINT32 len; Stream_Read_UINT32(s, len);"
+              " Stream_Read(s, name, len); return 0; }")
+    assert [r["cwe"] for r in f] == ["CWE-787"], f
+    assert f[0]["fn"] == "Stream_Read" and f[0]["taint"]
+
+
+def test_wire_length_is_not_flagged_when_bounded_or_heap_sized(tmp_path):
+    # Precision (0-FP on well-guarded code, the FreeRDP idiom): a length checked against the buffer
+    # size, OR a destination heap-allocated to the length, must NOT be flagged.
+    assert _scan(tmp_path,
+                 "int p(wStream* s){ char name[64]; UINT32 len; Stream_Read_UINT32(s, len);"
+                 " if (len > sizeof(name)) return -1; Stream_Read(s, name, len); return 0; }") == []
+    assert _scan(tmp_path,
+                 "int p(wStream* s){ BYTE* d; UINT32 len; Stream_Read_UINT32(s, len);"
+                 " d = malloc(len); memcpy(d, Stream_Pointer(s), len); return 0; }") == []
+
+
 def test_gets_is_flagged_universally(tmp_path):
     f = _scan(tmp_path, "void f(void){ char b[64]; gets(b); }")[0]
     assert f["cwe"] == "CWE-120" and f["fn"] == "gets"

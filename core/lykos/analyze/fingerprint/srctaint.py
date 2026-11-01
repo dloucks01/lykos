@@ -87,6 +87,17 @@ def reader_source(body: str, base: str):
     for fn in ("fgets", "gets", "fread"):                  # destination = 1st argument
         if re.search(rf"\b{fn}\s*\(\s*(?:&)?{b}\b", body):
             return f"{fn}()"
+    # Wire/stream readers -- the FreeRDP/WinPR wStream family and the common `Stream_Read` idiom.
+    # Bytes read FROM a stream are peer input, exactly like recv()/read(): `Stream_Read_UINTxx(s, dst)`
+    # and `Stream_Read(s, dst, n)` FILL the destination (2nd argument, macro-assigned, so no `&`), and
+    # `Stream_Get*`/`Stream_Pointer(s)` RETURN a pointer into the peer buffer (assigned-from). This is
+    # the ENTIRE attack surface of a protocol library (1,313 call sites in libfreerdp) -- without it a
+    # wire-read length/size/count that feeds a malloc/memcpy is never seen as untrusted, so the whole
+    # surface is invisible to the taint-gated detectors.
+    if re.search(rf"\bStream_Read(?:_[A-Za-z0-9]+)?\s*\(\s*[^,;()]+,\s*(?:&)?{b}\b", body):
+        return "Stream_Read()"
+    if re.search(rf"\b{b}\s*=\s*(?:\([^)=;]*\)\s*)?Stream_(?:Get|Pointer|Buffer|ConstBuffer)\w*\s*\(", body):
+        return "Stream_Get()"
     return None
 
 
