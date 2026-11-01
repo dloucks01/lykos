@@ -918,7 +918,7 @@ def build_report(
     _health = next((v for v in _HEALTH_ORDER if v in _hv), None) if _hv else None
     _levels = [t["verdict"]["level"] for t in targets_out if t["verdict"]["level"]]
 
-    return {
+    rep = {
         "schema": "lykos.report/1",
         "generated_at": _iso(int(time.time())),
         "tool": {"name": "lykos", "version": _lykos_version},
@@ -983,6 +983,17 @@ def build_report(
                 confirmed=by_state.get("confirmed", 0) + by_state.get("poc-backed", 0)),
         },
     }
+    # The engagement narrative (report/dossier.py): the part a reader acts on -- executive summary,
+    # one dossier per demonstrated finding, grouped leads, scope/method/limits. Best-effort: a
+    # failure here must never take down the inventory the renderers still print as the appendix.
+    try:
+        from .dossier import build_narrative
+        rep["narrative"] = build_narrative(store, case_id, rep)
+    except Exception:                                    # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).exception("narrative failed; report keeps its inventory")
+        rep["narrative"] = None
+    return rep
 
 
 def _safe_timing(store, case_id: str, all_runs) -> Optional[dict]:

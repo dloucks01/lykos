@@ -457,7 +457,15 @@ def to_html(report: dict[str, Any]) -> str:
         parts.append(f'<p class="notes">{esc(case["notes"])}</p>')
     parts.append('</header>')
 
-    # ---- executive summary ----
+    # ---- the engagement narrative (report/dossier.py): what the reader acts on, first ----
+    nar = report.get("narrative")
+    if nar:
+        parts.append(_narrative_html(nar))
+        parts.append('<h2 class="appendix-h">Appendix A &mdash; Technical inventory</h2>'
+                     '<p class="muted">Everything the run recorded, for audit. The sections above '
+                     'are derived from it.</p>')
+
+    # ---- inventory summary ----
     targets = report.get("targets", [])
     verdicts = [(t, _target_verdict(t)) for t in targets]
     # Impact FIRST: the strongest outcome across the whole case, in one sentence, before any count.
@@ -495,7 +503,8 @@ def to_html(report: dict[str, Any]) -> str:
             htone = "medium"
     elif not top_level and any(v.get("engine_health") == "degraded" for _t, v in verdicts):
         headline += " Dynamic analysis was degraded on at least one target (an engine failed)."
-    parts.append('<section class="card"><h2>Executive summary</h2>')
+    parts.append('<section class="card"><h2>' + ("Inventory summary" if nar else
+                                                 "Executive summary") + '</h2>')
     parts.append(f'<p class="headline tone-{htone}">{esc(headline)}</p>')
     # The engagement map (doc 49 Theme 2a) leads the summary: the path from target to proof, with
     # each phase showing what it produced and how far this run got. Trusted, internally-escaped SVG.
@@ -623,6 +632,141 @@ def to_html(report: dict[str, Any]) -> str:
                  f' · {esc(report.get("generated_at"))} · authorized use only</footer>')
     parts.append('</div></body></html>')
     return "".join(parts)
+
+
+def _narrative_html(nar: dict) -> str:
+    """Executive summary, findings at a glance, one dossier per demonstrated vulnerability, the
+    unproven leads (grouped), and scope/method/limitations -- see report/dossier.py."""
+    ex = nar.get("executive") or {}
+    risk = ex.get("risk") or "-"
+    p = ['<section class="card narrative"><h2>1. Executive summary</h2>',
+         f'<p class="headline tone-{esc(risk if risk in _SEV_COLOR else "info")}">Overall risk: '
+         f'{esc(str(risk).upper())}</p>']
+    p += [f"<p>{esc(x)}</p>" for x in ex.get("paragraphs") or []]
+    if ex.get("actions"):
+        p.append('<h3>Recommended actions</h3><ol>'
+                 + "".join(f"<li>{esc(a)}</li>" for a in ex["actions"]) + "</ol>")
+    p.append("</section>")
+
+    dos = [(t, d) for t in nar.get("targets") or [] for d in t.get("dossiers") or []]
+    p.append('<section class="card"><h2>2. Findings at a glance</h2>')
+    if dos:
+        p.append('<table class="htab"><thead><tr><th>#</th><th>Severity</th><th>Vulnerability</th>'
+                 '<th>Proof</th><th>Target</th></tr></thead><tbody>')
+        for i, (t, d) in enumerate(dos, 1):
+            sev = d.get("severity") or "medium"
+            p.append(f'<tr><td>{i}</td><td>{_badge(sev, _SEV_COLOR.get(sev, "#8b8d98"))}</td>'
+                     f'<td><a href="#dossier-{i}">{esc(d.get("title"))}</a></td>'
+                     f'<td>{esc(d.get("level") or "-")} '
+                     f'{"verified" if d.get("verified") else "not verified"}</td>'
+                     f'<td class="mono">{esc(t.get("filename"))}</td></tr>')
+        p.append("</tbody></table>")
+    else:
+        p.append('<p class="muted">No vulnerability was demonstrated by execution.</p>')
+    p.append("</section>")
+
+    p.append('<section class="card"><h2>3. Demonstrated vulnerabilities</h2>')
+    if not dos:
+        p.append('<p class="muted">None in this run.</p>')
+    for i, (t, d) in enumerate(dos, 1):
+        p.append(_dossier_html(i, d, t.get("filename")))
+    p.append("</section>")
+
+    p.append('<section class="card"><h2>4. Unproven leads</h2><p class="muted">Each row is one kind '
+             'of detection, with repeated call sites folded together. None was reproduced by '
+             'execution.</p>')
+    for t in nar.get("targets") or []:
+        leads = t.get("leads") or []
+        api = [g for g in leads if g.get("kind") == "API-use pattern"]
+        rest = [g for g in leads if g not in api]
+        if rest:
+            p.append('<table class="htab"><thead><tr><th>Lead</th><th>Kind</th><th>Why unproven</th>'
+                     '<th>Would prove it</th></tr></thead><tbody>')
+            for g in rest:
+                p.append(f'<tr><td><b>{esc(g.get("title"))}</b><br><span class="muted">'
+                         f'{esc(g.get("cwe") or "")} &middot; {esc(g.get("state"))} &middot; '
+                         f'detector grade {esc(g.get("severity"))}</span></td>'
+                         f'<td>{esc(g.get("kind"))}</td><td>{esc(g.get("why"))}</td>'
+                         f'<td>{esc(g.get("next"))}</td></tr>')
+            p.append("</tbody></table>")
+        if api:
+            p.append(f'<h3>Risky library calls ({sum(g["sites"] for g in api)} call sites)</h3>'
+                     '<p class="muted">Places to look, not vulnerabilities: no path from attacker '
+                     'input to these calls\' arguments was demonstrated.</p><ul>'
+                     + "".join(f'<li>{esc(g.get("title"))} <span class="muted">({esc(g.get("cwe"))}'
+                               f', {g.get("sites")} site(s))</span></li>' for g in api) + "</ul>")
+    p.append("</section>")
+
+    p.append('<section class="card"><h2>5. Scope and method</h2>')
+    for t in nar.get("targets") or []:
+        sc = t.get("scope") or {}
+        p.append(f'<h3 class="mono">{esc(sc.get("target"))}</h3>')
+        p.append(_kv([("Engagement", sc.get("engagement")),
+                      ("Type", (sc.get("type") or "") + (" (stripped)" if sc.get("stripped") else "")),
+                      ("SHA-256", sc.get("sha256")),
+                      ("Invocation", f'{sc.get("invocation")} (input via {sc.get("input_mode")})'),
+                      ("Seeds supplied", ", ".join(sc.get("seeds") or []) or "none"),
+                      ("Mitigations", sc.get("mitigations"))]))
+        if t.get("methodology"):
+            p.append("<h3>What was done</h3><ul>" + "".join(
+                f'<li><b>{esc(m["phase"])}</b> ({m["seconds"]}s): '
+                f'{esc("; ".join(m["techniques"]))}</li>' for m in t["methodology"]) + "</ul>")
+        if t.get("limitations"):
+            p.append("<h3>Limitations</h3><ul>" + "".join(
+                f"<li>{esc(x)}</li>" for x in t["limitations"]) + "</ul>")
+    p.append("</section>")
+    return "".join(p)
+
+
+def _dossier_html(i: int, d: dict, target: str) -> str:
+    sev = d.get("severity") or "medium"
+    why = d.get("severity_why") or ""
+    if d.get("detector_severity") and d["detector_severity"] != sev:
+        why += f' (the detector filed it as {d["detector_severity"]})'
+    p = [f'<div class="finding sev-{esc(sev)}" id="dossier-{i}">',
+         f'<h3>3.{i} {esc(d.get("title"))}</h3>',
+         f'<div class="chips">{_badge(sev, _SEV_COLOR.get(sev, "#8b8d98"))} '
+         f'{_badge((d.get("level") or "-") + (" verified" if d.get("verified") else ""), "#8e4fc7")} '
+         f'{_badge((d.get("cwe") or "") + " " + (d.get("cwe_name") or ""), "#5b6b7d")}</div>',
+         f'<p class="muted">Why this severity: {esc(why)}</p>']
+    if d.get("summary"):
+        p.append(f'<h4>What it is</h4><p>{esc(d["summary"])}</p>')
+    loc = d.get("location") or {}
+    p.append("<h4>Where</h4>" + _kv([("Target", target), ("Function", loc.get("function")),
+                                     ("Faulting address", loc.get("site")),
+                                     ("Faulting instruction", loc.get("instruction")),
+                                     ("Source", loc.get("source")),
+                                     ("Stack", " &larr; ".join(loc.get("stack") or []) or None)]))
+    if d.get("trigger"):
+        p.append("<h4>How it is triggered</h4><ul>"
+                 + "".join(f"<li>{esc(x)}</li>" for x in d["trigger"]) + "</ul>")
+    if d.get("reproduce"):
+        p.append("<h4>Reproduce</h4>")
+        for x in d["reproduce"]:
+            if isinstance(x, dict):
+                p.append(f'<p class="muted">{esc(x.get("note"))}</p>'
+                         f'<pre class="code">{esc(x.get("cmd"))}</pre>')
+            else:
+                p.append(f'<pre class="code">{esc(x)}</pre>')
+    inp = d.get("input")
+    if inp:
+        p.append(f'<h4>Crash input <span class="muted">({inp.get("size")} bytes, sha256 '
+                 f'<span class="mono">{esc(inp.get("sha256"))}</span>)</span></h4>'
+                 f'<pre class="code">{esc(chr(10).join(inp.get("hex") or []))}</pre>')
+    if d.get("evidence"):
+        p.append("<h4>Evidence</h4><ul>" + "".join(f"<li>{esc(x)}</li>" for x in d["evidence"])
+                 + "</ul>")
+    p.append(f'<h4>Impact</h4><p>{esc(d.get("impact"))}</p>')
+    if d.get("escalation"):
+        p.append("<h4>Why it stops at this level</h4><ul>"
+                 + "".join(f"<li>{esc(x)}</li>" for x in d["escalation"]) + "</ul>")
+    if d.get("mitigations"):
+        p.append("<h4>Mitigations in the way of an exploit</h4><ul>"
+                 + "".join(f"<li>{esc(x)}</li>" for x in d["mitigations"]) + "</ul>")
+    if d.get("remediation"):
+        p.append(f'<h4>Remediation</h4><p class="remed">{esc(d["remediation"])}</p>')
+    p.append("</div>")
+    return "".join(p)
 
 
 def _stat(n: Any, label: str) -> str:
@@ -1011,7 +1155,8 @@ def _finding_html(f: dict) -> str:
         p.append('<div class="figure reach"><div class="fig-h">Reachable from an input source '
                  '<span class="muted">— control-flow reachability, not verified dataflow</span>'
                  '</div>' + figs["reachability"] + '</div>')
-    ev = f.get("evidence", [])
+    from .dossier import compact_evidence
+    ev = compact_evidence(f.get("evidence", []))
     if ev:
         p.append('<div class="evlabel">Evidence trail</div><ul class="ev">')
         for e in ev:
@@ -1240,4 +1385,7 @@ a.dl:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
   .finding{break-inside:avoid;page-break-inside:avoid}
   a.dl{display:none}
 }
+.narrative p{margin:.35em 0}.appendix-h{margin:2.2em 0 .3em;font-size:1.25em}
+h4{margin:1em 0 .3em;font-size:.95em}pre.code{white-space:pre-wrap;word-break:break-all;
+font-size:.8em;padding:.5em .7em;border-radius:6px;background:rgba(127,127,127,.08)}
 </style></head><body>"""
