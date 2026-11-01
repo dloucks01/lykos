@@ -622,7 +622,10 @@ def _primitive_txt(prim: dict) -> bytes:
 # the database returned our row, /etc/passwd came back) -- and at L3 the old text promised the
 # reader a control-flow hijack that the bundle does not contain.
 _LEVEL_MEANING = {
-    "L0": "a crash reproducer -- the input makes the target fault",
+    # L0 is what build_poc files when its replay did NOT reproduce the fault: the input is kept as
+    # evidence of what was found, and the README must not tell the reader it makes the target fault.
+    "L0": "an UNVERIFIED candidate input -- the replay here did NOT reproduce the fault; kept as "
+          "evidence of what was found, not as a proof (see meta.json 'verified')",
     "L1": "a verified reproducer -- the defect is real and repeatable (a crash, or a confirmed "
           "injection whose effect was observed)",
     "L2": "an exploitation PRIMITIVE -- attacker control of the instruction pointer, a memory "

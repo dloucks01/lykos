@@ -264,7 +264,7 @@ def build_poc_stage(ctx) -> dict:
 
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
             "argv": argv, "expected_signal": res.signal_name, "isolation": res.isolation,
-            "verified": verified, "tool_version": TOOL_VERSION,
+            "verified": verified, "level": level, "tool_version": TOOL_VERSION,
             "recorded_signal": wanted, "signal_matches_finding": not mismatch}
     # EVERY runtime the bundle can replay, not just the JVM's two. A .pyc, a .NET assembly and a
     # WASM module all fell through to "native" here, and the reproducer then said

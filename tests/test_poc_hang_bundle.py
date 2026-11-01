@@ -424,3 +424,19 @@ def test_arg_and_env_bundles_deliver_exactly_what_the_kernel_did(tmp_path, mode,
     assert (poc / "got.bin").read_bytes() == want
     meta = json.loads((poc / "meta.json").read_text())
     assert ("input_truncated_at_nul" in meta) == (b"\0" in inp)
+
+
+def _readme(data: bytes) -> str:
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        return tf.extractfile("poc/README.txt").read().decode()
+
+
+def test_an_unverified_bundle_does_not_claim_to_be_a_verified_reproducer():
+    """build_poc files L0 when its replay did NOT reproduce the fault. The README used to default to
+    'Level L1: a verified reproducer' because the level never reached the bundle's meta."""
+    txt = _readme(bundle.build(b"x", b"in", {"target_sha256": "x", "arch": "x86-64",
+                                             "verified": False, "level": "L0"},
+                               b"", "file", ["@@"], "unknown"))
+    assert "Level L0" in txt and "UNVERIFIED" in txt and "verified reproducer" not in txt
