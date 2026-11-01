@@ -157,7 +157,10 @@ def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dic
         d = e.get("detail") or "" if isinstance(e, dict) else ""
         # Tolerant of both the forward wording ("lykos reached L2 here; next technique ...: X") and
         # the legacy marker ("weaponization reached L2 and stopped here: X") in older stored cases.
-        mo = re.search(r"(?:weaponization reached|lykos reached) (L\d)\b[^:]*:\s*(.+)", d)
+        # ...and the current one, which no longer claims a level was REACHED ("a recipe targeting
+        # L2 was computed but not executed; to carry it further: X").
+        mo = re.search(r"(?:weaponization reached|lykos reached|a recipe targeting) (L\d)\b"
+                       r"[^:]*:\s*(.+)", d)
         if mo:
             ceiling, raw = mo.group(1), mo.group(2).strip().rstrip(".")[:240]
             # Split off an inline "[needs: ...]" the emitter recorded -- the specific technique to

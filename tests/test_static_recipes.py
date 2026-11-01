@@ -432,7 +432,7 @@ def test_injection_recipe_needs_a_detected_lead_not_an_import(store, case):
     assert inject_stage._recipe_leads(_Ctx(store), t)["CWE-134"].detector == "format_string"
 
 
-def test_index_recipe_is_filed_corroborated_with_its_bytes(store, case, tmp_path):
+def test_index_recipe_follows_its_candidate_lead_and_carries_its_bytes(store, case, tmp_path):
     exe = _cc(tmp_path, "oob", _OOB.replace("GUARD", "arr[idx]=val;"))
     from lykos.analyze.ingest import ingest
     t = ingest(store, case.id, exe, filename="oob")
@@ -448,7 +448,8 @@ def test_index_recipe_is_filed_corroborated_with_its_bytes(store, case, tmp_path
     fids = oob_recipe.file_oob_index_recipe(ctx, t, lead, why="no execution here")
     assert len(fids) == 1
     rec = next(f for f in fd.list_by_target(t.id) if f.detector == "oob_recipe")
-    assert rec.state == "corroborated" and not PocDAO(store.conn).list_by_target(t.id)
+    # its lead is a single-detector CANDIDATE, so the recipe computed from it is one too
+    assert rec.state == "candidate" and not PocDAO(store.conn).list_by_target(t.id)
     ev = " ".join(e.get("detail", "") for e in rec.evidence)
     assert "printf@GOT" in ev and "NOT executed" in ev
     assert any(b"\n" in v and v.split(b"\n")[0].lstrip(b"-").isdigit() for v in ctx.stored.values())

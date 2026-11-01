@@ -132,6 +132,9 @@ def file_source_recipe(ctx, target, *, cwe: str, fn: str, arg: str, file: str, l
         title=f"Exploitation recipe: {technique} at {file}:{line}",
         summary=summary, steps=steps, why_not_executed=why,
         input_bytes=payload, input_mode=mode, lead=lead,
+        # every caller files a source recipe only for a STRONG source->sink link (argv, an input
+        # reader, a wire parser -- srctaint.untrusted_strength), which is the recipe's grounding
+        grounded=True,
         extra_evidence=[{"channel": "recipe-source",
                          "detail": (f"source finding at {file}:{line}; subject "
                                     f"'{arg_s}' flows from {src} ({via})")}])

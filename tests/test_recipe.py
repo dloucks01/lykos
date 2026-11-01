@@ -35,7 +35,7 @@ def _recipes(conn, tid):
             if (f.title or "").startswith("Exploitation recipe")]
 
 
-def test_recipe_is_corroborated_and_carries_the_bytes_but_no_verified_poc(store, case):
+def test_an_ungrounded_recipe_is_a_candidate_and_carries_the_bytes_but_no_verified_poc(store, case):
     t = _target(store, case)
     ctx = _FakeCtx(store.conn)
     fid = recipe.file_recipe(
@@ -47,8 +47,9 @@ def test_recipe_is_corroborated_and_carries_the_bytes_but_no_verified_poc(store,
     recs = _recipes(store.conn, t.id)
     assert len(recs) == 1
     r = recs[0]
-    # Honest state: corroborated, NOT poc-backed / confirmed.
-    assert r.state == "corroborated"
+    # Honest state: a payload computed from an IMPORT alone, with no lead and no proven
+    # source->sink link, is a candidate -- never corroborated, never poc-backed.
+    assert r.state == "candidate"
     # The actual bytes were stored as a plain artifact and referenced -- but NO verified PoC row.
     assert not PocDAO(store.conn).list_by_target(t.id)
     assert ctx.stored and b";id;\n" in ctx.stored.values()
@@ -136,3 +137,21 @@ def test_recipe_filing_never_raises_on_a_bad_artifact_sink(store, case):
         summary="write-what-where via %n", why_not_executed="not executed",
         input_bytes=b"%n%n%n")
     assert fid and len(_recipes(store.conn, t.id)) == 1
+
+
+
+def test_a_recipe_is_never_stronger_than_its_lead():
+    """jhead: a command-injection recipe was filed `corroborated` beside a system() lead whose own
+    grounding said the 'untrusted input' was an assumed source. Corroboration with nothing behind it."""
+    import json as _json
+    from types import SimpleNamespace as NS
+    unreached = NS(state="corroborated", evidence=[{"channel": "grounding-map", "detail": _json.dumps(
+        {"reachable": False, "verdict": "unreached"})}])
+    reached = NS(state="corroborated", evidence=[])
+    weak = NS(state="candidate", evidence=[])
+    assert recipe.recipe_state(unreached) == "candidate"
+    assert recipe.recipe_state(unreached, grounded=True) == "candidate"
+    assert recipe.recipe_state(reached) == "corroborated"
+    assert recipe.recipe_state(weak) == "candidate"
+    assert recipe.recipe_state(None) == "candidate"
+    assert recipe.recipe_state(None, grounded=True) == "corroborated"

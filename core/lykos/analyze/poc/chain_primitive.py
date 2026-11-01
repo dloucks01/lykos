@@ -2381,8 +2381,8 @@ def _annotate_lead_ceiling(ctx, target, lead, *, level, why, missing_technique=N
             "detector": lead.detector, "state": lead.state, "confidence": lead.confidence,
             "dedup_key": lead.dedup_key,
             "evidence": [{"channel": "chain-ceiling",
-                          "detail": f"lykos reached {level} here; next technique to carry it "
-                                    f"further: {why}{needs}"}]})
+                          "detail": f"a recipe targeting {level} was computed but not "
+                                    f"executed; to carry it further: {why}{needs}"}]})
     except Exception:                                    # noqa: BLE001 -- never fail the filing
         observe.absorbed(_log, "leaving the lead alone")
 
