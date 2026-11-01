@@ -121,8 +121,11 @@ def _cmd_analyze(args) -> int:
     from .jobs import JobConfig, JobQueue, WorkerPool
 
     path = Path(args.binary)
-    if not path.is_file():
-        print(f"not a file: {path}", file=sys.stderr)
+    # A DIRECTORY is a source project (or a challenge bundle): ingest builds it with sanitizers,
+    # exactly as a folder upload through the web GUI does. Refusing it here left the CLI unable to
+    # analyse a source tree at all -- a GUI/CLI parity gap.
+    if not (path.is_file() or path.is_dir()):
+        print(f"not a file or directory: {path}", file=sys.stderr)
         return 2
     case_dir = Path(args.case_store) if args.case_store else Path(
         tempfile.mkdtemp(prefix="lykos-case-"))
@@ -756,7 +759,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     an = sub.add_parser("analyze",
                         help="run the full pipeline on one binary and report what it did")
-    an.add_argument("binary", help="the file to analyse")
+    an.add_argument("binary", help="the file to analyse, or a source-project directory to build "
+                                    "with sanitizers and analyse")
     an.add_argument("--budget", type=float, default=900.0,
                     help="wall-clock seconds for this target (default 900); divided among the "
                          "recover/search/prove phases")
