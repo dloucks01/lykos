@@ -6,6 +6,13 @@ stage closes that loop: for each candidate function with a synthesisable signatu
 concrete input that faults under the sanitizer -- with a passing empty-input negative control -- is a
 proof, and it cross-references the originating static candidate up to `confirmed`.
 
+Candidate functions come from two discoverers. (1) STATIC source detectors (file:line sinks), whose
+enclosing function is driven and whose defect line steers the concolic rung. (2) UNDER-CONSTRAINED
+symbolic execution (uc_symbolic): it enters UNDRIVEN functions in isolation and flags a data-derived
+control-flow hijack -- functions no in-tree harness reaches and NO static detector pointed at. Routing
+those UC leads through this same proof mechanism is what lets lykos confirm bugs other tools never
+surface, while the confirmation bar is unchanged (a concrete faulting input + a negative control).
+
 HONEST CONTRACT: the synthesized driver calls the function with attacker-controlled (buf,size), so a
 confirmation here is a reproduced fault OF THE FUNCTION under that assumption -- the same assumption an
 in-tree parser harness makes -- recorded with the caveat that reachability from a real caller is not
@@ -16,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import os as _os
+import re as _re
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
@@ -26,6 +34,11 @@ from .source_confirm_stage import _CWE, _crossref_static, _parse_loc, _STATIC_SO
 
 TOOL, TOOL_VERSION = "synth_confirm", "synth-confirm-1"
 _SKIP = ("sanitizer", "ubsan", "asan", "fuzzer", "llvm", "std::", "gnu_cxx")
+#: detector name under which uc_symbolic files its control-hijack discovery leads, and the shape of
+#: its evidence detail ("...execution of <fn>() in isolation..."), from which the function name is
+#: recovered -- a UC lead knows only the function NAME (it runs on the binary), not a source line.
+_UC_TOOL = "uc_symbolic"
+_UC_FN_RE = _re.compile(r"execution of ([A-Za-z_]\w*)\(\)")
 
 
 def _candidate_functions(ctx, target, src_root, limit: int) -> list:
@@ -58,6 +71,37 @@ def _candidate_functions(ctx, target, src_root, limit: int) -> list:
             seen.add(nm)
             cands.append((nm, _os.path.basename(fp), fline))
     return cands
+
+
+def _uc_candidate_functions(ctx, target, already, limit: int) -> list:
+    """UC discovery leads worth synthesizing a driver for: UNDRIVEN functions where under-constrained
+    symbolic execution saw data-derived control flow (a hijack candidate NO static detector pointed
+    at). Each is `(fn, None, None)` -- UC runs on the binary and knows only the function NAME, so
+    there is no source line to steer to; the driver loop steers to the function entry via
+    `target_syms=[fn]`. The function name is recovered from the uc-symbolic evidence detail.
+    De-duplicated against `already` (the static candidates) and bounded. This is the half that
+    reaches functions the static-sink pipeline misses; the (buf,size)+sanitizer+negative-control
+    confirmation contract is identical, so it adds no false-confirmation surface."""
+    if limit <= 0:
+        return []
+    out: list = []
+    seen = set(already)
+    for f in FindingDAO(ctx.conn).list_by_target(target.id):
+        if (f.detector != _UC_TOOL or (f.state or "candidate") != "candidate"
+                or len(out) >= limit):
+            continue
+        fn = None
+        for e in (f.evidence or []):
+            if e.get("channel") == "uc-symbolic":
+                m = _UC_FN_RE.search(e.get("detail") or "")
+                if m:
+                    fn = m.group(1)
+                break
+        if (fn and fn not in seen and not fn.startswith("_")
+                and not any(s in fn.lower() for s in _SKIP)):
+            seen.add(fn)
+            out.append((fn, None, None))
+    return out
 
 
 def _file_confirmed(ctx, target, fn: str, res: dict) -> int:
@@ -101,9 +145,12 @@ def synth_confirm_stage(ctx) -> dict:
         ctx.emit("synth_confirm.done", payload={"supported": False, "note": "no source tree"})
         return {"metrics": {"supported": False}}
     cands = _candidate_functions(ctx, target, src, max_fns)
+    # UC-discovered undriven functions (control-hijack leads no static detector flagged) get the same
+    # proof treatment -- the 'find what others can't' half -- deduped against the static candidates.
+    cands += _uc_candidate_functions(ctx, target, {c[0] for c in cands}, max_fns - len(cands))
     if not cands:
         ctx.emit("synth_confirm.done", payload={"supported": False,
-                 "note": "no unproven source candidates with an enclosing function to drive"})
+                 "note": "no unproven source/UC candidates with an enclosing function to drive"})
         return {"metrics": {"supported": False}}
 
     from pathlib import Path

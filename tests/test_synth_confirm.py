@@ -34,6 +34,39 @@ def test_candidate_functions_from_source_candidates(store, case, tmp_path):
     assert cands == [("parse_pdu", "pdu.c", 4)]
 
 
+def _uc_lead(store, t, fn):
+    # exactly the shape uc_stage._file_uc_lead writes: the function name lives only in the
+    # uc-symbolic evidence detail ("...execution of <fn>() in isolation..."), not in a struct field.
+    FindingDAO(store.conn).upsert(t.id, t.case_id, {
+        "cwe": "CWE-94", "title": f"Control flow reaches data-derived pointer in {fn}() "
+                                  f"(under-constrained)",
+        "severity": "medium", "detector": "uc_symbolic", "state": "candidate", "confidence": 0.3,
+        "dedup_key": f"uc:CWE-94:{t.id}:{fn}", "site_detail": fn,
+        "evidence": [{"channel": "uc-symbolic",
+                      "detail": f"under-constrained symbolic execution of {fn}() in isolation: data "
+                                f"the function READ reaches the instruction pointer. CAVEAT: ..."}]})
+
+
+def test_uc_candidate_functions_recovered_from_uc_leads(store, case, tmp_path):
+    """UC control-hijack leads become driver-synthesis candidates (fn, None, None) -- the function
+    name recovered from the uc-symbolic evidence detail, with no source line to steer to. This is the
+    bridge that lets undriven, static-invisible functions reach the proof ladder."""
+    t = TargetDAO(store.conn).upsert(case.id, "t", "b" * 64, arch="source", bits=0)
+    _uc_lead(store, t, "decode_frame")
+    _uc_lead(store, t, "_internal_helper")          # leading underscore -> runtime/helper, skipped
+    cands = SC._uc_candidate_functions(_Ctx(store.conn), t, already=set(), limit=10)
+    assert cands == [("decode_frame", None, None)]
+
+
+def test_uc_candidate_is_deduped_against_a_static_candidate(store, case, tmp_path):
+    """A function already offered by a static candidate is NOT re-driven as a UC candidate."""
+    t = TargetDAO(store.conn).upsert(case.id, "t", "c" * 64, arch="source", bits=0)
+    _uc_lead(store, t, "parse")
+    assert SC._uc_candidate_functions(_Ctx(store.conn), t, already={"parse"}, limit=10) == []
+    # and a zero/negative remaining budget short-circuits
+    assert SC._uc_candidate_functions(_Ctx(store.conn), t, already=set(), limit=0) == []
+
+
 _VULN = ("#include <stdint.h>\n#include <string.h>\n"
          "void parse(const uint8_t *d, unsigned long n) {\n"
          "  char buf[16];\n"
