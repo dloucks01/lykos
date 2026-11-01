@@ -233,10 +233,7 @@ def scan_source(root: Path) -> list:
                                         f"{fn}() opens a path from untrusted input ('{arg}') with "
                                         f"no traversal sanitisation", taint))
                 elif mode == "length":                           # untrusted SIZE drives the copy/read
-                    # bound-check against the FULL length expression (`h->len`, not just `h`), so a
-                    # `if (h->len > sizeof dst)` guard on a struct-field length is recognised.
-                    if _bounded(lines, i, arg.strip()):          # the length is checked/clamped
-                        continue
+                    lenexpr = arg.strip()
                     dpos = _LEN_DST.get(fn)
                     dst = args[dpos] if (dpos is not None and dpos < len(args)) else None
                     dstbase = srctaint.base_ident(dst) if dst else None
@@ -244,10 +241,23 @@ def scan_source(root: Path) -> list:
                     # FIXED-SIZE buffer -- a declared stack/struct array `T buf[N]`. The common safe
                     # idiom `dst = malloc(len); copy(dst, src, len)` sizes the heap dst to the length
                     # (no OOB write), and a buffer handed back by an allocator (MF/Lock) is likewise
-                    # not fixed -- both are excluded. A fixed array copied with an untrusted length is
-                    # the classic wire-length stack/struct overflow.
+                    # not fixed -- both are excluded.
                     cap = _fixed_dst_cap(lines, i, dstbase)
                     if cap is None:
+                        continue
+                    # SIGNEDNESS (CWE-195): a SIGNED untrusted length with no NEGATIVITY guard is a
+                    # bug even when an upper-bound check exists -- `if (len > CAP)` passes a negative
+                    # value, which `(size_t)len` at the copy turns into a huge size. Checked BEFORE the
+                    # generic bound-suppression, because that upper-bound is exactly what fails here.
+                    if (srctaint.signed_decl(lines, i, srctaint.base_ident(arg))
+                            and not srctaint.neg_guarded(lines, i, lenexpr)):
+                        findings.append(_mk(label, i, fn, arg, "CWE-195",
+                                            f"{fn}() uses a SIGNED untrusted length ('{arg}') into a "
+                                            f"fixed-size buffer ('{dst}'[{cap}]) with no negativity "
+                                            f"check -- a negative value becomes a huge copy size", taint))
+                        continue
+                    # UNSIGNED: bound-check against the FULL length expression (`h->len`, not just `h`).
+                    if _bounded(lines, i, lenexpr):              # the length is checked/clamped
                         continue
                     findings.append(_mk(label, i, fn, arg, "CWE-787",
                                         f"{fn}() writes an untrusted, unbounded length ('{arg}') into a "

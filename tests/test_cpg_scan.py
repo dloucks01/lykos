@@ -94,6 +94,23 @@ def test_interprocedural_caller_tainted_param_length_is_cwe787(tmp_path):
     assert rows[0]["line"] == 4                       # the unguarded copy_into, not copy_ok
 
 
+def test_signed_untrusted_length_with_upper_bound_only_is_cwe195(tmp_path):
+    # Signedness (CWE-195): a SIGNED untrusted length with only an UPPER-bound check is a bug -- a
+    # negative value passes `len > CAP` and becomes a huge size_t at the copy. The negativity-guarded
+    # twin and the unsigned twin are both suppressed.
+    def one(body):
+        return [r["cwe"] for r in _scan(tmp_path, body)]
+    vuln = ("int f(wStream* s, const BYTE* src){ char buf[64]; int len; Stream_Read_UINT32(s, len);"
+            " if (len > (int)sizeof(buf)) return -1; memcpy(buf, src, len); return 0; }")
+    assert one(vuln) == ["CWE-195"], one(vuln)
+    neg = ("int f(wStream* s, const BYTE* src){ char buf[64]; int len; Stream_Read_UINT32(s, len);"
+           " if (len < 0 || len > (int)sizeof(buf)) return -1; memcpy(buf, src, len); return 0; }")
+    assert one(neg) == [], one(neg)
+    uns = ("int f(wStream* s, const BYTE* src){ char buf[64]; UINT32 len; Stream_Read_UINT32(s, len);"
+           " if (len > sizeof(buf)) return -1; memcpy(buf, src, len); return 0; }")
+    assert one(uns) == [], one(uns)
+
+
 def test_wire_length_is_not_flagged_when_bounded_or_heap_sized(tmp_path):
     # Precision (0-FP on well-guarded code, the FreeRDP idiom): a length checked against the buffer
     # size, OR a destination heap-allocated to the length, must NOT be flagged.

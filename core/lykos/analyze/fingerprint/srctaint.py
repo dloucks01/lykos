@@ -250,6 +250,49 @@ def resolve_type(lines: list, idx: int, var: str):
     return None
 
 
+_SIGNED_T = re.compile(r"\b(?:signed\s+)?(?:char|short|int|long|ssize_t|ptrdiff_t|intptr_t|"
+                       r"int8_t|int16_t|int32_t|int64_t|INT8|INT16|INT32|INT64|INT|LONG|SSIZE_T)\b")
+_UNSIGNED_T = re.compile(r"\b(?:unsigned|size_t|u?int\d+_t|UINT\d*|DWORD|QWORD|WORD|BYTE|BOOL|"
+                         r"ULONG|USHORT|uint|u_int|uint8_t|uint16_t|uint32_t|uint64_t)\b")
+
+
+def signed_decl(lines: list, idx: int, var: str) -> bool:
+    """True when `var` is declared with a SIGNED integer type in the enclosing function (so a value
+    with the high bit set is negative, and `(size_t)var` at a copy becomes huge). An `unsigned`/size_t/
+    UINTxx declaration is NOT signed. A var with no resolvable declaration returns False (unknown ->
+    not flagged)."""
+    if not var:
+        return False
+    start, _ = enclosing(lines, idx)
+    v = re.escape(var)
+    rx = re.compile(rf"\b((?:unsigned\s+|signed\s+)?[A-Za-z_]\w*(?:\s+\w+)?)\s+{v}\s*[;=\[,)]")
+    for j in range(start, min(idx + 1, len(lines))):
+        m = rx.search(lines[j])
+        if not m:
+            continue
+        decl = m.group(1)
+        if _UNSIGNED_T.search(decl):
+            return False
+        if _SIGNED_T.search(decl):
+            return True
+    return False
+
+
+def neg_guarded(lines: list, idx: int, lenexpr: str) -> bool:
+    """True when the enclosing function checks `lenexpr` for NEGATIVITY before the sink at `idx`:
+    `len < 0`, `len <= 0`, `0 > len`, `0 >= len`, a `(size_t)`/unsigned cast compared, or an
+    `(unsigned)len` comparison. An upper-bound check alone (`len > CAP`) is NOT a negativity guard --
+    a negative signed value passes it -- so it does not count here (that is the whole bug)."""
+    start, _ = enclosing(lines, idx)
+    body = "\n".join(lines[start:idx + 1])
+    b = re.escape(lenexpr.strip())
+    if re.search(rf"\b{b}\s*(?:<|<=)\s*0\b", body) or re.search(rf"\b0\s*(?:>|>=)\s*{b}\b", body):
+        return True
+    if re.search(rf"\(\s*(?:size_t|unsigned[\w ]*)\s*\)\s*{b}\b", body):   # cast to unsigned then used/checked
+        return True
+    return False
+
+
 def _field_parts(expr: str):
     """(struct-variable, field) for the LAST `->`/`.` access in `expr` (`a->b->len` -> ('b','len')),
     or (None, None). The last access is the one being used as the value at the sink."""
