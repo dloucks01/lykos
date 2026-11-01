@@ -48,6 +48,20 @@ def test_wire_length_into_fixed_buffer_is_cwe787(tmp_path):
     assert f[0]["fn"] == "Stream_Read" and f[0]["taint"]
 
 
+def test_interprocedural_struct_field_length_is_cwe787(tmp_path):
+    # Phase A (interprocedural): a length filled into a struct field in ONE function and used as a
+    # copy size into a FIXED buffer in ANOTHER is caught via the project-wide wire-field index. The
+    # bounded twin (checked against the buffer size) is still suppressed -> 0 false positive.
+    src = ("typedef struct { UINT32 len; } Hdr;\n"
+           "int parse(wStream* s, Hdr* h){ Stream_Read_UINT32(s, h->len); return 0; }\n"
+           "int use(Hdr* h, const BYTE* src){ char buf[64]; memcpy(buf, src, h->len); return 0; }\n"
+           "int use_ok(Hdr* h, const BYTE* src){ char buf[64];"
+           " if (h->len > sizeof(buf)) return -1; memcpy(buf, src, h->len); return 0; }\n")
+    rows = _scan(tmp_path, src)
+    assert [r["cwe"] for r in rows] == ["CWE-787"], rows
+    assert rows[0]["line"] == 3                       # the unguarded cross-function use, not use_ok
+
+
 def test_wire_length_is_not_flagged_when_bounded_or_heap_sized(tmp_path):
     # Precision (0-FP on well-guarded code, the FreeRDP idiom): a length checked against the buffer
     # size, OR a destination heap-allocated to the length, must NOT be flagged.

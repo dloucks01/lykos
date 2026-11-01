@@ -178,36 +178,122 @@ def is_parser_sig(sig: str) -> bool:
     return bool(sig and _WIRE_PARAM.search(sig))
 
 
-def untrusted_strength(lines: list, idx: int, expr: str):
+# ---- interprocedural Phase A: struct-field taint ------------------------------------------------
+# A struct FIELD filled from a wire read in ONE function is attacker-controlled wherever it is later
+# read -- often in a DIFFERENT function (`Stream_Read_UINT32(s, hdr->length)` in a parser, then
+# `memcpy(dst, p, obj->length)` in a handler). The intraprocedural link never sees that, so a whole
+# class of wire-controlled lengths is invisible. `scan_wire_fields` pre-indexes the TYPE.field names
+# that are wire-filled across the tree; `field_untrusted` then taints a read of such a field. Match is
+# TYPE-QUALIFIED (the struct variable's declared type + the field name), so a common field name alone
+# never taints -- keeping it precise.
+_TYPE_KW = {"return", "sizeof", "if", "while", "for", "switch", "case", "const", "struct", "union",
+            "else", "do", "static", "extern", "typedef", "goto", "break", "continue", "volatile"}
+
+
+def resolve_type(lines: list, idx: int, var: str):
+    """The declared type token of `var` visible at `idx` (the enclosing function's parameters and
+    local declarations). Returns the type name (e.g. `rdpSettings` for `rdpSettings* settings`) or
+    None. Pointer and value declarations both match; keywords are rejected so an assignment or a
+    control statement is not mistaken for a declaration."""
+    if not var:
+        return None
+    start, _ = enclosing(lines, idx)
+    v = re.escape(var)
+    rx_ptr = re.compile(rf"\b([A-Za-z_]\w+)\s*\*+\s*{v}\b")
+    rx_val = re.compile(rf"\b([A-Za-z_]\w+)\s+{v}\s*[;=\[,)]")
+    for j in range(start, min(idx + 1, len(lines))):
+        for rx in (rx_ptr, rx_val):
+            m = rx.search(lines[j])
+            if m and m.group(1) not in _TYPE_KW:
+                return m.group(1)
+    return None
+
+
+def _field_parts(expr: str):
+    """(struct-variable, field) for the LAST `->`/`.` access in `expr` (`a->b->len` -> ('b','len')),
+    or (None, None). The last access is the one being used as the value at the sink."""
+    pairs = re.findall(r"([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)", expr or "")
+    return pairs[-1] if pairs else (None, None)
+
+
+_FIELD_WRITE = re.compile(
+    r"\bStream_Read(?:_[A-Za-z0-9]+)?\s*\(\s*[^,;()]+,\s*&?\s*([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)")
+_FIELD_ASSIGN = re.compile(
+    r"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)\s*=\s*[^;]*?\b(?:Stream_Read\w*|Stream_Get\w*|read|recv|recvfrom|fread)\s*\(")
+
+
+def scan_wire_fields(files) -> set:
+    """Index of `TYPE.field` names that are filled from a wire read anywhere in the project: the field
+    is the destination of a `Stream_Read*`, or it is assigned from a reader/`Stream_Get*`. `files` is
+    an iterable of (label, COMMENT-STRIPPED text). The struct variable's type is resolved at the write
+    site; a field whose owner type cannot be resolved is skipped (type-qualified only -> precise)."""
+    out: set = set()
+    for _label, text in files:
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            for rx in (_FIELD_WRITE, _FIELD_ASSIGN):
+                for m in rx.finditer(ln):
+                    var, field = m.group(1), m.group(2)
+                    typ = resolve_type(lines, i, var)
+                    if typ:
+                        out.add(f"{typ}.{field}")
+    return out
+
+
+def field_untrusted(lines: list, idx: int, expr: str, wire_fields: set):
+    """A link when `expr` reads a struct field that `wire_fields` records as wire-filled (TYPE-
+    qualified), else None. This is the interprocedural source the intraprocedural link cannot see."""
+    if not wire_fields:
+        return None
+    var, field = _field_parts(expr)
+    if not field:
+        return None
+    typ = resolve_type(lines, idx, var)
+    if typ and f"{typ}.{field}" in wire_fields:
+        return {"via": "wire-field", "source": f"{typ}.{field} (wire-filled struct field)"}
+    return None
+
+
+def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None = None):
     """(strength, link) where strength is 'strong' | 'weak' | None. This is the PRECISION layer over
     untrusted_link: a value is STRONGLY untrusted when it comes from a real input reader, is argv, or
     is a parameter of an ENTRY POINT (main) or a PEER-DATA PARSER (by role name) -- there the
     attacker genuinely controls it. A plain parameter of a generic function is only WEAKLY untrusted
     (a forwarding wrapper whose caller decides) -- not enough to call a site an exploitable finding
     without over-approximating every wrapper. No link at all -> (None, None).
+
+    `wire_fields` (Phase A, interprocedural) adds a STRONG source: a struct field this project fills
+    from the wire, read here in another function (`scan_wire_fields`). It only RAISES strength, so a
+    caller that does not supply it gets exactly the old intraprocedural behaviour.
     """
     link = untrusted_link(lines, idx, expr)
-    if not link:
-        return None, None
-    if link["via"] == "input-reader" or "argv" in (link.get("source") or ""):
-        return "strong", link
-    # link["via"] == "parameter": strong only in an entry point (main), a role-named parser, or a
-    # function whose signature takes a wire/stream buffer (its parameters ARE wire data).
-    start, _ = enclosing(lines, idx)
-    fn = enclosing_name(lines, idx)
-    sig = lines[start] if 0 <= start < len(lines) else ""
-    if fn == "main" or is_parser_name(fn) or is_parser_sig(sig):
-        return "strong", link
-    return "weak", link
+    if link:
+        if link["via"] == "input-reader" or "argv" in (link.get("source") or ""):
+            return "strong", link
+        # link["via"] == "parameter": strong only in an entry point (main), a role-named parser, or a
+        # function whose signature takes a wire/stream buffer (its parameters ARE wire data).
+        start, _ = enclosing(lines, idx)
+        fn = enclosing_name(lines, idx)
+        sig = lines[start] if 0 <= start < len(lines) else ""
+        if fn == "main" or is_parser_name(fn) or is_parser_sig(sig):
+            return "strong", link
+        # a weak intraprocedural link can still be RAISED to strong by a wire-field match
+        fl = field_untrusted(lines, idx, expr, wire_fields) if wire_fields else None
+        return ("strong", fl) if fl else ("weak", link)
+    fl = field_untrusted(lines, idx, expr, wire_fields) if wire_fields else None
+    if fl:
+        return "strong", fl
+    return None, None
 
 
-def any_untrusted_strength(lines: list, idx: int, idents):
+def any_untrusted_strength(lines: list, idx: int, idents, wire_fields: set | None = None):
     """The strongest untrusted link among several candidate identifiers: (strength, link). 'strong'
-    beats 'weak' beats None (so one genuinely-untrusted operand decides)."""
+    beats 'weak' beats None (so one genuinely-untrusted operand decides). `wire_fields` is forwarded
+    to the Phase-A interprocedural struct-field source (default None = intraprocedural only)."""
     best = (None, None)
     rank = {None: 0, "weak": 1, "strong": 2}
     for ident in idents:
-        s, link = untrusted_strength(lines, idx, ident)
+        s, link = untrusted_strength(lines, idx, ident, wire_fields=wire_fields)
         if rank[s] > rank[best[0]]:
             best = (s, link)
             if s == "strong":

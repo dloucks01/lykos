@@ -147,8 +147,12 @@ def _mk(name, line, fn, arg, cwe, label, taint) -> dict:
 
 def scan_source(root: Path) -> list:
     findings: list = []
-    for label, _p, text in source_files(root):
-        text = _strip_comments(text)
+    # PHASE A (interprocedural): pre-index struct fields the project fills from the wire, so a length
+    # read as `obj->field` here is tainted even when the field was filled in another function. Built
+    # once over the comment-stripped tree, then passed to every taint query below.
+    files = [(label, _strip_comments(text)) for label, _p, text in source_files(root)]
+    wire_fields = srctaint.scan_wire_fields(files)
+    for label, text in files:
         lines = text.splitlines()
         for i, ln in enumerate(lines):
             if ln.lstrip().startswith("#"):
@@ -177,7 +181,7 @@ def scan_source(root: Path) -> list:
                 # PRECISION: require a STRONG untrusted source (input reader / argv / a parser's or
                 # main's parameter), not a generic parameter -- a path/buffer arg that is merely a
                 # forwarded parameter of a helper is not established attacker-controlled.
-                strength, taint = srctaint.untrusted_strength(lines, i, arg)
+                strength, taint = srctaint.untrusted_strength(lines, i, arg, wire_fields=wire_fields)
                 if strength != "strong":
                     continue
                 if mode == "path":
@@ -187,8 +191,9 @@ def scan_source(root: Path) -> list:
                                         f"{fn}() opens a path from untrusted input ('{arg}') with "
                                         f"no traversal sanitisation", taint))
                 elif mode == "length":                           # untrusted SIZE drives the copy/read
-                    lenbase = srctaint.base_ident(arg)
-                    if _bounded(lines, i, lenbase):              # the length is checked/clamped
+                    # bound-check against the FULL length expression (`h->len`, not just `h`), so a
+                    # `if (h->len > sizeof dst)` guard on a struct-field length is recognised.
+                    if _bounded(lines, i, arg.strip()):          # the length is checked/clamped
                         continue
                     dpos = _LEN_DST.get(fn)
                     dst = args[dpos] if (dpos is not None and dpos < len(args)) else None
