@@ -2516,7 +2516,14 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         env["LD_LIBRARY_PATH"] = os.pathsep.join(        # project's .so dirs to load
             [str(d) for d in lib_dirs] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     argv = [str(binary), str(corpus_dir), f"-max_total_time={seconds}", f"-max_len={max_len}",
-            f"-artifact_prefix={art}/", "-print_final_stats=1", "-rss_limit_mb=2048"]
+            f"-artifact_prefix={art}/", "-print_final_stats=1", "-rss_limit_mb=2048",
+            # Close the TARGET's stderr during execution. A chatty target that logs per input (FreeRDP's
+            # WLog prints a connection-state ERROR on every input) floods stderr and throttles the
+            # campaign to a crawl -- measured on FreeRDP's TestFuzzCoreClient: ~0.2 effective exec/s and
+            # 467 MB of log in 15s, vs ~480 exec/s with this flag (a ~2500x recovery). libFuzzer dups
+            # stderr for its OWN stats and ASan's crash report still reaches stderr (verified), so
+            # `fault_report` below and the crash harvest are unaffected -- only the routine spew is gone.
+            "-close_fd_mask=2"]
     crashes = []
     before = set(art.iterdir())
     try:
