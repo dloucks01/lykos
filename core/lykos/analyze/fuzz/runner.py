@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from ... import observe
 from ..dynamic import sandbox
@@ -66,10 +67,29 @@ def run_input(exe, mode, workfile, timeout, arch, d: bytes, *, endianness=None, 
     which on an emulated target comes from qemu's own block log. `guard_page` asks for the
     guard-page heap allocator, which turns a silent heap out-of-bounds into a SIGSEGV; the
     sandbox decides whether it can apply and records in the isolation tag whether it did."""
+    rw = ()
+    if mode == "file":
+        # The input is the TARGET's to modify, exactly as under the batch runner (a writable tmpfs):
+        # a program that edits its input in place must run the same code on a re-run as it did in
+        # the campaign, or every crash behind that edit fails to reproduce and is dropped.
+        workfile = writable_slot(workfile)
+        rw = (str(workfile.parent),)
     argv, stdin = invocation(mode, workfile, d, base_argv)
     return argv, sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=arch,
                              endianness=endianness, bits=bits, blocks=blocks,
-                             guard_page=guard_page)
+                             guard_page=guard_page, rw_binds=rw)
+
+
+def writable_slot(workfile) -> Path:
+    """`workfile` moved into its own directory, which the sandbox binds writable. Its own directory
+    and not the staged one, because the staged directory holds the target binary: binding that
+    writable would let one input rewrite the program every later input runs."""
+    workfile = Path(workfile)
+    if workfile.parent.name == "lykos-input":
+        return workfile
+    slot = workfile.parent / "lykos-input"
+    slot.mkdir(exist_ok=True)
+    return slot / workfile.name
 
 
 def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float = 0.08):

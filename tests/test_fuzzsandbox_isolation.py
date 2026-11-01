@@ -444,3 +444,55 @@ def test_menu_drain_does_not_block_on_a_lingering_grandchild():
         except OSError:
             pass
         menu._kill(p)
+
+
+# ------------------------------------------------------- an input the target edits in place
+# jhead -mkexif: refuses a read-only file ("Skipping readonly file"), renames it to a backup and
+# rewrites it -- and only THEN reaches its bug. The batch runner gives the input a writable tmpfs,
+# the per-exec re-run gave it a read-only bind, so 26 real heap-overflow crashes failed the
+# reproduce check and were dropped as flaky. Both runners must run the same code on the same input.
+_EDITS_INPUT = r"""
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv){
+    char bak[4096]; char b[8] = {0}; FILE *f;
+    if (argc < 2) return 2;
+    if (access(argv[1], W_OK)) { printf("Skipping readonly file '%s'\n", argv[1]); return 1; }
+    snprintf(bak, sizeof bak, "%s.t", argv[1]);
+    if (rename(argv[1], bak)) return 3;                 /* needs the DIRECTORY writable too */
+    f = fopen(bak, "rb"); if (!f) return 4;
+    fread(b, 1, 1, f); fclose(f);
+    if (b[0] == 'X') { volatile int *p = 0; *p = 1; }   /* the bug, behind the edit */
+    return 0;
+}
+"""
+
+
+@needs_cc
+@needs_bwrap
+def test_reproduce_runs_an_input_editing_target_the_way_the_campaign_did(tmp_path):
+    from lykos.analyze.fuzz.runner import run_input
+    exe = _build(tmp_path, "edits", _EDITS_INPUT)
+    rs = sandbox.run_batch(str(exe), [b"X", b"a"], mode="file", base_argv=["@@"])
+    if rs is None:
+        pytest.skip("batch path unavailable here")
+    assert [r.crashed for r in rs] == [True, False]
+    # the per-exec runner (the reproduce check, minimisation, PoC replay) must agree
+    _, r = run_input(str(exe), "file", tmp_path / "input.bin", 5, None, b"X", base_argv=["@@"])
+    assert r.crashed, r.stdout
+    _, r = run_input(str(exe), "file", tmp_path / "input.bin", 5, None, b"a", base_argv=["@@"])
+    assert not r.crashed and r.exit_code == 0, r.stdout
+
+
+@needs_cc
+@needs_bwrap
+def test_writable_input_slot_never_makes_the_target_binary_writable(tmp_path):
+    from lykos.analyze.fuzz.runner import run_input
+    src = r"""
+#include <stdio.h>
+int main(int argc, char **argv){ FILE *f = fopen(argv[0], "ab"); return f ? 7 : 0; }
+"""
+    exe = _build(tmp_path, "selfwrite", src)
+    _, r = run_input(str(exe), "file", tmp_path / "input.bin", 5, None, b"a", base_argv=["@@"])
+    assert r.exit_code == 0          # the staged program's own directory stays read-only

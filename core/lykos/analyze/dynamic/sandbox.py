@@ -2405,7 +2405,8 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),
         env_overrides: Optional[dict] = None, aslr: bool = False,
-        guard_page: bool = False, ro_binds=(), winedebug: Optional[str] = None) -> RunResult:
+        guard_page: bool = False, ro_binds=(), rw_binds=(),
+        winedebug: Optional[str] = None) -> RunResult:
     """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
     ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
     was running blind on output shape alone -- eleven of the twelve architectures the platform
@@ -2415,7 +2416,14 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     input staged outside the exe's own directory). The sandbox masks /tmp with an empty tmpfs, so
     an input file under /tmp that is not bound back in reaches the target as a name it cannot
     open -- every input then "runs" as the same usage error and a campaign reads clean. Native
-    (bwrap) path only; the managed runtimes bind their own argv paths."""
+    (bwrap) path only; the managed runtimes bind their own argv paths.
+
+    `rw_binds` are directories bound WRITABLE (after `ro_binds`, so they win): the throwaway slot a
+    `file`-mode input sits in. The batch runner hands the target its input in its own writable
+    tmpfs, so a target that edits its input in place (jhead -mkexif renames the file to a backup
+    and rewrites it) runs the same code under both runners; read-only here, the same target only
+    printed "Skipping readonly file" -- every crash the campaign found failed its re-run and was
+    dropped as flaky."""
     host = host or host_arch()
     if _is_elf_shared_object(exe):
         # Not a crash and not a clean run: this image has no entry point, so nothing of the
@@ -2575,6 +2583,10 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             _d = str(_d)
             if _d and os.path.isdir(_d) and os.path.realpath(_d) != os.path.realpath(exedir):
                 extra += ["--ro-bind", _d, _d]
+        for _d in rw_binds or ():
+            _d = str(_d)
+            if _d and os.path.isdir(_d) and os.path.realpath(_d) != os.path.realpath(exedir):
+                extra += ["--bind", _d, _d]
         if native_sysroot and os.path.isdir(native_sysroot):
             # The native sysroot's lib dirs are on LD_LIBRARY_PATH (above), but a sysroot under
             # /tmp is MASKED by the sandbox's tmpfs, so the loader would still not find the deps.

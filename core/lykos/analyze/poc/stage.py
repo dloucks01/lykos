@@ -149,7 +149,7 @@ def build_poc_stage(ctx) -> dict:
             # Delivered one FIELD PER PROMPT, not at exec: the bytes are the same, the pacing is
             # what makes them land in the right field.
             return list(argv), input_bytes, None
-        wf = ctx.scratch() / "input.bin"
+        wf = _input_slot
         wf.write_bytes(input_bytes)
         return place(argv, str(wf)), b"", None
 
@@ -159,6 +159,10 @@ def build_poc_stage(ctx) -> dict:
     # stripped binary faults only because every allocation sits against an unmapped page; replay
     # it unguarded and a genuinely confirmed crash is filed as an unverified L0.
     _guard = sandbox.GUARD_PAGE_TAG in (_dyn_isolation(ctx.conn, target, input_sha) or "")
+    # A file input is the target's to edit, as it was in the campaign (runner.writable_slot):
+    # replayed read-only, jhead -mkexif prints "Skipping readonly file" and never reaches its bug.
+    from ..fuzz.runner import writable_slot
+    _input_slot = writable_slot(ctx.scratch() / "input.bin")
     ctx.progress(msg="verifying PoC in a clean sandbox"
                      + (" (guard-page allocator, as it was found)" if _guard else ""))
     # endianness/bits are load-bearing, not decoration: _qemu_for routes ppc64->ppc64le,
@@ -209,7 +213,8 @@ def build_poc_stage(ctx) -> dict:
             run_argv, stdin, run_env = _delivery(m)
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
                               arch=target.arch, endianness=target.endianness, bits=target.bits,
-                              env_overrides=run_env, guard_page=_guard)
+                              env_overrides=run_env, guard_page=_guard,
+                              rw_binds=(str(_input_slot.parent),) if m == "file" else ())
             tried.append(m if not pre else f"{m}+{' '.join(pre)}")
             # A SANITIZER FAULT IS A REPRODUCTION, so the sweep has to stop on it. This loop
             # broke only on `res.crashed` -- "was it killed by a signal" -- and a libFuzzer
