@@ -665,9 +665,17 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
     anything else is a starting guess that the caller sweeps past.
     """
     from ...db.dao import DynResultDAO
-    if params.get("input_mode"):
+    # The run that found THIS input is consulted before the operator's facts: its argv is the
+    # operator's own argv PLUS the option prefix the campaign found the crash under (`run_argv =
+    # prefix + base_argv`). jhead's heap over-read only fires under `-exifmap -mkexif`; taking the
+    # operator's bare `@@` first built a PoC that ran `jhead input.bin`, exited 0 and shipped as an
+    # unverified L0 for a confirmed crash. The operator's facts still decide every input no run
+    # recorded (a supplied crasher, a synthesized payload).
+    recorded = DynResultDAO(conn).list_by_target(target.id) if input_sha else []
+    if params.get("input_mode") and not any(r.input_sha == input_sha and r.input_mode
+                                            for r in recorded):
         return params["input_mode"], list(params.get("argv") or []), FEED_GIVEN
-    for r in DynResultDAO(conn).list_by_target(target.id):
+    for r in recorded:
         # PROMPTED delivery is recorded in the ISOLATION tag, not in `input_mode`: the campaign
         # runs the prompt protocol over the stdin CHANNEL (`channels = ["stdin"]` in fuzz/stage),
         # so the mode it stores is "stdin" and the pacing is what the tag remembers. `poc/stage`
