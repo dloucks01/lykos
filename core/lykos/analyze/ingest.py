@@ -449,6 +449,20 @@ def _source_tree_tgz(root, *, skip_binary=None) -> bytes:
     return buf.getvalue()
 
 
+def _single_file_tgz(data: bytes, name: str) -> bytes:
+    """A gzipped tar holding ONE source file -- the `source-project` shape for a single-file upload.
+    Deterministic (fixed mtime), so re-ingesting the same file dedups to the same blob."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        ti = tarfile.TarInfo(name=name or "a.c")
+        ti.size, ti.mtime, ti.mode = len(data), 0, 0o644
+        tf.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def _is_program_elf(p) -> bool:
     """True for an ELF that can be RUN as a target -- ET_EXEC, or a PIE (ET_DYN not named a shared
     library). A plain `.so`/`.a` the loose builder may return as a 'binary' is not runnable as a
@@ -707,6 +721,17 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 meta["lsan"] = True
             store.put_artifact(case_id, "source-code", data=path.read_bytes(),
                                meta={"binary_sha": info["sha256"], "filename": fname, **meta})
+            # ...and as a one-file source TREE. Every source bug detector (cpg, oob_write,
+            # int_overflow, uaf, assert_guard, source_sinks, ...) reads the `source-project` tree, so
+            # a single-file upload -- the source sitting right here -- got "no archived source tree"
+            # from all of them and was analysed as if it had no source at all.
+            try:
+                store.put_artifact(case_id, "source-project",
+                                   data=_single_file_tgz(path.read_bytes(), Path(fname).name),
+                                   meta={"binary_sha": info["sha256"], "filename": fname,
+                                         "single_file": True})
+            except Exception:                        # noqa: BLE001 -- best-effort enrichment
+                pass
             store.put_artifact(case_id, "target-blob", src=binout)
             return store.targets.upsert(case_id, fname, info["sha256"],
                                         md5=info["md5"], sha1=info["sha1"], size=info["size"])

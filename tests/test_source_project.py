@@ -161,6 +161,25 @@ def test_ingest_source_from_mismatched_ondisk_name(store, case, gcc_or_skip):
     assert arts and arts[0].meta.get("filename") == "overflow.c"
 
 
+def test_single_file_upload_is_also_archived_as_a_source_tree(store, case):
+    """The source detectors read the `source-project` tree; a single-file upload must provide one,
+    or every one of them reports 'no archived source tree' with the source right there."""
+    import io
+    import tarfile
+    import tempfile
+    from pathlib import Path
+
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.source_lookup import source_project_for
+    src = Path(tempfile.mkdtemp()) / "svc.c"
+    src.write_text("int main(void){ return 0; }\n")
+    t = ingest(store, case.id, src)
+    proj = source_project_for(store.conn, t)
+    assert proj is not None and proj.meta.get("binary_sha") == t.sha256
+    with tarfile.open(fileobj=io.BytesIO(store.content.path(proj.sha256).read_bytes())) as tf:
+        assert tf.getnames() == ["svc.c"]
+
+
 def test_failed_source_build_surfaces_reason_not_bundle_error(store, case, monkeypatch):
     """A source project that fails to build (e.g. cmake/make not installed) must report WHY. The
     code falls through to the prebuilt-binary bundle path, which found no ELF and raised the generic
