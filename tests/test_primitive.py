@@ -718,3 +718,22 @@ def test_ppc_names_its_branch_register_in_the_mnemonic():
     assert ibr("bctrl", {"ctr": 1}) == "ctr"
     assert ibr("bctr", {"ctr": 1}) == "ctr"
     assert ibr("bctrl", {"rdx": 1}) == "", "not a register this capture has"
+
+
+def test_a_read_off_the_buffer_end_onto_guard_pages_is_not_address_control():
+    """jhead 3.06.0.1 `-exifmap`: a 9-byte over-read of a malloc'd buffer. Under the guard-page
+    allocator every fault lands on a page boundary; no varied byte moves it, but sibling crashes
+    (other allocation layouts) land on other guard pages. That is heap layout, not the attacker
+    choosing the address -- it was filed as an L2 arbitrary read."""
+    def cap(addr, pc=0x55555555e3f0):
+        return {"ok": True, "signal_name": "SIGSEGV", "fault_addr": addr, "pc": pc}
+    obs = ([("orig", cap(0x7ffff7f96000)), ("orig", cap(0x7ffff7f96000))]
+           + [(f"byte@{o}=0xff", cap(0x7ffff7f96000)) for o in (25, 50, 75)]
+           + [("crash@aaaa", cap(0x7ffff7f8d000)), ("crash@bbbb", cap(0x7ffff7f99000))])
+    v = P.address_primitive(obs, disasm="movzx edx,BYTE PTR [rbx]")
+    assert not v["controlled"] and not v["confirmed"] and v["max_level"] == 1, v
+    assert "page boundary" in v["note"]
+    # an address that moves OFF page boundaries between inputs is still the attacker's
+    moved = [(lbl, cap(c["fault_addr"] + 0x18)) for lbl, c in obs]
+    m = P.address_primitive(moved, disasm="movzx edx,BYTE PTR [rbx]")
+    assert m["controlled"] and m["max_level"] == 2
