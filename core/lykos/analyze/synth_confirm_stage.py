@@ -15,6 +15,7 @@ negative control. Deterministic, offline, no LLM.
 from __future__ import annotations
 
 import hashlib
+import os as _os
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
@@ -28,14 +29,16 @@ _SKIP = ("sanitizer", "ubsan", "asan", "fuzzer", "llvm", "std::", "gnu_cxx")
 
 
 def _candidate_functions(ctx, target, src_root, limit: int) -> list:
-    """Enclosing function names of the as-yet-unproven source candidates -- the functions worth
-    synthesizing a driver for. De-duplicated, project-looking, bounded. Best-effort: a file we cannot
-    read or a line with no clean enclosing signature is skipped."""
-    names: list = []
+    """The as-yet-unproven source candidates worth synthesizing a driver for, as (fn, basename, line)
+    -- the enclosing FUNCTION to drive AND the suspected bug SITE inside it, which steers the concolic
+    rung toward the defect line (not merely the function entry). De-duplicated by function,
+    project-looking, bounded. Best-effort: a file we cannot read or a line with no clean enclosing
+    signature is skipped."""
+    cands: list = []
     seen: set = set()
     for f in FindingDAO(ctx.conn).list_by_target(target.id):
         if (f.detector not in _STATIC_SOURCE_DETECTORS
-                or (f.state or "candidate") != "candidate" or len(names) >= limit):
+                or (f.state or "candidate") != "candidate" or len(cands) >= limit):
             continue
         fp = fline = None
         for e in (f.evidence or []):
@@ -53,8 +56,8 @@ def _candidate_functions(ctx, target, src_root, limit: int) -> list:
         if (nm and nm not in seen and not nm.startswith("_")
                 and not any(s in nm.lower() for s in _SKIP)):
             seen.add(nm)
-            names.append(nm)
-    return names
+            cands.append((nm, _os.path.basename(fp), fline))
+    return cands
 
 
 def _file_confirmed(ctx, target, fn: str, res: dict) -> int:
@@ -97,17 +100,19 @@ def synth_confirm_stage(ctx) -> dict:
     if src is None:
         ctx.emit("synth_confirm.done", payload={"supported": False, "note": "no source tree"})
         return {"metrics": {"supported": False}}
-    names = _candidate_functions(ctx, target, src, max_fns)
-    if not names:
+    cands = _candidate_functions(ctx, target, src, max_fns)
+    if not cands:
         ctx.emit("synth_confirm.done", payload={"supported": False,
                  "note": "no unproven source candidates with an enclosing function to drive"})
         return {"metrics": {"supported": False}}
 
     from pathlib import Path
-    per = max(30, int(budget / max(1, len(names))))
+    from .symbolic import dwarfline
+    per = max(30, int(budget / max(1, len(cands))))
+    input_size = int(p.get("input_size") or 4096)
     synthesized = confirmed = upgraded = 0
-    ctx.progress(msg=f"synthesizing drivers for {len(names)} candidate function(s)")
-    for fn in names:
+    ctx.progress(msg=f"synthesizing drivers for {len(cands)} candidate function(s)")
+    for fn, bn, line in cands:
         out = Path(ctx.scratch()) / f"synthdrv_{fn[:40]}.bin"
         try:
             b = LF.build_libfuzzer(src, out, harness_fn=fn, timeout=max(60, per))
@@ -116,13 +121,41 @@ def synth_confirm_stage(ctx) -> dict:
         if not b.get("ok") or not b.get("binary"):
             continue                                         # not a synthesizable signature / no link
         synthesized += 1
-        res = DC.smartfuzz_confirm(b["binary"], lib_dirs=b.get("lib_dirs"), seeds=[b"A" * 64],
-                                   input_size=int(p.get("input_size") or 4096), timeout=per)
-        if res.get("confirmed"):
+        # The EXPLORE build: the same synthesized driver with libFuzzer instrumentation only (no
+        # ASan), which the concolic rung explores -- angr is confused by ASan's shadow memory.
+        # Best-effort: if it does not build, concolic reuses the ASan binary (slower, still sound).
+        explore = None
+        try:
+            eb = LF.build_libfuzzer(src, Path(ctx.scratch()) / f"synthdrv_{fn[:40]}.explore.bin",
+                                    harness_fn=fn, timeout=max(60, per), sanitize=False)
+            if eb.get("ok"):
+                explore = eb.get("binary")
+        except Exception:                                    # noqa: BLE001
+            explore = None
+        explore = explore or b["binary"]
+        # Steer the concolic rung. When DWARF resolves the suspected bug LINE, steer to THAT and NOT
+        # the function entry: the entry is reached by any input, so adding it as a find target
+        # short-circuits exploration there and the generated input skips the guard the defect sits
+        # behind. The function name is only the fallback steer when DWARF cannot resolve the line.
+        try:
+            targets = dwarfline.site_addrs(explore, [(bn, line)]) if (bn and line) else []
+        except Exception:                                    # noqa: BLE001
+            targets = []
+        harness = {"name": f"synth:{fn}", "explore_binary": explore,
+                   "replay_binary": b["binary"], "fuzz_binary": b["binary"],
+                   "lib_dirs": b.get("lib_dirs"), "input_size": input_size,
+                   "harness_fn": "LLVMFuzzerTestOneInput",
+                   "target_syms": None if targets else [fn],
+                   "targets": targets or None, "seeds": [b"A" * 64]}
+        attempts: list = []
+        proven = DC.confirm_ladder([harness], timeout_per=per, ctx=ctx, attempts_out=attempts)
+        if proven:
+            res = proven[0]
             confirmed += 1
             upgraded += _file_confirmed(ctx, target, fn, res)
-            ctx.progress(msg=f"CONFIRMED via synthesized driver: {res.get('class')} in {fn}()")
-    ctx.emit("synth_confirm.done", payload={"supported": True, "candidates": len(names),
+            ctx.progress(msg=f"CONFIRMED via synthesized driver ({res.get('rung')}): "
+                             f"{res.get('class')} in {fn}()")
+    ctx.emit("synth_confirm.done", payload={"supported": True, "candidates": len(cands),
              "synthesized": synthesized, "confirmed": confirmed, "upgraded": upgraded})
     ctx.progress(pct=100, msg=f"synth drivers: {synthesized} built, {confirmed} confirmed")
     return {"metrics": {"supported": True, "synthesized": synthesized, "confirmed": confirmed,

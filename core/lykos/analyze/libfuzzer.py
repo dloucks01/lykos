@@ -49,6 +49,15 @@ _SAN = ["-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=fuzzer,address,undef
         "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
         "-Wno-error=int-conversion", "-D_GNU_SOURCE"]
 
+#: The EXPLORE build: libFuzzer entry only, NO address/undefined sanitizer. angr is confused by
+#: ASan's shadow-memory accesses (see symbolic/directed_confirm), so the concolic rung explores a
+#: fuzzer-only build while confirmation still replays under the ASan `_SAN` build. The parser logic
+#: is identical, so an input the clean build's parser accepts drives the same path under ASan.
+_SAN_EXPLORE = ["-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=fuzzer",
+                "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-w",
+                "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
+                "-Wno-error=int-conversion", "-D_GNU_SOURCE"]
+
 
 def _clang(cxx: bool):
     return shutil.which("clang++" if cxx else "clang")
@@ -2023,15 +2032,20 @@ class BuildCache:
 
 def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
                     harness_kind: str | None = None, timeout: int = 300,
-                    spec: dict | None = None, cache: BuildCache | None = None) -> dict:
+                    spec: dict | None = None, cache: BuildCache | None = None,
+                    sanitize: bool = True) -> dict:
     """Build a libFuzzer target from the project at `root`. Uses an in-tree LLVMFuzzerTestOneInput
     if present, else synthesizes one. Returns {ok, binary, harness, log}.
 
     `spec` names WHICH harness to build (see `plan_harnesses`); without one this resolves the
     strongest, which is what it has always done. `cache` carries the library's compiled objects
-    between calls so building a second harness does not recompile the library.
+    between calls so building a second harness does not recompile the library. `sanitize` False
+    builds the fuzzer-only EXPLORE variant (`_SAN_EXPLORE`, no ASan) that the concolic rung explores
+    -- the per-TU path honors it; the cmake in-tree fallback stays ASan (it is not on the synthesized
+    path this flag serves).
     """
     root = Path(root).resolve()
+    san = _SAN if sanitize else _SAN_EXPLORE
     if spec is None:
         if harness_fn:
             spec = fn_spec(root, harness_fn, harness_kind)
@@ -2055,7 +2069,7 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     ensure_configured(root, timeout=timeout)
     tmp = Path(tempfile.mkdtemp(prefix="lykos-lf-"))
     try:
-        res = _build_in(root, out, tmp, spec, kind, cxx, timeout, cache)
+        res = _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=san)
     finally:
         # any raise between mkdtemp and the old trailing rmtree (a synth helper, a path outside
         # the tree, a compile-pool error) leaked one lykos-lf-* directory per call
@@ -2098,7 +2112,7 @@ def _cmake_cached(cache, root, timeout):
     return res
 
 
-def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
+def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=None) -> dict:
     srcs = _sources(root, exclude_main=True)
     # Compile THE LIBRARY the entry point belongs to, not the whole repository. Building every
     # source in a real project drags in `contrib/` and `test/`, which reference symbols that do
@@ -2167,36 +2181,47 @@ def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
     # The harness is REQUIRED: skipping a translation unit is right for a platform shim or a test,
     # and wrong for the one file that defines the entry point. Silently skipping it produced a link
     # error about `LLVMFuzzerTestOneInput` instead of the compile error that caused it.
-    res = _compile_and_link(srcs, incs, out, tmp, timeout, required=h, cache=cache)
+    res = _compile_and_link(srcs, incs, out, tmp, timeout, required=h, cache=cache, san=san)
     res["harness"] = harness_desc
     res["harness_id"] = spec["id"]
     res["entry"] = spec.get("entry")
     return res
 
 
-def _obj_name(src, incs) -> str:
+def _san_tag(san) -> str:
+    """A short stable tag for a sanitizer flag set, to key cached objects by their instrumentation
+    (so an ASan object is never reused for a clean EXPLORE build)."""
+    return hashlib.sha1("\x00".join(san).encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _obj_name(src, incs, sant: str = "") -> str:
     """A stable object-file name for one translation unit: content-addressed by what decides its
-    contents (the path and the flags), so a cached object is only reused for the same compile."""
-    key = str(src) + "\x00" + "\x00".join(incs)
+    contents (the path, the flags, and the sanitizer set), so a cached object is only reused for the
+    same compile."""
+    key = str(src) + "\x00" + "\x00".join(incs) + "\x00" + sant
     return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:20] + ".o"
 
 
-def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
+def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None, san=None) -> list:
     """Compile each translation unit with the driver for ITS language. Returns [(src, obj, err)].
 
     `cache` makes the library's objects outlive one build, which is what lets several harnesses
-    share one compile of the library (see `BuildCache`).
+    share one compile of the library (see `BuildCache`). `san` is the sanitizer/instrumentation flag
+    set (default `_SAN`); it is part of the cache key and object name so an ASan object is never
+    reused for a clean EXPLORE build or vice versa.
     """
+    san = san or _SAN
+    sant = _san_tag(san)
     out_dir = cache.dir if cache is not None else tmp
-    todo = [s for s in srcs if cache is None or (str(s), tuple(incs)) not in cache.objs]
+    todo = [s for s in srcs if cache is None or (str(s), tuple(incs), sant) not in cache.objs]
 
     def _one(src):
         src = Path(src)
-        obj = out_dir / _obj_name(src, incs)
+        obj = out_dir / _obj_name(src, incs, sant)
         drv = _clang(src.suffix in _CXX_EXT)
         if not drv:
             return None, f"{src.name}: no clang driver"
-        argv = [drv] + _SAN + ["-c", str(src), "-o", str(obj)] + incs
+        argv = [drv] + san + ["-c", str(src), "-o", str(obj)] + incs
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as e:
@@ -2212,7 +2237,7 @@ def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
                 fresh[str(src)] = got
     results = []
     for src in srcs:
-        k = (str(src), tuple(incs))
+        k = (str(src), tuple(incs), sant)
         if str(src) in fresh:
             got = fresh[str(src)]
             if cache is not None:
@@ -2226,7 +2251,7 @@ def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
 
 
 def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, required=None,
-                      cache=None) -> dict:
+                      cache=None, san=None) -> dict:
     """Compile every translation unit, then link what compiled.
 
     One source file decided the language for the whole project, and `any(.cxx)` is true for
@@ -2242,9 +2267,10 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
     reported. The count of skipped units is in the log either way, so a build that quietly
     dropped half the project is visible rather than silently thinner than it looks.
     """
+    san = san or _SAN
     objs, failed, logs = [], [], []
     failed_paths = []
-    for src, obj, err in _compile_objs(srcs, incs, tmp, timeout, cache=cache):
+    for src, obj, err in _compile_objs(srcs, incs, tmp, timeout, cache=cache, san=san):
         if obj is not None:
             objs.append(obj)
         else:
@@ -2263,7 +2289,7 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
     # Link with the C++ driver when any C++ object is present, so libstdc++ comes along.
     link_cxx = any(Path(s).suffix in _CXX_EXT for s in srcs)
     drv = _clang(link_cxx) or _clang(False)
-    argv = [drv] + _SAN + [str(o) for o in objs] + ["-o", str(out)]
+    argv = [drv] + san + [str(o) for o in objs] + ["-o", str(out)]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
@@ -2295,7 +2321,7 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
                 "header or a missing -D."))[-4000:]}
         libs = _libs_for_undefined(err)
         if libs:
-            retry = [drv] + _SAN + [str(o) for o in objs] + libs + ["-o", str(out)]
+            retry = [drv] + san + [str(o) for o in objs] + libs + ["-o", str(out)]
             try:
                 r2 = subprocess.run(retry, capture_output=True, text=True, timeout=timeout)
                 logs.append("relinked with " + " ".join(libs))
