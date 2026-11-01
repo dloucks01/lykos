@@ -137,3 +137,13 @@ def test_the_api_dispatch_tables_are_derived_from_the_autopilot_registry():
     from lykos.api.server import Handler
     assert Handler._TARGET_STAGES == _TARGET, "the API target-stage table drifted from orchestrate._TARGET"
     assert Handler._CASE_STAGES == _CASE, "the API case-stage table drifted from orchestrate._CASE"
+
+
+def test_uc_discovery_runs_before_the_synth_confirm_proof_that_consumes_it():
+    """synth_confirm proves uc_symbolic's leads, so UC must run FIRST. In the old order a UC lead
+    was filed after the only stage that could prove it had already run -- measured on a real
+    autopilot run, where synth_confirm declined 'no unproven source/UC candidates' and UC then
+    filed the very lead it would have proven."""
+    src = pathlib.Path(analyze_pkg.__path__[0], "orchestrate.py").read_text()
+    body = src.split("def run_case_autopilot", 1)[1]
+    assert body.index('"uc_symbolic"') < body.index('"synth_confirm"')

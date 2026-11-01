@@ -104,7 +104,46 @@ def _uc_candidate_functions(ctx, target, already, limit: int) -> list:
     return out
 
 
-def _file_confirmed(ctx, target, fn: str, res: dict) -> int:
+def _fn_in_fault_stack(report: str, fn: str) -> bool:
+    """True when `fn` is a frame of the sanitizer report's FAULTING stack (the first one, before any
+    'allocated by'/'freed by' history) -- the fault happened in, or under, that function. A plain
+    substring test would also match the allocation history or an unrelated symbol prefix."""
+    head = _re.split(r"\n[^\n]*(?:allocated by|freed by|is located in)", report or "",
+                     maxsplit=1)[0]
+    return bool(_re.search(r"#\d+ 0x[0-9a-f]+ in " + _re.escape(fn) + r"\b", head))
+
+
+def _link_uc_lead(ctx, target, fn: str, res: dict, proof_cwe: str, input_sha: str) -> bool:
+    """Tie a UC control-hijack lead to the synthesized-driver proof that followed it up.
+
+    Advances the lead to `corroborated` -- NOT `confirmed`: the proof is a memory-safety fault in the
+    function under attacker-controlled (buf,size), which is how read data reaches the instruction
+    pointer, but it does not itself demonstrate PC control, so claiming the CWE-94 hijack as
+    confirmed would over-state it. Linked only when the function is in the FAULTING stack, so a fault
+    the driver hit somewhere else never corroborates this lead. Returns whether the lead was linked."""
+    if not _fn_in_fault_stack(res.get("report") or "", fn):
+        return False
+    lead = next((f for f in FindingDAO(ctx.conn).list_by_target(target.id)
+                 if f.detector == _UC_TOOL and f.dedup_key == f"uc:CWE-94:{target.id}:{fn}"), None)
+    if lead is None:
+        return False
+    src_line = res.get("source") or ""
+    FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        "cwe": lead.cwe, "title": lead.title, "severity": lead.severity or "medium",
+        "detector": lead.detector, "dedup_key": lead.dedup_key, "site_detail": fn,
+        "state": "corroborated", "confidence": 0.6, "channel": "dynamic-confirm",
+        "evidence": [{"channel": "dynamic-confirm",
+                      "detail": (f"followed up by synth_confirm: a synthesized driver for {fn}() "
+                                 f"reproduced a {proof_cwe} fault"
+                                 + (f" at {src_line}" if src_line else "")
+                                 + f" under AddressSanitizer with a passing negative control "
+                                 f"(input {input_sha[:12]}; see the confirmed synth_confirm finding). "
+                                 f"Instruction-pointer control itself is not demonstrated.")}]})
+    return True
+
+
+def _file_confirmed(ctx, target, fn: str, res: dict, *, from_uc: bool = False,
+                    driver_sha: str | None = None) -> int:
     rep = res.get("report") or ""
     cls = parse_asan_report(rep) or {}
     klass = res.get("class") or cls.get("class") or "memory-safety fault"
@@ -121,11 +160,22 @@ def _file_confirmed(ctx, target, fn: str, res: dict) -> int:
         "severity": "high", "detector": TOOL, "state": "confirmed", "confidence": 0.9,
         "dedup_key": f"{cwe}:synth_confirm:{fn}:{src_line or hashlib.sha1(rep[:128].encode('latin-1','ignore')).hexdigest()[:8]}",
         "site_detail": src_line, "function_addr": None, "site_addr": None,
-        "evidence": [{"channel": "sanitizer", "detail": detail}]})
+        "evidence": [{"channel": "sanitizer", "detail": detail}]
+                    + ([{"channel": "uc-symbolic",
+                         "detail": f"discovered by under-constrained symbolic execution of {fn}(), "
+                                   f"a function no harness or static detector reached"}]
+                       if from_uc else [])})
+    if from_uc:
+        _link_uc_lead(ctx, target, fn, res, cwe, input_sha)
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, input_sha=input_sha, input_mode="file", argv=["@@"],
         crashed=True, signal_name=(cls.get("class") or klass),
-        isolation=f"synth_confirm/{fn}", defect_key=f"synth_confirm:{fn}",
+        # The crash is a crash of the SYNTHESIZED DRIVER, not of the ingested program -- which may
+        # never call `fn` at all (that is why it needed a driver). Tagged like a libFuzzer harness
+        # crash so build_poc replays the input against the stored driver; tagged by function name,
+        # the bundle packaged the ingested program, which exited 0 on the input ("verified: False").
+        isolation=(f"libfuzzer/{driver_sha[:12]}" if driver_sha else f"synth_confirm/{fn}"),
+        defect_key=f"synth_confirm:{fn}",
         note=f"synthesized-driver confirmation: {klass}" + (f" at {src_line}" if src_line else ""))
     return _crossref_static(ctx, target, src_line, cwe, input_sha, f"synth:{fn}")
 
@@ -147,7 +197,9 @@ def synth_confirm_stage(ctx) -> dict:
     cands = _candidate_functions(ctx, target, src, max_fns)
     # UC-discovered undriven functions (control-hijack leads no static detector flagged) get the same
     # proof treatment -- the 'find what others can't' half -- deduped against the static candidates.
-    cands += _uc_candidate_functions(ctx, target, {c[0] for c in cands}, max_fns - len(cands))
+    uc_cands = _uc_candidate_functions(ctx, target, {c[0] for c in cands}, max_fns - len(cands))
+    uc_fns = {c[0] for c in uc_cands}
+    cands += uc_cands
     if not cands:
         ctx.emit("synth_confirm.done", payload={"supported": False,
                  "note": "no unproven source/UC candidates with an enclosing function to drive"})
@@ -199,7 +251,18 @@ def synth_confirm_stage(ctx) -> dict:
         if proven:
             res = proven[0]
             confirmed += 1
-            upgraded += _file_confirmed(ctx, target, fn, res)
+            # KEEP THE DRIVER: it is half the reproducer (see libfuzzer_stage) -- the ASan build every
+            # rung replayed the proving input against.
+            driver_sha = None
+            try:
+                driver_sha = ctx.put_artifact(
+                    "libfuzzer-harness", data=Path(b["binary"]).read_bytes(),
+                    meta={"harness": b.get("harness"), "target": target.sha256,
+                          "entry": f"{fn}()", "synthesized": True})
+            except Exception:                                # noqa: BLE001 -- the finding still stands
+                driver_sha = None
+            upgraded += _file_confirmed(ctx, target, fn, res, from_uc=fn in uc_fns,
+                                        driver_sha=driver_sha)
             ctx.progress(msg=f"CONFIRMED via synthesized driver ({res.get('rung')}): "
                              f"{res.get('class')} in {fn}()")
     ctx.emit("synth_confirm.done", payload={"supported": True, "candidates": len(cands),

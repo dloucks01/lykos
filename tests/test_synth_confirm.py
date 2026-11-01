@@ -181,3 +181,134 @@ def test_clean_explore_build_omits_asan(tmp_path):
     asan_syms = subprocess.run(["nm", str(asan["binary"])], capture_output=True, text=True).stdout
     assert "__asan_init" not in syms, "explore build must not carry the ASan runtime"
     assert "__asan_init" in asan_syms, "confirmation build must carry the ASan runtime"
+
+
+# ---- a candidate function that lives in a PROGRAM's translation unit, beside its main() ----------
+
+_PROG = ("#include <string.h>\n#include <stdio.h>\n"
+         "struct rec { char name[16]; void (*h)(const char *); };\n"
+         "static void dflt(const char *s) { puts(s); }\n"
+         "void dispatch_record(const unsigned char *d, unsigned long n) {\n"        # line 5
+         "  struct rec r; r.h = dflt;\n"
+         "  if (n < 4 || d[0] != 'R') return;\n"
+         "  unsigned len = d[1]; if (len > n - 2) return;\n"
+         "  memcpy(r.name, d + 2, len);\n"                                            # line 9: bug
+         "  r.h(r.name);\n}\n"
+         "int main(int argc, char **argv) { return argc > 5; }\n")
+
+
+def test_program_unit_function_gets_its_real_signature(tmp_path):
+    """A function defined beside main() is not a library entry point, but when it is NAMED for a
+    driver its real (buf,len) signature must be found. Without it the harness fell back to
+    `void fn(char *)` -- a one-argument call to a two-argument function, whose garbage second
+    argument can fault and fabricate a confirmation."""
+    from lykos.analyze import libfuzzer as LF
+    (tmp_path / "svc.c").write_text(_PROG)
+    assert LF.fn_def_file(tmp_path, "dispatch_record") == tmp_path / "svc.c"
+    assert LF.fn_params(tmp_path, "dispatch_record") == ["const unsigned char *d", "unsigned long n"]
+    assert LF.harness_kind_for(tmp_path, "dispatch_record") == "buflen"
+    # ...but the RANKING still treats a program unit as not-the-library
+    assert all(p.name != "svc.c" for p, _ in LF._library_srcs(tmp_path))
+
+
+def test_library_definition_wins_over_a_program_unit_one(tmp_path):
+    from lykos.analyze import libfuzzer as LF
+    (tmp_path / "lib.c").write_text("int parse(const char *s) { return s[0]; }\n")
+    (tmp_path / "tool.c").write_text("int parse(const char *s, int n) { return n; }\n"
+                                     "int main(void) { return 0; }\n")
+    assert LF.fn_def_file(tmp_path, "parse") == tmp_path / "lib.c"
+
+
+def test_program_unit_shim_renames_main_and_keeps_the_original_file(tmp_path):
+    from lykos.analyze import libfuzzer as LF
+    (tmp_path / "svc.c").write_text(_PROG)
+    shim = LF._program_unit_shim(tmp_path / "svc.c", [], tmp_path)
+    txt = shim.read_text()
+    assert f"#define main {LF._PROGRAM_MAIN}" in txt and str((tmp_path / "svc.c").resolve()) in txt
+    # already compiled (no main to rename) -> no shim
+    assert LF._program_unit_shim(tmp_path / "svc.c", [tmp_path / "svc.c"], tmp_path) is None
+
+
+@pytest.mark.skipif(not shutil.which("clang"), reason="needs clang for -fsanitize=fuzzer")
+def test_synthesized_driver_for_a_program_unit_function_confirms(tmp_path):
+    """End to end: the driver links the function out of the program unit (main renamed) and the
+    smart-fuzz rung confirms the overflow AT ITS SOURCE LINE in the original file."""
+    from lykos.analyze import libfuzzer as LF
+    from lykos.analyze.symbolic import directed_confirm as DC
+    if subprocess.run([shutil.which("clang"), "-fsanitize=fuzzer,address", "-xc", "-", "-o",
+                       str(tmp_path / "p.bin")],
+                      input=b"int LLVMFuzzerTestOneInput(const unsigned char*d,unsigned long s){return 0;}",
+                      capture_output=True).returncode:
+        pytest.skip("this clang cannot link -fsanitize=fuzzer")
+    d = tmp_path / "proj"
+    d.mkdir()
+    (d / "svc.c").write_text(_PROG)
+    b = LF.build_libfuzzer(d, d / "_drv.bin", harness_fn="dispatch_record", timeout=150)
+    assert b.get("ok"), (b.get("log") or "")[-500:]
+    assert "[buflen]" in b["harness"] and "main() renamed" in b["harness"]
+    res = DC.smartfuzz_confirm(b["binary"], lib_dirs=b.get("lib_dirs"), seeds=[b"A" * 64],
+                               input_size=256, timeout=90)
+    assert res.get("confirmed"), res.get("reason")
+    assert "svc.c:9" in (res.get("report") or "")
+
+
+# ---- a synth_confirm proof links back to the UC lead that prompted it ----------------------------
+
+_REPORT = ("==1==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x1\n"
+           "WRITE of size 48 at 0x1 thread T0\n"
+           "    #0 0x5d in __asan_memcpy (/x+0x1)\n"
+           "    #1 0x5e in dispatch_record /src/svc.c:9:5\n"
+           "    #2 0x5f in LLVMFuzzerTestOneInput /tmp/harness.c:7:5\n\n"
+           "Address 0x1 is located in stack of thread T0 at offset 56 in frame\n"
+           "    #0 0x60 in other_owner /src/svc.c:3\n")
+
+
+def test_fn_in_fault_stack_reads_only_the_faulting_stack():
+    assert SC._fn_in_fault_stack(_REPORT, "dispatch_record")
+    assert not SC._fn_in_fault_stack(_REPORT, "dispatch")          # a prefix is not a frame
+    assert not SC._fn_in_fault_stack(_REPORT, "other_owner")       # frame-owner section, not the fault
+
+
+class _ArtCtx(_Ctx):
+    def put_artifact(self, kind, data=b"", **kw):
+        return "f" * 64
+
+
+def test_a_proof_corroborates_its_uc_lead_but_never_confirms_the_hijack(store, case):
+    t = TargetDAO(store.conn).upsert(case.id, "t", "9" * 64, arch="source", bits=0)
+    _uc_lead(store, t, "dispatch_record")
+    ctx = _ArtCtx(store.conn)
+    SC._file_confirmed(ctx, t, "dispatch_record",
+                       {"report": _REPORT, "input": b"R0AAAA", "class": "stack-buffer-overflow",
+                        "source": "svc.c:9"}, from_uc=True)
+    fs = FindingDAO(store.conn).list_by_target(t.id)
+    lead = next(f for f in fs if f.detector == "uc_symbolic")
+    proof = next(f for f in fs if f.detector == "synth_confirm")
+    assert proof.state == "confirmed"
+    assert any(e.get("channel") == "uc-symbolic" for e in proof.evidence)     # discovery credit
+    assert lead.state == "corroborated"                                        # NOT confirmed
+    assert any(e.get("channel") == "dynamic-confirm" and "not demonstrated" in e.get("detail", "")
+               for e in lead.evidence)
+
+
+def test_a_fault_outside_the_function_does_not_touch_the_uc_lead(store, case):
+    t = TargetDAO(store.conn).upsert(case.id, "t", "8" * 64, arch="source", bits=0)
+    _uc_lead(store, t, "decode_frame")
+    SC._file_confirmed(_ArtCtx(store.conn), t, "decode_frame",
+                       {"report": _REPORT, "input": b"x", "class": "stack-buffer-overflow",
+                        "source": "svc.c:9"}, from_uc=True)
+    lead = next(f for f in FindingDAO(store.conn).list_by_target(t.id)
+                if f.detector == "uc_symbolic")
+    assert lead.state == "candidate"
+
+
+def test_a_driver_proof_replays_against_the_stored_driver(store, case):
+    """The proving input crashes the synthesized DRIVER, not the ingested program, so its run is
+    tagged like a libFuzzer harness crash -- build_poc then replays against the driver."""
+    from lykos.db.dao import DynResultDAO
+    t = TargetDAO(store.conn).upsert(case.id, "t", "5" * 64, arch="source", bits=0)
+    SC._file_confirmed(_ArtCtx(store.conn), t, "dispatch_record",
+                       {"report": _REPORT, "input": b"R0", "class": "stack-buffer-overflow",
+                        "source": "svc.c:9"}, driver_sha="ab" * 32)
+    runs = DynResultDAO(store.conn).list_by_target(t.id)
+    assert runs and runs[0].isolation == "libfuzzer/" + ("ab" * 6)

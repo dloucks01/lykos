@@ -160,6 +160,23 @@ def defs_index(root) -> dict:
             if name in _KEYWORDS:
                 continue
             idx.setdefault(name, (path, params))
+    # PROGRAM units (a file with its own `main`) last, never overriding a library definition. They
+    # are not library entry points -- the RANKING scanners read `_library_srcs` and never see them --
+    # but a function NAMED for a driver (a UC lead, a static candidate) may well live in one, and
+    # without its real signature the harness falls back to `void fn(char *)`: a one-argument call to
+    # a two-argument function, whose garbage second argument can fault and FABRICATE a confirmation.
+    # `_program_unit_shim` is what then links such a unit, with its `main` renamed.
+    for path in _sources(Path(root), exclude_main=False):
+        try:
+            txt = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        if not _MAIN_RE.search(txt) or _HARNESS_RE.search(txt):
+            continue
+        for name, params in _fn_defs(txt, sa):
+            if name in _KEYWORDS:
+                continue
+            idx.setdefault(name, (path, params))
     return _cache_put(_DEFS_CACHE, key, idx)
 
 
@@ -2173,6 +2190,14 @@ def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=None) -> dict
                                        params=fn_params(root, fn)))
         srcs = srcs + [h]
         harness_desc = f"synthesized for {fn}() [{fk}]"
+        # The function may live in a PROGRAM's translation unit, beside its `main` -- which
+        # `_sources(exclude_main=True)` dropped, so the driver could never link ("undefined
+        # reference to <fn>"). That is the common shape of an exported-but-undriven parser in a
+        # single-file tool, and exactly what the UC/synth_confirm proof path is for.
+        shim = _program_unit_shim(def_file, srcs, tmp)
+        if shim is not None:
+            srcs = srcs + [shim]
+            harness_desc += f" [program unit {def_file.name}, its main() renamed]"
     # What a configured autotools build would have on its command line. Without it expat's
     # xmlparse.c does not compile at all (see `config_defines`).
     incs = list(config_defines(root))
@@ -2186,6 +2211,30 @@ def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=None) -> dict
     res["harness_id"] = spec["id"]
     res["entry"] = spec.get("entry")
     return res
+
+
+#: what a program unit's `main` is renamed to when the unit is linked into a fuzz driver
+_PROGRAM_MAIN = "lykos_program_main"
+
+
+def _program_unit_shim(def_file, srcs, tmp: Path):
+    """A wrapper translation unit that compiles `def_file` -- a source file with its own `main`,
+    excluded from the build -- with that `main` renamed, so a driver can link the OTHER functions in
+    it without colliding with libFuzzer's `main`. None when `def_file` is already being compiled (no
+    main) or is not a C/C++ file.
+
+    The wrapper `#include`s the original by absolute path, so quoted includes still resolve from the
+    original file's directory and DWARF/ASan line attributions still name the original file and line
+    -- steering to a bug line and the crash's file:line are unchanged. The rename is a macro, scoped
+    to this one unit: every other source keeps its own `main` spelling (it has none)."""
+    if def_file is None or Path(def_file).suffix not in _SRC_EXT:
+        return None
+    d = Path(def_file).resolve()
+    if any(Path(s).resolve() == d for s in srcs):
+        return None
+    shim = tmp / f"_lykos_prog_{hashlib.sha1(str(d).encode()).hexdigest()[:10]}{d.suffix}"
+    shim.write_text(f"#define main {_PROGRAM_MAIN}\n#include \"{d}\"\n")
+    return shim
 
 
 def _san_tag(san) -> str:
