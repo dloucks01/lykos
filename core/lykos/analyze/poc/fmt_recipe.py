@@ -332,6 +332,44 @@ def _fmt_leads(conn, target) -> list:
     return out
 
 
+def format_is_literal(conn, target, lead) -> bool:
+    """True when the lead's printf-family site PROVABLY passes a constant format (a `lea` of a string
+    literal / rip-relative constant into the format register) -- the one shape that is never CWE-134.
+    False when the site, its IR or the sink name cannot be recovered (unknown is not 'literal')."""
+    if not (lead.function_addr and lead.site_addr):
+        return False
+    ir = _function_ir(conn, target.id, lead.function_addr)
+    if not ir:
+        return False
+    k = FMT_ARG_INDEX.get(_sink_name(ir, lead.site_addr) or "")
+    if k is None:
+        return False
+    instrs = x64frame.instructions(ir)
+    idx = x64frame.site_index(instrs, lead.site_addr)
+    if idx is None:
+        return False
+    src = x64frame.pointer_source([t for _, t in instrs[:idx]], x64frame.ARG_REGS[k])
+    return bool(src and src[0] == "literal")
+
+
+def real_format_lead(conn, target):
+    """The CWE-134 lead a format-string RECIPE may stand on, or None. A bare import-pattern hit
+    ('printf -- check the format string is not tainted', which fires on any program that calls
+    printf) is NOT one: the lead must come from the precise `format_string` detector or carry taint
+    evidence, and its site must not provably pass a literal format. Without this a program whose
+    every printf has a constant format got a corroborated '%hhn write-what-where' recipe."""
+    from ...db.dao import FindingDAO
+    rows = [f for f in FindingDAO(conn).list_by_target(target.id) if f.cwe == "CWE-134"
+            and not str(f.dedup_key or "").startswith("recipe:")]
+    rows.sort(key=lambda f: (f.detector != "format_string", -(f.confidence or 0)))
+    for f in rows:
+        precise = f.detector == "format_string"
+        tainted = any("taint" in str(e.get("channel", "")) for e in f.evidence or [])
+        if (precise or tainted) and not format_is_literal(conn, target, f):
+            return f
+    return None
+
+
 def _function_ir(conn, target_id, faddr):
     from ...db.dao import FunctionDAO
     fd = FunctionDAO(conn)
