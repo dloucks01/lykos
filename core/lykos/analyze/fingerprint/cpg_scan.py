@@ -27,8 +27,45 @@ from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..source_lookup import source_project_for
 from . import srctaint
+from .assert_guard import functions as _iter_functions
 from .source_sinks import _balanced_arg, _is_declaration, _is_literal, _split_args, _strip_comments
 from .srcwalk import source_files
+
+_ANYCALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
+
+def _build_param_taint(files, wire_fields, ret_funcs) -> set:
+    """Phase C (interprocedural): the set of `<function>.<param>` names that SOME caller passes a
+    strongly-untrusted argument into -- so a length that is a bare parameter of its function is
+    resolved to strong. One hop (caller args are evaluated with A/B but not C, so no fixpoint). The
+    callee's parameter NAMES come from its definition; a call whose callee is unknown is skipped."""
+    func_params: dict = {}
+    for _label, text in files:
+        for name, params, _b0, _b1, _body in _iter_functions(text):
+            func_params.setdefault(name, params)
+    tainted: set = set()
+    for _label, text in files:
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            for m in _ANYCALL.finditer(ln):
+                callee = m.group(1)
+                ps = func_params.get(callee)
+                if not ps or _is_declaration(ln[:m.start()]):   # skip the definition line itself
+                    continue
+                try:
+                    args = _split_args(_balanced_arg(ln, ln.index("(", m.end() - 1)))
+                except ValueError:
+                    continue
+                for pos, a in enumerate(args):
+                    if pos >= len(ps):
+                        break
+                    if f"{callee}.{ps[pos]}" in tainted or not srctaint.base_ident(a):
+                        continue                                 # already known / not a simple l-value
+                    s, _ = srctaint.untrusted_strength(lines, i, a, wire_fields=wire_fields,
+                                                       ret_funcs=ret_funcs)
+                    if s == "strong":
+                        tainted.add(f"{callee}.{ps[pos]}")
+    return tainted
 
 CPG_STAGE = "cpg_scan"
 TOOL, TOOL_VERSION = "cpg", "cpg-1"
@@ -154,6 +191,8 @@ def scan_source(root: Path) -> list:
     wire_fields = srctaint.scan_wire_fields(files)
     # PHASE B: functions whose return value is wire-derived, so `len = f(s)` here is tainted.
     ret_funcs = srctaint.scan_return_taint(files, wire_fields=wire_fields)
+    # PHASE C: <function>.<param> a caller passes an untrusted argument into -> the param is tainted.
+    param_taint = _build_param_taint(files, wire_fields, ret_funcs)
     for label, text in files:
         lines = text.splitlines()
         for i, ln in enumerate(lines):
@@ -184,7 +223,7 @@ def scan_source(root: Path) -> list:
                 # main's parameter), not a generic parameter -- a path/buffer arg that is merely a
                 # forwarded parameter of a helper is not established attacker-controlled.
                 strength, taint = srctaint.untrusted_strength(lines, i, arg, wire_fields=wire_fields,
-                                                              ret_funcs=ret_funcs)
+                                                              ret_funcs=ret_funcs, param_taint=param_taint)
                 if strength != "strong":
                     continue
                 if mode == "path":

@@ -296,7 +296,7 @@ def field_untrusted(lines: list, idx: int, expr: str, wire_fields: set):
 
 
 def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None = None,
-                       ret_funcs: set | None = None):
+                       ret_funcs: set | None = None, param_taint: set | None = None):
     """(strength, link) where strength is 'strong' | 'weak' | None. This is the PRECISION layer over
     untrusted_link: a value is STRONGLY untrusted when it comes from a real input reader, is argv, or
     is a parameter of an ENTRY POINT (main) or a PEER-DATA PARSER (by role name) -- there the
@@ -304,21 +304,27 @@ def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None
     (a forwarding wrapper whose caller decides) -- not enough to call a site an exploitable finding
     without over-approximating every wrapper. No link at all -> (None, None).
 
-    `wire_fields` (Phase A) and `ret_funcs` (Phase B) are the interprocedural sources: a struct field
-    this project fills from the wire, and a function whose return value is wire-derived. Both only
-    RAISE strength, so a caller that supplies neither gets exactly the old intraprocedural behaviour.
+    `wire_fields` (Phase A), `ret_funcs` (Phase B) and `param_taint` (Phase C) are the interprocedural
+    sources: a struct field this project fills from the wire, a function whose return value is wire-
+    derived, and a `<function>.<param>` some caller passes an untrusted argument into. All only RAISE
+    strength, so a caller that supplies none gets exactly the old intraprocedural behaviour.
     """
     link = untrusted_link(lines, idx, expr, ret_funcs=ret_funcs)
     if link:
         if link["via"] == "input-reader" or "argv" in (link.get("source") or ""):
             return "strong", link
-        # link["via"] == "parameter": strong only in an entry point (main), a role-named parser, or a
-        # function whose signature takes a wire/stream buffer (its parameters ARE wire data).
+        # link["via"] == "parameter": strong only in an entry point (main), a role-named parser, a
+        # function whose signature takes a wire/stream buffer (its parameters ARE wire data), or --
+        # Phase C -- a parameter some caller passes an untrusted argument into.
         start, _ = enclosing(lines, idx)
         fn = enclosing_name(lines, idx)
         sig = lines[start] if 0 <= start < len(lines) else ""
         if fn == "main" or is_parser_name(fn) or is_parser_sig(sig):
             return "strong", link
+        base = base_ident(expr)
+        if param_taint and fn and base and f"{fn}.{base}" in param_taint:
+            return "strong", {"via": "caller-param",
+                              "source": f"an untrusted argument is passed to '{base}' by a caller"}
         # a weak intraprocedural link can still be RAISED to strong by a wire-field match
         fl = field_untrusted(lines, idx, expr, wire_fields) if wire_fields else None
         return ("strong", fl) if fl else ("weak", link)
@@ -329,14 +335,15 @@ def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None
 
 
 def any_untrusted_strength(lines: list, idx: int, idents, wire_fields: set | None = None,
-                           ret_funcs: set | None = None):
+                           ret_funcs: set | None = None, param_taint: set | None = None):
     """The strongest untrusted link among several candidate identifiers: (strength, link). 'strong'
-    beats 'weak' beats None (so one genuinely-untrusted operand decides). `wire_fields` (Phase A) and
-    `ret_funcs` (Phase B) are forwarded to the interprocedural sources (default None = intra only)."""
+    beats 'weak' beats None (so one genuinely-untrusted operand decides). `wire_fields` (A),
+    `ret_funcs` (B) and `param_taint` (C) are forwarded to the interprocedural sources."""
     best = (None, None)
     rank = {None: 0, "weak": 1, "strong": 2}
     for ident in idents:
-        s, link = untrusted_strength(lines, idx, ident, wire_fields=wire_fields, ret_funcs=ret_funcs)
+        s, link = untrusted_strength(lines, idx, ident, wire_fields=wire_fields, ret_funcs=ret_funcs,
+                                     param_taint=param_taint)
         if rank[s] > rank[best[0]]:
             best = (s, link)
             if s == "strong":

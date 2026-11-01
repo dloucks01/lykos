@@ -78,6 +78,22 @@ def test_interprocedural_return_value_length_is_cwe787(tmp_path):
     assert "read_len() return" in rows[0]["evidence"][1]["detail"]   # the taint is via the returner
 
 
+def test_interprocedural_caller_tainted_param_length_is_cwe787(tmp_path):
+    # Phase C (interprocedural): a length that is a bare PARAMETER of a copy helper is tainted when a
+    # caller passes an untrusted argument into it. caller() reads a wire length and passes it to
+    # copy_into(len); copy_into memcpy's len into a fixed buf -> CWE-787. The bounded helper (copy_ok,
+    # also called with the untrusted value) is suppressed by its own length check.
+    src = ("void copy_into(const BYTE* src, UINT32 len)\n{\n    char buf[64];\n"
+           "    memcpy(buf, src, len);\n}\n"
+           "void copy_ok(const BYTE* src, UINT32 len)\n{\n    char buf[64];\n"
+           "    if (len > sizeof(buf)) return;\n    memcpy(buf, src, len);\n}\n"
+           "int caller(wStream* s, const BYTE* src)\n{\n    UINT32 n;\n"
+           "    Stream_Read_UINT32(s, n);\n    copy_into(src, n);\n    copy_ok(src, n);\n    return 0;\n}\n")
+    rows = _scan(tmp_path, src)
+    assert [r["cwe"] for r in rows] == ["CWE-787"], rows
+    assert rows[0]["line"] == 4                       # the unguarded copy_into, not copy_ok
+
+
 def test_wire_length_is_not_flagged_when_bounded_or_heap_sized(tmp_path):
     # Precision (0-FP on well-guarded code, the FreeRDP idiom): a length checked against the buffer
     # size, OR a destination heap-allocated to the length, must NOT be flagged.
