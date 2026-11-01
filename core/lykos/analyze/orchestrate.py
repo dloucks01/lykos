@@ -465,6 +465,12 @@ def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dic
     for key, value in (overrides or {}).items():
         if value in (None, [], ""):
             continue
+        # A stage replaying ONE recorded input carries the invocation that input was found under,
+        # which is the operator's argv PLUS the option prefix the campaign found it with. jhead's
+        # crash needs `-exifmap -mkexif`; overwriting it with the operator's bare `@@` made
+        # root_cause report "did not fault under the debugger" for a verified crash.
+        if out.get("input_sha") and key in ("argv", "input_mode") and out.get(key):
+            continue
         scope = _OVERRIDE_SCOPE.get(key, frozenset())
         if scope is None or stage in scope:
             out[key] = value
@@ -2483,6 +2489,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     if stop.is_set():
                         break
                     p = {"input_sha": cr.input_sha}
+                    # Replay it the way it was found (see _apply_overrides).
+                    if getattr(cr, "input_mode", None) and getattr(cr, "argv", None):
+                        p.update(argv=list(cr.argv), input_mode=cr.input_mode)
                     cve = cve_origin.get(cr.input_sha)
                     lvl0 = _max_verified_poc_level(store, tid) if cve else 0
                     _staged(bud, store, t, "root_cause", status, stop, p, want=60.0)

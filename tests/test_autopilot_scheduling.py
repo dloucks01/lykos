@@ -147,3 +147,16 @@ def test_uc_discovery_runs_before_the_synth_confirm_proof_that_consumes_it():
     src = pathlib.Path(analyze_pkg.__path__[0], "orchestrate.py").read_text()
     body = src.split("def run_case_autopilot", 1)[1]
     assert body.index('"uc_symbolic"') < body.index('"synth_confirm"')
+
+
+def test_a_replay_keeps_the_invocation_its_input_was_found_under():
+    """jhead's crash needs `-exifmap -mkexif @@`; the operator gave `@@`. root_cause was handed the
+    operator's argv, replayed without the flags and reported 'did not fault' for a verified crash."""
+    from lykos.analyze.orchestrate import _apply_overrides
+    over = {"argv": ["@@"], "input_mode": "file"}
+    p = _apply_overrides("root_cause", {"input_sha": "ab", "argv": ["-exifmap", "-mkexif", "@@"],
+                                        "input_mode": "file"}, over)
+    assert p["argv"] == ["-exifmap", "-mkexif", "@@"]
+    # a stage with no recorded input still takes the operator's facts
+    assert _apply_overrides("fuzz", {}, over)["argv"] == ["@@"]
+    assert _apply_overrides("root_cause", {"input_sha": "ab"}, over)["argv"] == ["@@"]

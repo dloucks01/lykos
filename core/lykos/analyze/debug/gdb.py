@@ -43,7 +43,8 @@ def locate_gdb(config: Optional[str] = None) -> Optional[Path]:
     return Path(w) if w else None
 
 
-def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int) -> str:
+def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int,
+               rw_dirs=()) -> str:
     """Write `cmds` to a script and run `gdb -batch` on the (hostile) target INSIDE the sandbox
     -- bwrap read-only root with /home,/root masked (net unshared; ptrace needs no loopback) and
     rlimits, so a runaway/forking inferior cannot exhaust or write to the host. Returns gdb's
@@ -64,7 +65,10 @@ def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int) -> 
             ro.append(str(Path(stdin_file).resolve().parent))
         inner = ([str(gdb), "-q", "-batch", "-nx", "-x", str(script), "--args", exe_abs]
                  + [sandbox.argv_bytes(a) for a in argv])
-        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=ro) + inner
+        # `rw_dirs`: the writable slot a file input sits in -- the target may edit its input in
+        # place (jhead -mkexif), and read-only it refuses before reaching the fault.
+        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=ro,
+                                     rw_binds=[str(x) for x in rw_dirs]) + inner
         preexec = sandbox._rlimits(2048, int(timeout) + 15, set_as=False)
         if ctx is not None:
             proc = ctx.run_subprocess(cmd, timeout=timeout + 15, preexec_fn=preexec)
@@ -112,11 +116,11 @@ def _capture_cmds(stdin_file, preload: str | None = None):
 
 
 def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30,
-            preload: str | None = None) -> dict:
+            preload: str | None = None, rw_dirs=()) -> dict:
     if stdin_file:                                     # absolute: the `run < file` redirect is
         stdin_file = str(Path(stdin_file).resolve())   # resolved before bwrap chdirs to /tmp
     return _parse(_drive_gdb(gdb, exe, argv, stdin_file, _capture_cmds(stdin_file, preload),
-                             ctx=ctx, timeout=timeout))
+                             ctx=ctx, timeout=timeout, rw_dirs=rw_dirs))
 
 
 _FORK = re.compile(r"fork to child process (\d+)")

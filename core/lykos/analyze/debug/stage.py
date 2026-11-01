@@ -362,11 +362,16 @@ def root_cause_stage(ctx) -> dict:
                     argv = place(argv, sandbox.argv_arg(input_bytes, truncate=True))
                 except sandbox.ArgvNulError as e:
                     return {"ok": False, "reason": f"argv cannot carry this input: {e}"}
-            elif m == "file":
-                (ctx.scratch() / "input.bin").write_bytes(input_bytes)
-                argv = place(argv, str(ctx.scratch() / "input.bin"))
+            rw = ()
+            if m == "file":
+                # writable, as the campaign had it (fuzz.runner.writable_slot)
+                from ..fuzz.runner import writable_slot
+                wf = writable_slot(ctx.scratch() / "input.bin")
+                wf.write_bytes(input_bytes)
+                argv = place(argv, str(wf))
+                rw = (str(wf.parent),)
             return gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout),
-                               preload=_guard_preload)
+                               preload=_guard_preload, rw_dirs=rw)
         return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable,
                             guard_page=_guard)(input_bytes)
 
