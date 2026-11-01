@@ -152,6 +152,8 @@ def scan_source(root: Path) -> list:
     # once over the comment-stripped tree, then passed to every taint query below.
     files = [(label, _strip_comments(text)) for label, _p, text in source_files(root)]
     wire_fields = srctaint.scan_wire_fields(files)
+    # PHASE B: functions whose return value is wire-derived, so `len = f(s)` here is tainted.
+    ret_funcs = srctaint.scan_return_taint(files, wire_fields=wire_fields)
     for label, text in files:
         lines = text.splitlines()
         for i, ln in enumerate(lines):
@@ -181,7 +183,8 @@ def scan_source(root: Path) -> list:
                 # PRECISION: require a STRONG untrusted source (input reader / argv / a parser's or
                 # main's parameter), not a generic parameter -- a path/buffer arg that is merely a
                 # forwarded parameter of a helper is not established attacker-controlled.
-                strength, taint = srctaint.untrusted_strength(lines, i, arg, wire_fields=wire_fields)
+                strength, taint = srctaint.untrusted_strength(lines, i, arg, wire_fields=wire_fields,
+                                                              ret_funcs=ret_funcs)
                 if strength != "strong":
                     continue
                 if mode == "path":

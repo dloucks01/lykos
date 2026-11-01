@@ -62,6 +62,22 @@ def test_interprocedural_struct_field_length_is_cwe787(tmp_path):
     assert rows[0]["line"] == 3                       # the unguarded cross-function use, not use_ok
 
 
+def test_interprocedural_return_value_length_is_cwe787(tmp_path):
+    # Phase B (interprocedural): a function whose return value is wire-derived (read_len reads a
+    # length off the stream and returns it) taints `len = read_len(s)` at the call site, so a copy of
+    # that length into a FIXED buffer in another function is caught. The bounded twin is suppressed.
+    src = ("UINT32 read_len(wStream* s)\n{\n    UINT32 n;\n    Stream_Read_UINT32(s, n);\n"
+           "    return n;\n}\n"
+           "int use(wStream* s, const BYTE* src)\n{\n    char buf[64];\n"
+           "    UINT32 len = read_len(s);\n    memcpy(buf, src, len);\n    return 0;\n}\n"
+           "int use_ok(wStream* s, const BYTE* src)\n{\n    char buf[64];\n"
+           "    UINT32 len = read_len(s);\n    if (len > sizeof(buf)) return -1;\n"
+           "    memcpy(buf, src, len);\n    return 0;\n}\n")
+    rows = _scan(tmp_path, src)
+    assert [r["cwe"] for r in rows] == ["CWE-787"], rows
+    assert "read_len() return" in rows[0]["evidence"][1]["detail"]   # the taint is via the returner
+
+
 def test_wire_length_is_not_flagged_when_bounded_or_heap_sized(tmp_path):
     # Precision (0-FP on well-guarded code, the FreeRDP idiom): a length checked against the buffer
     # size, OR a destination heap-allocated to the length, must NOT be flagged.

@@ -108,9 +108,46 @@ _DERIVE_FNS = ("atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoul
 _DERIVE_RX = re.compile(r"=\s*(?:\([^)=;]*\)\s*)?(" + "|".join(_DERIVE_FNS) + r")\s*\(([^;]*)\)")
 
 
-def untrusted_link(lines: list, idx: int, expr: str, _depth: int = 0):
+def scan_return_taint(files, wire_fields: set | None = None) -> set:
+    """Phase B (interprocedural): the set of function NAMES whose RETURN value is wire-derived, so a
+    `len = f(s)` elsewhere inherits the taint. A function qualifies when any `return EXPR;` is strongly
+    untrusted inside it (a reader/Stream_Read into the returned var, a wire-field, or a parser's own
+    parameter) -- i.e. it hands back an attacker-CHOSEN value, not a safe derived bound. One extra hop:
+    a function that returns a call to an already-qualifying function also qualifies. `files` is an
+    iterable of (label, COMMENT-STRIPPED text)."""
+    funcs: set = set()
+    pending: list = []
+    for _label, text in files:
+        lines = text.splitlines()
+        for j, ln in enumerate(lines):
+            for m in re.finditer(r"\breturn\s+([^;{}]+);", ln):  # mid-line returns too (one-liners)
+                expr = m.group(1).strip()
+                fn = enclosing_name(lines, j)
+                if not fn:
+                    continue
+                s, _ = untrusted_strength(lines, j, expr, wire_fields=wire_fields)
+                if s == "strong":
+                    funcs.add(fn)
+                else:
+                    mc = re.match(r"([A-Za-z_]\w*)\s*\(", expr)   # `return g(...)` -> 2-hop candidate
+                    if mc:
+                        pending.append((fn, mc.group(1)))
+    for fn, callee in pending:                               # one hop: returns a call to a tainted fn
+        if callee in funcs:
+            funcs.add(fn)
+    return funcs
+
+
+def _returns_to(body: str, base: str, ret_funcs: set):
+    """The tainted-returning function name if `base = f(...)` for some f in `ret_funcs`, else None."""
+    m = re.search(rf"\b{re.escape(base)}\s*=\s*(?:\([^)=;]*\)\s*)?([A-Za-z_]\w*)\s*\(", body)
+    return m.group(1) if (m and m.group(1) in ret_funcs) else None
+
+
+def untrusted_link(lines: list, idx: int, expr: str, _depth: int = 0, ret_funcs: set | None = None):
     """Syntactic link from `expr` (an l-value) to an untrusted source in its enclosing function, or
-    None. Returns {"via": "parameter"|"input-reader", "source": "<human label>"}."""
+    None. Returns {"via": "parameter"|"input-reader", "source": "<human label>"}. `ret_funcs` (Phase B)
+    additionally treats `base = f(...)` as untrusted when f is a wire-deriving returner."""
     base = base_ident(expr)
     if not base:
         return None
@@ -122,6 +159,10 @@ def untrusted_link(lines: list, idx: int, expr: str, _depth: int = 0):
     rdr = reader_source(body, base)
     if rdr:
         return {"via": "input-reader", "source": f"{rdr} into '{base}'"}
+    if ret_funcs:                                            # base = <wire-deriving function>(...)
+        rf = _returns_to(body, base, ret_funcs)
+        if rf:
+            return {"via": "input-reader", "source": f"{rf}() return (wire-derived) into '{base}'"}
     # ONE transitive hop: `base = atoi(inner)` / `base = strtol(inner, ...)` -> base is as untrusted
     # as inner. This traces a converted input (the canonical `n = atoi(argv[1]); malloc(n * k)`)
     # without a general dataflow engine. Bounded to one hop so it cannot loop.
@@ -131,7 +172,7 @@ def untrusted_link(lines: list, idx: int, expr: str, _depth: int = 0):
             for inner in re.findall(_IDENT, m.group(2)):
                 if inner == base or inner in _DERIVE_FNS:
                     continue
-                sub = untrusted_link(lines, idx, inner, _depth + 1)
+                sub = untrusted_link(lines, idx, inner, _depth + 1, ret_funcs=ret_funcs)
                 if sub:
                     return {"via": sub["via"],
                             "source": f"{sub['source']} via {m.group(1)}() into '{base}'"}
@@ -254,7 +295,8 @@ def field_untrusted(lines: list, idx: int, expr: str, wire_fields: set):
     return None
 
 
-def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None = None):
+def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None = None,
+                       ret_funcs: set | None = None):
     """(strength, link) where strength is 'strong' | 'weak' | None. This is the PRECISION layer over
     untrusted_link: a value is STRONGLY untrusted when it comes from a real input reader, is argv, or
     is a parameter of an ENTRY POINT (main) or a PEER-DATA PARSER (by role name) -- there the
@@ -262,11 +304,11 @@ def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None
     (a forwarding wrapper whose caller decides) -- not enough to call a site an exploitable finding
     without over-approximating every wrapper. No link at all -> (None, None).
 
-    `wire_fields` (Phase A, interprocedural) adds a STRONG source: a struct field this project fills
-    from the wire, read here in another function (`scan_wire_fields`). It only RAISES strength, so a
-    caller that does not supply it gets exactly the old intraprocedural behaviour.
+    `wire_fields` (Phase A) and `ret_funcs` (Phase B) are the interprocedural sources: a struct field
+    this project fills from the wire, and a function whose return value is wire-derived. Both only
+    RAISE strength, so a caller that supplies neither gets exactly the old intraprocedural behaviour.
     """
-    link = untrusted_link(lines, idx, expr)
+    link = untrusted_link(lines, idx, expr, ret_funcs=ret_funcs)
     if link:
         if link["via"] == "input-reader" or "argv" in (link.get("source") or ""):
             return "strong", link
@@ -286,14 +328,15 @@ def untrusted_strength(lines: list, idx: int, expr: str, wire_fields: set | None
     return None, None
 
 
-def any_untrusted_strength(lines: list, idx: int, idents, wire_fields: set | None = None):
+def any_untrusted_strength(lines: list, idx: int, idents, wire_fields: set | None = None,
+                           ret_funcs: set | None = None):
     """The strongest untrusted link among several candidate identifiers: (strength, link). 'strong'
-    beats 'weak' beats None (so one genuinely-untrusted operand decides). `wire_fields` is forwarded
-    to the Phase-A interprocedural struct-field source (default None = intraprocedural only)."""
+    beats 'weak' beats None (so one genuinely-untrusted operand decides). `wire_fields` (Phase A) and
+    `ret_funcs` (Phase B) are forwarded to the interprocedural sources (default None = intra only)."""
     best = (None, None)
     rank = {None: 0, "weak": 1, "strong": 2}
     for ident in idents:
-        s, link = untrusted_strength(lines, idx, ident, wire_fields=wire_fields)
+        s, link = untrusted_strength(lines, idx, ident, wire_fields=wire_fields, ret_funcs=ret_funcs)
         if rank[s] > rank[best[0]]:
             best = (s, link)
             if s == "strong":
