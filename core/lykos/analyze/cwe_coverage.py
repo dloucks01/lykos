@@ -37,6 +37,9 @@ CEILING: dict[str, str] = {
     "CWE-824": "rce", "CWE-763": "rce", "CWE-562": "rce", "CWE-825": "rce",
     # invalid / mismatched free -> tcache-poison / fastbin-dup -> control (chain_primitive double_free)
     "CWE-590": "rce", "CWE-762": "rce",
+    # a negative size parameter wraps to an undersized/over-long allocation or copy -> heap overflow
+    # -> control (chain_primitive heap_overflow); detonation-gated, so a DoS-only case stays honest.
+    "CWE-1284": "rce",
     # hard-coded / recoverable secrets -> authentication (a usable credential)
     "CWE-798": "logic", "CWE-321": "logic", "CWE-259": "logic",
     # reads / disclosure -> leak

@@ -45,6 +45,9 @@ def test_vclass_maps_every_primitive_cwe():
     # an out-of-range pointer offset is a write-what-where -> route through the oob_write branch
     assert chain._VCLASS["CWE-823"] == "oob_write"
     assert "CWE-823" in chain._CHAINABLE_CWE
+    # a negative size parameter wraps to an undersized/over-long alloc -> the heap-overflow engine
+    assert chain._VCLASS["CWE-1284"] == "heap_overflow"
+    assert "CWE-1284" in chain._CHAINABLE_CWE
 
 
 # --- lead admission: a NAMED primitive is chained on its CWE, not only its detector ----------------
