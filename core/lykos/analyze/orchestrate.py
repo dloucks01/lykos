@@ -461,20 +461,40 @@ _OVERRIDE_SCOPE: dict = {
 }
 
 
-def _corpus_cache_dir(target) -> Optional["Path"]:
-    """A STABLE per-target corpus directory, keyed by the ingested binary's sha, under
-    `$LYKOS_CORPUS_DIR` -- or None when that is unset. Opt-in on purpose: by default a run is
-    self-contained (the air-gap bundle ships nothing and writes only its case store), and only an
-    operator who WANTS reruns to accumulate -- the recall benchmark, a repeated engagement -- sets
-    the variable. With it, a rerun seeds from every interesting input prior runs found, so findings
-    can only be ADDED, never lost to fuzzing's run-to-run luck."""
+def _corpus_cache_key(store, target) -> Optional[str]:
+    """A STABLE identity for this target's corpus across runs -- the hard part of a cross-run
+    cache. The instrumented binary's sha is NOT it: a source project is REBUILT every run (paths
+    and timestamps baked in -> a new sha each time), and a multi-binary tree's per-binary shas all
+    move, so keying by sha missed the rebuilt binary entirely. For a source target, key by the
+    source TREE's artifact sha plus the binary's own filename (gif2rgb vs giftext stay distinct and
+    both survive a rebuild); for a binary target, the binary's sha is already stable."""
+    try:
+        from .source_lookup import source_project_for
+        art = source_project_for(store.conn, target)
+    except Exception:                                    # noqa: BLE001
+        art = None
+    name = (getattr(target, "filename", None) or "bin").replace("/", "_")[:40]
+    if art is not None and getattr(art, "sha256", None):
+        return f"{art.sha256[:16]}-{name}"
+    sha = getattr(target, "sha256", None)
+    return sha[:16] if sha else None
+
+
+def _corpus_cache_dir(store, target) -> Optional["Path"]:
+    """The cross-run corpus directory for this target under `$LYKOS_CORPUS_DIR`, or None when that
+    is unset. Opt-in on purpose: by default a run is self-contained (the air-gap bundle ships
+    nothing and writes only its case store), and only an operator who WANTS reruns to accumulate --
+    the recall benchmark, a repeated engagement -- sets the variable. With it, a rerun seeds from
+    every interesting input prior runs found, so findings can only be ADDED, never lost to
+    fuzzing's run-to-run luck."""
     import os
     from pathlib import Path
     root = os.environ.get("LYKOS_CORPUS_DIR")
-    if not root or not getattr(target, "sha256", None):
+    key = _corpus_cache_key(store, target) if root else None
+    if not root or not key:
         return None
     try:
-        d = Path(root) / target.sha256[:16]
+        d = Path(root) / key
         d.mkdir(parents=True, exist_ok=True)
         return d
     except OSError:
@@ -484,7 +504,7 @@ def _corpus_cache_dir(target) -> Optional["Path"]:
 def _persist_corpus(store, target) -> int:
     """Write this target's distinct crashing + corpus inputs into its cross-run cache (capped), so
     the next run of the same binary starts from them. Best-effort; returns how many were written."""
-    cache = _corpus_cache_dir(target)
+    cache = _corpus_cache_dir(store, target)
     if cache is None:
         return 0
     from .fuzz import session as _session
@@ -565,7 +585,7 @@ def _with_tree_seeds(store, target, overrides: Optional[dict]) -> Optional[dict]
     # Cross-run corpus (opt-in, $LYKOS_CORPUS_DIR): every interesting input prior runs of THIS
     # binary found, merged in so a rerun can only add findings. Session blobs are passed as whole
     # sessions; plain inputs as file seeds.
-    cache = _corpus_cache_dir(target)
+    cache = _corpus_cache_dir(store, target)
     if cache is not None:
         import base64 as _b64
         files = [str(p) for p in sorted(cache.glob("*.bin")) if p.is_file()]
