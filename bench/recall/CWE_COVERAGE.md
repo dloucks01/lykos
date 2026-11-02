@@ -49,21 +49,34 @@ New this session (all demonstrated / validated): **CWE-125 jhead GPS → L3** di
 (`jpeg_overread`), the **unzip ASan build fix** that puts CWE-121 `zip_overflow` L1 in-pipeline, and
 the **sanitizer-exit detection fix** (an ASan error that exits without a signal now counts).
 
-## Remaining capability frontiers (TTPs — genuine, not yet built)
+## Capability frontiers (TTPs) — built this cycle, with the honest remainders named
 
-These are real reach/weaponization gaps (a ceiling is lykos's to overcome, per the mission), each
-needing a technique that is not yet built rather than a target that happens to exercise it:
+The five frontiers the earlier editions named are now built; what remains on each is a narrower,
+named next technique (a ceiling is lykos's to overcome, never a target property):
 
-- **Win64 weaponiser + WoW64** — PE exploitation tops out at L2 (SEH-frame control via Wine); a
-  Win64 ROP/stack weaponiser is the named next technique.
-- **format-string-on-PIE** — the two-stage leak→write chain works on a disclosed leak, but the
-  fmt-on-PIE sweep is slow and the fgets-loop leak channel is not detected; needs the faster sweep
-  + loop-channel detection.
-- **tcache poisoning → L3** for double/invalid free (CWE-415/590/762): the heap engine reaches a
-  primitive; the tcache-poison → allocation-overlap → control technique is the next build.
-- **int-overflow → undersized-alloc → heap-OOB chain** (CWE-190→122): the pieces exist separately;
-  the chaining is not wired.
-- **Go/Rust injection probes** (CWE-78): the only known gap in the otherwise-solid injection column.
+- **int-overflow → undersized-alloc → heap-OOB chain (CWE-190→122)** — BUILT. The CWE-190 detector
+  now catches the dominant `var * literal` shape (`malloc(n*16)`), the scanf family is a strong
+  input reader (so a scanf-sourced size is attacker-controlled, not hygiene), and a CWE-190 lead is
+  admitted into `chain_primitive` and routed to the heap-overflow engine (whose `menu.alloc_primers`
+  already drives the 32-bit wrap thresholds that undersize the allocation). Validated end-to-end: a
+  scanf-sourced `malloc(count*16)` files a high CWE-190 + a source recipe + a chain recipe, and the
+  bug reaches a poc-backed control-flow hijack. Honest remainder: L3 via the CWE-190 path on a PIE
+  target needs an in-band ASLR leak (the live-hijack path is non-PIE); the deterministic, no-fuzz
+  ASan confirmation of the undersizing overflow (independent of win/leak) is the next refinement.
+- **tcache poisoning → L3 for double/invalid free (CWE-415/590/762)** — the tcache-poison /
+  fastbin-dup engine already reaches L3 for 415/416; CWE-590/762 (invalid / mismatched free) are now
+  routed into it (admitted as leads, mapped to the double_free vclass) and moved to the rce ceiling.
+- **Go/Rust injection probes (CWE-78)** — BUILT. argv-direct exec payloads (`echo <marker>`), the
+  `posix_spawn` libc sink, and the Go/Rust managed sink + stdin-channel vocabularies; the
+  forgery-proof marker oracle is unchanged, so a non-injectable managed target still never confirms.
+- **format-string-on-PIE** — the fgets/read-loop leak-channel detection is built (a sink reached ≥2×
+  via a proven caller-loop now gets the two-stage plan). Honest remainder: the sweep-speed half —
+  pinning the %hhn write slot from recovered cross-function frame geometry to shrink the k-sweep.
+- **Win64 weaponiser + WoW64** — the single-call Win64 ROP → WinExec/system L3 is joined by a
+  COMPOSED multi-register chain (`rop_solver.solve_reg_chain` over `_pe_exec_segments`), so a PE
+  lacking the exact `pop rcx; ret` gadget but with a clean multi-insn setter now reaches L3, and a
+  multi-argument sink can be driven. Honest remainder: the 32-bit WoW64 lane (stdcall stack args,
+  32-bit SEH overwrite) and leak-based ROP under Wine's fixed addresses (unverifiable there).
 
 ## Memory corruption (high-leverage: overflow → ROP / disclosure)
 
@@ -75,7 +88,7 @@ needing a technique that is not yet built rather than a target that happens to e
 | 122 | heap buffer overflow | ✓ | heap, heap_groom | — | drive narrowed heap-overflow candidate to groom→hijack |
 | 119/788/126/127/124 | bounds errors | ✓ | (shared w/ 787/125) | L2 (ncompress 119) | fold into 787/125 mechanisms |
 | 416 | use-after-free | ✓ | heap, aaheg | ? | prove on a real UAF target (none in bench yet) |
-| 415/590/762 | double/invalid free | ✓/– | heap, aaheg | — | detector for 590/762; tcache-poison → L3 |
+| 415/590/762 | double/invalid free | ✓ | heap, aaheg, **chain_primitive (tcache-poison/fastbin-dup)** | L3 (415/416) | CWE-590/762 (invalid/mismatched free) now ROUTED into the double_free tcache-poison/fastbin-dup engine that already reaches L3 for 415/416 (admitted as leads, mapped to the double_free vclass, moved to the rce ceiling) |
 | 476 | NULL deref | ✓ | rootcause (SEGV→CWE-476) | — | **IMPLEMENTED** (rootcause.py maps SEGV/null-deref→CWE-476; a reached fault files L1). Honest DoS ceiling unless the pointer is controllable. Undemonstrated on the current bench |
 | 824/822 | uninit/untrusted pointer | ✓ | chain_primitive | — | drive to controlled deref |
 | 457 | uninitialized read | ✓ | MSan build + mem_oracle | — | **IMPLEMENTED** (compile_source_msan + `mem_oracle` detonates the corpus on the MSan build → CWE-457/200). Undemonstrated on the current bench (also listed in the logic/hygiene table) |
@@ -84,7 +97,7 @@ needing a technique that is not yet built rather than a target that happens to e
 
 | CWE | name | detect | mechanism | demo | gap → next mechanism |
 |-----|------|:--:|:--:|:--:|------|
-| 190 | integer overflow | ✓ | overflow_recipe | ? | int-overflow → undersized alloc → heap OOB chain to L3 |
+| 190 | integer overflow | ✓ | overflow_recipe, source_recipe, **chain_primitive (heap_overflow)** | **L2 recipe + fuzz-confirmed hijack** | CHAIN WIRED: detector now catches `var*literal` (`malloc(n*16)`) + scanf-sourced sizes are strong; a CWE-190 lead is admitted into chain_primitive and routed to the heap-overflow engine (alloc_primers wrap thresholds undersize the allocation). L3 via this path on PIE needs an in-band ASLR leak; a deterministic ASan confirmation of the undersizing overflow is the next refinement |
 | 191 | integer underflow | ✓ | – | — | fold into the 190 chain |
 | 131 | wrong buffer-size calc | ✓ | oob_recipe | — | → 787/122 |
 | 369 | divide by zero | ✓ | rootcause (SIGFPE→CWE-369) | — | **IMPLEMENTED** (rootcause.py maps SIGFPE→CWE-369; a reached fault files L1). Honest DoS ceiling. Undemonstrated on the current bench (no div-by-zero target) |
