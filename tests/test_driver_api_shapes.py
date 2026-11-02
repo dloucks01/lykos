@@ -78,7 +78,10 @@ def test_typedefs_and_function_pointer_params_are_read(mdlike):
 
 def test_the_public_one_call_api_outranks_an_internal_helper(mdlike):
     ranked = L.rank_harness_fns(mdlike, limit=8)
-    assert ranked[0] == "md_html", ranked
+    # the public parser APIs -- md_html, and md_parse now that its callbacks struct is constructed
+    # from the project's own header -- both outrank the internal helper
+    assert set(ranked[:2]) == {"md_html", "md_parse"}, ranked
+    assert ranked.index("entity_lookup") > 1
 
 
 def test_a_callback_stub_has_the_callbacks_exact_signature():
@@ -114,9 +117,28 @@ def test_md_html_driver_passes_the_gate_and_finds_the_real_bug(mdlike, tmp_path)
                                      or "stack-buffer-overflow" in reports)
 
 
-def test_a_call_with_an_invented_null_struct_is_never_fuzzed(mdlike, tmp_path):
+def test_a_callbacks_struct_from_the_projects_header_is_constructed(mdlike, tmp_path):
+    """md_parse(text, size, const MD_PARSER*, userdata): the header defines MD_PARSER, so the
+    driver includes it, zeroes one and points its callbacks at exact-signature stubs -- the parser
+    is driven instead of dereferencing a NULL the harness invented."""
     _clang()
     b = L.build_libfuzzer(mdlike, tmp_path / "parse.bin", spec=L.fn_spec(mdlike, "md_parse"))
+    assert b["ok"], b.get("log", "")[-800:]
+    assert "struct" in b["harness"]
+    assert L.trivial_input_crash(b["binary"], tmp_path / "triv") is None
+
+
+def test_a_call_with_an_invented_null_struct_is_never_fuzzed(tmp_path):
+    """A handle whose layout the project keeps private (defined only in its .c) cannot be
+    constructed: the harness passes NULL, the library dereferences it on the first input, and the
+    trivial-input gate refuses the harness rather than file our NULL as the library's crash."""
+    _clang()
+    (tmp_path / "h.h").write_text("struct hidden;\nint use(const char *d, unsigned n, "
+                                  "struct hidden *h);\n")
+    (tmp_path / "h.c").write_text('#include "h.h"\nstruct hidden { int v; };\n'
+                                  "int use(const char *d, unsigned n, struct hidden *h)"
+                                  "{ return h->v + (int)n + (d ? 0 : 1); }\n")
+    b = L.build_libfuzzer(tmp_path, tmp_path / "use.bin", spec=L.fn_spec(tmp_path, "use"))
     assert b["ok"], b.get("log", "")[-800:]
     bad = L.trivial_input_crash(b["binary"], tmp_path / "triv")
     assert bad and "0-byte input" in bad

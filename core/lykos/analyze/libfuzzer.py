@@ -192,6 +192,22 @@ def defs_index(root) -> dict:
     return _cache_put(_DEFS_CACHE, key, idx)
 
 
+def _raw_params(root, fn: str) -> list:
+    """`fn`'s parameters as SPELLED in its definition (typedef names kept) -- what a harness that
+    includes the project's header must use."""
+    hit = defs_index(root).get(fn)
+    if not hit:
+        return []
+    try:
+        txt = Path(hit[0]).read_text(errors="ignore")
+    except OSError:
+        return list(hit[1])
+    for name, params in _fn_defs(txt, static_aliases(root)):
+        if name == fn:
+            return [] if params == ["void"] else list(params)
+    return list(hit[1])
+
+
 def fn_params(root, fn: str) -> list:
     """`fn`'s parameter type spellings, or [] when it is not found / takes none."""
     params = defs_index(root).get(fn, (None, []))[1]
@@ -820,9 +836,11 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
             # flags)` -- six honest arguments, the library's documented one-call API -- below
             # `entity_lookup(name, len)`, an internal table lookup.
             extra = raw[2:] if len(raw) > 2 else []
-            score = -sum(1 for a in extra if not _opaque_param(a))
-            if any(_opaque_param(a) for a in raw[1:]):
-                score -= 6 + 2 * sum(1 for a in raw[1:] if _opaque_param(a))
+            # a callbacks struct the tree's own header defines is constructed, not invented
+            _opq = [a for a in raw[1:] if _opaque_param(a) and not constructible(root, a)]
+            score = -sum(1 for a in extra if a not in _opq)
+            if _opq:
+                score -= 6 + 2 * len(_opq)
             # The (bytes, length) pair libFuzzer hands over directly: the whole input reaches the
             # function intact, with no NUL-termination or file round trip in between.
             if len(raw) >= 2 and _LEN_PARAM.search(raw[1]) and "*" not in raw[1]:
@@ -1460,6 +1478,117 @@ def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
             f"    {consume}({', '.join(args)});\n"
             + free_call
             + "    return 0;\n}\n")
+
+
+# ---- constructing a callbacks struct an API takes by pointer ------------------------------------
+#
+# md4c's `md_parse(text, size, const MD_PARSER *parser, userdata)` takes its renderer as a struct of
+# callbacks, so the parser could only be fuzzed through `md_html` -- every other user of the parser
+# was unreachable, and handing it NULL makes it dereference our NULL (the trivial-input gate rejects
+# exactly that). The project's OWN header defines the struct, so the harness includes it, zeroes an
+# instance, and points each function-pointer field at a stub of that field's exact signature that
+# does nothing and returns 0 ("continue" / success, the near-universal C callback convention). A
+# field the library actually needs set to something else makes it fail on the trivial input, and the
+# gate then refuses the harness -- so this cannot manufacture a finding, only reach code.
+
+_STRUCT_DEF = r"(?:typedef\s+)?struct\s+(\w+)?\s*\{{([^{{}}]*)\}}\s*(\w*)\s*;"
+_FIELD_FNPTR = re.compile(r"^\s*(.+?)\s*\(\s*\*\s*(\w+)\s*\)\s*\((.*)\)\s*$", re.S)
+
+
+def _strip_comments_c(t: str) -> str:
+    return re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", "", t, flags=re.S))
+
+
+def struct_layout(root, name: str):
+    """(header, [(field_name, ret_type, [param types])] for the function-pointer fields) of the
+    struct named `name` (tag or typedef) in the tree's headers, or None when it is not defined
+    there, nests braces, or has a function-pointer field whose parameters cannot be spelled."""
+    root = Path(root)
+    for h in sorted(root.rglob("*.h")):
+        if any(seg in _SKIP_DIRS for seg in h.relative_to(root).parts):
+            continue
+        try:
+            txt = _strip_comments_c(h.read_text(errors="ignore"))
+        except OSError:
+            continue
+        for m in re.finditer(_STRUCT_DEF.format(), txt, re.S):
+            tag, body, alias = m.group(1), m.group(2), m.group(3)
+            if name not in (tag, alias):
+                continue
+            fns = []
+            for decl in body.split(";"):
+                decl = " ".join(decl.split())
+                if not decl or "(" not in decl:
+                    continue
+                fm = _FIELD_FNPTR.match(decl)
+                if not fm:
+                    return None
+                ret, fname, params = fm.group(1).strip(), fm.group(2), fm.group(3)
+                ps = [] if params.strip() in ("", "void") else split_params(params)
+                if any("(" in x for x in ps):
+                    return None                          # a callback taking a callback: not spelled
+                fns.append((fname, ret, ps))
+            return h, fns
+    return None
+
+
+def struct_param_type(param: str):
+    """The struct name a `T *name` / `const T* name` parameter points at, else None."""
+    m = re.match(r"^\s*(?:const\s+)?(?:struct\s+)?(\w+)\s*\*\s*\w*\s*$", param or "")
+    if not m or m.group(1) in ("char", "void", "int", "unsigned", "uint8_t", "u_char", "short",
+                               "long", "size_t", "FILE"):
+        return None
+    return m.group(1)
+
+
+def constructible(root, param: str) -> bool:
+    t = struct_param_type(param)
+    return bool(t) and struct_layout(root, t) is not None
+
+
+def synth_struct_harness(root, fn: str, raw_params: list) -> str | None:
+    """A harness that includes the header declaring `fn`, constructs every callbacks-struct
+    argument (see the block comment above), and passes the fuzz bytes as (data, size)."""
+    hdr = _declared_in_header(root, fn)
+    if hdr is None or len(raw_params) < 2:
+        return None
+    pre, stubs, args, n = [], [], [], 0
+    resolved = resolve_params(raw_params, typedef_map(root))     # shapes are tested resolved
+    for i, prm in enumerate(raw_params):
+        t = _strip_param_name(prm)
+        if i == 0:
+            args.append(f"({t})data")
+            continue
+        if i == 1 and _LEN_PARAM.search(resolved[i]) and "*" not in resolved[i]:
+            args.append(f"({t})size")
+            continue
+        st = struct_param_type(prm)
+        lay = struct_layout(root, st) if st else None
+        if lay is not None:
+            var = f"lykos_s{n}"
+            n += 1
+            pre.append(f"    {st} {var}; memset(&{var}, 0, sizeof {var});\n")
+            for fname, ret, ps in lay[1]:
+                sname = f"lykos_cb_{var}_{fname}"
+                named = ", ".join(f"{_strip_param_name(x)} a{k}" for k, x in enumerate(ps)) \
+                    or "void"
+                body = "" if ret.strip() == "void" else " return 0;"
+                stubs.append(f"static {ret} {sname}({named}) {{{body} }}\n")
+                pre.append(f"    {var}.{fname} = {sname};\n")
+            args.append(f"&{var}")
+        elif is_void_callback(prm):
+            args.append(f"(void*){callback_stub(prm)}")
+        elif "*" in prm:
+            args.append("NULL")
+        else:
+            args.append("0")
+    if not n:
+        return None
+    return with_stubs(
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
+        f'#include "{Path(hdr).name}"\n' + "".join(stubs)
+        + "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n" + "".join(pre)
+        + f"    {fn}({', '.join(args)});\n    return 0;\n}}\n")
 
 
 def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None,
@@ -2358,11 +2487,18 @@ def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=None) -> dict
         # `cstring` for everything, which delivers the fuzz bytes as a string -- wrong for every
         # entry point that takes a FILENAME, i.e. every file-format library.
         fk = spec.get("fn_kind") or harness_kind_for(root, fn)
-        if fk == "file":
+        _raw = _raw_params(root, fn)
+        _sh = (synth_struct_harness(root, fn, _raw)
+               if fk == "buflen" and not cxx and any(constructible(root, a) for a in _raw)
+               else None)
+        if _sh is not None:
+            h.write_text(_sh)
+            fk = "buflen+struct"
+        elif fk == "file":
             params = fn_params(root, fn)
             h.write_text(synth_file_harness(fn, params, closer=fn_closer(root, fn),
                                             cxx=cxx, c_linkage=c_linkage))
-        else:
+        elif _sh is None:
             h.write_text(synth_harness(fn, kind=fk, arg_type=fn_first_arg_type(root, fn),
                                        cxx=cxx, c_linkage=c_linkage,
                                        params=fn_params(root, fn)))
