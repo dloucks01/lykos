@@ -107,6 +107,7 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("cve_poc", "CVE weaponization", "target", "..analyze.poc", "enqueue_cve_poc", no_params=True),
     StageSpec("cve_corroborate", "CVE corroboration", "target", "..analyze.fingerprint", "enqueue_cve_corroborate", no_params=True),
     StageSpec("synthesize_injection", "Injection probes", "target", "..analyze.poc", "enqueue_inject"),
+    StageSpec("palette_overread", "Palette over-read (directed)", "target", "..analyze.poc", "enqueue_palette_overread", no_params=True),
     StageSpec("fuzz", "Black-box fuzzing", "target", "..analyze.fuzz", "enqueue_fuzz"),
     StageSpec("coverage_fuzz", "Coverage fuzzing", "target", "..analyze.fuzz", "enqueue_coverage_fuzz"),
     StageSpec("directed_fuzz", "Directed fuzzing", "target", "..analyze.fuzz", "enqueue_directed_fuzz"),

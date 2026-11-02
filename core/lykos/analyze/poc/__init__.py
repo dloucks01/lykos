@@ -11,6 +11,9 @@ from .exploit_stage import EXPLOIT_STAGE, enqueue_exploit  # noqa: F401
 from .exploit_stage import register as _register_exploit
 from .inject_stage import INJECT_STAGE, enqueue_inject  # noqa: F401
 from .inject_stage import register as _register_inject
+from .palette_overread_stage import STAGE as PALETTE_STAGE  # noqa: F401
+from .palette_overread_stage import enqueue_palette_overread  # noqa: F401
+from .palette_overread_stage import register as _register_palette
 from .poc_diff import POC_DIFF_STAGE, enqueue_poc_diff  # noqa: F401
 from .poc_diff import register as _register_poc_diff
 from .primitive_stage import PRIMITIVE_STAGE, enqueue_primitive  # noqa: F401
@@ -31,5 +34,6 @@ def register() -> None:
     _register_poc_diff()
     _register_synth()
     _register_inject()
+    _register_palette()
     _register_secret()
     _register_cve_poc()

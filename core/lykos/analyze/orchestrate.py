@@ -2354,6 +2354,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
                 # CWE-class probes -- recording a verified reproduction only if the target faults.
                 _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
+                # Directed, no-fuzzing trigger for a GIF palette over-read (gif2rgb /
+                # CVE-2016-3977 shape): construct a valid GIF whose pixel index is past the colour
+                # table, reproduce the heap over-read (L1), then disclose heap at an attacker-chosen
+                # offset to the output (L3). Self-skips on a non-GIF target, so a non-GIF pays ~0.
+                _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
                 # Demonstrate injection / format-string leaks by probing the binary's sinks directly
                 # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
                 if not _is_server:          # a stdin prober; a server never reads stdin
@@ -2382,7 +2387,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     _srv_decline = ("heap_check heap_trace oob_index mem_oracle chain_primitive "
                                     "env_fuzz fuzz coverage_fuzz directed_fuzz synthesize_poc "
                                     "concolic behavior_trace dynamic_taint multi_debug "
-                                    "debug_monitor").split()
+                                    "debug_monitor palette_overread").split()
                     bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
                                           **{k: _why_srv for k in _srv_decline}}
                 # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
