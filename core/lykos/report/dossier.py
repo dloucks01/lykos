@@ -108,8 +108,10 @@ def assess_severity(f: dict, level: str, *, access: Optional[str], effect: Optio
         return "medium", "a reproducible hang/exhaustion: denial of service"
     if cwe == "CWE-401":
         return "low", "a reproducible memory leak: slow resource exhaustion"
-    if access == "write" or "use-after-free" in k or "double-free" in k or cwe in (
-            "CWE-416", "CWE-415", "CWE-787", "CWE-121", "CWE-122"):
+    # The MEASURED access decides before the CWE label does: a replayed crash is often filed under
+    # a write CWE by default, and a heap-buffer-overflow READ was graded as corruption.
+    if access == "write" or "use-after-free" in k or "double-free" in k or (
+            access is None and cwe in ("CWE-416", "CWE-415", "CWE-787", "CWE-121", "CWE-122")):
         return "high", ("memory CORRUPTION reproduced (an out-of-bounds or freed-memory write); "
                         "exploitation was not demonstrated, but this class routinely is")
     if "null" in k or cwe == "CWE-476":
@@ -216,6 +218,16 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
     level = f.get("level") or (poc or {}).get("level") or ""
     input_sha = (poc or {}).get("input_sha") or next(
         (c.get("input_sha") for c in f.get("crashes") or [] if c.get("input_sha")), None)
+    if not input_sha:
+        # a finding that names its crashing input only in its evidence ("crashing input 3e95..")
+        for e in f.get("evidence") or []:
+            m = re.search(r"\binput ([0-9a-f]{12})", e.get("detail") or "")
+            if m:
+                full = next((d.input_sha for d in DynResultDAO(cx.conn).list_by_target(t["id"])
+                             if (d.input_sha or "").startswith(m.group(1))), None)
+                input_sha = full or input_sha
+                if full:
+                    break
     dyns = [d for d in DynResultDAO(cx.conn).list_by_target(t["id"])
             if input_sha and d.input_sha == input_sha]
     dyn = next((d for d in dyns if d.argv), dyns[0] if dyns else None)
@@ -240,7 +252,10 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
         if b:
             stderr = b.decode("latin-1", "ignore")
             break
+    if not parse_sanitizer(stderr) and poc and poc.get("bundle_sha"):
+        stderr = _bundle_stderr(cx.bytes_of(poc.get("bundle_sha"))) or stderr
     san = parse_sanitizer(stderr)
+    harness = next((d.isolation for d in dyns if (d.isolation or "").startswith("libfuzzer")), None)
 
     # what it is, in words
     access = (san or {}).get("access") or av.get("access") or pv.get("access")
@@ -271,11 +286,17 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
 
     # how it is triggered and reproduced
     exe = t.get("filename") or "target"
+    if harness:
+        # the crash is the HARNESS's (the bundle ships it as target.bin), not the program's
+        exe, argv, mode = "harness", ["@@"], "file"
     flags = [a for a in argv if a != "@@"]
     trig = []
     if flags:
         trig.append("invoked with " + " ".join(flags) + " (options the fuzzer found; the defect "
                     "is not reached without them)")
+    if harness:
+        trig.append("reached through the libFuzzer harness lykos built for the library's API "
+                    "(the PoC bundle ships it as target.bin)")
     trig.append({"file": "input delivered as a file argument", "stdin": "input on standard input",
                  "arg": "input as a command-line argument",
                  "env": "input in an environment variable"}.get(mode, f"input via {mode}"))
@@ -294,7 +315,8 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
     if poc and poc.get("bundle_sha"):
         b = (poc.get("bundle_sha") or "")[:8]
         repro.append({"note": "the self-contained PoC bundle (target, input and runner):",
-                      "cmd": f"tar xzf {exe}-{level or 'L1'}-{b}.tar.gz && sh poc/runner.sh"})
+                      "cmd": f"tar xzf {t.get('filename') or 'target'}-{level or 'L1'}-{b}.tar.gz"
+                             " && sh poc/runner.sh"})
     repro.append({"note": "or by hand, with the crash input saved as poc-input.bin "
                           "(run in a sandbox or VM):", "cmd": cmd})
     data = cx.bytes_of(input_sha) or b""
@@ -318,9 +340,16 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
            if (access != "read" or controlled) else [])
 
     from .html import _remediation
+    cwe, cwe_name = f.get("cwe"), f.get("cwe_name")
+    # The sanitizer says READ or WRITE; a generic crash finding guesses. A replayed libFuzzer
+    # crash was filed CWE-787 (out-of-bounds WRITE) for a heap-buffer-overflow READ.
+    if access in ("read", "write") and cwe in ("CWE-119", "CWE-787", "CWE-125", "CWE-122", None):
+        from ..cwe import cwe_info
+        cwe = "CWE-125" if access == "read" else "CWE-787"
+        cwe_name = cwe_info(cwe)[0] or cwe_name
     return {
         "id": f.get("id"), "title": what["title"], "summary": what["summary"],
-        "cwe": f.get("cwe"), "cwe_name": f.get("cwe_name"), "state": f.get("state"),
+        "cwe": cwe, "cwe_name": cwe_name, "state": f.get("state"),
         "level": level, "verified": bool((poc or {}).get("verified")),
         "severity": sev, "severity_why": why_sev, "detector_severity": f.get("severity"),
         "location": loc, "trigger": trig, "reproduce": repro,
@@ -331,11 +360,10 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
         "escalation": stops, "mitigations": mit,
         # The remediation follows what the defect DOES: CWE-119 is the umbrella a binary crash is
         # filed under, and its write-overflow advice is wrong for a read past the buffer end.
-        "remediation": _remediation("CWE-125" if access == "read" and f.get("cwe") in (
-            "CWE-119", None) else ("CWE-787" if access == "write" and f.get("cwe") == "CWE-119"
-                                   else f.get("cwe"))),
+        "remediation": _remediation(cwe),
         "found_by": f.get("stage_label") or f.get("detector"),
         "bundle": (poc or {}).get("bundle_sha"),
+        "input_sha": input_sha,
     }
 
 
@@ -640,7 +668,7 @@ def build_narrative(store, case_id: str, report: dict) -> dict:
                                      "reproduce": [], "input": None, "evidence": [],
                                      "escalation": [], "mitigations": [],
                                      "remediation": "", "impact": "", "cwe": f.get("cwe")})
-        dossiers = _merge_attributed(dossiers, t)
+        dossiers = _merge_same_input(_merge_attributed(dossiers, t))
         dossiers.sort(key=lambda d: (-_SEV_RANK.get(d.get("severity") or "info", 0),
                                      -_LEVEL_RANK.get(d.get("level") or "L0", 0)))
         all_dossiers += [dict(d, target=t.get("filename")) for d in dossiers]
@@ -649,6 +677,54 @@ def build_narrative(store, case_id: str, report: dict) -> dict:
                         "methodology": _methodology(report, t),
                         "limitations": _limitations(t)})
     return {"executive": _executive(report, targets, all_dossiers), "targets": targets}
+
+
+def _bundle_stderr(blob: Optional[bytes]) -> Optional[str]:
+    """`poc/stderr.txt` from a PoC bundle: the sanitizer report the verifying replay printed."""
+    if not blob:
+        return None
+    import io
+    import tarfile
+    try:
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as tf:
+            for m in tf.getmembers():
+                if m.name.endswith("stderr.txt") and m.isfile() and m.size < (4 << 20):
+                    fh = tf.extractfile(m)
+                    return fh.read().decode("latin-1", "ignore") if fh else None
+    except Exception:                                    # noqa: BLE001 -- a report helper
+        return None
+    return None
+
+
+def _merge_same_input(dossiers: list) -> list:
+    """One dossier per crashing INPUT: the stage that found a crash and the stage that replayed it
+    (build_poc files its own 'Reproduced crash' row) describe one defect. md4c's heap overflow was
+    shown twice -- as 'heap-buffer-overflow (libFuzzer)' and as 'Reproduced crash (SIGABRT)'.
+    The one with a sanitizer-derived title and the verified proof wins; the other's evidence
+    is kept."""
+    out: list = []
+    by_input: dict = {}
+    for d in dossiers:
+        key = d.get("input_sha")
+        if not key or key not in by_input:
+            out.append(d)
+            if key:
+                by_input[key] = d
+            continue
+        a = by_input[key]
+        keep, drop = (a, d) if (bool(a.get("sanitizer")), bool(a.get("verified"))) >= (
+            bool(d.get("sanitizer")), bool(d.get("verified"))) else (d, a)
+        for k in ("level", "verified", "bundle"):
+            if not keep.get(k) and drop.get(k):
+                keep[k] = drop[k]
+        if drop.get("reproduce") and not any("tar xzf" in str(r) for r in keep.get("reproduce") or []):
+            keep["reproduce"] = drop["reproduce"]
+        keep["evidence"] = list(dict.fromkeys((keep.get("evidence") or [])
+                                              + (drop.get("evidence") or [])))[:10]
+        if keep is d:
+            out[out.index(a)] = d
+            by_input[key] = d
+    return out
 
 
 _ATTRIB = re.compile(r"faulting instruction IS this site \((0x[0-9a-f]+)")

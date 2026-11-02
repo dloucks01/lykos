@@ -71,3 +71,23 @@ def test_leads_explain_why_and_fold_call_sites():
     assert g["dangerous_api"]["sites"] == 2 and g["dangerous_api"]["kind"] == "API-use pattern"
     assert "not a defect" in g["dangerous_api"]["why"]
     assert "assumed" in g["uc_symbolic"]["why"] or "isolation" in g["uc_symbolic"]["why"]
+
+
+def test_the_measured_access_outranks_the_cwe_label():
+    """md4c: a heap-buffer-overflow READ replayed by build_poc was filed CWE-787 and graded as
+    corruption."""
+    f = {"cwe": "CWE-787", "severity": "high"}
+    assert D.assess_severity(f, "L1", access="read", effect=None, controlled=False)[0] == "medium"
+    assert D.assess_severity(f, "L1", access=None, effect=None, controlled=False)[0] == "high"
+
+
+def test_one_dossier_per_crashing_input():
+    found = {"id": "a", "input_sha": "x" * 64, "sanitizer": {"kind": "heap-buffer-overflow"},
+             "verified": False, "evidence": ["libFuzzer found it"], "reproduce": []}
+    replayed = {"id": "b", "input_sha": "x" * 64, "sanitizer": None, "verified": True,
+                "level": "L1", "bundle": "b" * 64, "evidence": ["PoC verified"],
+                "reproduce": [{"cmd": "tar xzf t-L1-bbbb.tar.gz && sh poc/runner.sh"}]}
+    out = D._merge_same_input([found, replayed])
+    assert out == [found]
+    assert found["verified"] and found["level"] == "L1" and found["bundle"] == "b" * 64
+    assert "PoC verified" in found["evidence"] and "tar xzf" in str(found["reproduce"])
