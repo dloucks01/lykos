@@ -240,6 +240,14 @@ _RUST_SOURCES = ("env::args", "env..args", "env::var", "env..var", "io::stdin", 
 _RUST_SIG = re.compile(r"::h[0-9a-f]{16}\b")
 
 
+def _go_canon(name) -> str:
+    """A Go method symbol in radare2's flag form, which the source/sink tables are written in:
+    rizin renders `bufio.(*Reader).ReadString` where radare2 renders `bufio._Reader_.ReadString`,
+    so with rizin present no Go input source matched and the os/exec.Command sink fed by stdin
+    stayed a candidate."""
+    return re.sub(r"\(\*?([\w.]+)\)", r"_\1_", name or "")
+
+
 @register_detector
 def lang_sinks(ctx: DetectContext):
     tc = (ctx.toolchain or "").lower()
@@ -257,7 +265,7 @@ def lang_sinks(ctx: DetectContext):
     sources = _GO_SOURCES if is_go else _RUST_SOURCES
 
     def _hit(name, needles):
-        n = name or ""
+        n = _go_canon(name)
         return any(k in n for k in needles)
     src_fns = {e.src_addr for e in ctx.call_edges if _hit(e.dst_name, sources)}
     callers = defaultdict(set)
@@ -268,7 +276,7 @@ def lang_sinks(ctx: DetectContext):
     out, seen = [], set()
     for e in ctx.call_edges:
         hit = next(((cwe, sev, desc) for pat, cwe, sev, desc in sinks
-                    if e.dst_name and pat in e.dst_name), None)
+                    if e.dst_name and pat in _go_canon(e.dst_name)), None)
         if not hit:
             continue
         cwe, sev, desc = hit
