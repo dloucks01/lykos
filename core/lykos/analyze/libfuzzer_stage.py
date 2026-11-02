@@ -374,8 +374,22 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     corpus = corpus + [g for g in _generic if g not in corpus]
     ctx.progress(msg=f"libFuzzer: {spec.get('entry')} for {int(seconds)}s"
                      + (f", {len(corpus)} seeds" if corpus else ""))
+    _t0 = time.monotonic()
     res = LF.run_libfuzzer(build["binary"], ctx.scratch() / spec["id"], seconds=int(seconds),
                            max_len=max_len, corpus=corpus or None, lib_dirs=build.get("lib_dirs"))
+    # A plain run stops at its FIRST crash. When it did and the slice has time left, keep fuzzing
+    # the same entry point past it (fork mode), so one door's second and third defects are found
+    # instead of handing the rest of its time to the next entry point.
+    _left = seconds - (time.monotonic() - _t0)
+    if res.get("crashes") and _left >= 20:
+        more = LF.run_libfuzzer(build["binary"], ctx.scratch() / (spec["id"] + "-kg"),
+                                seconds=int(_left), max_len=max_len,
+                                corpus=(res.get("corpus") or corpus or None),
+                                lib_dirs=build.get("lib_dirs"), keep_going=True)
+        res["crashes"] = list(res["crashes"]) + list(more.get("crashes") or [])
+        res["execs"] = int(res.get("execs") or 0) + int(more.get("execs") or 0)
+        res["corpus"] = more.get("corpus") or res.get("corpus")
+        row["kept_going"] = True
     row["execs"] = int(res.get("execs") or 0)
     row["corpus_in"] = len(corpus)
     row["corpus_kept"] = _save_corpus(cache_dir, res.get("corpus") or [])

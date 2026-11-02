@@ -2653,7 +2653,8 @@ _UNITS_RE = re.compile(r"stat::number_of_executed_units:\s*(\d+)")
 #: Every progress line is prefixed with the execution count (`#4096\tpulse  cov: 211 ...`). The
 #: final-stats block does not print when the run ends in a crash, which is precisely the run whose
 #: count matters, so the counter is read from the log as well.
-_TICK_RE = re.compile(r"^#(\d+)\s", re.M)
+# `#1234\tNEW ...` in the normal loop, `#55042: cov: ...` in fork mode (-fork=N)
+_TICK_RE = re.compile(r"^#(\d+):?\s", re.M)
 
 
 def executions(log: str) -> int:
@@ -2691,6 +2692,19 @@ def _report_has_source(report: str | None) -> bool:
         # Best-effort predicate: if the report cannot be classified, treat it as sourceless so the
         # replay pass still runs (it loses nothing -- a replay that also yields no source is a no-op).
         return False
+
+
+def _fault_signature(report: str) -> str:
+    """A defect's identity in a sanitizer report: its first SOURCE frame (file:line), else its
+    summary line -- so repeated hits of one bug collapse and two bugs stay two."""
+    m = re.search(r"#\d+ 0x[0-9a-f]+ in \S+ (\S+:\d+)", report or "")
+    if m:
+        return m.group(1).rsplit("/", 1)[-1]
+    m = re.search(r"([^\s/]+:\d+):\d+: runtime error", report or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"SUMMARY: (.+)", report or "")
+    return (m.group(1)[:120] if m else "")
 
 
 def _replay_report(binary, workdir: Path, data: bytes) -> str:
@@ -2761,8 +2775,13 @@ def trivial_input_crash(binary, workdir, *, lib_dirs: list | None = None) -> str
     return None
 
 
+#: How many crash files a keep-going run replays for their own reports (each is one exec).
+_KEEP_GOING_REPLAYS = 64
+
+
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
-                  corpus: list | None = None, lib_dirs: list | None = None) -> dict:
+                  corpus: list | None = None, lib_dirs: list | None = None,
+                  keep_going: bool = False) -> dict:
     """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
     Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed."""
     workdir = Path(workdir)
@@ -2789,6 +2808,11 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
             # stderr for its OWN stats and ASan's crash report still reaches stderr (verified), so
             # `fault_report` below and the crash harvest are unaffected -- only the routine spew is gone.
             "-close_fd_mask=2"]
+    if keep_going:
+        # Past the first crash. A plain run STOPS at it: md4c's md_html harness found a heap
+        # overflow after 9,705 executions and the rest of its slice went to another entry point,
+        # while fork mode on the same harness reaches a second, different defect within seconds.
+        argv += ["-fork=1", "-ignore_crashes=1", "-ignore_timeouts=1", "-ignore_ooms=1"]
     crashes = []
     before = set(art.iterdir())
     try:
@@ -2800,6 +2824,29 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         return {"crashes": [], "log": f"libFuzzer binary could not be run: {e!r}", "corpus": [],
                 "execs": 0}
     report = fault_report(out)
+    if keep_going:
+        # One log, many crashes: the loop's report belongs to whichever crashed LAST. Each file is
+        # replayed on its own for its own report, and one input is kept per distinct fault site.
+        seen_sig: set = set()
+        for f in sorted(set(art.iterdir()) - before)[:_KEEP_GOING_REPLAYS]:
+            kind = next((k for pre, k in ARTIFACT_KINDS.items() if f.name.startswith(pre)), None)
+            if not kind:
+                continue
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            rep = _replay_report(binary, workdir, data) if kind == "crash" else ""
+            if kind == "crash" and not rep:
+                continue                                 # did not reproduce alone: not kept
+            sig = (kind, _fault_signature(rep))
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            crashes.append({"input": data, "report": rep, "kind": kind, "artifact": f.name,
+                            "reproduced": bool(rep) or kind != "crash"})
+        return {"crashes": crashes, "log": out[-4000:], "corpus": _harvest(corpus_dir),
+                "execs": executions(out)}
     for f in sorted(set(art.iterdir()) - before):
         kind = next((k for pre, k in ARTIFACT_KINDS.items() if f.name.startswith(pre)), None)
         if kind:

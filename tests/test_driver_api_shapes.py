@@ -120,3 +120,17 @@ def test_a_call_with_an_invented_null_struct_is_never_fuzzed(mdlike, tmp_path):
     assert b["ok"], b.get("log", "")[-800:]
     bad = L.trivial_input_crash(b["binary"], tmp_path / "triv")
     assert bad and "0-byte input" in bad
+
+
+def test_keep_going_finds_more_than_the_first_crash(mdlike, tmp_path):
+    """A plain libFuzzer run stops at its first crash; md4c's md_html harness then handed the rest
+    of its slice to another entry point. Fork mode keeps going, one input per distinct defect."""
+    _clang()
+    b = L.build_libfuzzer(mdlike, tmp_path / "html.bin", spec=L.fn_spec(mdlike, "md_html"))
+    assert b["ok"]
+    r = L.run_libfuzzer(b["binary"], tmp_path / "kg", seconds=15, corpus=[b"BUG", b"hi"],
+                        keep_going=True)
+    sigs = {L._fault_signature(c["report"]) for c in r["crashes"]}
+    assert any(sig.startswith("md.c:16") for sig in sigs), sigs
+    assert len(sigs) == len(r["crashes"])                # one input per distinct defect
+    assert r["execs"] > 0                                # fork-mode progress lines are counted
