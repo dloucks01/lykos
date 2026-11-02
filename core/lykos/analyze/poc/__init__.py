@@ -11,6 +11,9 @@ from .exploit_stage import EXPLOIT_STAGE, enqueue_exploit  # noqa: F401
 from .exploit_stage import register as _register_exploit
 from .inject_stage import INJECT_STAGE, enqueue_inject  # noqa: F401
 from .inject_stage import register as _register_inject
+from .jpeg_overread_stage import STAGE as JPEGREAD_STAGE  # noqa: F401
+from .jpeg_overread_stage import enqueue_jpeg_overread  # noqa: F401
+from .jpeg_overread_stage import register as _register_jpegread
 from .palette_overread_stage import STAGE as PALETTE_STAGE  # noqa: F401
 from .palette_overread_stage import enqueue_palette_overread  # noqa: F401
 from .palette_overread_stage import register as _register_palette
@@ -39,5 +42,6 @@ def register() -> None:
     _register_inject()
     _register_palette()
     _register_zipflow()
+    _register_jpegread()
     _register_secret()
     _register_cve_poc()
