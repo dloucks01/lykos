@@ -343,7 +343,12 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
     cwe, cwe_name = f.get("cwe"), f.get("cwe_name")
     # The sanitizer says READ or WRITE; a generic crash finding guesses. A replayed libFuzzer
     # crash was filed CWE-787 (out-of-bounds WRITE) for a heap-buffer-overflow READ.
-    if access in ("read", "write") and cwe in ("CWE-119", "CWE-787", "CWE-125", "CWE-122", None):
+    if (san or {}).get("kind") == "undefined-behavior":
+        from ..cwe import cwe_info
+        cwe = "CWE-758"
+        cwe_name = cwe_info(cwe)[0] or "Undefined behavior"
+    elif access in ("read", "write") and cwe in ("CWE-119", "CWE-787", "CWE-125", "CWE-122",
+                                                 None):
         from ..cwe import cwe_info
         cwe = "CWE-125" if access == "read" else "CWE-787"
         cwe_name = cwe_info(cwe)[0] or cwe_name
@@ -376,8 +381,15 @@ def _what_it_is(f, san, av, pv, rc, access) -> dict:
         if san.get("region"):
             r = san["region"]
             where = f' {r["offset"]} byte(s) {r["where"]} a {r["size"]}-byte buffer'
-        fn = (san.get("frames") or [{}])[0].get("fn") or ""
-        title = f"{k[0].upper()}{k[1:]}" + (f" in {fn}()" if fn else "")
+        fr0 = (san.get("frames") or [{}])[0]
+        fn = fr0.get("fn") or ""
+        where = f' ({fr0["file"]}:{fr0["line"]})' if fr0.get("file") and fr0.get("line") else ""
+        if san.get("kind") == "undefined-behavior" and san.get("message"):
+            # what UBSan said, not just the class: "execution reached an unreachable program point"
+            return {"title": f"Undefined behavior: {san['message'][:90]}{where}",
+                    "summary": f"UndefinedBehaviorSanitizer: {san['message']}{where}."}
+        # the source line goes in the title: two defects in one function stay two
+        title = f"{k[0].upper()}{k[1:]}" + (f" in {fn}()" if fn else "") + where
         return {"title": title,
                 "summary": f"{san['tool']} reports a {k}:{acc}{where}"
                            + (f", in {fn}()" if fn else "") + "."}

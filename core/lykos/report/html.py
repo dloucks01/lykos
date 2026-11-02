@@ -90,6 +90,11 @@ _REMEDIATION = {
                "scrub buffers before they cross the boundary.",
     "CWE-362": "Protect shared state with appropriate locking/atomics; run a thread sanitizer in CI.",
     "CWE-369": "Reject a zero (or INT_MIN/-1) divisor from untrusted input before dividing.",
+    "CWE-758": "Fix the code path the sanitizer reports: an input reaches behaviour the language "
+               "leaves undefined (here, code the authors marked unreachable), which an optimising "
+               "compiler may turn into an arbitrary jump. Handle that input explicitly.",
+    "CWE-617": "Replace the assertion on this path with input validation that rejects the input; an "
+               "assertion reachable from attacker input is a denial of service.",
     "CWE-798": "Remove embedded credentials/keys; load secrets from a managed store or environment "
                "at runtime and rotate the exposed ones.",
     "CWE-295": "Verify the full certificate chain and hostname; never disable validation.",
