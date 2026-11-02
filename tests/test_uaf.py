@@ -30,6 +30,24 @@ def test_double_free_is_flagged(tmp_path):
     assert len(h) == 1 and h[0]["cwe"] == "CWE-415"
 
 
+def test_free_of_a_non_start_pointer_is_cwe_761(tmp_path):
+    """Freeing a pointer-arithmetic or address-of expression is a free of a non-allocation-start
+    pointer (CWE-761) -- you can only free the exact value malloc returned."""
+    for expr in ("free(p + n)", "free(buf - 1)", "free(s->data + k)", "free(&x)", "free(&arr[i])"):
+        root = _tree(tmp_path, {"v.c": f"void f(char*p){{ {expr}; }}\n"})
+        h = [x for x in _hits(root) if x["cwe"] == "CWE-761"]
+        assert len(h) == 1, expr
+
+
+def test_a_normal_free_is_not_mistaken_for_a_non_start_free(tmp_path):
+    """0-FP: freeing a bare pointer, a member pointer, an array-of-pointers element, a function
+    return, a cast or a dereference is legitimate and must NOT be flagged CWE-761."""
+    for expr in ("free(p)", "free(p->next)", "free(list->head)", "free(arr[i])", "free(get())",
+                 "free((void*)p)", "free(*pp)", "g_free(node->name)"):
+        root = _tree(tmp_path, {"v.c": f"void f(char*p){{ {expr}; }}\n"})
+        assert not [x for x in _hits(root) if x["cwe"] == "CWE-761"], expr
+
+
 def test_use_after_free_deref_is_flagged(tmp_path):
     root = _tree(tmp_path, {"v.c": "void f(obj*o){\n free(o);\n o->next = 0;\n}\n"})
     h = _hits(root)

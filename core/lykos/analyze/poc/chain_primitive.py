@@ -62,7 +62,7 @@ _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow
            # An invalid / mismatched free lands a controlled (non-heap, or wrong-size-class) pointer
            # in a bin -- the same forward-pointer poison a double-free seeds -- so route it through
            # the tcache-poison / fastbin-dup dispatch the double_free class already drives to L3.
-           "CWE-590": "double_free", "CWE-762": "double_free",
+           "CWE-590": "double_free", "CWE-762": "double_free", "CWE-761": "double_free",
            # A negative size parameter (rootcause negative-size-param) wraps to a huge/truncated
            # allocation or copy -- the same undersizing an integer overflow creates -- so route it
            # through the heap-overflow engine (detonation-gated: a negative size that only fails the
@@ -87,7 +87,7 @@ _RECIPE_DETECTORS = ("chain_primitive", "oob_recipe", "recipe")
 #: CWE-762 (an invalid / mismatched free from `heap_monitor` / `memoracle` / the sanitizer root-cause
 #: names the bad-free primitive). Each is still DETONATION-gated downstream, so admitting a weak
 #: candidate as a lead cannot manufacture a finding -- it just gives the engine something to try.
-_CHAINABLE_CWE = ("CWE-129", "CWE-190", "CWE-590", "CWE-762", "CWE-823", "CWE-1284")
+_CHAINABLE_CWE = ("CWE-129", "CWE-190", "CWE-590", "CWE-762", "CWE-761", "CWE-823", "CWE-1284")
 
 
 def _p64(v: int) -> bytes:

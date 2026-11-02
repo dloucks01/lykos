@@ -42,6 +42,7 @@ def test_vclass_maps_every_primitive_cwe():
     assert chain._VCLASS["CWE-190"] == "heap_overflow"
     assert chain._VCLASS["CWE-590"] == "double_free"
     assert chain._VCLASS["CWE-762"] == "double_free"
+    assert chain._VCLASS["CWE-761"] == "double_free"      # free of a non-start pointer
     # an out-of-range pointer offset is a write-what-where -> route through the oob_write branch
     assert chain._VCLASS["CWE-823"] == "oob_write"
     assert "CWE-823" in chain._CHAINABLE_CWE
