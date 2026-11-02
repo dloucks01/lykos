@@ -1563,7 +1563,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
                                         bits=target.bits, blocks=arm, base_argv=run_argv,
-                                        guard_page=guard_eff)
+                                        guard_page=guard_eff,
+                                        # novelty is judged in batch order, so a block an earlier
+                                        # input reached need not trap again (see batch_runner)
+                                        share_breakpoints=block_dist is None)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
             else:

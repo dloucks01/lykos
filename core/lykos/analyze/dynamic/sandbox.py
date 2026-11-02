@@ -272,7 +272,8 @@ def _batch_runner_path() -> str:
 
 def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
               arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048,
-              blocks=(), guard_page: bool = False, fault_pc: bool = False):
+              blocks=(), guard_page: bool = False, fault_pc: bool = False,
+              share_breakpoints: bool = False):
     """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
 
     `blocks` are image-relative basic-block addresses to watch; each result then carries the
@@ -338,6 +339,12 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
         if guarded:
             env = dict(env if env is not None else os.environ)
             env["LYKOS_PRELOAD"] = _genv.get("LD_PRELOAD", "").split(":")[0]
+    if share_breakpoints and blocks:
+        # one-shot across the BATCH (see batch_runner): only for a caller that judges each input
+        # by "did it reach anything new", which batch order already answers -- never for one that
+        # needs every input's full coverage (distillation, directed distance)
+        env = dict(env if env is not None else os.environ)
+        env["LYKOS_SHARED_ARM"] = "1"
     if fault_pc:
         # ask the runner to ptrace and report the faulting PC even with no coverage blocks -- the
         # crash attribution the native-crash validator needs. Added last so no env setup clobbers it.

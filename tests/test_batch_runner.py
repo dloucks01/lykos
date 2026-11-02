@@ -378,3 +378,22 @@ def test_different_inputs_take_different_paths(gcc, tmp_path):
     if res is None or not res[0].blocks_hit:
         pytest.skip("batched coverage unavailable here")
     assert res[0].stdout != res[1].stdout, "the fixture did not actually branch"
+
+
+def test_shared_arming_is_opt_in_and_only_drops_already_reached_blocks(gcc, tmp_path):
+    """md4c's ASan md2html: every seed of the first batch re-trapped on every block it touched
+    (~1 s each), so a 28 s campaign ran 126 executions. A caller that judges inputs by novelty in
+    batch order can share the one-shot breakpoints across the batch; the default is unchanged."""
+    exe = _build(gcc, tmp_path, _BRANCH_C, "shared", extra=["-no-pie"])
+    blocks = _blocks_of(exe)
+    if not blocks:
+        pytest.skip("no function entries recovered")
+    res = sandbox.run_batch(exe, [b"a", b"a", b"z"], mode="stdin", timeout=5, blocks=blocks,
+                            share_breakpoints=True)
+    if res is None or not res[0].blocks_hit:
+        pytest.skip("batched coverage unavailable here")
+    first, again, other = (set(r.blocks_hit or ()) for r in res)
+    assert first and not again                       # nothing new for an identical input
+    assert not (other & first)                       # 'z' reports only what 'a' did not reach
+    full = sandbox.run_batch(exe, [b"z"], mode="stdin", timeout=5, blocks=blocks)
+    assert other <= set(full[0].blocks_hit or ())

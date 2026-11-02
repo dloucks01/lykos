@@ -526,6 +526,9 @@ def main():
     # coverage -- took the untraced fast path and could never report WHERE it crashed, so the
     # native-crash oracle could never attribute a crash to its site.
     want_fault = os.environ.get("LYKOS_FAULT_PC") == "1"
+    # opt-in (sandbox.run_batch(share_breakpoints=True)): a block one input reached is disarmed for
+    # the rest of the batch. Off by default -- each input then reports its FULL coverage.
+    shared_arm = os.environ.get("LYKOS_SHARED_ARM") == "1"
     trace = bool(blocks) or want_fault
     libc = ctypes.CDLL("libc.so.6", use_errno=True) if trace else None
     if libc is not None:
@@ -570,6 +573,21 @@ def main():
         if trace:
             rc, so, se, flags, reached, fault_pc = _trace_one(libc, argv, stdin, per_timeout,
                                                               blocks, exe, plan, sanitizer)
+            if reached and shared_arm:
+                # ONE-SHOT ACROSS THE BATCH, not just within one execution: a block an earlier
+                # input of this batch reached is disarmed for the rest of it. The plan used to be
+                # replayed whole for every input, so each input trapped on every block it touched
+                # -- on md4c's ASan md2html (thousands of blocks) the 19 seeds cost ~1 s apiece and
+                # a 28 s campaign ran 126 executions. The parent judges novelty against everything
+                # it has already seen, so nothing it decides changes.
+                hit = set(reached)
+                blocks = [b for b in blocks if b not in hit]
+                if plan and plan.get("orig"):
+                    txt = bytearray(plan["text"])
+                    for rel in hit:
+                        if rel in plan["orig"]:
+                            txt[rel - plan["lo"]] = plan["orig"].pop(rel)
+                    plan["text"] = bytes(txt)
         else:
             try:
                 rc, so, se, flags = _run_untraced(argv, stdin, per_timeout,
