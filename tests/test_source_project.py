@@ -324,13 +324,14 @@ def test_every_builder_forces_a_rebuild():
     from lykos.analyze import source_project
     src = inspect.getsource(source_project.build_source_project)
     assert '["make", "-B", "-j"]' in src, "the autotools builder does not force a rebuild"
-    # The make builder assembles its argv (it has a CC/CFLAGS override to pass) and inserts -B
-    # ahead of it, so the forced rebuild is this splice rather than a literal command line. The
-    # spelling changed when a plain-make RETRY was added for trees whose maintainer rules cannot
-    # run here; the guarantee this test exists for did not.
-    assert 'argv[:1] + ["-B"] + argv[1:]' in src, \
-        "the make builder does not force a rebuild"
-    assert 'f"CC={wrapdir' in src, "the make builder does not override the compiler"
+    # The make builder now runs a SEQUENCE of attempts -- `-B` (forced rebuild) first, then a plain
+    # make, then the aggregate targets `all`/`generic` for a Makefile whose default builds nothing,
+    # then a `-std=gnu89` retry for a pre-ANSI K&R tree. The forced-rebuild guarantee this test
+    # exists for lives in the first attempt (`("-B", ["-B"], ...)`); the compiler override lives in
+    # `_cc_vars`, which every attempt passes.
+    assert '("-B",      ["-B"],      env_mk)' in src, \
+        "the make builder does not force a rebuild first"
+    assert 'f"CC={wd' in src, "the make builder does not override the compiler"
     assert '"--clean-first"' in src, "the cmake builder does not force a rebuild"
 
 
@@ -409,6 +410,74 @@ def test_autotools_defeats_maintainer_rules_then_cleans_before_a_plain_make():
         "autotools must defeat maintainer rules, clean, then plain make; -B is only the last retry"
     assert 'if rcm != 0 and not _elf_executables(root, start_make)' in body, \
         "the -B retry must be gated on the plain make having produced nothing"
+
+
+# ------------------------------------------- Info-ZIP unzip 6.0: a non-building default + K&R tree
+def test_make_builder_tries_aggregate_targets_then_a_gnu89_retry():
+    """The make builder must cope with two things an old hand-written Makefile does, both measured
+    on Info-ZIP unzip 6.0 (which the whole unzip benchmark, 0/11, waits on):
+
+      * its DEFAULT target is `help:` -- it succeeds (rc 0) while building nothing, so success must
+        be judged by a freshly-produced ELF, not by rc, and the conventional aggregate targets
+        `all`/`generic` must be tried when the default yields no binary;
+      * its sources carry a pre-ANSI K&R redeclaration (`struct tm *gmtime(), *localtime();`) that
+        gcc 14+ makes a HARD conflicting-types error, cleared by compiling `-std=gnu89`.
+
+    A source-level guard: reproducing it needs the real tree, and that is the slow part.
+    """
+    import inspect
+
+    from lykos.analyze import source_project as sp
+    src = inspect.getsource(sp.build_source_project)
+    i_make = src.index("def _b_make")
+    body = src[i_make:src.index("def _b_loose")]
+    assert '("all",     ["all"],     env_mk)' in body and \
+           '("generic", ["generic"], env_mk)' in body, \
+        "the make builder does not try the aggregate targets when the default builds nothing"
+    assert 'only a freshly-produced ELF counts' in body.lower() or \
+           'Only a freshly-produced ELF counts' in body, \
+        "success must be judged by a produced ELF, not by rc"
+    # the gnu89 retry wrapper and its clean-before-retry
+    assert 'env89' in body and 'gnu89' in body, "no gnu89 retry attempt"
+    assert '(root / junk).unlink()' in body, \
+        "the gnu89 retry must reset the stale configure/flags state first"
+    # and the wrapper actually appends -std=gnu89 AFTER the project args so it overrides
+    wsrc = inspect.getsource(sp._write_wrappers)
+    assert '"$@"{tail}' in wsrc, "the trailing wrapper flag is not placed after the project args"
+
+
+def test_defines_main_distinguishes_main_from_other_objects(tmp_path, gcc_or_skip):
+    from lykos.analyze.source_project import _defines_main
+    m = tmp_path / "m.c"; m.write_text("int main(void){return 0;}\n")
+    h = tmp_path / "h.c"; h.write_text("int helper(void){return 1;}\n")
+    mo, ho = tmp_path / "m.o", tmp_path / "h.o"
+    subprocess.run(["cc", "-c", str(m), "-o", str(mo)], check=True)
+    subprocess.run(["cc", "-c", str(h), "-o", str(ho)], check=True)
+    assert _defines_main(str(mo)) is True
+    assert _defines_main(str(ho)) is False
+
+
+def test_loose_builder_links_each_main_into_its_own_program(tmp_path, gcc_or_skip):
+    """A tree with several `main`s and NO build file forces the loose fallback. Linking them all
+    into one executable fails with 'multiple definition of main' (Info-ZIP unzip ships
+    unzip/funzip/unzipsfx/unzipstb; bzip2 ships four). The builder must link each main-object with
+    the shared objects into its OWN program so every entry point is produced."""
+    from lykos.analyze.source_project import build_source_project
+    root = tmp_path / "multi"
+    root.mkdir()
+    # a shared helper plus TWO programs, no Makefile/configure/CMakeLists -> loose builder
+    (root / "util.c").write_text("int shared_add(int a,int b){return a+b;}\n")
+    (root / "alpha.c").write_text(
+        "#include <stdio.h>\nint shared_add(int,int);\n"
+        "int main(void){printf(\"%d\\n\", shared_add(1,2));return 0;}\n")
+    (root / "beta.c").write_text(
+        "#include <stdio.h>\nint shared_add(int,int);\n"
+        "int main(void){printf(\"%d\\n\", shared_add(3,4));return 0;}\n")
+    r = build_source_project(root) or {}
+    assert r.get("ok"), f"a multi-main loose tree did not build: {(r.get('log') or '')[-400:]}"
+    assert r.get("system") == "loose", f"expected the loose builder, got {r.get('system')!r}"
+    names = {Path(b).name for b in r.get("binaries", [])}
+    assert len(names) >= 2, f"the loose builder did not produce a program per main(): {names}"
 
 
 def test_an_already_built_autotools_tree_rebuilds_all_programs(tmp_path, gcc_or_skip):

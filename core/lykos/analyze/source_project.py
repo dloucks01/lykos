@@ -75,15 +75,38 @@ def _which_cc():
             shutil.which("g++") or shutil.which("clang++"))
 
 
-def _write_wrappers(bindir: Path, flag_list=None):
+def _defines_main(obj: str) -> bool:
+    """True if the ELF object DEFINES `main` (a `T`/`t` text symbol, not an undefined `U`). Used to
+    link a multi-program tree one executable per main() instead of colliding them all into one."""
+    nm = shutil.which("nm")
+    if not nm:
+        return False
+    try:
+        out = subprocess.run([nm, obj], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] in ("T", "t") and parts[2] == "main":
+            return True
+    return False
+
+
+def _write_wrappers(bindir: Path, flag_list=None, trailing: str = ""):
     """A cc/c++ wrapper pair that appends `_SAN_FLAGS` to the real compiler. Putting them on PATH as
-    `cc`/`gcc`/`clang` (and the C++ names) forces instrumentation through make/cmake/configure."""
+    `cc`/`gcc`/`clang` (and the C++ names) forces instrumentation through make/cmake/configure.
+
+    `trailing` is appended AFTER the project's own arguments (`"$@"`), so a flag placed there WINS
+    over whatever the project set -- used for the gnu89 retry wrapper, whose `-std=gnu89` must
+    override a project `-std=` to clear the K&R conflicting-types hard errors that gcc 14+ makes
+    fatal (`struct tm *gmtime(), *localtime();` vs. the modern prototypes -- Info-ZIP unzip 6.0)."""
     cc, cxx = _which_cc()
     if not cc or not cxx:
         return None
     flags = " ".join(_SAN_FLAGS if flag_list is None else flag_list)
+    tail = (" " + trailing) if trailing else ""
     for names, real in ((("cc", "gcc", "clang"), cc), (("c++", "g++", "clang++"), cxx)):
-        body = f'#!/bin/sh\nexec "{real}" {flags} "$@"\n'
+        body = f'#!/bin/sh\nexec "{real}" {flags} "$@"{tail}\n'
         for n in names:
             w = bindir / n
             w.write_text(body)
@@ -177,7 +200,7 @@ def _elf_objects(root: Path, since: float):
     return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
 
 
-def _build_confinement(root: Path, wrapdir: Path) -> list:
+def _build_confinement(root: Path, *wrapdirs: Path) -> list:
     """bwrap prefix for running a project's build commands, or [] when bwrap is unusable (the
     build then runs unconfined, as before; the build log says so). Opt out with
     LYKOS_BUILD_UNCONFINED=1 for a project whose build legitimately needs to write elsewhere."""
@@ -185,7 +208,8 @@ def _build_confinement(root: Path, wrapdir: Path) -> list:
         return []
     try:
         from .dynamic import sandbox
-        return sandbox.isolate_prefix(str(root), net=False, rw_binds=[str(root), str(wrapdir)],
+        return sandbox.isolate_prefix(str(root), net=False,
+                                      rw_binds=[str(root)] + [str(w) for w in wrapdirs],
                                       chdir=str(root))
     except Exception:                                     # noqa: BLE001 -- best-effort containment
         return []
@@ -304,6 +328,13 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
         flag_list = [opt if f.startswith("-O") else f for f in flag_list]
     san_ld = "-fsanitize=address,undefined" if sanitize else ""
     _write_wrappers(wrapdir, flag_list)
+    # A second wrapper set whose `-std=gnu89` is appended AFTER the project's args, so it overrides
+    # a project `-std=` and makes gcc accept pre-ANSI K&R code that gcc 14+ now rejects outright
+    # (implicit int, implicit declarations, and the `struct tm *gmtime()` conflicting-types error in
+    # Info-ZIP unzip 6.0's unxcfg.h). Used only as a LAST-RESORT retry when the normal build produced
+    # no binary, so it can never regress a tree that already builds under the modern default.
+    wrapdir89 = Path(tempfile.mkdtemp(prefix="lykos-ccwrap89-"))
+    _write_wrappers(wrapdir89, flag_list, trailing="-std=gnu89")
     env = dict(os.environ)
     env["PATH"] = f"{wrapdir}:{env.get('PATH', '')}"
     env["CC"], env["CXX"] = "cc", "c++"                   # the wrappers, resolved via PATH
@@ -311,6 +342,14 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
     env["CFLAGS"] = (env.get("CFLAGS", "") + " " + flags).strip()
     env["CXXFLAGS"] = (env.get("CXXFLAGS", "") + " " + flags).strip()
     env["LDFLAGS"] = (env.get("LDFLAGS", "") + " " + san_ld).strip()
+    # The gnu89 retry runs the wrapdir89 wrappers (PATH + explicit CC/CXX) and must NOT carry the
+    # CFLAGS/CXXFLAGS overrides: those duplicate the sanitizer flags the wrappers already inject and,
+    # more importantly, clobber a Makefile's own include/define flags (unzip's `-I.`).
+    env89 = dict(env)
+    env89["PATH"] = f"{wrapdir89}:{env.get('PATH', '')}"
+    env89["CC"], env89["CXX"] = str(wrapdir89 / "cc"), str(wrapdir89 / "c++")
+    env89.pop("CFLAGS", None)
+    env89.pop("CXXFLAGS", None)
 
     # A DEADLINE FOR THE WHOLE CHAIN, not just per command. `timeout` bounds one command, and the
     # chain is cmake -> autotools -> make -> loose with up to two commands each: a project that
@@ -328,15 +367,16 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
     # host. Confine every build command when bwrap is usable: read-only root with the secret
     # dirs masked, no network, fresh /tmp, and only the project tree + the compiler-wrapper dir
     # writable -- so a hostile build can produce binaries in its own tree and nothing else.
-    confine = _build_confinement(root, wrapdir)
+    confine = _build_confinement(root, wrapdir, wrapdir89)
     if confine:
         env["CCACHE_DISABLE"] = "1"      # a ccache'd compiler would fail writing ~/.ccache (ro)
+        env89["CCACHE_DISABLE"] = "1"
 
-    def _run(argv, cwd=root):
+    def _run(argv, cwd=root, run_env=None):
         slice_s = min(float(timeout), _left())
         if slice_s <= 1.0:
             return 1, f"{argv[0]}: skipped, the build budget is spent"
-        return _run_group(confine + list(argv), cwd=cwd, env=env, timeout=slice_s)
+        return _run_group(confine + list(argv), cwd=cwd, env=run_env or env, timeout=slice_s)
 
     # STATIC libraries, for both builders. A shared build of a library project produces tools that
     # are unrunnable here for two independent reasons, measured on libtiff 4.0.3 and expat 2.1.0:
@@ -444,20 +484,81 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
         return "autotools", o1 + o2
 
     def _b_make():
-        # Pass the wrapped CC/flags as make VARIABLES too (override the Makefile's own). Same
-        # order as the autotools builder above and for the same measured reasons: `-B` forces
-        # the rebuild that makes our instrumentation real, and a plain make is the retry for a
-        # tree whose maintainer rules cannot run here.
+        # Drive the build through the PATH compiler-wrappers (they inject the sanitizer) and set
+        # CC/CXX/LD as make variables so a Makefile that hard-codes a compiler path still goes
+        # through the wrapper. Crucially, do NOT pass CFLAGS/CXXFLAGS as make overrides: a
+        # command-line `CFLAGS=` wins over the Makefile's own, dropping the project's include/define
+        # flags. unzip 6.0's `generic` target runs `configure` to write those flags (notably `-I.`),
+        # and overriding CFLAGS produced `fatal error: unzip.h: No such file`. The sanitizer flags
+        # the old override carried are already injected by the wrappers, so dropping it only helps.
+        # `-B` forces the rebuild that makes our instrumentation real on an already-built tree.
         start_make = time.time()
-        argv = ["make", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
-                f"CFLAGS={flags}", f"CXXFLAGS={flags}",
-                f"LDFLAGS={san_ld}"]
-        rcm, o = _run(argv[:1] + ["-B"] + argv[1:])
-        if rcm != 0 and not _elf_executables(root, start_make) \
-                and not _elf_libraries(root, start_make):
-            _, o2 = _run(argv)
-            o = o + "\n-- `make -B` failed and produced nothing; retried without -B --\n" + o2
-        return "make", o
+
+        def _cc_vars(wd):
+            return [f"CC={wd/'cc'}", f"CXX={wd/'c++'}", f"LD={wd/'cc'}"]
+
+        def _made(since):
+            # rc is NOT a reliable success signal: an old Makefile's default target is often a
+            # help/usage message that succeeds (rc=0) while building nothing (unzip 6.0's first
+            # rule is `help:`). Only a freshly-produced ELF counts.
+            return _elf_executables(root, since) or _elf_libraries(root, since)
+
+        # Each attempt is (label, extra-make-args, which-wrapper-env). `-B` forces the rebuild that
+        # makes our instrumentation real on an already-built tree; a plain `make` is the retry for a
+        # tree whose maintainer rules cannot run under `-B`. The default target may build nothing
+        # (unzip's `help`), so the conventional aggregate targets `all`/`generic` are tried next
+        # (`generic` is unzip's own autoconfigure-then-build). Finally, a pre-ANSI K&R tree gcc 14+
+        # refuses outright (unzip's `gmtime` conflicting-types error) is retried through the gnu89
+        # wrapper, whose `-std=gnu89` makes gcc accept the old declarations -- this is what builds
+        # unzip 6.0 as an ASan binary so `zip_overflow` fires in-pipeline.
+        # The make attempts carry NO CFLAGS/CXXFLAGS in the environment either: `make` imports
+        # CFLAGS from the env, so an env `CFLAGS=<sanitizer flags>` clobbers a Makefile's own
+        # include/define flags the same way a command-line override does (unzip's `-I.` -> "unzip.h:
+        # No such file"). The wrappers inject the sanitizer, so the env flags are redundant here.
+        env_mk = dict(env)
+        env_mk.pop("CFLAGS", None)
+        env_mk.pop("CXXFLAGS", None)
+        modern = [("-B",      ["-B"],      env_mk),
+                  ("plain",   [],          env_mk),
+                  ("all",     ["all"],     env_mk),
+                  ("generic", ["generic"], env_mk)]
+        gnu89 = [("-B gnu89",      ["-B"],      env89),
+                 ("all gnu89",     ["all"],     env89),
+                 ("generic gnu89", ["generic"], env89)]
+
+        def _try(attempts):
+            nonlocal o
+            for label, extra, e in attempts:
+                s = time.time()
+                wd = wrapdir89 if e is env89 else wrapdir
+                _, ot = _run(["make", "-j"] + extra + _cc_vars(wd), run_env=e)
+                o += f"\n-- make attempt [{label}] --\n" + ot
+                if _made(s):
+                    return "make", o
+            return None
+
+        o = ""
+        done = _try(modern)
+        if done:
+            return done
+        # Before the gnu89 retry, reset the autoconf-style state the modern attempts left behind.
+        # unzip's `generic` writes a `flags` file from a `configure` PROBE; a probe run under the
+        # modern compiler bakes in choices that defeat `-std=gnu89` (configure is not re-run while
+        # `flags` is up to date), so the retry still hits the K&R error. Removing the probe outputs
+        # (and the stale objects) makes `generic` re-probe under the gnu89 wrapper -- measured to
+        # turn the retry from a 0.1s no-op back into unzip/unzipsfx/funzip.
+        _run(["make", "clean"], run_env=env89)             # best-effort; may be a no-op echo
+        for junk in ("flags", "config.cache", "config.status", "config.log"):
+            try:
+                (root / junk).unlink()
+            except OSError:
+                pass
+        for obj in list(root.rglob("*.o")) + list(root.rglob("*.obj")):
+            try:
+                obj.unlink()
+            except OSError:
+                pass
+        return _try(gnu89) or ("make", o)
 
     def _b_loose():
         srcs = sorted(str(p) for p in root.rglob("*") if p.suffix in _SOURCE_EXT)
@@ -487,16 +588,35 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
             return "loose", log or "no translation unit compiled"
         # Link with c++ when any C++ object is present, so libstdc++ comes along.
         driver = str(wrapdir / ("c++" if cxx_present else "cc"))
-        srcs = objs                                      # the link steps below take the objects
-        out = root / "a.lykos.bin"
-        _, l2 = _run([driver] + srcs + ["-o", str(out)])
-        log += l2
-        if not out.exists():
+        # Partition the objects by whether they DEFINE `main`. A tree with several programs ships
+        # several main()s (Info-ZIP unzip: unzip/funzip/unzipsfx/unzipstb; bzip2: bzip2/
+        # bzip2recover/spewG/unzcrash). Linking them all into one executable fails with "multiple
+        # definition of `main`", which used to sink the whole tree to "did not build". Link each
+        # main-object with all the NON-main objects into its OWN program instead, so every entry
+        # point is produced and analysed.
+        mains = [o for o in objs if _defines_main(o)]
+        shared = [o for o in objs if o not in mains]
+        made_any = False
+        if len(mains) <= 1:
+            out = root / "a.lykos.bin"
+            _, l2 = _run([driver] + objs + ["-o", str(out)])
+            log += l2
+            made_any = out.exists()
+        else:
+            for m in mains:
+                stem = Path(m).name.replace(".lykos.o", "") or "prog"
+                out = root / f"a.lykos.{stem}.bin"
+                _, l2 = _run([driver, m] + shared + ["-o", str(out)])
+                log += l2
+                made_any = made_any or out.exists()
+            if made_any:
+                log = f"-- linked {len(mains)} program(s) per-main (multiple main() in tree) --\n" + log
+        if not made_any:
             # No main() (a LIBRARY) -> link a shared object instead, so a pure library still
             # ingests. Static detectors run on it and the libFuzzer stage builds a harness for
             # its exported functions from the retained source.
             so = root / "a.lykos.so"
-            _, log2 = _run([driver, "-shared", "-fPIC"] + srcs + ["-o", str(so)])
+            _, log2 = _run([driver, "-shared", "-fPIC"] + objs + ["-o", str(so)])
             log = log + "\n" + log2
         return "loose", log
 
@@ -584,3 +704,4 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
                 "primary": None, "compiler": Path(cc).name, "log": full_log[-4000:]}
     finally:
         shutil.rmtree(wrapdir, ignore_errors=True)
+        shutil.rmtree(wrapdir89, ignore_errors=True)
