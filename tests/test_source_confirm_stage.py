@@ -122,3 +122,22 @@ def test_a_confirmation_is_stored_as_its_own_replay_harness(tmp_path):
     assert libs == []                                    # the static build needs no .so dirs
     assert stored["libfuzzer-harness"][0] == b.read_bytes()
     assert stored["libfuzzer-harness"][1]["lib_dirs"] == []
+
+
+def test_uc_leads_steer_the_concolic_rung_to_their_function(store, tmp_path):
+    """The from-entry half of a UC lead: steer concolic from the harness's real entry to the
+    function UC flagged, so a proof need not assume its arguments are attacker-controlled."""
+    from types import SimpleNamespace as NS
+    from lykos.analyze.source_confirm_stage import _uc_sites
+    from lykos.db.dao import FindingDAO, TargetDAO
+    (tmp_path / "lib.c").write_text("#include <string.h>\n\nstatic int x;\n"
+                                    "void dispatch_record(const unsigned char *d,\n"
+                                    "                     unsigned long n)\n{\n  (void)d; (void)n;\n}\n")
+    c = store.cases.create("u")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "e" * 64)
+    FindingDAO(store.conn).upsert(t.id, c.id, {
+        "cwe": "CWE-94", "title": "Control flow reaches data-derived pointer in dispatch_record() "
+        "(under-constrained)", "severity": "medium", "detector": "uc_symbolic",
+        "state": "candidate", "confidence": 0.4, "dedup_key": "uc:x", "evidence": []})
+    assert _uc_sites(NS(conn=store.conn), t, tmp_path) == [("lib.c", 4)]
+    assert _uc_sites(NS(conn=store.conn), t, None) == []

@@ -54,6 +54,41 @@ def _suffix_match(a, b) -> bool:
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
+def _uc_sites(ctx, target, src) -> list:
+    """(basename, line) of the DEFINITION of every function an under-constrained symbolic lead names.
+
+    A UC lead says "this function, entered in isolation with attacker-shaped arguments, lets data
+    reach the instruction pointer". synth_confirm tries to prove that through a generated driver,
+    which assumes the arguments are attacker-controlled; steering the concolic rung to the function
+    from the harness's REAL entry is the other half -- if the program's own input reaches it and
+    faults, the assumption was never needed."""
+    if not src:
+        return []
+    from .libfuzzer import defs_index
+    idx = defs_index(src)
+    out: list = []
+    for f in FindingDAO(ctx.conn).list_by_target(target.id):
+        if f.detector != "uc_symbolic":
+            continue
+        fn = getattr(f, "site_detail", None) or ""
+        if not fn:
+            m = re.search(r"\bin (\w+)\(\)", f.title or "")
+            fn = m.group(1) if m else ""
+        hit = idx.get(fn)
+        if not hit:
+            continue
+        try:
+            lines = Path(hit[0]).read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        pat = re.compile(r"^\s*(?:[\w*\s]+\s+)?" + re.escape(fn) + r"\s*\(")
+        for i, ln in enumerate(lines):
+            if pat.match(ln) and not ln.rstrip().endswith(";"):
+                out.append((os.path.basename(str(hit[0])), i + 1))
+                break
+    return out[:32]
+
+
 def _steer_sites(ctx, target) -> list:
     """The (basename, line) SITES of the static source candidates, to steer the concolic rung toward
     the statically-suspected bug LINES (not the enclosing function entry -- that would stop before the
@@ -371,6 +406,9 @@ def source_confirm_stage(ctx) -> dict:
     # table). Only computed when a concolic (explore) build exists -- the only rung that consumes it.
     # Steering only affects exploration efficiency, never soundness (replay + negative control gate it).
     sites = _steer_sites(ctx, target) if (ex_by or exc_by) else []
+    if ex_by or exc_by:
+        # the UC leads' functions first: reaching one from the real entry is the from-entry proof
+        sites = [s_ for s_ in _uc_sites(ctx, target, src) if s_ not in sites] + sites
     names = sorted(set(ex_by) | set(exc_by) | set(fz_by))
     harnesses = []
     for n in names:
