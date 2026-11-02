@@ -349,8 +349,6 @@ def _what_it_is(f, san, av, pv, rc, access) -> dict:
         return {"title": title,
                 "summary": f"{san['tool']} reports a {k}:{acc}{where}"
                            + (f", in {fn}()" if fn else "") + "."}
-    if rc and rc.get("summary"):
-        return {"title": f.get("title") or "Reproduced crash", "summary": rc["summary"]}
     eff = pv.get("effect_kind") or av.get("effect_kind")
     if av and av.get("access") and not av.get("controlled"):
         acc = av["access"]
@@ -364,6 +362,8 @@ def _what_it_is(f, san, av, pv, rc, access) -> dict:
                             (f"An out-of-bounds memory {acc} faults at "
                              f"`{av.get('disasm') or '?'}`. "))
                            + f"The attacker controls whether it happens, not where it {acc}s."}
+    if rc and rc.get("summary"):
+        return {"title": f.get("title") or "Reproduced crash", "summary": rc["summary"]}
     if eff == "control-flow-hijack":
         return {"title": "Control-flow hijack", "summary": pv.get("note") or ""}
     return {"title": f.get("title") or "Reproduced crash",
@@ -636,6 +636,7 @@ def build_narrative(store, case_id: str, report: dict) -> dict:
                                      "reproduce": [], "input": None, "evidence": [],
                                      "escalation": [], "mitigations": [],
                                      "remediation": "", "impact": "", "cwe": f.get("cwe")})
+        dossiers = _merge_attributed(dossiers, t)
         dossiers.sort(key=lambda d: (-_SEV_RANK.get(d.get("severity") or "info", 0),
                                      -_LEVEL_RANK.get(d.get("level") or "L0", 0)))
         all_dossiers += [dict(d, target=t.get("filename")) for d in dossiers]
@@ -644,6 +645,34 @@ def build_narrative(store, case_id: str, report: dict) -> dict:
                         "methodology": _methodology(report, t),
                         "limitations": _limitations(t)})
     return {"executive": _executive(report, targets, all_dossiers), "targets": targets}
+
+
+_ATTRIB = re.compile(r"faulting instruction IS this site \((0x[0-9a-f]+)")
+
+
+def _merge_attributed(dossiers: list, t: dict) -> list:
+    """One dossier per DEFECT. A static finding promoted because a reproduced crash faulted at one
+    of its sites (root_cause's crash attribution) is the same defect as that crash: on jhead the
+    `tainted_deref` detector had listed the faulting load among its 151 sites, and the report showed
+    the one bug twice -- once as the crash, once as 'Out-of-bounds read candidate ... (not
+    verified)'. It becomes a line of the crash's evidence: the static analysis predicted it."""
+    by_id = {f.get("id"): f for f in t.get("findings") or []}
+    by_site = {(d.get("location") or {}).get("site"): d for d in dossiers
+               if d.get("input") and (d.get("location") or {}).get("site")}
+    out = []
+    for d in dossiers:
+        f = by_id.get(d.get("id")) or {}
+        sites = [m.group(1) for e in f.get("evidence") or []
+                 if e.get("channel") == "crash-attribution"
+                 for m in [_ATTRIB.search(e.get("detail") or "")] if m]
+        host = next((by_site[s_] for s_ in sites if s_ in by_site and by_site[s_] is not d), None)
+        if host is not None and not d.get("input"):
+            host.setdefault("evidence", []).append(
+                f'predicted statically: the {f.get("detector")} detector flagged this exact '
+                f'instruction ({sites[0]}) before it was reproduced')
+            continue
+        out.append(d)
+    return out
 
 
 def _executive(report, targets, dossiers) -> dict:

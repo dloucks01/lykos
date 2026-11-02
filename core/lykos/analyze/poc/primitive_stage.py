@@ -1428,6 +1428,7 @@ def primitive_stage(ctx) -> dict:
         # question here too, for the same reason it is asked when the cyclic does not fault at
         # all. Skipped when a SANITIZER reported the defect: those classes have their own
         # verdicts above, measured from a report rather than from a faulting instruction.
+        _av = None
         if not _cls and not emulated:
             _av, _demo, _dcap, _dmode = _address_verdict(
                 ctx, lambda m: _capture_for(m), sweep_modes(mode, orig),
@@ -1447,6 +1448,10 @@ def primitive_stage(ctx) -> dict:
         ctx.emit("primitive.done", payload={
             "primitive": ("register-control" if regs else None), "supported": True,
             "registers": regs, "signal": cap0.get("signal_name"), "sanitizer_class": _cls,
+            # the measured answer even when it is "no control" -- the report states WHY the
+            # defect stops at a crash from exactly this (an out-of-bounds read past a buffer end
+            # whose address the attacker does not choose); dropping it left the reader nothing
+            "address_verdict": _av,
             "note": (f"no primitive verdict for {_cls}: {_why}" if _why else
                      "crash reproduced but no instruction-pointer / memory primitive found")})
         ctx.progress(pct=100, msg=(f"{_cls}: no verdict ({_why[:60]})" if _why
