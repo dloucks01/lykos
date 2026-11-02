@@ -131,6 +131,36 @@ named next technique (a ceiling is lykos's to overcome, never a target property)
 | 401 | memory leak | ✓ | LSan build + dos | — | **IMPLEMENTED** (compile_source_lsan + dos escalates CWE-401 at L1/L2/L3 via the growth ratio). Undemonstrated on the current bench |
 | 200 | information exposure | ✓ | leak, chain_primitive, **jpeg_overread (GPS)** | **L3 (jhead JPEG GPS disclosure)** | GPS over-read → printed-coordinate numeric disclosure proven forgery-proof on jhead (CVE-2020-6625). Also reached generically via leak/chain_primitive (exfiltrate secret/pointer bytes under a control) |
 
+## Comprehensive-L3 program (levers 1-2 + buckets A-D) — progress
+
+The operator asked to drive "all CWEs to L3" via two cross-cutting levers then four buckets, with a
+hard rule that any fuzzing stays directed/reach-gated/narrow. Landed so far (all detonation-gated,
+so wiring never manufactures a finding):
+
+- **Lever 1 (reach/depth) — format-aware placement** extended to PNG and BMP palette over-reads
+  (`png_overread`, `bmp_overread`: L1 ASan READ + L3 forgery-proof disclosure), joining GIF/ZIP/JPEG.
+  Remaining: TIFF; wire the purpose-built-but-unwired `directed_reach_pie` for memory sinks.
+- **Lever 2 (disclosure -> consume)** — `_pie_run` now recovers the base with `allow_single=True`
+  (a lone unique-page-offset image pointer, forgery-proof), and the confirmed-disclosure chains run
+  as the PIE-hijack fallback (extracting the ASLR-defeat leak as its own poc-backed CWE-200 L3)
+  instead of stopping at "PIE leak-chain not confirmed". Remaining (named): consume that recovered
+  base IN-PROCESS to relocate the win -- the full memory-corruption L3 on PIE.
+- **Bucket A (primitive L2->L3)** — CWE-129 already L3; CWE-823 routed to the oob_write branch;
+  CWE-119 UBSan "index out of bounds" reclassified to the precise CWE-129; CWE-129/822/823 moved to
+  the rce ceiling. CWE-822 has a consumer (heap_overflow branch).
+- **Bucket B (detect-only orphans)** — CWE-1284 (negative-size-param) routed to the heap-overflow
+  chain. Remaining: new detectors for the native classes NOT yet named (CWE-805 buffer-access-with-
+  incorrect-length, CWE-763 free-not-at-start, CWE-908 uninit-resource, CWE-682 incorrect-calc,
+  CWE-754/755 exceptional-condition) + a demonstration corpus for the implemented-undemonstrated
+  classes (457/362/401/369/476/835/674/409/918/798).
+- **Fuzz-smart rule** — the plateau/zero-progress bail is now ON by default (not only converge runs),
+  twice as patient (idle tail >= 2x productive head), fail-open; opt out with {"plateau": False}.
+- **Measurement** — `cwe_coverage.run_matrix(findings, pocs)` now reports the best PoC LEVEL (L0..L3)
+  per class and `l3_class_count` -- the per-CWE scorecard that makes "every class to L3" a tracked
+  number, wired through the CLI, the report/GUI rollup and `format_report`.
+- Remaining buckets C (deterministic no-fuzz confirmations) and D (honest-ceiling demos: 203 timing,
+  798 secret-use, 22 traversal, 362 race) are the tail.
+
 ## Cross-cutting enablers (unblock MANY classes at once)
 
 1. **Format-aware trigger placement** — embed the trigger (overlong field / out-of-range index /
