@@ -274,14 +274,28 @@ def synthesize_injection_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     ctx.emit("inject.start", payload={"probes": sorted(applicable), "channels": channels})
+    import time as _time
+    # A DEADLINE across every probe and channel: the stage had none, and on md4c it ran 65 s of a
+    # 30 s slice -- time taken from the fuzzers scheduled after it. Probes the clock does not reach
+    # are named in the done-event, never silently treated as "not injectable".
+    _deadline = _time.monotonic() + float(p.get("max_seconds") or 120)
+    cut_short: list = []
+
+    def _over() -> bool:
+        return _time.monotonic() > _deadline
     confirmed = []
     navs = None                                      # built lazily: only a failing probe needs it
     concolic_out = None                              # angr solve, run at most once across probes
     for name, spec in applicable.items():
+        if _over():
+            cut_short.append(name)
+            continue
         marker = _marker()
         payloads = spec["payloads"](marker)
 
         def _attempt(payload, mode, nav=b"", spec=spec, marker=marker):
+            if _over():
+                return None
             run_argv, stdin = _deliver(mode, payload, argv_base, ctx, nav)
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
                               arch=target.arch, endianness=target.endianness, bits=target.bits)
@@ -300,6 +314,9 @@ def synthesize_injection_stage(ctx) -> dict:
                     break
             if hit:
                 break
+        if hit is None and _over():
+            cut_short.append(name)
+            continue
         if hit is None:                              # 2. NAVIGATE to a sink behind a menu / gate
             if navs is None:
                 navs = _nav_preambles(ctx, target, target_bytes)
@@ -311,7 +328,7 @@ def synthesize_injection_stage(ctx) -> dict:
                         break
                 if hit:
                     break
-        if hit is None:                              # 3. DIRECTED multi-step reach to a DEEP sink
+        if hit is None and not _over():              # 3. DIRECTED multi-step reach to a DEEP sink
             # The sink sits behind multi-step state single-nav cannot pass: breakpoint it and search
             # option sequences that drive execution to it, then inject + confirm on each.
             for nav in _directed_navs(ctx, target, target_bytes, exe, spec["sinks"]):
@@ -322,7 +339,7 @@ def synthesize_injection_stage(ctx) -> dict:
                         break
                 if hit:
                     break
-        if hit is None and spec.get("cwe") in ("CWE-78", "CWE-134"):   # 4. CONCOLIC value-guard reach
+        if hit is None and not _over() and spec.get("cwe") in ("CWE-78", "CWE-134"):   # 4. CONCOLIC
             # A sink behind a VALUE GUARD (a magic number / byte compare) that no option sequence
             # passes: symbolically solve a stdin that reaches it (angr hypo driver, scoped under
             # MemoryMax), then substitute our forgery-proof payload into the solved sink argument.
@@ -367,6 +384,7 @@ def synthesize_injection_stage(ctx) -> dict:
                  "target could not run); the write plan is computed from the recovered frame"))
 
     ctx.emit("inject.done", payload={"ok": True, "confirmed": len(confirmed),
+             "cut_short_for_budget": cut_short,
              # input_sha + resolved_base are the HANDOFF to build_exploit: a CWE-134 leak that
              # already resolved a PIE/libc base is a measured disclosure recipe, so L3's leak recon
              # can replay this exact input instead of re-deriving the %p offset from scratch (see
