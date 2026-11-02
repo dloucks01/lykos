@@ -35,6 +35,8 @@ CEILING: dict[str, str] = {
     "CWE-123": "rce", "CWE-134": "rce", "CWE-416": "rce", "CWE-415": "rce", "CWE-843": "rce",
     "CWE-190": "rce", "CWE-191": "rce", "CWE-680": "rce", "CWE-131": "rce", "CWE-193": "rce",
     "CWE-824": "rce", "CWE-763": "rce", "CWE-562": "rce", "CWE-825": "rce",
+    # invalid / mismatched free -> tcache-poison / fastbin-dup -> control (chain_primitive double_free)
+    "CWE-590": "rce", "CWE-762": "rce",
     # hard-coded / recoverable secrets -> authentication (a usable credential)
     "CWE-798": "logic", "CWE-321": "logic", "CWE-259": "logic",
     # reads / disclosure -> leak
@@ -46,7 +48,7 @@ CEILING: dict[str, str] = {
     "CWE-476": "dos", "CWE-617": "dos", "CWE-835": "dos", "CWE-400": "dos", "CWE-770": "dos",
     "CWE-369": "dos", "CWE-674": "dos", "CWE-401": "dos", "CWE-789": "dos", "CWE-248": "dos",
     "CWE-252": "dos", "CWE-690": "dos", "CWE-833": "dos", "CWE-409": "dos", "CWE-776": "dos",
-    "CWE-590": "dos", "CWE-761": "dos", "CWE-762": "dos",
+    "CWE-761": "dos",
     # logic / auth / crypto / traversal -> the finding is the impact
     "CWE-22": "logic", "CWE-23": "logic", "CWE-59": "logic", "CWE-79": "logic", "CWE-20": "logic",
     "CWE-287": "logic", "CWE-306": "logic", "CWE-862": "logic", "CWE-863": "logic",

@@ -47,7 +47,17 @@ _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow
            # A pointer WRITE computed from input is a write-what-where by another name, and an
            # indirect call through a field is the hijack this stage searches for -- the same two
            # routes the CWE-129 and CWE-122 leads take.
-           "CWE-787": "oob_write", "CWE-822": "heap_overflow"}
+           "CWE-787": "oob_write", "CWE-822": "heap_overflow",
+           # An integer overflow that UNDERSIZES an allocation IS a heap overflow by its arithmetic:
+           # the heap_overflow branch's `menu.alloc_primers` already drives the count past the
+           # integer width so the size computation wraps and the allocation is too small -- the only
+           # state in which the following copy has anything to run past (CWE-190 -> CWE-122). Routing
+           # it here finishes the "pieces exist, chaining unwired" gap the coverage ledger named.
+           "CWE-190": "heap_overflow",
+           # An invalid / mismatched free lands a controlled (non-heap, or wrong-size-class) pointer
+           # in a bin -- the same forward-pointer poison a double-free seeds -- so route it through
+           # the tcache-poison / fastbin-dup dispatch the double_free class already drives to L3.
+           "CWE-590": "double_free", "CWE-762": "double_free"}
 #: Which detectors produce a lead worth chaining. Measured across 22 kept conformance stores:
 #: `tainted_deref/CWE-787` ("writes through a pointer computed from input") stayed below
 #: poc-backed 13 times out of 13, and `heap_fptr_call/CWE-822` ("indirect call through a function
@@ -60,6 +70,14 @@ _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow
 _LEAD_DETECTORS = ("heap_trace", "oob_index", "tainted_deref", "heap_fptr_call")
 #: Rows this stage / the recipe helpers file themselves -- never re-consumed as a lead.
 _RECIPE_DETECTORS = ("chain_primitive", "oob_recipe", "recipe")
+#: CWE classes whose NAMED primitive is chainable regardless of which detector found it -- the lead
+#: is admitted on its CWE, not its detector. CWE-129 (an array-index write names the indexed-write
+#: primitive whoever found it); CWE-190 (an undersized-allocation finding from `int_overflow_alloc`
+#: (binary p-code) or `int_overflow` (source) names the heap overflow the wrap creates); CWE-590 /
+#: CWE-762 (an invalid / mismatched free from `heap_monitor` / `memoracle` / the sanitizer root-cause
+#: names the bad-free primitive). Each is still DETONATION-gated downstream, so admitting a weak
+#: candidate as a lead cannot manufacture a finding -- it just gives the engine something to try.
+_CHAINABLE_CWE = ("CWE-129", "CWE-190", "CWE-590", "CWE-762")
 
 
 def _p64(v: int) -> bytes:
@@ -92,11 +110,13 @@ def _lead_finding(conn, target):
     one (see `_LEAD_DETECTORS`). A DYNAMIC lead outranks a static one at equal confidence, because
     a traced use-after-free is a fact about this run and a pattern match is a fact about the code."""
     from ...db.dao import FindingDAO
-    # Any detector's CWE-129 also counts: an array-index finding NAMES the indexed-write primitive
-    # whoever found it (a static array-index detector included). Recipe rows are never leads.
+    # Any detector's CWE in `_CHAINABLE_CWE` also counts: the finding NAMES the primitive whoever
+    # found it (an array-index write, an undersized integer-overflow allocation, a bad free), so a
+    # static or corroborating detector that found the exact shape can hand it over even though it is
+    # not one of the dynamic lead detectors. Recipe rows are never leads.
     leads = [f for f in FindingDAO(conn).list_by_target(target.id)
              if f.cwe in _VCLASS and f.detector not in _RECIPE_DETECTORS
-             and (f.detector in _LEAD_DETECTORS or f.cwe == "CWE-129")]
+             and (f.detector in _LEAD_DETECTORS or f.cwe in _CHAINABLE_CWE)]
     return max(leads, key=lambda f: (f.confidence, f.detector in ("heap_trace", "oob_index")),
                default=None)
 

@@ -32,6 +32,15 @@ def test_named_classes_with_a_ceiling_agree_with_the_matrix():
             assert m[cwe] == ceil
 
 
+def test_invalid_free_classes_weaponize_to_rce():
+    """CWE-590/762 now route into the double_free tcache-poison / fastbin-dup engine (chain_primitive),
+    so their honest ceiling is code execution, not denial of service."""
+    assert cc.weaponizable("CWE-590") == "rce"
+    assert cc.weaponizable("CWE-762") == "rce"
+    # CWE-190 (integer-overflow allocation) was already rce and now actually chains there.
+    assert cc.weaponizable("CWE-190") == "rce"
+
+
 def test_capability_matrix_covers_all_named_classes():
     m = cc.capability_matrix()
     assert len(m) == len(CWE_NAMES)

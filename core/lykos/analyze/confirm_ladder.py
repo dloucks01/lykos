@@ -64,6 +64,8 @@ CLASS_PRIMITIVE = {
     "CWE-191": "integer underflow -> oversized length -> out-of-bounds access",
     "CWE-415": "double free -> allocator metadata corruption",
     "CWE-416": "use-after-free -> controlled reclaimed object (read/write via a dangling pointer)",
+    "CWE-590": "free of an invalid / non-heap pointer -> controlled pointer in a free list",
+    "CWE-762": "mismatched free (wrong allocator / size class) -> allocator metadata corruption",
     "CWE-457": "uninitialised memory use -> disclosure / control-flow influence",
     "CWE-476": "null-pointer dereference -> denial of service",
     "CWE-787": "out-of-bounds write",
@@ -105,6 +107,10 @@ MISSING_TECHNIQUE = {
     "CWE-191": "bound the underflowed length and a reaching driver to steer the oversized access",
     "CWE-415": "an allocator-state model to turn the double free into a controlled reclaim",
     "CWE-416": "a reclaim/grooming solver to reoccupy the freed chunk with an attacker-shaped object",
+    "CWE-590": "a reaching driver plus an allocator-state model to land the invalid free's controlled "
+               "pointer in a free list and allocate it back (tcache-poison / fastbin-dup)",
+    "CWE-762": "a reaching driver plus an allocator-state model to turn the mismatched free into a "
+               "controlled reclaim across the wrong size class",
     "CWE-457": "a path that observes the uninitialised bytes through the program's output",
     "CWE-787": "a reaching driver plus the write-target layout to steer the OOB write onto a live "
                "pointer",

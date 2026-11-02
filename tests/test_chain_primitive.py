@@ -36,6 +36,69 @@ def test_vclass_maps_every_primitive_cwe():
     assert chain._VCLASS["CWE-416"] == "uaf"
     assert chain._VCLASS["CWE-122"] == "heap_overflow"
     assert chain._VCLASS["CWE-129"] == "oob_write"
+    # TTP wiring: an integer overflow that undersizes an allocation is a heap overflow by its
+    # arithmetic, and an invalid / mismatched free seeds the same forward-pointer poison a
+    # double-free does -- both route into branches that already reach L3.
+    assert chain._VCLASS["CWE-190"] == "heap_overflow"
+    assert chain._VCLASS["CWE-590"] == "double_free"
+    assert chain._VCLASS["CWE-762"] == "double_free"
+
+
+# --- lead admission: a NAMED primitive is chained on its CWE, not only its detector ----------------
+import types as _types  # noqa: E402
+from collections import namedtuple as _nt  # noqa: E402
+
+_F = _nt("_F", "cwe detector confidence")
+
+
+def _patch_findings(monkeypatch, rows):
+    """Make chain_primitive's locally-imported FindingDAO return `rows` for any target."""
+    import lykos.db.dao as dao
+
+    class _FakeDAO:
+        def __init__(self, conn):
+            pass
+
+        def list_by_target(self, _tid):
+            return list(rows)
+
+    monkeypatch.setattr(dao, "FindingDAO", _FakeDAO)
+
+
+def test_lead_finding_admits_int_overflow_alloc_by_cwe(monkeypatch):
+    # int_overflow_alloc is NOT a dynamic lead detector, but a CWE-190 undersized-allocation finding
+    # names the heap overflow the wrap creates -- it must be admitted so the chain can finish it.
+    _patch_findings(monkeypatch, [_F("CWE-190", "int_overflow_alloc", 0.35)])
+    lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+    assert lead is not None and lead.cwe == "CWE-190"
+    # the source detector counts too
+    _patch_findings(monkeypatch, [_F("CWE-190", "int_overflow", 0.6)])
+    assert chain._lead_finding(object(), _types.SimpleNamespace(id=1)).cwe == "CWE-190"
+
+
+def test_lead_finding_admits_invalid_free_by_cwe(monkeypatch):
+    # CWE-590/762 come from heap_monitor / memoracle / the sanitizer root-cause -- none of them a
+    # dynamic lead detector -- yet each names a bad-free primitive the double_free branch can chain.
+    for det, cwe in (("heap_monitor", "CWE-590"), ("memoracle", "CWE-590"), ("rootcause", "CWE-762")):
+        _patch_findings(monkeypatch, [_F(cwe, det, 0.9)])
+        lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+        assert lead is not None and lead.cwe == cwe, (det, cwe)
+
+
+def test_lead_finding_dynamic_still_outranks_a_static_candidate(monkeypatch):
+    # A traced double-free (heap_trace, high confidence) is a fact about THIS run and must outrank a
+    # static CWE-190 candidate -- admitting the new classes never demotes the dynamic lead.
+    _patch_findings(monkeypatch, [_F("CWE-190", "int_overflow_alloc", 0.35),
+                                  _F("CWE-415", "heap_trace", 0.9)])
+    lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+    assert lead.cwe == "CWE-415" and lead.detector == "heap_trace"
+
+
+def test_lead_finding_excludes_recipe_rows_and_unknown_classes(monkeypatch):
+    # a recipe row this stage filed itself is never re-consumed; an unmapped class is not a lead.
+    _patch_findings(monkeypatch, [_F("CWE-190", "chain_primitive", 0.9),
+                                  _F("CWE-200", "leak", 0.9)])
+    assert chain._lead_finding(object(), _types.SimpleNamespace(id=1)) is None
 
 
 def test_recipe_control_flow_when_win_reachable():
