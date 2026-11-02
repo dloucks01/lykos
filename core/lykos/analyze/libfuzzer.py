@@ -109,7 +109,11 @@ def find_harness(root) -> Path | None:
 _FN_DEF = re.compile(
     r"(?:^|\n)[ \t]*(?!static\b|typedef\b|return\b|else\b|switch\b|case\b)"
     r"(?:[A-Za-z_][\w \t*]*?[ \t*]+)?"
-    r"([A-Za-z_]\w*)[ \t]*\(([^;{}()]*)\)[ \t]*(?:\r?\n[ \t]*)?\{",
+    # One level of nesting inside the parameter list: a FUNCTION-POINTER parameter
+    # (`void (*process_output)(const MD_CHAR*, MD_SIZE, void*)`) has two paren groups, and with a
+    # flat `[^()]` the whole definition went unseen -- md4c's `md_html`, its main entry point, was
+    # absent from every index, so the library was fuzzed through `entity_lookup` instead.
+    r"([A-Za-z_]\w*)[ \t]*\(((?:[^;{}()]|\([^;{}()]*\))*)\)[ \t]*(?:\r?\n[ \t]*)?\{",
     re.M)
 # The first parameter has to be something fuzz bytes (or a path to them) can be delivered as.
 _PTR_FIRST = re.compile(r"^(?:const\s+)?(?:unsigned\s+)?(?:char|void|uint8_t|u_char)\s*\*", re.I)
@@ -131,7 +135,14 @@ _FILLABLE = re.compile(r"^(?:const\s+)?(?:unsigned\s+|signed\s+)?"
 
 
 def _opaque_param(param: str) -> bool:
-    """Is this parameter one the harness cannot supply an honest value for?"""
+    """Is this parameter one the harness cannot supply an honest value for? A void callback is
+    not: a do-nothing function is an honest output sink (see `_VOID_CB`)."""
+    if is_void_callback(param):
+        return False
+    # Any OTHER function pointer is opaque: `int (*cb)(void)` begins with `int`, matched the
+    # scalar pattern, and was handed 0 -- a NULL callback the library then calls.
+    if re.search(r"\(\s*\*", param or ""):
+        return True
     return not _FILLABLE.match(param.strip())
 
 
@@ -155,11 +166,12 @@ def defs_index(root) -> dict:
         return _DEFS_CACHE[key]
     idx: dict = {}
     sa = static_aliases(root)
+    tmap = typedef_map(root)
     for path, txt in _library_srcs(root):
         for name, params in _fn_defs(txt, sa):
             if name in _KEYWORDS:
                 continue
-            idx.setdefault(name, (path, params))
+            idx.setdefault(name, (path, resolve_params(params, tmap)))
     # PROGRAM units (a file with its own `main`) last, never overriding a library definition. They
     # are not library entry points -- the RANKING scanners read `_library_srcs` and never see them --
     # but a function NAMED for a driver (a UC lead, a static candidate) may well live in one, and
@@ -176,7 +188,7 @@ def defs_index(root) -> dict:
         for name, params in _fn_defs(txt, sa):
             if name in _KEYWORDS:
                 continue
-            idx.setdefault(name, (path, params))
+            idx.setdefault(name, (path, resolve_params(params, tmap)))
     return _cache_put(_DEFS_CACHE, key, idx)
 
 
@@ -271,6 +283,10 @@ def _unwrap_macro_args(text: str) -> str:
 _INSTALL_AUTOMAKE = re.compile(r"^[ \t]*\w*include_HEADERS[ \t]*\+?=((?:[^\n\\]|\\\n)*)", re.M)
 _INSTALL_CMAKE = re.compile(r"\binstall\s*\(\s*FILES\b(.{0,2000}?)\)", re.S | re.I)
 _INSTALL_MESON = re.compile(r"\binstall_headers\s*\((.{0,2000}?)\)", re.S)
+#: `set_target_properties(md4c PROPERTIES PUBLIC_HEADER md4c.h)` + `install(TARGETS ... PUBLIC_HEADER
+#: DESTINATION ...)` -- the other way CMake installs a header, and md4c's only one. Missing it made
+#: the tree's API "unknown", so its public `md_html` scored like an internal helper.
+_INSTALL_CMAKE_PUBHDR = re.compile(r"\bPUBLIC_HEADER\s+((?:(?!DESTINATION\b)[^\s)]+\s*)+)", re.I)
 #: `set(ZLIB_PUBLIC_HDRS ... zlib.h)` -- zlib installs its headers through a variable, so the
 #: install rule itself names no file at all.
 _CMAKE_SET = re.compile(r"\bset\s*\(\s*([A-Za-z_]\w*)(.{0,2000}?)\)", re.S | re.I)
@@ -368,7 +384,7 @@ def installed_headers(root) -> frozenset:
             except OSError:
                 continue
             found = []
-            for pat in (_INSTALL_AUTOMAKE, _INSTALL_CMAKE, _INSTALL_MESON):
+            for pat in (_INSTALL_AUTOMAKE, _INSTALL_CMAKE, _INSTALL_MESON, _INSTALL_CMAKE_PUBHDR):
                 found += [m.group(1) for m in pat.finditer(txt)]
             if not found:
                 continue
@@ -560,6 +576,130 @@ def _kr_params(names: str, decls: str) -> list:
     return [typed.get(n, f"int {n}") for n in order]
 
 
+def split_params(s: str) -> list:
+    """A parameter list split on its TOP-LEVEL commas: a function-pointer parameter carries its
+    own parenthesised list, which a plain `split(",")` cut into three bogus parameters."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return [" ".join(a.split()) for a in out if a]
+
+
+#: `void (*name)(...)` -- a callback the library CALLS and whose result it ignores. The harness can
+#: supply one honestly: a function that does nothing (an output sink that discards the output).
+#: A callback that RETURNS something cannot be faked -- the library acts on the answer.
+_VOID_CB = re.compile(r"^\s*void\s*\(\s*\*\s*\w*\s*\)\s*\((.*)\)\s*$", re.S)
+
+
+def is_void_callback(param: str) -> bool:
+    """A void callback the harness can supply HONESTLY: every parameter of it is a type the harness
+    can name (a scalar, or a pointer to char/void/a scalar), because the stub has to be defined
+    with that exact signature -- UBSan's -fsanitize=function aborts a call through a mismatched
+    function-pointer type, so a generic stub would itself be a crash filed against the library."""
+    return callback_stub(param) is not None
+
+
+_TYPE_WORDS = frozenset({"const", "volatile", "unsigned", "signed", "char", "short", "int", "long",
+                         "void", "float", "double", "size_t", "ssize_t", "struct", "enum"})
+
+
+def _strip_param_name(a: str) -> str:
+    """`const char* text` -> `const char*`; `unsigned size` -> `unsigned`; `void*` -> `void*`."""
+    toks = re.findall(r"\*|[A-Za-z_]\w*", a or "")
+    if len(toks) >= 2 and toks[-1] != "*" and toks[-1] not in _TYPE_WORDS \
+            and not re.fullmatch(r"u?int\d+_t", toks[-1]):
+        toks = toks[:-1]
+    out = ""
+    for tk in toks:
+        out += ("*" if tk == "*" else (" " if out and not out.endswith(" ") else "") + tk)
+    return out.replace(" *", "*").strip()
+
+
+_CB_DEFS: dict = {}
+_CB_NAME = re.compile(r"\blykos_cb_[0-9a-f]{8}\b")
+
+
+def callback_stub(param: str) -> str | None:
+    """The name of a do-nothing stub matching this void-callback parameter's exact signature, or
+    None when it is not a void callback or names a type the harness cannot spell."""
+    m = _VOID_CB.match(param or "")
+    if not m:
+        return None
+    inner = split_params(m.group(1))
+    if inner in ([], ["void"]):
+        args = "void"
+    else:
+        parts = []
+        for i, a in enumerate(inner):
+            t = _strip_param_name(a)
+            if not (_FILLABLE.match(t) or re.match(r"^(?:const\s+)?(?:unsigned\s+|signed\s+)?"
+                                                   r"(?:char|short|int|long|size_t|u?int\d+_t)"
+                                                   r"\s*\*$", t)):
+                return None                              # a type the harness cannot name
+            parts.append(f"{t} a{i}")
+        args = ", ".join(parts)
+    import hashlib as _h
+    name = "lykos_cb_" + _h.sha1(args.encode()).hexdigest()[:8]
+    _CB_DEFS[name] = f"static void {name}({args}) {{ (void)0; }}\n"
+    return name
+
+
+#: `typedef <scalar or char type> NAME;` -- the simple aliases a library spells its API with.
+_TYPEDEF = re.compile(
+    r"\btypedef\s+((?:const\s+)?(?:(?:unsigned|signed)\s+)?(?:char|short|int|long\s+long|long|"
+    r"size_t|ssize_t|u?int\d+_t|u_char|unsigned|signed|wchar_t)(?:\s+int)?)\s+([A-Za-z_]\w*)\s*;")
+_TYPEDEF_CACHE: dict = {}
+
+
+def typedef_map(root) -> dict:
+    """{alias: base} for the tree's simple scalar/char typedefs (resolved through chains).
+
+    md4c spells its whole API in `MD_CHAR` (= char) and `MD_SIZE` (= unsigned): `md_parse(const
+    MD_CHAR*, MD_SIZE, ...)` failed the pointer-first test and its length was not a length, so the
+    parser was never a candidate. The harness never NAMES these types (see `_types_only`); this
+    only lets the shape tests see what they are."""
+    key = str(root)
+    if key in _TYPEDEF_CACHE:
+        return _TYPEDEF_CACHE[key]
+    tm: dict = {}
+    root = Path(root)
+    for p in list(root.rglob("*.h"))[:2000] + list(root.rglob("*.c"))[:2000]:
+        if any(seg in _SKIP_DIRS for seg in p.relative_to(root).parts):
+            continue
+        try:
+            txt = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _TYPEDEF.finditer(txt):
+            tm.setdefault(m.group(2), " ".join(m.group(1).split()))
+    # an alias of an alias
+    word = re.compile(r"\b(" + "|".join(map(re.escape, tm)) + r")\b") if tm else None
+    if word:
+        for _ in range(3):
+            tm = {k: word.sub(lambda m: tm.get(m.group(1), m.group(1)) if m.group(1) != k
+                              else m.group(1), v) for k, v in tm.items()}
+    return _cache_put(_TYPEDEF_CACHE, key, tm)
+
+
+def resolve_params(params: list, tmap: dict) -> list:
+    """`params` with the simple typedefs spelled as their base types."""
+    if not tmap:
+        return list(params)
+    word = re.compile(r"\b(" + "|".join(map(re.escape, tmap)) + r")\b")
+    return [word.sub(lambda m: tmap[m.group(1)], a) for a in params]
+
+
 def _fn_defs(txt: str, statics=()):
     """(name, params) for every NON-static function defined in `txt`, in either C style.
 
@@ -570,7 +710,7 @@ def _fn_defs(txt: str, statics=()):
     for m in _FN_DEF.finditer(txt):
         if _static_before(txt, m.start(1), statics):
             continue
-        yield m.group(1), [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
+        yield m.group(1), split_params(m.group(2) or "")
     for m in _KR_DEF.finditer(txt):
         if _static_before(txt, m.start(1), statics):
             continue
@@ -648,10 +788,13 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
     # the link failed on `gzlog_close`, which is not compiled at all. A function outside the
     # library is not a worse choice, it is not a choice -- see `_library_srcs`.
     _sa = static_aliases(root)
+    _tm = typedef_map(root)
+    _inst = installed_headers(root)
     for _p, txt in _library_srcs(root):
         for name, raw in _fn_defs(txt, _sa):
             if name in _KEYWORDS:
                 continue
+            raw = resolve_params(raw, _tm)
             first = raw[0] if raw else ""
             if not _PTR_FIRST.match(first):
                 continue                                 # nothing to deliver the bytes through
@@ -670,9 +813,20 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
             # parser-ish entry point of libtiff and it takes eight callbacks, so a synthesized
             # call passes NULL function pointers and faults inside our own harness. Prefer the
             # narrow door: `TIFFOpen(name, mode)` is the same parser reached honestly.
-            score = -2 * max(0, len(raw) - 2)
+            # Every argument past (buffer, length) is one the harness must supply. One it can
+            # supply HONESTLY (a number, NULL for an optional pointer, a do-nothing output callback)
+            # costs a little; one it cannot (a handle, a struct it never built) costs a lot. A flat
+            # -2 per extra argument ranked md4c's `md_html(text, size, out_cb, userdata, flags,
+            # flags)` -- six honest arguments, the library's documented one-call API -- below
+            # `entity_lookup(name, len)`, an internal table lookup.
+            extra = raw[2:] if len(raw) > 2 else []
+            score = -sum(1 for a in extra if not _opaque_param(a))
             if any(_opaque_param(a) for a in raw[1:]):
-                score -= 6
+                score -= 6 + 2 * sum(1 for a in raw[1:] if _opaque_param(a))
+            # The (bytes, length) pair libFuzzer hands over directly: the whole input reaches the
+            # function intact, with no NUL-termination or file round trip in between.
+            if len(raw) >= 2 and _LEN_PARAM.search(raw[1]) and "*" not in raw[1]:
+                score += 3
             if not _const:
                 score -= 3                               # plausibly input, but it does not say so
             if _PARSERISH.search(name):
@@ -693,8 +847,10 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
                 # A bonus and not an exclusion here: a single function is called through its own
                 # forward declaration, so an internal one still compiles, still runs, and is
                 # worth fuzzing once the public doors are taken.
-                if header_is_installed(root, _hdr) and installed_headers(root):
+                if _inst and header_is_installed(root, _hdr):
                     score += 4
+                elif _inst:
+                    score -= 3                       # declared, but in a header it never ships
             if score > best.get(name, -(10 ** 6)):
                 best[name] = score
     # Ties broken by NAME, so a plan is reproducible: two runs of the same tree have to build the
@@ -738,13 +894,30 @@ def _arg_values(params: list) -> list:                   # noqa: D401
     out = []
     for a in params:
         low = a.lower()
-        if "char" in low and "*" in low:
+        if is_void_callback(a):
+            out.append(f"(void*){callback_stub(a)}")     # an output sink that discards
+        elif "char" in low and "*" in low:
             out.append('(void*)"r"')                     # declared void *, so cast explicitly
         elif "*" in low:
             out.append("(void*)0")
         else:
             out.append("0")
     return out
+
+
+def with_stubs(src: str) -> str:
+    """Define each do-nothing callback stub (`callback_stub`) the harness passes, ahead of the
+    declarations that use it. Each has the callback's exact signature and returns nothing the
+    library could act on -- an output sink that discards."""
+    names = sorted(set(_CB_NAME.findall(src)))
+    defs = "".join(_CB_DEFS[n] for n in names if n in _CB_DEFS and _CB_DEFS[n] not in src)
+    if not defs:
+        return src
+    i = src.find("extern ")
+    j = src.find("int LLVMFuzzerTestOneInput") if i < 0 else i
+    if j < 0:
+        return defs + src
+    return src[:j] + defs + src[j:]
 
 
 _SCALARS = re.compile(r"\b(void|char|short|int|long|unsigned|signed|float|double|size_t|"
@@ -806,7 +979,7 @@ def synth_file_harness(fn: str, params: list, *, closer: str | None = None,
         decl = f'{fn_qual}void *{fn}({_types_only(params)});\n'
     close_decl = f'{fn_qual}void {closer}(void *);\n' if closer else ""
     close_call = f"        if (h) {closer}(h);\n" if closer else ""
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+    return with_stubs("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n#include <unistd.h>\n"
             + decl + close_decl
             + f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
@@ -1104,7 +1277,9 @@ def _opener_arg_values(params: list) -> list:
     """
     out, used_path = [], False
     for a in params or ():
-        if _is_string_param(a):
+        if is_void_callback(a):
+            out.append(callback_stub(a))
+        elif _is_string_param(a):
             if not used_path:
                 out.append("path")
                 used_path = True
@@ -1162,7 +1337,9 @@ def _ctor_arg_values(params: list) -> list:
     """
     out = []
     for a in params:
-        if "*" in a:
+        if is_void_callback(a):
+            out.append(callback_stub(a))
+        elif "*" in a:
             out.append("NULL")
         elif _is_capacity_param(a):
             out.append(_CAPACITY_DEFAULT)
@@ -1218,7 +1395,7 @@ def synth_file_handle_harness(triple: dict, *, cxx: bool = False) -> str:
     # ours first and closing afterwards would be a use-after-free committed by the harness and
     # reported against the library. Freeing last cannot be wrong: nothing holds the pointer once
     # the handle is gone.
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+    return with_stubs("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n#include <unistd.h>\n"
             f'#include "{hdr}"\n'
             f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
@@ -1275,7 +1452,7 @@ def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
         i += 1
     fuzz_qual = 'extern "C" ' if cxx else ""
     free_call = f"    {dtor}(h);\n" if dtor else ""
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+    return with_stubs("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
             f'#include "{hdr}"\n'
             f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
             f"    {h} h = {ctor}({ctor_args});\n"
@@ -1320,10 +1497,11 @@ def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None
         pre = ("    char *s = (char*)malloc(size + 1);\n    if (!s) return 0;\n"
                "    memcpy(s, data, size); s[size] = 0;\n")
         call = f"    {fn}(({at})s);\n    free(s);\n"
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
-            f"{fn_qual}void {fn}({decl});\n"
-            f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
-            f"{pre}{call}    return 0;\n}}\n")
+    return with_stubs(
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
+        f"{fn_qual}void {fn}({decl});\n"
+        f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
+        f"{pre}{call}    return 0;\n}}\n")
 
 
 def _sources(root: Path, exclude_main: bool):
@@ -2543,6 +2721,44 @@ def _replay_report(binary, workdir: Path, data: bytes) -> str:
     except (subprocess.TimeoutExpired, OSError):
         return ""
     return fault_report((r.stderr or "") + (r.stdout or "")) or ""
+
+
+#: Inputs any honest call into a byte-consuming API must survive: nothing, and one byte.
+_TRIVIAL_INPUTS = (b"", b"A")
+
+
+def trivial_input_crash(binary, workdir, *, lib_dirs: list | None = None) -> str | None:
+    """The sanitizer/signal report when a SYNTHESIZED harness crashes on a trivial input, else None.
+
+    A synthesized call invents every argument past the bytes. When one of them is wrong -- NULL
+    for a struct the library dereferences (md4c's `md_parse(text, size, NULL, NULL)` reads
+    `parser->abi_version` first), a zero capacity -- the harness crashes inside the library on
+    the very first input, and that crash would be filed as a confirmed library defect. A real
+    parser handles an empty or one-byte input; a harness that cannot is testing our call, not the
+    library, so it is not fuzzed at all."""
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0:" + env.get("ASAN_OPTIONS", "")
+    if lib_dirs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [str(d) for d in lib_dirs] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH")
+                                          else []))
+    for i, data in enumerate(_TRIVIAL_INPUTS):
+        f = workdir / f"trivial{i}"
+        f.write_bytes(data)
+        try:
+            r = _run_group([str(binary), str(f)], timeout=30, env=env, cwd=str(workdir))
+        except subprocess.TimeoutExpired:
+            continue                                     # a hang is not this gate's question
+        except OSError:
+            return None
+        out = (r.stderr or "") + (r.stdout or "")
+        if r.returncode != 0 and ("ERROR: AddressSanitizer" in out or "deadly signal" in out
+                                  or "runtime error:" in out or r.returncode < 0):
+            head = next((ln for ln in out.splitlines() if "ERROR:" in ln or "deadly" in ln), "")
+            return f"crashes on a {len(data)}-byte input: {head.strip()[:200]}"
+    return None
 
 
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,

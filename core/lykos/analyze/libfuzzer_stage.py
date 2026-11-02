@@ -309,6 +309,33 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
         row["why"] = _build_why(build["log"])
         return row
     row["built"], row["harness"] = True, build["harness"]
+    # A SYNTHESIZED call must survive a trivial input before anything it finds is believed: one
+    # that crashes on nothing is crashing on an argument WE invented (see trivial_input_crash).
+    # In-tree and known harnesses are the project's own / documented calls and are exempt.
+    if spec.get("kind") not in ("in-tree", "known"):
+        bad = LF.trivial_input_crash(build["binary"], ctx.scratch() / f"triv-{spec['id']}",
+                                     lib_dirs=build.get("lib_dirs"))
+        # The FILE shape is a guess from the function's name (`parse*(char *)` might take a path)
+        # and the guess can be the invented argument: it hands the function a 19-byte temp PATH,
+        # and `parse(char *s){ char t[16]; strcpy(t, s); }` overflows on that path on every input
+        # -- a crash the fuzz bytes play no part in. Fall back to handing it the bytes themselves,
+        # where the same overflow is reached by attacker data instead of by our path.
+        if bad and spec.get("kind") == "function" and "[file]" in (build.get("harness") or ""):
+            alt = dict(spec, fn_kind="cstring", id=spec["id"] + "-str")
+            b2 = LF.build_libfuzzer(src, ctx.scratch() / f"lf-{alt['id']}.bin", spec=alt,
+                                    cache=cache)
+            if b2["ok"] and not LF.trivial_input_crash(
+                    b2["binary"], ctx.scratch() / f"triv-{alt['id']}",
+                    lib_dirs=b2.get("lib_dirs")):
+                bad, build, spec = None, b2, alt
+                row["harness"] = build["harness"]
+                row["kind_fallback"] = "file -> cstring (the path the file shape passes crashed it)"
+        if bad:
+            row["why"] = (f"not fuzzed: the synthesized call to {spec.get('entry')} {bad} -- an "
+                          "argument the harness had to invent is not a valid call, so its crashes "
+                          "would be ours, not the library's")
+            row["rejected"] = True
+            return row
     # SEED IT with the format this target reads. `run_libfuzzer` has always taken a corpus and
     # this caller never passed one, so the in-process engine started from an empty corpus and had
     # to invent a container format byte by byte -- while the pipeline already knows the format and
