@@ -26,7 +26,7 @@ from ...db.dao import DynResultDAO, FindingDAO, PocDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import (asan_defect_key, crash_dedup_key, crash_finding_candidate,
-                             crash_key_parts)
+                             crash_key_parts, sanitizer_hit)
 from ..invocation import staged_name as _staged_name
 from . import bundle, jpeg_overread
 from .capture import plain_build_bytes
@@ -93,8 +93,9 @@ def jpeg_overread_stage(ctx) -> dict:
         jpath.write_bytes(data)
         ctx.progress(msg=f"detonating a constructed JPEG over-read ({name})")
         r = _run(exe, jpath, target, timeout)
-        if (r.crashed and r.stderr and b"heap-buffer-overflow" in r.stderr
-                and b"READ of size" in r.stderr):
+        # Confirmed whether ASan aborted or exited cleanly (the run() path does not force
+        # abort_on_error, so a redzone-caught READ can exit code 1 with no signal).
+        if sanitizer_hit(r, (b"heap-buffer-overflow", b"READ of size")):
             res, trigger_name, jdata = r, name, data
             break
     if res is None:
@@ -104,30 +105,31 @@ def jpeg_overread_stage(ctx) -> dict:
 
     mode, argv_base = "file", []
     input_sha = ctx.put_artifact("jpegread-crash-input", data=jdata)
+    # A sanitizer error that EXITED (no signal) is morally an abort; key it as SIGABRT.
+    eff_signal = res.signal_name or "SIGABRT"
     defect_key = asan_defect_key(res.stderr)
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha, input_mode=mode,
-        argv=list(argv_base), signal=res.signal, signal_name=res.signal_name, crashed=True,
+        argv=list(argv_base), signal=res.signal, signal_name=eff_signal, crashed=True,
         isolation=res.isolation, duration_ms=res.duration_ms, fault_pc=res.fault_pc,
         defect_key=defect_key, note=f"constructed JPEG EXIF over-read ({trigger_name}); no fuzzing")
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
-            "argv": argv_base, "expected_signal": res.signal_name, "isolation": res.isolation,
+            "argv": argv_base, "expected_signal": eff_signal, "isolation": res.isolation,
             "verified": True, "level": "L1", "constructed": True, "tool_version": TOOL_VERSION}
-    data = bundle.build(target_bytes, jdata, meta, res.stderr, mode, argv_base,
-                        res.signal_name or "SIGABRT")
+    data = bundle.build(target_bytes, jdata, meta, res.stderr, mode, argv_base, eff_signal)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": "L1"})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L1", verified=True,
-                                     signal_name=res.signal_name, input_sha=input_sha,
+                                     signal_name=eff_signal, input_sha=input_sha,
                                      bundle_sha=bundle_sha)
     fd = FindingDAO(ctx.conn)
     fault_pc, disc, _ = crash_key_parts(ctx.conn, target.id, input_sha)
     fd.upsert(target.id, target.case_id, crash_finding_candidate(
-        res.signal_name, input_sha, res.isolation, "jpeg_overread",
+        eff_signal, input_sha, res.isolation, "jpeg_overread",
         f"(constructed JPEG: a malformed EXIF field ({trigger_name}) -> heap over-read READ behind "
         "the JPEG parser; no fuzzing)",
         state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc,
         discriminator=disc, file_type=target.file_type))
-    fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc, disc))
+    fid = fd.id_for_dedup(target.id, crash_dedup_key(eff_signal, fault_pc, disc))
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
     ctx.emit("jpegread.l1", payload={"level": "L1", "bundle": bundle_sha, "input_sha": input_sha,

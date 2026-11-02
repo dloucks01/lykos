@@ -92,6 +92,21 @@ def asan_defect_key(stderr) -> str | None:
     return (disc.replace(" ", "_")[:120] or None)
 
 
+def sanitizer_hit(res, tokens) -> bool:
+    """True when `res` is a CONFIRMED sanitizer defect carrying every byte-token in `tokens`
+    (e.g. b"stack-buffer-overflow" + b"WRITE of size"). A sanitizer error is a confirmed defect
+    whether the process ABORTED (SIGABRT, `res.crashed`) or merely EXITED after printing the report:
+    on the `sandbox.run` path ASan is not forced to abort_on_error, so a redzone-caught write exits
+    with code 1 and NO signal, and gating on `res.crashed` alone silently drops a real overflow
+    (measured: unzip's `methbuf` stack overflow reproduced in stderr but `crashed=False`). Requiring
+    a PARSEABLE ASan report (`asan_defect_key`) as well as the tokens keeps it forgery-proof -- a
+    target that merely echoed the token text would not produce a report the parser accepts."""
+    se = getattr(res, "stderr", None)
+    if not se or not all(t in se for t in tokens):
+        return False
+    return bool(res.crashed or asan_defect_key(se))
+
+
 def crash_dedup_key(signal_name, fault_pc=None, discriminator=None, *, hijack=False) -> str:
     """The bucket a crash belongs to. Every stage that files one must agree, or a verified PoC
     opens a second finding beside the crash it just proved."""

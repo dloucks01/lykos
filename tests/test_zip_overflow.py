@@ -80,3 +80,33 @@ def test_the_out_of_range_method_reproduces_a_stack_overflow(tmp_path):
         "the out-of-range method did not produce the expected stack overflow"
     safe = subprocess.run([str(exe), "999"], capture_output=True, env=env)
     assert b"stack-buffer-overflow" not in safe.stderr          # 3-digit method is in bounds (0-FP)
+
+
+# ------------------------------------------------- the no-signal ASan-exit detection (the in-pipeline bug)
+def test_sanitizer_hit_accepts_an_asan_error_that_exited_without_a_signal():
+    """`sandbox.run` does not force abort_on_error, so a redzone-caught WRITE prints the ASan report
+    and EXITS code 1 with NO signal (crashed=False). The directed stages must still treat that as a
+    confirmed overflow -- gating on crashed alone silently dropped unzip's real `methbuf` overflow
+    in-pipeline. Forgery-proof: a parseable ASan report is required, not merely the token text."""
+    from lykos.analyze.dynamic.stage import sanitizer_hit
+
+    class R:
+        def __init__(self, crashed, stderr):
+            self.crashed = crashed
+            self.stderr = stderr
+
+    report = (b"=================================================================\n"
+              b"==2==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7bfff48f00c8 "
+              b"at pc 0x55 bp 0x7f sp 0x7f\n"
+              b"WRITE of size 6 at 0x7bfff48f00c8 thread T0\n"
+              b"    #0 0x55 in list_files list.c:342\n")
+    tokens = (b"stack-buffer-overflow", b"WRITE of size")
+    # exited without a signal, but the report is real -> a hit
+    assert sanitizer_hit(R(False, report), tokens) is True
+    # aborted (signal) with the report -> also a hit
+    assert sanitizer_hit(R(True, report), tokens) is True
+    # a clean run with no report -> not a hit (0-FP)
+    assert sanitizer_hit(R(False, b"Archive:  a.zip\n  inflating: x\n"), tokens) is False
+    # the token text echoed but with NO parseable ASan report -> not a hit (forgery guard)
+    assert sanitizer_hit(R(False, b"stack-buffer-overflow WRITE of size (just echoed text)"),
+                         tokens) is False

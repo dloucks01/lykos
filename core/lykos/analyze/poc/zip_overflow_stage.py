@@ -24,7 +24,7 @@ from ...db.dao import DynResultDAO, FindingDAO, PocDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import (asan_defect_key, crash_dedup_key, crash_finding_candidate,
-                             crash_key_parts)
+                             crash_key_parts, sanitizer_hit)
 from ..invocation import staged_name as _staged_name
 from . import bundle, zip_overflow
 
@@ -92,8 +92,10 @@ def zip_overflow_stage(ctx) -> dict:
     for variant in _ARGV_VARIANTS:
         ctx.progress(msg=f"detonating a constructed over-method ZIP ({' '.join(variant)})")
         r = _run(exe, variant, zpath, target, timeout)
-        if (r.crashed and r.stderr and b"stack-buffer-overflow" in r.stderr
-                and b"WRITE of size" in r.stderr):
+        # A sanitizer-reported stack overflow is confirmed whether ASan aborted or exited cleanly
+        # (the run() path does not force abort_on_error, so a redzone-caught WRITE exits code 1 with
+        # no signal -- gating on r.crashed alone dropped this real overflow).
+        if sanitizer_hit(r, (b"stack-buffer-overflow", b"WRITE of size")):
             res, argv_prefix = r, variant
             break
     if res is None:
@@ -105,30 +107,32 @@ def zip_overflow_stage(ctx) -> dict:
     mode = "file"
     argv_base = list(argv_prefix) + ["@@"]
     input_sha = ctx.put_artifact("zipflow-crash-input", data=zdata)
+    # A sanitizer error that EXITED (no signal) is morally an abort; key it as SIGABRT so the
+    # finding/bundle/dedup agree with the signalled case and `asan_defect_key` discriminates it.
+    eff_signal = res.signal_name or "SIGABRT"
     defect_key = asan_defect_key(res.stderr)
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha, input_mode=mode,
-        argv=list(argv_base), signal=res.signal, signal_name=res.signal_name, crashed=True,
+        argv=list(argv_base), signal=res.signal, signal_name=eff_signal, crashed=True,
         isolation=res.isolation, duration_ms=res.duration_ms, fault_pc=res.fault_pc,
         defect_key=defect_key, note="constructed ZIP compression-method overflow; no fuzzing")
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
-            "argv": argv_base, "expected_signal": res.signal_name, "isolation": res.isolation,
+            "argv": argv_base, "expected_signal": eff_signal, "isolation": res.isolation,
             "verified": True, "level": "L1", "constructed": True, "tool_version": TOOL_VERSION}
-    data = bundle.build(target_bytes, zdata, meta, res.stderr, mode, argv_base,
-                        res.signal_name or "SIGABRT")
+    data = bundle.build(target_bytes, zdata, meta, res.stderr, mode, argv_base, eff_signal)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": "L1"})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L1", verified=True,
-                                     signal_name=res.signal_name, input_sha=input_sha,
+                                     signal_name=eff_signal, input_sha=input_sha,
                                      bundle_sha=bundle_sha)
     fd = FindingDAO(ctx.conn)
     fault_pc, disc, _ = crash_key_parts(ctx.conn, target.id, input_sha)
     fd.upsert(target.id, target.case_id, crash_finding_candidate(
-        res.signal_name, input_sha, res.isolation, "zip_overflow",
+        eff_signal, input_sha, res.isolation, "zip_overflow",
         "(constructed ZIP: an out-of-range compression_method rendered into a fixed stack buffer "
         "-> stack-buffer-overflow WRITE behind the ZIP parser; no fuzzing)",
         state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc,
         discriminator=disc, file_type=target.file_type))
-    fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc, disc))
+    fid = fd.id_for_dedup(target.id, crash_dedup_key(eff_signal, fault_pc, disc))
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
     ctx.emit("zipflow.l1", payload={"level": "L1", "bundle": bundle_sha, "input_sha": input_sha,
