@@ -2354,11 +2354,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
                 # CWE-class probes -- recording a verified reproduction only if the target faults.
                 _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
-                # Directed, no-fuzzing trigger for a GIF palette over-read (gif2rgb /
-                # CVE-2016-3977 shape): construct a valid GIF whose pixel index is past the colour
-                # table, reproduce the heap over-read (L1), then disclose heap at an attacker-chosen
-                # offset to the output (L3). Self-skips on a non-GIF target, so a non-GIF pays ~0.
-                _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
                 # Demonstrate injection / format-string leaks by probing the binary's sinks directly
                 # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
                 if not _is_server:          # a stdin prober; a server never reads stdin
@@ -2390,6 +2385,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                                     "debug_monitor palette_overread").split()
                     bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
                                           **{k: _why_srv for k in _srv_decline}}
+                # FIRST in the search phase, before any blind fuzzer: a DIRECTED, deterministic,
+                # one-shot trigger for a narrowed format sink (a GIF palette over-read -- gif2rgb /
+                # CVE-2016-3977). It constructs a valid over-indexed GIF, reproduces the heap
+                # over-read (L1), and discloses heap to the output (L3) -- no campaign. Placed ahead
+                # of coverage_fuzz/directed_fuzz/fuzz so a deterministic proof is never starved by a
+                # blind campaign (the smart-first rule); it self-skips on a non-GIF target in ~0 s.
+                if not _is_server:
+                    _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
                 # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
                 channels = _ranked_channels(store, tid)
                 primary = channels[0] if channels else None
