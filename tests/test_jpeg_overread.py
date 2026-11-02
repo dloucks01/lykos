@@ -68,6 +68,72 @@ def test_all_triggers_are_registered():
     assert names == ["tiny_app1", "short_exif", "gps_wrongfmt"]
 
 
+def test_gps_disclose_is_a_complete_jpeg_declaring_one_component():
+    d = jo.gps_disclose(sentinel_min=31337, sentinel_sec=22251)
+    ms = _markers(d)
+    types = [m for (m, _) in ms]
+    assert 0xE1 in types and 0xC0 in types and 0xDA in types, \
+        "the disclosure JPEG must carry APP1 + a baseline frame (SOF0) + a scan (SOS)"
+    assert d[:2] == b"\xff\xd8" and d[-2:] == b"\xff\xd9"
+    # the latitude entry declares exactly ONE URATIONAL component (the bug reads three)
+    tiff = d[d.index(b"Exif\x00\x00") + 6:]
+    gps_off = struct.unpack("<I", tiff[10 + 8:10 + 12])[0]
+    n = struct.unpack("<H", tiff[gps_off:gps_off + 2])[0]
+    lat = tiff[gps_off + 2 + 12:gps_off + 2 + 24]          # 2nd entry (after LAT_REF)
+    tag, fmt, comps = struct.unpack("<HHI", lat[:8])
+    assert tag == jo._TAG_GPS_LAT and fmt == jo.FMT_URATIONAL and comps == 1
+
+
+def test_confirm_gps_disclosure_is_forgery_proof():
+    # a faithful stand-in for jhead: reads 3 components regardless of the declared count, so the
+    # two past-the-field sentinels surface as minutes/seconds -> the oracle must confirm.
+    def honest_reader(smin, ssec):
+        return (12, smin, ssec)
+    assert jo.confirm_gps_disclosure(honest_reader)["disclosed"] is True
+    # a target that only ever prints the one DECLARED component (no over-read) must NOT confirm
+    def safe_reader(smin, ssec):
+        return (12, 0, 0)
+    assert jo.confirm_gps_disclosure(safe_reader)["disclosed"] is False
+    # a target that echoes a constant (ignores the input) must NOT confirm (forgery guard)
+    def constant_reader(smin, ssec):
+        return (12, 999, 999)
+    assert jo.confirm_gps_disclosure(constant_reader)["disclosed"] is False
+
+
+@pytest.mark.skipif(not (shutil.which("gcc") or shutil.which("cc")), reason="no C compiler")
+def test_gps_disclosure_reproduces_on_a_faithful_sink(tmp_path):
+    """A faithful fixture of ProcessGpsInfo's fixed three-component loop over a one-component
+    value: it must print the two past-the-field rationals as the coordinate, and the printed value
+    must track the injected sentinels (the disclosure)."""
+    cc = shutil.which("gcc") or shutil.which("cc")
+    src = tmp_path / "sink.c"
+    src.write_text(r"""
+#include <stdio.h>
+#include <stdint.h>
+/* value[] holds ONE declared rational (8 bytes); the loop reads THREE, past the field. */
+int main(int argc, char**argv){
+    int32_t buf[6];                       /* [deg/1][min/1][sec/1] laid out as the EXIF would be */
+    buf[0]=12; buf[1]=1;                   /* declared component: 12/1 */
+    buf[2]=atoi(argv[1]); buf[3]=1;        /* past-the-field 1 (minutes) */
+    buf[4]=atoi(argv[2]); buf[5]=1;        /* past-the-field 2 (seconds) */
+    double v[3];
+    for(int a=0;a<3;a++){ v[a]=(double)buf[a*2]/(double)buf[a*2+1]; }
+    printf("GPS Latitude : N %0.0fd %0.0fm %0.0fs\n", v[0], v[1], v[2]);
+    return 0;
+}
+""")
+    exe = tmp_path / "sink"
+    import subprocess as sp
+    if sp.run([cc, "-O0", "-w", "-o", str(exe), str(src)], capture_output=True).returncode:
+        pytest.skip("cannot build sink fixture")
+    import re
+    def read_coord(smin, ssec):
+        r = sp.run([str(exe), str(smin), str(ssec)], capture_output=True)
+        m = re.search(rb"N\s+(\d+)d\s+(\d+)m\s+(\d+)s", r.stdout)
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+    assert jo.confirm_gps_disclosure(read_coord)["disclosed"] is True
+
+
 # A faithful fixture of the tiny-APP1 sink: a 2-byte allocation that a 4-byte compare reads past.
 _VULN = r"""
 #include <stdlib.h>
