@@ -60,10 +60,14 @@ def parse_sanitizer(text: str) -> Optional[dict]:
         if a:
             out["access"], out["size"] = a.group(1).lower(), int(a.group(2))
         frames = []
-        for f in _ASAN_FRAME.finditer(text[m.start():]):
+        body = text[m.start():]
+        for f in _ASAN_FRAME.finditer(body):
+            # the FAULTING stack only: stop where the allocation / free stacks begin
+            if re.search(r"allocated by|freed by|previously allocated", body[:f.start()]):
+                break
             frames.append({"fn": f.group(2), "file": f.group(3).rsplit("/", 1)[-1],
                            "line": int(f.group(4)), "path": f.group(3)})
-            if len(frames) >= 6 or "allocated by" in text[m.start():f.start() + m.start()]:
+            if len(frames) >= 6:
                 break
         out["frames"] = frames
         r = _ASAN_REGION.search(text)
