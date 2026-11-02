@@ -373,35 +373,93 @@ def test_a_prebuilt_tree_is_rebuilt_not_reused(tmp_path, gcc_or_skip):
     assert "asan" in out or "asan" in dyn, "the rebuilt binary carries no ASan"
 
 # ----------------------------------------------- what stopped two real libraries from building
-def test_a_plain_make_is_the_retry_when_B_cannot_run():
-    """`-B` first (it is what makes an already-built tree rebuild with our instrumentation), and
-    a plain make as the RETRY when it fails having produced nothing.
+def test_autotools_defeats_maintainer_rules_then_cleans_before_a_plain_make():
+    """The autotools builder must NOT lead with `make -B`, and must clean before a plain make.
 
-    Measured on libsndfile 1.0.28: `./configure` succeeded, then `make -B -j` forced autotools'
-    maintainer rules and died with
+    `make -B` traded one failure for another. It is what rebuilds an already-built tree with our
+    instrumentation -- but it also forces autotools' MAINTAINER rules, so the tree tries to
+    regenerate aclocal.m4 and dies, because `aclocal` is not installed here:
 
-        make: *** [Makefile:484: aclocal.m4] Error 127
+        make: *** [Makefile:587: aclocal.m4] Error 127
 
-    because `aclocal` is not installed here. The project fell through to the `loose` builder,
-    which cannot link a tree containing several programs with their own main(), so libsndfile
-    ingested as a PREBUILT BINARY with no source -- which is why its libFuzzer stage reported
-    "no source for this target" and the campaign ran at 359 exec/s through the black-box path
-    instead of building in-process doors. With the retry: 10 entry points, primary
-    `programs/sndfile-info`, an 8 MB ASan ELF.
+    Measured on BOTH libsndfile 1.0.28 and giflib 5.1.4: each fell through to the `loose` builder
+    and ingested wrong -- libsndfile as a prebuilt binary with no source (libFuzzer said "no
+    source", 359 exec/s), giflib as a SINGLE library, so gif2rgb/giftool -- where its CVEs live --
+    were never analysed and its recall went 6 -> 0 between two runs of the same code (the only
+    difference was whether the tree had already been built).
 
-    The order matters in both directions, which is why both tests exist: reversing it (plain
-    make first) makes `test_a_prebuilt_tree_is_rebuilt_not_reused` fail, because make then says
-    "nothing to be done" and the stale uninstrumented artifact is analysed instead.
+    The fix fixes both at the root: defeat the maintainer rules (so make never reaches for
+    aclocal), `make clean` so the stale artifacts are gone, THEN a plain `make` that rebuilds every
+    program from source with our wrappers. `-B` survives only as a last-resort retry gated on the
+    plain make having produced nothing. `test_a_prebuilt_tree_is_rebuilt_not_reused` and
+    `test_an_already_built_autotools_tree_rebuilds_all_programs` guard that it still rebuilds.
     """
     import inspect
 
     from lykos.analyze import source_project as sp
     src = inspect.getsource(sp.build_source_project)
-    first = src.index('_run(["make", "-B", "-j"], cwd=root)')
-    retry = src.index('_run(["make", "-j"], cwd=root)')
-    assert first < retry, "-B has to be attempted first; a plain make is the fallback"
-    assert 'if rcm != 0 and not _elf_executables(root, start_make)' in src, \
-        "the retry must be gated on -B having FAILED and produced nothing"
+    i_auto = src.index("def _b_autotools")
+    i_make = src.index("def _b_make")
+    body = src[i_auto:i_make]                      # the autotools builder only
+    defeat = body.index("_defeat_maintainer_rules(root)")
+    clean = body.index('_run(["make", "clean"]')
+    plain = body.index('_run(["make", "-j"], cwd=root)')
+    forced = body.index('_run(["make", "-B", "-j"], cwd=root)')
+    assert defeat < clean < plain < forced, \
+        "autotools must defeat maintainer rules, clean, then plain make; -B is only the last retry"
+    assert 'if rcm != 0 and not _elf_executables(root, start_make)' in body, \
+        "the -B retry must be gated on the plain make having produced nothing"
+
+
+def test_an_already_built_autotools_tree_rebuilds_all_programs(tmp_path, gcc_or_skip):
+    """The giflib 5.1.4 shape, minimised: an autotools tree (a `configure`, a Makefile whose `all`
+    depends on a MAINTAINER target that needs a tool we lack) that is ALREADY BUILT with stale,
+    uninstrumented binaries. The old `make -B` strategy hit the maintainer rule and died; the
+    retry (plain make) then did nothing because the tree looked up to date -- so the tree ingested
+    as a single mis-built artefact and every program behind it went unanalysed. The builder must
+    now rebuild BOTH programs, instrumented."""
+    import time
+    root = tmp_path / "proj"
+    (root / "m4").mkdir(parents=True)
+    (root / "configure.ac").write_text("AC_INIT([proj],[1])\n")
+    # the shipped, generated files a release tarball carries -- present, so no autoconf is needed.
+    (root / "aclocal.m4").write_text("# generated\n")
+    (root / "configure").write_text("#!/bin/sh\nexit 0\n")
+    os.chmod(root / "configure", 0o755)
+    for name in ("tool", "helper"):
+        (root / f"{name}.c").write_text(
+            "#include <stdio.h>\n#include <string.h>\n"
+            f"int main(int c,char**v){{char b[8]; if(c>1) strcpy(b,v[1]); printf(\"{name} %s\\n\",b);"
+            " return 0;}\n")
+    # `all` reaches the two programs THROUGH a maintainer rule that runs a missing tool: exactly
+    # what `make -B` forces (and what defeating the maintainer rules + a clean must route around).
+    (root / "Makefile").write_text(
+        "all: aclocal.m4 tool helper\n"
+        "aclocal.m4: configure.ac\n\taclocal-1.15 -I m4\n"
+        "tool: tool.c\n\t$(CC) $(CFLAGS) tool.c -o tool\n"
+        "helper: helper.c\n\t$(CC) $(CFLAGS) helper.c -o helper\n"
+        "clean:\n\trm -f tool helper\n")
+    # pre-build with the PROJECT's flags (no sanitizer), newest, and make configure.ac newer than
+    # the generated aclocal.m4 so a naive `make` WOULD fire the maintainer rule.
+    os.utime(root / "aclocal.m4", (1, 1))
+    os.system(f"cd {root} && make tool helper CC=cc >/dev/null 2>&1")
+    assert (root / "tool").exists(), "fixture did not pre-build"
+    plain_sz = (root / "tool").stat().st_size
+    time.sleep(0.05)
+    os.utime(root / "tool", None)
+    os.utime(root / "helper", None)
+    os.utime(root / "configure.ac", None)                    # newer than aclocal.m4 -> rule armed
+
+    r = build_source_project(root) or {}
+    assert r.get("ok"), f"already-built autotools tree did not build: {(r.get('log') or '')[-500:]}"
+    names = {Path(b).name for b in (r.get("binaries") or [])}
+    assert {"tool", "helper"} <= names, \
+        f"not every program was rebuilt (got {names}); the maintainer-rule trap was not routed around"
+    exe = root / "tool"
+    assert exe.stat().st_size > plain_sz, "stale uninstrumented artefact reused, not rebuilt"
+    dyn = subprocess.run(["readelf", "-d", str(exe)], capture_output=True, text=True).stdout.lower()
+    nm = subprocess.run(["nm", "-D", str(exe)], capture_output=True, text=True).stdout.lower()
+    assert "asan" in dyn or "asan" in nm, "the rebuilt binary carries no ASan"
 
 
 def test_cmake_retries_past_a_removed_minimum_version():

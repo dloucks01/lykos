@@ -250,6 +250,41 @@ def _run_group(argv, *, cwd, env, timeout: float):
     return proc.returncode, text
 
 
+def _defeat_maintainer_rules(root: Path) -> None:
+    """Make an autotools tree's GENERATED files look newer than their sources, so `make` never
+    tries to re-run aclocal / automake / autoconf -- none of which is installed on an air-gapped
+    host. A released tarball ships `aclocal.m4`, `configure`, `config.h.in` and every `Makefile.in`
+    pre-generated; whether `make` leaves them alone is purely an mtime question, and unpacking (or
+    our own `git`/`cp` of the tree) does not preserve the shipped ordering. When a generated file
+    looks older than a source it depends on, make fires the MAINTAINER rule to regenerate it and
+    dies -- measured on libsndfile 1.0.28 AND giflib 5.1.4:
+
+        make: *** [Makefile:587: aclocal.m4] Error 127   (aclocal-1.15: command not found)
+
+    after which the project fell through to the loose builder and ingested wrong (libsndfile as a
+    prebuilt binary with no source; giflib as a single library, so gif2rgb/giftool -- where its
+    CVEs live -- were never analysed and recall collapsed 6 -> 0). Touching the generated files
+    forward, in dependency order, is the standard "I have no maintainer tools" autotools
+    workaround; it is a no-op on a tree that has none of these files (a plain Makefile / CMake
+    project)."""
+    import time as _time
+    base = _time.time() + 1.0
+    # oldest -> newest; each tier must end up newer than the tier(s) it is generated from.
+    tiers = ({"aclocal.m4"},
+             {"configure", "config.h.in"},
+             {"Makefile.in"},
+             {"config.status"},
+             {"Makefile", "config.h", "stamp-h1"})
+    for i, names in enumerate(tiers):
+        ts = base + i
+        for p in root.rglob("*"):
+            if p.name in names and p.is_file():
+                try:
+                    os.utime(p, (ts, ts))
+                except OSError:
+                    pass
+
+
 def build_source_project(root, *, timeout: int = 300, total: int | None = None,
                          sanitize: bool = True, opt: str | None = None) -> dict:
     """Build the project rooted at `root` with sanitizers forced in. Returns
@@ -379,28 +414,33 @@ def build_source_project(root, *, timeout: int = 300, total: int | None = None,
             if rc2 != 0:
                 _, o3 = _run(["./configure", "--static"], cwd=root)
                 o1 = o1 + "\n-- retried with --static --\n" + o3
-        # `-B` FIRST, then a plain make as the retry -- in that order, because each fixes a
-        # failure the other causes.
+        # Two failures have to be fixed AT ONCE here; `make -B` -- the old strategy -- could only
+        # trade one for the other:
         #
-        #   * `-B` is what makes an ALREADY-BUILT tree get rebuilt with our instrumentation.
-        #     Without it make says "nothing to be done", the stale uninstrumented artifact is
-        #     analysed, and nothing anywhere says so (test_a_prebuilt_tree_is_rebuilt_not_reused).
-        #   * but `-B` also forces autotools' MAINTAINER rules, so a freshly unpacked release
-        #     tarball tries to regenerate aclocal.m4 -> `aclocal` -> not installed here:
-        #         make: *** [Makefile:484: aclocal.m4] Error 127
-        #     and libsndfile 1.0.28 fell through to the `loose` builder, which cannot link a tree
-        #     containing several programs with their own main(). It then ingested as a PREBUILT
-        #     BINARY with no source, so its libFuzzer stage said "no source for this target" and
-        #     the campaign ran at 359 exec/s instead of building in-process doors.
+        #   * an ALREADY-BUILT tree (a shipped tarball's binaries, or our own previous run's) must
+        #     be REBUILT with our instrumentation, not reused. A plain `make` on it says "nothing
+        #     to be done", the stale uninstrumented artifact is analysed, and nothing says so
+        #     (test_a_prebuilt_tree_is_rebuilt_not_reused).
+        #   * but `make -B` also forces autotools' MAINTAINER rules, so the tree tries to
+        #     regenerate aclocal.m4 -> `aclocal` -> not installed here:
+        #         make: *** [Makefile:587: aclocal.m4] Error 127
+        #     measured on BOTH libsndfile 1.0.28 and giflib 5.1.4; each fell through to the loose
+        #     builder and ingested wrong -- libsndfile as a prebuilt binary with no source (its
+        #     libFuzzer stage said "no source" and ran at 359 exec/s), giflib as ONE library, so
+        #     gif2rgb/giftool -- where its CVEs live -- were never analysed and recall went 6 -> 0.
         #
-        # So: force the rebuild, and if that leaves nothing, build the ordinary way. Measured
-        # after the retry: libsndfile yields 10 entry points, primary `programs/sndfile-info`.
-        rcm, o2 = _run(["make", "-B", "-j"], cwd=root)
+        # So fix both at the root: defeat the maintainer rules (make never reaches for aclocal),
+        # `make clean` so the stale artifacts are gone, then a plain `make` that rebuilds every
+        # program from source with our wrappers. Measured after this: giflib yields its 6 util
+        # programs, libsndfile its 10 entry points -- deterministically, on a fresh OR an
+        # already-built tree. `-B` stays only as a last-resort retry (a non-standard `clean`).
+        _defeat_maintainer_rules(root)
+        _run(["make", "clean"], cwd=root)              # best-effort; ignore a missing clean target
+        rcm, o2 = _run(["make", "-j"], cwd=root)
         if rcm != 0 and not _elf_executables(root, start_make) \
                 and not _elf_libraries(root, start_make):
-            _, o2b = _run(["make", "-j"], cwd=root)
-            o2 = o2 + "\n-- `make -B` failed and produced nothing (maintainer rules need tools "
-            o2 = o2 + "this host lacks); retried without -B --\n" + o2b
+            _, o2b = _run(["make", "-B", "-j"], cwd=root)
+            o2 = o2 + "\n-- plain make produced nothing after clean; retried with -B --\n" + o2b
         return "autotools", o1 + o2
 
     def _b_make():
