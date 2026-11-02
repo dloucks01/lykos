@@ -53,3 +53,18 @@ def test_file_uc_lead_is_a_candidate_with_the_caveat(store, case):
     assert f.state == "candidate" and f.cwe == "CWE-94"                 # never 'confirmed'
     ev = " ".join(str(e.get("detail", "")) for e in (f.evidence or []))
     assert "under-constrained" in ev and "NOT a proven bug" in ev and "freerdp_dispatch" in ev
+
+
+def test_a_call_through_a_callers_object_is_not_a_hijack_lead():
+    """md4c: UC filed CWE-94 leads on the renderer's own callbacks, which call `r->process_output`
+    through the caller's context object. Same machine shape as a byte buffer turned into a code
+    pointer; only the declared parameters tell them apart."""
+    from lykos.analyze.symbolic.uc_stage import callback_dispatch_only
+    assert callback_dispatch_only(["MD_BLOCKTYPE type", "void* detail", "void* userdata"])
+    assert callback_dispatch_only(["struct ctx *c"])
+    # a byte buffer can carry the code pointer: still a lead
+    assert not callback_dispatch_only(["char *p"])
+    assert not callback_dispatch_only(["const unsigned char* d", "unsigned long len"])
+    assert not callback_dispatch_only(["void *buf", "size_t n"])
+    # no source signature: no claim either way
+    assert not callback_dispatch_only(None)

@@ -16,6 +16,8 @@ as the concolic rung does) is a follow-up.
 """
 from __future__ import annotations
 
+import re
+
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 
@@ -79,6 +81,47 @@ def _file_uc_lead(ctx, target, fn: str, uc: dict) -> None:
         "evidence": [{"channel": "uc-symbolic", "detail": detail}]})
 
 
+#: A parameter that carries INPUT BYTES: a byte/char pointer, or an untyped pointer followed by a
+#: length. Anything else a pointer parameter can be is an OBJECT the caller built.
+_BYTE_PTR = re.compile(r"^(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:char|uint8_t|u_char|int8_t|"
+                       r"u8|byte|BYTE)\s*\*", re.I)
+
+
+def callback_dispatch_only(params) -> bool:
+    """True when a function's declared parameters include NO input-byte buffer, so a data-derived
+    PC can only have been loaded from an object its caller supplied -- a callback / vtable dispatch,
+    not attacker data reaching control flow.
+
+    UC treats everything behind a parameter as attacker data, and on md4c that filed five CWE-94
+    'control-flow hijack' leads on the HTML renderer's own callbacks -- `enter_block_callback(
+    MD_BLOCKTYPE type, void* detail, void* userdata)` calls `r->process_output(...)` through the
+    caller's context object, by design. At machine level that is the same shape as
+    `call_mem(char *p){ (*(fp*)p)(); }`, which IS a lead (bytes become a code pointer); only the
+    declared types tell them apart, so this needs the source and says nothing without it."""
+    if params is None:
+        return False                                     # no source signature: no claim
+    ps = [str(a) for a in params if str(a).strip() not in ("", "void")]
+    for i, a in enumerate(ps):
+        if _BYTE_PTR.match(a.strip()):
+            return False
+        if re.match(r"^(?:const\s+)?void\s*\*", a.strip()) and i + 1 < len(ps) and re.search(
+                r"\b(size_t|ssize_t|unsigned|int|long|uint\d+_t|len|size)\b", ps[i + 1]):
+            return False                                 # (void *buf, size_t n): bytes
+    return True
+
+
+def _source_params(src, fn):
+    """`fn`'s declared parameters from the archived source tree `src`, or None without one."""
+    if not src:
+        return None
+    try:
+        from ..libfuzzer import defs_index
+        hit = defs_index(src).get(fn)
+        return list(hit[1]) if hit else None
+    except Exception:                                    # noqa: BLE001 -- no source, no claim
+        return None
+
+
 def uc_symbolic_stage(ctx) -> dict:
     import tempfile
     from pathlib import Path
@@ -113,18 +156,34 @@ def uc_symbolic_stage(ctx) -> dict:
 
     per = max(20, int(budget / max(1, len(names))))
     scanned = hijackable = 0
+    dispatch: list = []
+    src = None                                           # the archived source, fetched on demand
     ctx.progress(msg=f"UC-scanning {len(names)} undriven project function(s)")
     for fn in names:
         uc = uc_scan_function(binp, fn, timeout=per, ctx=ctx)
         if not uc.get("reached"):
             continue
         scanned += 1
+        if uc.get("hijackable") and src is None:
+            from ..libfuzzer_stage import _materialize_source
+            try:
+                src = _materialize_source(ctx, target) or False
+            except Exception:                            # noqa: BLE001 -- no source, no claim
+                src = False
+        if uc.get("hijackable") and callback_dispatch_only(_source_params(src, fn)):
+            dispatch.append(fn)
+            continue
         if uc.get("hijackable"):
             _file_uc_lead(ctx, target, fn, uc)
             hijackable += 1
             ctx.progress(msg=f"UC candidate (control-flow hijack, under-constrained): {fn}()")
     ctx.emit("uc_symbolic.done", payload={"supported": True, "functions": len(names),
-             "scanned": scanned, "hijackable": hijackable})
+             "scanned": scanned, "hijackable": hijackable,
+             # said, not hidden: these reached PC through a caller-supplied object
+             "callback_dispatch_not_filed": dispatch[:16],
+             "why": ("no input-byte parameter: the called pointer comes from an object the "
+                     "caller built (a callback/vtable dispatch), not from attacker data")
+             if dispatch else None})
     ctx.progress(pct=100, msg=f"UC: {scanned} function(s) scanned, {hijackable} candidate(s)")
     return {"metrics": {"supported": True, "scanned": scanned, "hijackable": hijackable}}
 
