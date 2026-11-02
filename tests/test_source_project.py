@@ -533,3 +533,23 @@ def test_elf_objects_finds_relocatables_and_skips_scaffold(tmp_path, gcc_or_skip
     found = {p.name for p in _elf_objects(tmp_path, since)}
     assert "a.o" in found
     assert "conftest.o" not in found and "probe.o" not in found
+
+
+def test_a_source_project_also_gets_an_uninstrumented_build(store, case, gcc_or_skip):
+    """AFL++ cannot run an ASan binary, so without a plain build every source PROJECT declined
+    coverage-guided fuzzing (md4c). Single-file uploads always had one."""
+    import tempfile
+    from pathlib import Path
+
+    from lykos.analyze.fuzz import aflpp
+    d = Path(tempfile.mkdtemp())
+    _make_project(d)
+    register()
+    t = ingest(store, case.id, d, filename="myproj")
+    plain = [a for a in ArtifactDAO(store.conn).list_by_case(case.id) if a.kind == "plain-blob"]
+    assert plain and plain[0].meta.get("binary_sha") == t.sha256
+    blob = store.content.get_bytes(plain[0].sha256)
+    assert not aflpp.is_sanitizer_build(blob)
+    assert aflpp.is_sanitizer_build(store.content.get_bytes(t.sha256))
+    # the sanitizer build's tree is untouched by the second build
+    assert not (d / "_lykos_plain").exists()

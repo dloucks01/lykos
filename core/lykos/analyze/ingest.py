@@ -506,6 +506,47 @@ def _preflight_stage_line(preflight) -> str:
     return "\n\nstage these before going offline (lykos deps <dir> for detail): " + ", ".join(toks)
 
 
+def _store_plain_project_builds(store, case_id, root, built) -> int:
+    """An UNINSTRUMENTED build of a source project, stored as `plain-blob` per executable (matched
+    by name to the sanitizer build it shadows). Single-file uploads always had one; projects did not,
+    so AFL++ -- which cannot run an ASan binary under its memory model -- declined every source
+    project outright: md4c's coverage-guided fuzzer never ran. Built in a scratch COPY of the tree
+    so the sanitizer build's objects are untouched. Best-effort: a project whose plain build fails
+    simply keeps the sandbox fuzzers, as before. Returns how many plain builds were stored."""
+    import shutil
+    import tempfile
+    from . import source_project
+    bins = [Path(b) for b in (built.get("binaries") or []) if b]
+    if built.get("primary"):
+        bins.insert(0, Path(built["primary"]))
+    want = {b.name: b for b in bins if b.is_file()}
+    if not want:
+        return 0
+    tmp = Path(tempfile.mkdtemp(prefix="lykos-plain-"))
+    stored = 0
+    try:
+        copy = tmp / "src"
+        shutil.copytree(Path(root), copy, symlinks=True,
+                        ignore=shutil.ignore_patterns("_lykos_build", ".git"))
+        plain = source_project.build_source_project(copy, sanitize=False, timeout=240, total=420)
+        if not plain.get("ok"):
+            return 0
+        got = {Path(b).name: Path(b) for b in (plain.get("binaries") or []) if b}
+        for name, sanbin in want.items():
+            pb = got.get(name)
+            if pb is None or not pb.is_file():
+                continue
+            store.put_artifact(case_id, "plain-blob", src=pb,
+                               meta={"binary_sha": hash_all_file(sanbin)["sha256"],
+                                     "filename": name, "project": True})
+            stored += 1
+    except Exception:                                    # noqa: BLE001 -- an optional build
+        return stored
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return stored
+
+
 def _ingest_built_project(store, case_id, root, built, filename):
     """Ingest the binary produced by building a source PROJECT: store the primary instrumented
     executable as the target, keep the source TREE (tar.gz) keyed to its hash so the code view can
@@ -534,6 +575,7 @@ def _ingest_built_project(store, case_id, root, built, filename):
     store.put_artifact(case_id, "target-blob", src=primary)
     main = store.targets.upsert(case_id, filename, info["sha256"],
                                 md5=info["md5"], sha1=info["sha1"], size=info["size"])
+    _store_plain_project_builds(store, case_id, root, built)
     # EVERY ENTRY POINT THE BUILD PRODUCED, not just the biggest one. A library project builds a
     # tool per operation -- libtiff builds ~20 -- and each is a different parser front end with a
     # different attack surface, while only `primary` (the largest executable) was ever registered.

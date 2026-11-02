@@ -296,15 +296,30 @@ def coverage_stage(ctx) -> dict:
     # allocate without bound and OOM the host -- observed here. So AFL does not fuzz sanitizer
     # builds at all: the sandbox `fuzz`/`directed_fuzz` stages run them under rlimits (memory
     # bounded, crashes still caught as the sanitizer's SIGABRT), which is safe and effective.
+    _plain = None
     if aflpp.is_sanitizer_build(_blob):
+        # The UNINSTRUMENTED build of the same source, when ingest made one: AFL fuzzes THAT, and
+        # every crash it finds is replayed by root_cause/build_poc against the sanitizer build,
+        # which is what classifies and verifies it -- so nothing is believed on the plain build's
+        # word alone.
+        from ..poc.capture import plain_build_bytes
+        _plain = plain_build_bytes(ctx, target)
+    if aflpp.is_sanitizer_build(_blob) and _plain is None:
         note = ("sanitizer build: not fuzzed under AFL (its shadow memory is incompatible with "
-                "AFL's memory model). The sandbox fuzzers cover it under rlimits.")
+                "AFL's memory model) and no uninstrumented build of the source was available. "
+                "The sandbox fuzzers cover it under rlimits.")
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
                                            "sanitizer": True, "note": note})
         ctx.progress(pct=100, msg="sanitizer build — fuzzed by the sandbox path instead")
         return {}
     ctx.content.stage_target(target, exe.parent, exe.name)   # + bundled loader/libc, if any
+    if _plain is not None:
+        exe.write_bytes(_plain)
+        exe.chmod(0o755)
+        ctx.emit("coverage.build_choice", payload={
+            "build": "uninstrumented", "note": "AFL fuzzes the plain build of the same source; "
+            "crashes are replayed on the sanitizer build to be classified and verified"})
 
     # seed corpus for AFL's input dir. A coverage-guided campaign is only as good as the seed it
     # starts from: format-aware seeds (a valid jpeg/gif/config sample built from the binary's own
