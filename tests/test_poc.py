@@ -252,3 +252,26 @@ def test_a_pyc_poc_bundle_reproduces_for_real(tmp_path):
     m = json.loads((root / "meta.json").read_text())
     txt = (r.stdout + r.stderr).decode("utf-8", "replace")
     assert r.returncode != 0 and m["verdict"]["stderr"] in txt, txt[-300:]
+
+
+def test_a_verified_poc_promotes_the_finding_that_names_its_input(store):
+    """md4c: libFuzzer filed 'heap-buffer-overflow (libFuzzer)' for an input; build_poc then opened
+    a generic 'Reproduced crash (SIGABRT)' row beside it for the SAME input -- every bug listed
+    twice. The finding that already names the input is the one a PoC proves."""
+    from lykos.analyze.poc.stage import _finding_naming_input
+    from lykos.db.dao import FindingDAO, TargetDAO
+    c = store.cases.create("n")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "f" * 64)
+    fd = FindingDAO(store.conn)
+    sha = "3e95d4825a26" + "0" * 52
+    fd.upsert(t.id, c.id, {"cwe": "CWE-125", "title": "heap-buffer-overflow (libFuzzer)",
+                           "severity": "high", "detector": "libfuzzer", "state": "confirmed",
+                           "confidence": 0.92, "dedup_key": "CWE-125:libfuzzer:md4c.c:2272",
+                           "evidence": [{"channel": "sanitizer", "detail":
+                                         f"... (crashing input {sha[:12]})"}]})
+    fd.upsert(t.id, c.id, {"cwe": "CWE-120", "title": "strcpy", "severity": "low",
+                           "detector": "dangerous_api", "state": "candidate", "confidence": 0.3,
+                           "dedup_key": "x", "evidence": [{"channel": "pattern", "detail": sha[:12]}]})
+    owner = _finding_naming_input(fd, t, sha)
+    assert owner is not None and owner.detector == "libfuzzer"
+    assert _finding_naming_input(fd, t, "9" * 64) is None

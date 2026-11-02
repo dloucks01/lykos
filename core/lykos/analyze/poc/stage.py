@@ -323,12 +323,27 @@ def build_poc_stage(ctx) -> dict:
         # `SIGABRT:<class>@<file>:<line>` -- so this did the very thing the comment above warns
         # against, and did it to every sanitizer-reported defect. See `crash_key_parts`.
         fault_pc, disc, hj = crash_key_parts(ctx.conn, target.id, input_sha)
-        fd.upsert(target.id, target.case_id, crash_finding_candidate(
-            res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
-            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha,
-            fault_pc=fault_pc, discriminator=disc, hijack=hj, file_type=target.file_type))
-        fid = fd.id_for_dedup(
-            target.id, crash_dedup_key(res.signal_name, fault_pc, disc, hijack=hj))
+        # A finding that ALREADY names this input -- the libFuzzer stage files its own row, keyed
+        # by its fault site -- is the one this PoC proves. Promoting it, rather than opening the
+        # generic 'Reproduced crash (SIGABRT)' row beside it, is what kept md4c's five heap
+        # overflows from being listed ten times.
+        owner = _finding_naming_input(fd, target, input_sha)
+        if owner is not None:
+            fd.upsert(target.id, target.case_id, {
+                "cwe": owner.cwe, "title": owner.title, "severity": owner.severity,
+                "detector": owner.detector, "dedup_key": owner.dedup_key,
+                "state": "poc-backed", "confidence": max(owner.confidence or 0, 0.95),
+                "evidence": [{"channel": "poc",
+                              "detail": f"verified PoC bundle {bundle_sha[:12]} -- reproduced "
+                                        f"{res.signal_name} with input {input_sha[:12]}"}]})
+            fid = owner.id
+        else:
+            fd.upsert(target.id, target.case_id, crash_finding_candidate(
+                res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
+                state="poc-backed", confidence=0.95, bundle_sha=bundle_sha,
+                fault_pc=fault_pc, discriminator=disc, hijack=hj, file_type=target.file_type))
+            fid = fd.id_for_dedup(
+                target.id, crash_dedup_key(res.signal_name, fault_pc, disc, hijack=hj))
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 
@@ -364,3 +379,19 @@ def enqueue_build_poc(queue, target, *, params=None, force: bool = True):
     return queue.enqueue(target.case_id, BUILD_POC_STAGE, target_id=target.id,
                          params=params or {}, input_hashes=[target.sha256], tool=TOOL,
                          tool_version=TOOL_VERSION, resource_class="cpu", force=force)
+
+
+def _finding_naming_input(fd, target, input_sha):
+    """The demonstrated finding (not one of build_poc's own rows) whose evidence names this exact
+    crashing input, or None. Matched on the full sha when the evidence carries it, else on the
+    12-character prefix every stage prints ("crashing input 3e95d4825a26")."""
+    if not input_sha:
+        return None
+    short = input_sha[:12]
+    for f in fd.list_by_target(target.id):
+        if f.detector == "poc" or f.state not in ("confirmed", "poc-backed"):
+            continue
+        for e in f.evidence or []:
+            if e.get("input_sha") == input_sha or short in (e.get("detail") or ""):
+                return f
+    return None

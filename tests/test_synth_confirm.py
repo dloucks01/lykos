@@ -249,7 +249,12 @@ def test_synthesized_driver_for_a_program_unit_function_confirms(tmp_path):
     res = DC.smartfuzz_confirm(b["binary"], lib_dirs=b.get("lib_dirs"), seeds=[b"A" * 64],
                                input_size=256, timeout=90)
     assert res.get("confirmed"), res.get("reason")
-    assert "svc.c:9" in (res.get("report") or "")
+    # ONE defect, two manifestations: a copy that stays inside the struct is an intra-object
+    # overflow ASan cannot see, so it surfaces at the overwritten function-pointer call (svc.c:10);
+    # one that runs past the struct is caught at the memcpy (svc.c:9). Which one the smart-fuzz
+    # rung reaches first depends on the length it happens to try.
+    rep = res.get("report") or ""
+    assert ("svc.c:9" in rep or "svc.c:10" in rep) and "dispatch_record" in rep, rep[-400:]
 
 
 # ---- a synth_confirm proof links back to the UC lead that prompted it ----------------------------
