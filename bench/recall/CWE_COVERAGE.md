@@ -24,32 +24,73 @@ means a working, validated demonstration, never a candidate:
 - divide-by-zero / assertion / null (369/617/476) → the fault reached and the process downed, plus
   the attacker-reachability proof that makes the downing a usable DoS (not merely L1).
 
+## Status note (2026-11-02): detector breadth vs. demonstration
+
+A survey of the implementation corrected a systematic error in earlier editions of this ledger: the
+classes it marked "**no detector — add**" / "**no mechanism**" are, with few exceptions, **already
+implemented** — they were simply never exercised by one of the six bench targets, which is a
+property of the *bench corpus*, not of the platform. Grounded pointers:
+
+- **CWE-457** uninitialised read → `compile_source_msan` + the `mem_oracle` stage.
+- **CWE-362** data race → `compile_source_tsan` + `tsan_detonate` (driven from the coverage path).
+- **CWE-401** memory leak → `compile_source_lsan` + `dos` (L1/L2/L3 by growth ratio).
+- **CWE-835/674** loop / recursion → `fuzz._verify_hang` + `dos` + `rootcause` recursion mapping.
+- **CWE-369 / 476** divide-by-zero / NULL-deref → `rootcause` signal mapping (SIGFPE/SEGV).
+- **CWE-409** compression bomb → `cve_triggers` + `dos`.
+- **CWE-798/321/242** secrets → `embedded_audit` + `extract_secrets` + `secret_stage`.
+- **CWE-918/611/643/776** SSRF/XXE/XPath/XML → `detect/detectors.py` SSRF sinks + `injection`.
+
+So the honest remaining work is **demonstration** (give each implemented class a target that
+exercises it — the bench corpus lacks div-by-zero, race, leak, SSRF, … targets) and a few genuine
+capability frontiers (the TTPs below). The rows marked **IMPLEMENTED** name the module and say
+"undemonstrated on the current bench" rather than falsely claiming the detector is missing.
+
+New this session (all demonstrated / validated): **CWE-125 jhead GPS → L3** disclosure
+(`jpeg_overread`), the **unzip ASan build fix** that puts CWE-121 `zip_overflow` L1 in-pipeline, and
+the **sanitizer-exit detection fix** (an ASan error that exits without a signal now counts).
+
+## Remaining capability frontiers (TTPs — genuine, not yet built)
+
+These are real reach/weaponization gaps (a ceiling is lykos's to overcome, per the mission), each
+needing a technique that is not yet built rather than a target that happens to exercise it:
+
+- **Win64 weaponiser + WoW64** — PE exploitation tops out at L2 (SEH-frame control via Wine); a
+  Win64 ROP/stack weaponiser is the named next technique.
+- **format-string-on-PIE** — the two-stage leak→write chain works on a disclosed leak, but the
+  fmt-on-PIE sweep is slow and the fgets-loop leak channel is not detected; needs the faster sweep
+  + loop-channel detection.
+- **tcache poisoning → L3** for double/invalid free (CWE-415/590/762): the heap engine reaches a
+  primitive; the tcache-poison → allocation-overlap → control technique is the next build.
+- **int-overflow → undersized-alloc → heap-OOB chain** (CWE-190→122): the pieces exist separately;
+  the chaining is not wired.
+- **Go/Rust injection probes** (CWE-78): the only known gap in the otherwise-solid injection column.
+
 ## Memory corruption (high-leverage: overflow → ROP / disclosure)
 
 | CWE | name | detect | mechanism | demo | gap → next mechanism |
 |-----|------|:--:|:--:|:--:|------|
-| 121 | stack buffer overflow | ✓ | synthesize_poc, x64frame, rop_solver, **zip_overflow (ZIP)** | **L2** (ncompress) + **L1 standalone (unzip); in-pipeline BLOCKED by a build gap** | zip_overflow: a valid ZIP whose central-dir `compression_method`≥1000 overflows `methbuf[8]` at unzip list.c:342 (CVE-2014-9913), reproduced via format-aware placement behind the ZIP parser, no fuzzing. **Validated standalone** against a real ASan unzip (method 999 safe, 1000→WRITE size 5, 61453→WRITE size 6, all at list_files). **In-pipeline it does NOT fire**: lykos analyses the STALE pre-built non-ASan `unzip` from the source tree (byte-identical sha), because unzip's ASan build fails three ways — the default make target is `help` (builds nothing), `_b_loose` dies on unzip's multiple `main()`s (funzip/unzipstb/gbloffs/…), and `make all`→`generic` hits a gmtime/localtime K&R conflicting-types hard error under gcc 14. The 1–2 byte ASCII overrun is invisible without ASan, so a plain build can't reveal it. Honest L1 for this bug anyway (too small for the saved return addr). **Actionable fix (3-part build-robustness task for source_project `_b_make`):** try `make all`/`generic` when the default yields no ELF; link multiple-main trees per-program; work around the K&R gmtime redecl (patch or a `-fgnu89-inline`/C89 path). This would unblock the WHOLE unzip benchmark (currently 0/11), not just this stage. L2→L3 ROP needs a control-grade overflow; the class reaches L3 via rop_solver on a target that overwrites the saved frame. |
+| 121 | stack buffer overflow | ✓ | synthesize_poc, x64frame, rop_solver, **zip_overflow (ZIP)** | **L2** (ncompress) + **L1 (unzip, in-pipeline)** | zip_overflow: a valid ZIP whose central-dir `compression_method`≥1000 overflows `methbuf[8]` at unzip list.c:342 (CVE-2014-9913), reproduced via format-aware placement behind the ZIP parser, no fuzzing. Validated standalone AND in-pipeline against a real ASan unzip (method 999 safe, 1000→WRITE size 5, 61453→WRITE size 6, all at list_files). **The build gap is FIXED** (source_project `_b_make`, commit 340e508): the make builder now tries `all`/`generic` when the default target builds nothing, drops the CFLAGS override that clobbered unzip's `-I.`, and retries through a `-std=gnu89` wrapper that clears unzip's K&R `gmtime` conflicting-types hard error — so unzip builds as ASan ELFs (unzip/unzipsfx/funzip). The stage's L1 gate also no longer requires a signal (commit c7d9ebc): an ASan error that EXITS code 1 is still a confirmed overflow. Honest L1 for this bug (1–2 byte ASCII overrun, too small for the saved return addr). L2→L3 ROP needs a control-grade overflow; the class reaches L3 via rop_solver on a target that overwrites the saved frame. |
 | 787 | out-of-bounds write | ✓ | oob_construct, chain_primitive | **L2** (ncompress) | PIE-indexed write needs a leak first; wire the leak→write chain |
-| 125 | out-of-bounds read | ✓ | palette_overread (GIF), **jpeg_overread (JPEG)**, chain_primitive._oob_read_disclose | **L1+L3 (giflib, pipeline) + L1 wired (jhead JPEG)** | GIF palette over-read: L1 in the real pipeline (gif2rgb.c:294, CVE-2016-3977) + L3 disclosure oracle (CWE-200). jpeg_overread: three documented jhead EXIF over-reads reproduced via format-aware JPEG placement, no fuzzing (CVE-2020-26208 memcmp past a 2-byte APP1; CVE-2018-6612 Get32u(ExifSection+12); CVE-2020-6625 ProcessGpsInfo gpsinfo.c:138) — honest L1 (internal reads, not disclosed). jhead's L3 instance is the GPS coordinate the over-read feeds into the printed summary (ProcessGpsInfo→ImageInfo.GpsLat): a numeric disclosure oracle over a complete JPEG is the named next step. md4c's is a 1-byte over-read hidden by parser slack → honest L1. Next: PNG/BMP palette |
+| 125 | out-of-bounds read | ✓ | palette_overread (GIF), **jpeg_overread (JPEG)**, chain_primitive._oob_read_disclose | **L1+L3 (giflib) + L1+L3 (jhead JPEG)** | GIF palette over-read: L1 in the real pipeline (gif2rgb.c:294, CVE-2016-3977) + L3 disclosure oracle (CWE-200). jpeg_overread: three documented jhead EXIF over-reads reproduced via format-aware JPEG placement, no fuzzing (CVE-2020-26208 memcmp past a 2-byte APP1; CVE-2018-6612 Get32u(ExifSection+12); CVE-2020-6625 ProcessGpsInfo gpsinfo.c:138) — L1. **The GPS over-read now reaches L3**: `gps_disclose`/`confirm_gps_disclosure` build a complete JPEG whose GPS latitude declares one component but whose sub-IFD is followed by two rationals jhead's fixed three-component loop reads and PRINTS as the coordinate; varying only those past-the-field bytes (declared degrees fixed) makes the printed coordinate a forgery-proof function of OOB memory (CWE-200 disclosure). md4c's is a 1-byte over-read hidden by parser slack → honest L1. Next: PNG/BMP palette |
 | 122 | heap buffer overflow | ✓ | heap, heap_groom | — | drive narrowed heap-overflow candidate to groom→hijack |
 | 119/788/126/127/124 | bounds errors | ✓ | (shared w/ 787/125) | L2 (ncompress 119) | fold into 787/125 mechanisms |
 | 416 | use-after-free | ✓ | heap, aaheg | ? | prove on a real UAF target (none in bench yet) |
 | 415/590/762 | double/invalid free | ✓/– | heap, aaheg | — | detector for 590/762; tcache-poison → L3 |
-| 476 | NULL deref | ✓ | (crash) | — | reproduce → L1 (honest ceiling unless controllable) |
+| 476 | NULL deref | ✓ | rootcause (SEGV→CWE-476) | — | **IMPLEMENTED** (rootcause.py maps SEGV/null-deref→CWE-476; a reached fault files L1). Honest DoS ceiling unless the pointer is controllable. Undemonstrated on the current bench |
 | 824/822 | uninit/untrusted pointer | ✓ | chain_primitive | — | drive to controlled deref |
-| 457 | uninitialized read | – | (MSan build) | — | **no detector** — add; → L1/disclosure |
+| 457 | uninitialized read | ✓ | MSan build + mem_oracle | — | **IMPLEMENTED** (compile_source_msan + `mem_oracle` detonates the corpus on the MSan build → CWE-457/200). Undemonstrated on the current bench (also listed in the logic/hygiene table) |
 
 ## Numeric / allocation
 
 | CWE | name | detect | mechanism | demo | gap → next mechanism |
 |-----|------|:--:|:--:|:--:|------|
 | 190 | integer overflow | ✓ | overflow_recipe | ? | int-overflow → undersized alloc → heap OOB chain to L3 |
-| 191 | integer underflow | ✓ | – | — | **no mechanism** — fold into 190 chain |
+| 191 | integer underflow | ✓ | – | — | fold into the 190 chain |
 | 131 | wrong buffer-size calc | ✓ | oob_recipe | — | → 787/122 |
-| 369 | divide by zero | ✓ | – | — | **no mechanism** — reproduce → L1 |
+| 369 | divide by zero | ✓ | rootcause (SIGFPE→CWE-369) | — | **IMPLEMENTED** (rootcause.py maps SIGFPE→CWE-369; a reached fault files L1). Honest DoS ceiling. Undemonstrated on the current bench (no div-by-zero target) |
 | 789/770/400 | alloc/resource exhaustion | ✓/– | dos | — | → L1 DoS demonstration |
-| 835/674 | infinite loop / deep recursion | – | dos | — | **no detector** — add; → L1 DoS |
-| 409 | compression bomb | – | dos | — | **no detector** — add |
+| 835/674 | infinite loop / deep recursion | ✓ | dos (hang-verify), rootcause (recursion) | — | **IMPLEMENTED** (fuzz `_verify_hang` differential + dos non-termination + rootcause.py recursion/stack-exhaustion → CWE-674); → L1 DoS. Undemonstrated on the current bench |
+| 409 | compression bomb | ✓ | dos, cve_triggers | — | **IMPLEMENTED** (cve_triggers + dos amplification/ratio). Undemonstrated on the current bench |
 
 ## Injection (reaches L3 today)
 
@@ -60,8 +101,8 @@ means a working, validated demonstration, never a candidate:
 | 22 | path traversal | ✓ | inject_stage | **L3** (giflib unlisted) | **reach** on unzip (7 high candidates, 0 demo) — needs mode/input |
 | 94/77 | code/command injection | ✓/– | injection | — | prove on a real target |
 | 89 | SQL injection | ✓ | injection | — | prove on a real target |
-| 918/611/643/776 | SSRF / XXE / XPath / XML bomb | – | injection, dos | — | **no detector** — add |
-| 79/116 | XSS / encoding | ✓ | – | — | **no mechanism** (web-shaped; low priority offline) |
+| 918/611/643/776 | SSRF / XXE / XPath / XML bomb | ✓ | detectors (SSRF sinks), injection, dos | — | **IMPLEMENTED** (detectors.py flags http.Get/Post→CWE-918 SSRF sinks; injection/inject_stage cover XXE/XPath/XML-bomb). Web/service-shaped → no offline bench target issues the request/parse, so undemonstrated here |
+| 79/116 | XSS / encoding | ✓ | – | — | web-shaped; no offline mechanism (low priority for a native/air-gap engagement) |
 
 ## Logic / hygiene / secrets (also to L3 — demonstrated impact, not a candidate)
 
@@ -71,20 +112,23 @@ means a working, validated demonstration, never a candidate:
 | 252 | unchecked return value | ✓ | – | — | drive the unchecked error path to its memory-safety consequence (NULL/OOB) → L3 |
 | 693/1188/20 | protection failure / unsafe init / input-val | ✓ | – | — | reach the weakened path and demonstrate the concrete bypass it enables → L3 |
 | 203 | observable discrepancy | ✓ | – | — | time the oracle under control and recover a secret bit-by-bit (demonstrated) → L3 |
-| 798/321/242 | hardcoded creds / key / dangerous fn | – | secret_stage | — | **no detector** — add; L3 = use the extracted secret against what it guards |
-| 362 | race condition | – | (TSan build) | — | **no detector** — add; L3 = win the TOCTOU window to a concrete effect |
-| 401 | memory leak | – | (LSan build) | — | **no detector** — add; L3 = demonstrate growth to allocation failure (DoS) |
-| 200 | information exposure | ✓ | leak, chain_primitive | — | L3 disclosure (shared w/ 125): exfiltrate secret/pointer bytes under a control |
+| 798/321/242 | hardcoded creds / key / dangerous fn | ✓ | embedded_audit, extract_secrets, secret_stage | — | **IMPLEMENTED** (embedded_audit + extract_secrets detect; secret_stage synthesises). Undemonstrated on the current bench (no embedded secret). L3 = use the extracted secret against what it guards |
+| 457 | uninitialised read | ✓ | MSan build + mem_oracle | — | **IMPLEMENTED** (compile_source_msan + the `mem_oracle` stage detonates the corpus on the MSan build → CWE-457/200). Undemonstrated on the current bench |
+| 362 | race condition | ✓ | TSan build + tsan_detonate | — | **IMPLEMENTED** (compile_source_tsan + `tsan_detonate`, driven from the coverage/fuzz path, files CWE-362). Needs a concurrent/racy target to demonstrate; none on the current bench |
+| 401 | memory leak | ✓ | LSan build + dos | — | **IMPLEMENTED** (compile_source_lsan + dos escalates CWE-401 at L1/L2/L3 via the growth ratio). Undemonstrated on the current bench |
+| 200 | information exposure | ✓ | leak, chain_primitive, **jpeg_overread (GPS)** | **L3 (jhead JPEG GPS disclosure)** | GPS over-read → printed-coordinate numeric disclosure proven forgery-proof on jhead (CVE-2020-6625). Also reached generically via leak/chain_primitive (exfiltrate secret/pointer bytes under a control) |
 
 ## Cross-cutting enablers (unblock MANY classes at once)
 
 1. **Format-aware trigger placement** — embed the trigger (overlong field / out-of-range index /
    oversized count) into a *valid* container field, so a directed stage reaches a sink behind a
-   parser. Instances landed: `palette_overread` (GIF/CWE-125, over-read→disclosure) and
-   `zip_overflow` (ZIP/CWE-121, central-dir `compression_method`→stack overflow, CVE-2014-9913).
-   Both confirmed against a real ASan build reaching the exact sink, no fuzzing. Generalize next to
-   JPEG (jhead EXIF/GPS over-reads) / PNG / BMP and to the CWE-787/190 shapes. This is what unblocks
-   the reach-behind-parser misses on jhead/giflib/unzip that `synthesize_poc` (raw blob) cannot.
+   parser. Instances landed: `palette_overread` (GIF/CWE-125, over-read→disclosure),
+   `zip_overflow` (ZIP/CWE-121, central-dir `compression_method`→stack overflow, CVE-2014-9913,
+   now firing IN-PIPELINE after the unzip build fix), and `jpeg_overread` (JPEG/CWE-125, jhead EXIF
+   over-reads at L1 and the **GPS coordinate at L3** — `gps_disclose`/`confirm_gps_disclosure`).
+   All confirmed against a real ASan build reaching the exact sink, no fuzzing. Generalize next to
+   PNG / BMP and to the CWE-787/190 shapes. This is what unblocks the reach-behind-parser misses on
+   jhead/giflib/unzip that `synthesize_poc` (raw blob) cannot.
 2. **Smart-first scheduling** — directed/synthesis stages run first with guaranteed budget; blind
    fuzzing becomes a small, last, narrowed top-up. Measured need: unzip's `synthesize_poc` ran
    "out of time" after ~300s of `coverage_fuzz`+`directed_fuzz`+`fuzz`.
