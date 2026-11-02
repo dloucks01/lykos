@@ -47,6 +47,24 @@ def test_variable_times_a_literal_size_is_flagged(tmp_path):
         assert len(hits) == 1 and hits[0]["cwe"] == "CWE-190", expr
 
 
+def test_a_scanf_sourced_count_is_a_high_attacker_controlled_finding(tmp_path):
+    """`scanf("%u",&n)` fills n from stdin, so malloc(n * 16) is an ATTACKER-CONTROLLED undersized
+    allocation (high), not a hygiene note -- the scanf family is a real input reader whose
+    destination is a `&var` argument, which srctaint previously missed (only read/fread/fgets)."""
+    root = _tree(tmp_path, {"v.c":
+                            'void *f(void){ unsigned n; if(scanf("%u",&n)!=1) return 0;\n'
+                            "  return malloc(n * 16); }\n"})
+    hits = _hits(root)
+    assert len(hits) == 1 and hits[0]["cwe"] == "CWE-190"
+    assert hits[0]["strong"] is True and hits[0]["severity"] == "high"
+    # a destination at a varying position in a multi-value scanf is still linked
+    root2 = _tree(tmp_path, {"w.c":
+                             'void *g(void){ int i; unsigned n; if(scanf("%d %u",&i,&n)!=2) return 0;\n'
+                             "  return malloc(n * 16); }\n"})
+    h2 = _hits(root2)
+    assert h2 and h2[0]["strong"] is True
+
+
 def test_a_literal_only_size_is_still_not_flagged(tmp_path):
     """A product of pure constants cannot wrap from input -- precision must survive the literal
     operand change."""
