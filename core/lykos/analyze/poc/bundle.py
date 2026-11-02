@@ -45,7 +45,7 @@ def _argv_text(argv, *, carrier=None) -> str:
 def _setup_and_invoke(mode: str, argv, run_cmd=None, runtime: str = "native",
                       main_class: str | None = None, sanitizer: str = "",
                       guard_page: str = "", exec_name: str = "", mem_cap_mb: int = 0,
-                      trailing_newline: bool = False):
+                      trailing_newline: bool = False, *, san_build: bool = False):
     """(setup, invoke): the shell that prepares the replay and the ONE command line that feeds
     ./input.bin to the target. Shared by runner.sh and the hang check, so the non-termination
     reproducer runs exactly the command a crash reproducer would.
@@ -82,7 +82,7 @@ def _setup_and_invoke(mode: str, argv, run_cmd=None, runtime: str = "native",
                   ' is a heap error that does NOT fault on its own." >&2;\n'
                   '  echo "Install AFL++ (libdislocator.so) and set LYKOS_GUARD_PAGE to its'
                   ' path." >&2; fi\n')
-    if sanitizer:
+    if sanitizer or san_build:
         # A sanitizer build does not die on a signal by DEFAULT: ASan prints its report and calls
         # _exit(1). The capture and the fuzzers set `abort_on_error=1` so the fault is a SIGABRT,
         # and the bundle has to set it too -- otherwise the operator who unpacks this runs the
@@ -181,9 +181,10 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
             main_class: str | None = None, sanitizer: str = "", retries: int = 0,
             marker: str = "", guard_page: str = "", exec_name: str = "",
             hang: dict | None = None, mem_cap_mb: int = 0,
-            trailing_newline: bool = False) -> bytes:
+            trailing_newline: bool = False, san_build: bool = False) -> bytes:
     setup, invoke = _setup_and_invoke(mode, argv, run_cmd, runtime, main_class, sanitizer,
-                                      guard_page, exec_name, mem_cap_mb, trailing_newline)
+                                      guard_page, exec_name, mem_cap_mb, trailing_newline,
+                                      san_build=san_build)
     if hang:
         # A NON-TERMINATION is not an exit status: "it is still running" is only a finding next
         # to an input that FINISHES under the same limits. The check lives in hang_check.py
@@ -1120,8 +1121,12 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         # own measured rate justifies. The marker is the detector's own report line, because a
         # sanitizer's exit code belongs to the detector and other things exit non-zero too.
         _race = (primitive or {}).get("race")
+        # an L1 bundle of a sanitizer build (a libFuzzer harness, a source target) has no
+        # primitive to say so, and its runner exited 1 under a header promising SIGABRT
+        from ..fuzz.aflpp import is_sanitizer_build as _isb
         _rsh = _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
-                       sanitizer=sanitizer, guard_page=guard_page, exec_name=exec_name,
+                       sanitizer=sanitizer, san_build=_isb(target_bytes or b""),
+                       guard_page=guard_page, exec_name=exec_name,
                        retries=int((primitive or {}).get("retries") or 0) if _race else 0,
                        marker=_race_marker(primitive) if _race else "", hang=hang,
                        mem_cap_mb=mem_cap_mb, trailing_newline=_nl)
