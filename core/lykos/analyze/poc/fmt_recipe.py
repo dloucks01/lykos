@@ -408,6 +408,51 @@ def _function_frame(conn, target_id, faddr):
     return None
 
 
+def sink_reached_repeatedly(conn, target_id, lead, edges) -> bool:
+    """True when a CALLER invokes the sink's FUNCTION from inside a loop, so the sink is re-executed
+    across iterations even though its own body has no back-edge.
+
+    This is the fgets/read-loop leak channel the single-function `x64frame.in_loop` misses: the
+    classic shape is a `main` that loops reading a menu choice and dispatches to a handler which
+    reads input and calls `printf(user)` exactly ONCE per call. `in_loop(sink)` is False (the
+    handler has no back-edge), so the two-stage leak->write plan was withheld (CWE-134 fell to an
+    L2 offset-only recipe) even though the program physically takes a second input and the runtime
+    exploit path would have confirmed it. The two-stage plan needs the sink reached at least twice,
+    which a caller-loop provides.
+
+    Sound / precise: it requires a real back-edge over the EXACT call site (the recovered
+    `CallEdge.site_addr`) in the caller's own IR -- not "there is a loop somewhere in a caller".
+    x86-64; a caller whose IR is unavailable is simply not counted. Pure (reads the stored IR)."""
+    if not edges or getattr(lead, "function_addr", None) is None:
+        return False
+
+    def _as_int(v):
+        try:
+            return int(v, 16) if isinstance(v, str) else (int(v) if v is not None else None)
+        except (TypeError, ValueError):
+            return None
+
+    sink = _as_int(lead.function_addr)
+    if sink is None:
+        return False
+    seen = set()
+    for e in edges:
+        if _as_int(getattr(e, "dst_addr", None)) != sink:
+            continue
+        src = getattr(e, "src_addr", None)
+        if src in seen or src is None:
+            continue
+        seen.add(src)
+        cir = _function_ir(conn, target_id, src)
+        if not cir:
+            continue
+        cinstrs = x64frame.instructions(cir)
+        cidx = x64frame.site_index(cinstrs, getattr(e, "site_addr", None))
+        if cidx is not None and x64frame.in_loop(cinstrs, cidx):
+            return True
+    return False
+
+
 def _static_layout_from_frame(ir, frame, site_addr, fname: str) -> Optional[dict]:
     """doc 58 non-runnable path: recover the printf arg offset with NO execution when the decompiler
     symbolized the stack local (so the numeric displacement is hidden from the instruction text).
@@ -633,6 +678,15 @@ def file_format_write_recipes(ctx, target, *, why: str, target_bytes: Optional[b
                 fl = _static_layout_from_frame(ir, frame, lead.site_addr, name)
                 if fl:
                     layout = fl
+            # A sink whose OWN body has no back-edge may still be reached more than once when a
+            # caller invokes it inside a loop (a menu/dispatch re-read). The two-stage leak->write
+            # plan needs exactly that; gating it on the sink's own in_loop() alone withheld it from
+            # this common shape. `loop` means "the sink is re-executed", which a proven caller-loop
+            # satisfies -- so set it (additively, never clearing a True) when one is found.
+            if layout and not layout.get("loop") and sink_reached_repeatedly(
+                    ctx.conn, target.id, lead, edges or []):
+                layout["loop"] = True
+                layout["loop_via"] = "caller-loop"
             plan = plan_format_write(target_bytes, layout, win=win) if layout else None
             # Emit a standalone exploit SCRIPT (the operator-runnable deliverable): a write-what-where
             # when a plan exists, else a leak-only PoC -- a format string is always at least an info
