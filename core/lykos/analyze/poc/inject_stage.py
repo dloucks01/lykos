@@ -30,14 +30,24 @@ def _marker():
     return "LYK" + os.urandom(5).hex().upper()       # unique per run, avoids stale-output hits
 
 
+#: Go / Rust stdin readers. A managed binary never imports libc `read`/`fgets`, so without these a
+#: Go/Rust program that reads stdin had `stdin` ranked below `arg`. Recovered-symbol forms (Go's are
+#: `_go_canon`-normalized): bufio/os.Stdin/fmt.Scan* for Go, std::io::stdin / Stdin::read_line for
+#: Rust. Substring-matched because the mangled suffix (`::h<hex>`) varies.
+_MANAGED_STDIN = ("os.Stdin", "bufio.", "fmt.Scan", "fmt.Fscan", "io::stdin", "Stdin", "read_line",
+                  "read_to_string", "read_to_end", "ReadString", "ReadLine", "ReadBytes")
+
+
 def _channels(call_edges, given):
     if given:
         return [given]
     names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
+    raw = {e.dst_name for e in call_edges if e.dst_name}       # unnormalized: managed symbols
     order = []
     if names & {"fopen", "fopen64", "open", "open64", "freopen"}:
         order.append("file")
-    if names & {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getline"}:
+    if (names & {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getline"}
+            or any(tok in n for n in raw for tok in _MANAGED_STDIN)):
         order.append("stdin")
     order.append("arg")
     for m in ("stdin", "arg", "file"):

@@ -50,6 +50,43 @@ def test_an_execution_alongside_an_echo_still_confirms_only_if_the_literal_is_go
     assert not injection.cmdi_confirm(both, f"; echo {MARK}", MARK)
 
 
+def test_argv_direct_payloads_cover_the_no_shell_exec_case():
+    """A managed exec sink (Go exec.Command / Rust process::Command) runs the program with NO
+    shell, so a metacharacter never breaks out -- but `echo <marker>` run directly still prints
+    the marker. The payload set must carry a bare-command form, and the oracle must treat an
+    executed one as a confirmation and an echoed one as not."""
+    pays = injection.cmdi_payloads(MARK)
+    assert f"echo {MARK}" in pays and f"/bin/echo {MARK}" in pays
+    # executed directly: echo printed the marker, the literal "echo <marker>" is gone -> confirm
+    assert injection.cmdi_confirm(f"{MARK}\n".encode(), f"echo {MARK}", MARK)
+    # the program printed the payload verbatim (not injectable) -> must NOT confirm
+    assert not injection.cmdi_confirm(f"you ran: echo {MARK}\n".encode(), f"echo {MARK}", MARK)
+
+
+def test_command_injection_sinks_cover_posix_spawn_and_go_exec():
+    """posix_spawn is the libc spawn path a stripped binary bottoms out in; the Go managed exec
+    names let the set-match / objdump sink-reach see a Go binary directly."""
+    sinks = injection.PROBES["command-injection"]["sinks"]
+    assert {"posix_spawn", "posix_spawnp"} <= sinks
+    assert {"os_exec.Command", "syscall.Exec"} <= sinks
+
+
+def test_channels_ranks_stdin_for_a_go_or_rust_stdin_reader():
+    """A managed binary reading stdin imports no libc read symbol, so without the managed-reader
+    vocabulary `stdin` was ranked below `arg` and the probe wasted its stdin tries. Both a Go
+    (`bufio`) and a Rust (`read_line`) stdin reader must rank stdin ahead of arg."""
+    from collections import namedtuple
+    from lykos.analyze.poc.inject_stage import _channels
+    _E = namedtuple("_E", "dst_name")
+    go = _channels([_E("bufio._Reader_.ReadString"), _E("os_exec.Command")], None)
+    assert go.index("stdin") < go.index("arg")
+    rust = _channels([_E("std..io..Stdin..read_line..h0123456789abcdef"),
+                      _E("_ZN3std7process7Command5spawn")], None)
+    assert rust.index("stdin") < rust.index("arg")
+    # a program with no reader at all still defaults to arg-first (unchanged behaviour)
+    assert _channels([_E("printf")], None)[0] == "arg"
+
+
 # ---- format string -----------------------------------------------------------------------
 
 def test_format_payloads_carry_directives_and_a_marker():
