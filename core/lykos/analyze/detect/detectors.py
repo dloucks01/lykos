@@ -1188,14 +1188,19 @@ def _resolve_scanf_format(sym: str, strings):
     flagified form equals the (flagified) symbol is that format. Returns the conversion list when
     every matching string agrees on it, else None (ambiguous or not found -- never guessed)."""
     key = _r2_flagify(sym)
+    # rizin builds the same flag by DROPPING the punctuation (`%16s` -> `str.16s`, r2: `str._16s`),
+    # so compare with runs of non-alphanumerics collapsed and trimmed too -- without it every
+    # width-bounded scanf on a rizin host went unread and the off-by-one detector was silent
+    loose = re.sub(r"_+", "_", key).strip("_")
     convs = None
     for s in strings or []:
         v = getattr(s, "value", "") or ""
         if "%" not in v:
             continue
         fv = _r2_flagify(v)
+        fl = re.sub(r"_+", "_", fv).strip("_")
         # exact, or r2 truncated a long flag name (only trusted for a long, specific prefix)
-        if fv != key and not (len(key) >= 24 and fv.startswith(key)):
+        if fv != key and fl != loose and not (len(key) >= 24 and fv.startswith(key)):
             continue
         c = _scanf_conversions(v)
         if c is None:
@@ -1320,7 +1325,7 @@ def scanf_bounded_overflow(ctx: DetectContext):
                     if fmt is not None or w in real_widths:
                         checks.append((w, regs[k]))
             elif sym:
-                m0 = re.match(r"_(\d+)[hlLjztq]*s", sym)
+                m0 = re.match(r"_?(\d+)[hlLjztq]*s", sym)     # r2 `_16s`, rizin `16s`
                 if m0 and int(m0.group(1)) in real_widths:
                     checks.append((int(m0.group(1)), buf_reg))
             for n, dreg in checks:
