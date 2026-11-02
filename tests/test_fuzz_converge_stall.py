@@ -39,6 +39,19 @@ def test_plateaued_needs_both_executions_and_time():
     assert not FS._plateaued(50_000, 10_000.0, 49_000, 9_900.0)
 
 
+def test_ordinary_run_plateau_is_twice_as_patient_as_converge():
+    """On a time-boxed run the bail is ON by default but uses FRAC_DEFAULT (2/3): the idle tail must
+    be at least TWICE the productive head, vs once for a converge run -- so it only reclaims budget
+    on an unmistakable flatline and never cuts a still-productive campaign."""
+    assert FS._PLATEAU_FRAC_DEFAULT > FS._PLATEAU_FRAC == 0.5
+    # head at exec/time 10_000. At 29_000 (idle 19_000) a converge(0.5) run has converged...
+    assert FS._plateaued(29_000, 29_000.0, 10_000, 10_000.0, FS._PLATEAU_FRAC)
+    # ...but the ordinary run needs the idle tail to be ~2x the head (need = 2/3 * 29_000 ~ 19_333):
+    assert not FS._plateaued(29_000, 29_000.0, 10_000, 10_000.0, FS._PLATEAU_FRAC_DEFAULT)
+    # once the idle tail reaches twice the head in BOTH axes, the ordinary run bails too
+    assert FS._plateaued(45_000, 45_000.0, 10_000, 10_000.0, FS._PLATEAU_FRAC_DEFAULT)
+
+
 def test_stall_grace_window():
     # floors: 32 attempts AND max(30 s, 15 x timeout, 5% of the slice capped at 300 s)
     assert FS._stall_grace_s(2.0, 30.0) == 30.0
@@ -172,12 +185,28 @@ def test_converge_stops_at_the_plateau_and_returns_the_budget(store, case, pool,
     assert eng["stopped"] == "converged" and "converged" in (eng["reason"] or "")
 
 
-def test_time_boxed_run_keeps_its_slice(store, case, pool, progs, monkeypatch):
+def test_time_boxed_run_also_bails_on_a_plateau_by_default(store, case, pool, progs, monkeypatch):
+    """The operator's "fuzz smart, never blind" rule: an ordinary time-boxed run now ALSO returns
+    its slice once coverage has flatlined (it used to spend the whole slice). It is twice as patient
+    as a converge run, but it does bail -- it does not burn budget on a dead campaign."""
     if "fast" not in progs:
         pytest.skip("build failed")
-    _shrink_plateau(monkeypatch)                    # would converge quickly IF it applied
-    took = _run(store, case, pool, progs["fast"], max_seconds=5, max_execs=10**7,
-                exec_timeout=1)
+    _shrink_plateau(monkeypatch)
+    took = _run(store, case, pool, progs["fast"], max_seconds=30, max_execs=10**7, exec_timeout=1)
+    conv = _events(store, case.id, "fuzz.converged")
+    assert conv, "a flatlined time-boxed run must converge and return its slice (fuzz-smart rule)"
+    assert conv[-1]["reason"] == "plateau" and conv[-1]["budget_returned_s"] > 0
+    assert took < 30                                 # returned the slice rather than running it out
+
+
+def test_plateau_opt_out_keeps_the_whole_slice(store, case, pool, progs, monkeypatch):
+    """`{"plateau": False}` restores the old keep-the-whole-slice behaviour for a caller that
+    explicitly wants an exhaustive time-boxed run."""
+    if "fast" not in progs:
+        pytest.skip("build failed")
+    _shrink_plateau(monkeypatch)
+    took = _run(store, case, pool, progs["fast"], max_seconds=5, max_execs=10**7, exec_timeout=1,
+                plateau=False)
     assert not _events(store, case.id, "fuzz.converged")
     done = _events(store, case.id, "fuzz.done")[-1]
     assert done["stopped"] is None

@@ -1043,6 +1043,12 @@ _ERROR_LOOP_SAMPLE = 64
 _PLATEAU_MIN_EXECS = 1000
 _PLATEAU_MIN_S = 60.0
 _PLATEAU_FRAC = 0.5
+#: On an ordinary time-boxed run the plateau bail is still ON (a blind campaign must not spend its
+#: whole slice after coverage has flatlined -- the operator's "fuzz smart, never blind" rule), but
+#: TWICE as patient as a converge run: the idle tail must be at least TWICE the productive head
+#: (frac = k/(k+1) with k=2 => 2/3), so it only reclaims budget on an unmistakable, observed flatline
+#: and never cuts a campaign still finding things (fail-open: any new coverage/crash resets the head).
+_PLATEAU_FRAC_DEFAULT = 2.0 / 3.0
 
 #: STALL AUTO-SKIP. A campaign whose executions have stopped COMPLETING -- every one runs into the
 #: per-execution limit, reaches nothing new and crashes nothing -- is a wedged target (it waits on
@@ -1064,15 +1070,18 @@ _STALL_SHARE_CAP_S = 300.0       # ... capped, so a 6-hour ceiling waits 5 minut
 _TIMEOUT_BATCH = 8
 
 
-def _plateau_window(execs: int, elapsed: float) -> tuple:
-    """(idle executions, idle seconds) the campaign must go without a find to have converged."""
-    return (max(_PLATEAU_MIN_EXECS, int(_PLATEAU_FRAC * max(0, execs))),
-            max(_PLATEAU_MIN_S, _PLATEAU_FRAC * max(0.0, elapsed)))
+def _plateau_window(execs: int, elapsed: float, frac: float = _PLATEAU_FRAC) -> tuple:
+    """(idle executions, idle seconds) the campaign must go without a find to have converged. `frac`
+    is the share of the productive head the idle tail must match (0.5 for a converge run, 1.0 for an
+    ordinary run -- twice as patient)."""
+    return (max(_PLATEAU_MIN_EXECS, int(frac * max(0, execs))),
+            max(_PLATEAU_MIN_S, frac * max(0.0, elapsed)))
 
 
-def _plateaued(execs: int, elapsed: float, gain_exec: int, gain_s: float) -> bool:
+def _plateaued(execs: int, elapsed: float, gain_exec: int, gain_s: float,
+               frac: float = _PLATEAU_FRAC) -> bool:
     """Has the campaign found nothing new since (`gain_exec`, `gain_s`) for long enough?"""
-    need_e, need_s = _plateau_window(execs, elapsed)
+    need_e, need_s = _plateau_window(execs, elapsed, frac)
     return (execs - gain_exec) >= need_e and (elapsed - gain_s) >= need_s
 
 
@@ -1552,6 +1561,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # to the case budget (it is wall-clock), and the stage's other channels.
     _p = ctx.params or {}
     converge = bool(_p.get("converge"))
+    # The plateau bail is ON by default even on a time-boxed run (the "fuzz smart, never blind" rule):
+    # a blind/directed campaign that has flatlined returns its slice instead of spending it. A
+    # converge run bails at FRAC=0.5; an ordinary run is twice as patient (FRAC_DEFAULT) so it only
+    # reclaims budget on an unmistakable flatline. Opt out with params {"plateau": False}.
+    plateau_on = converge or bool(_p.get("plateau", True))
+    plateau_frac = _PLATEAU_FRAC if converge else _PLATEAU_FRAC_DEFAULT
     stall_check = bool(_p.get("stall_check", True))
     if stall_check and _baseline_nonterm(ctx.conn, target.id):
         stall_check = False
@@ -1911,8 +1926,9 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                             "streak_s": round(stall_s, 1),
                             "grace_s": round(_stall_grace_s(exec_timeout, max_seconds), 1),
                             "exec_timeout": exec_timeout}
-        elif converge and plateau_armed and _plateaued(execs, _now - t_start, gain_exec, gain_t):
-            _we, _ws = _plateau_window(execs, _now - t_start)
+        elif plateau_on and plateau_armed and _plateaued(execs, _now - t_start, gain_exec, gain_t,
+                                                          plateau_frac):
+            _we, _ws = _plateau_window(execs, _now - t_start, plateau_frac)
             _unit = "blocks" if (all_blocks and cover_reported) else "behaviours"
             _cov = len(seen_blocks) if _unit == "blocks" else len(seen_behaviour)
             stopped = "converged"
