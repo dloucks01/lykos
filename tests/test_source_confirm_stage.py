@@ -82,5 +82,43 @@ def test_source_confirm_stage_files_confirmed_poc(store, tmp_path):
     assert any("overflow" in (f.title or "") for f in finds), f"titles={[f.title for f in finds]}"
     # a DynResult the exploit ladder can see, carrying the reproducing input
     drs = [d for d in DynResultDAO(store.conn).list_by_target(t.id)
-           if (d.isolation or "").startswith("source_confirm")]
+           if (d.defect_key or "").startswith("source_confirm")]
     assert drs and drs[0].crashed and drs[0].input_sha
+    # ...tagged with the HARNESS that proved it, stored, so build_poc replays there and not
+    # against the ingested program
+    assert (drs[0].isolation or "").startswith("libfuzzer/"), drs[0].isolation
+    prefix = drs[0].isolation.split("/", 1)[1]
+    assert any(a.kind == "libfuzzer-harness" and a.sha256.startswith(prefix)
+               for a in store.artifacts.list_by_case(t.case_id))
+
+
+# ---- a confirmation is replayed against the binary that proved it ------------------------------
+def test_the_ladder_names_the_binary_each_rung_proved_on():
+    from lykos.analyze.symbolic.directed_confirm import _rung_binary
+    h = {"explore_binary": "/e", "replay_binary": "/r", "fuzz_binary": "/f"}
+    assert _rung_binary(h, "concolic") == "/r"
+    assert _rung_binary(h, "template") == "/r"
+    assert _rung_binary(h, "smart-fuzz") == "/f"
+    assert _rung_binary({"fuzz_binary": "/f"}, "template") == "/f"
+
+
+def test_a_confirmation_is_stored_as_its_own_replay_harness(tmp_path):
+    """source_confirm tagged its proofs `source_confirm/<name>`, which no replay path reads, so the
+    PoC was replayed against the ingested PROGRAM and every bundle shipped unverified."""
+    from types import SimpleNamespace as NS
+    from lykos.analyze.source_confirm_stage import _replay_harness
+    b = tmp_path / "h_static"
+    b.write_bytes(b"\x7fELF-static-asan-harness")
+    stored = {}
+
+    class Ctx:
+        def put_artifact(self, kind, data=b"", meta=None):
+            stored[kind] = (data, meta)
+            return "ab" * 32
+    iso, libs = _replay_harness(Ctx(), NS(sha256="t" * 64),
+                                {"harness": "fuzz_x", "binary": str(b), "lib_dirs": ["/lib/x"],
+                                 "input": b"A"}, {"fuzz_x": str(b)})
+    assert iso == "libfuzzer/" + ("ab" * 6)
+    assert libs == []                                    # the static build needs no .so dirs
+    assert stored["libfuzzer-harness"][0] == b.read_bytes()
+    assert stored["libfuzzer-harness"][1]["lib_dirs"] == []

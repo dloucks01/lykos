@@ -316,6 +316,19 @@ def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=
                 if key in seen:
                     break
                 seen.add(key)
-                out.append({"harness": h.get("name"), **r})
+                # WHICH BINARY proved it, so the PoC can be replayed against that binary and not
+                # against the ingested program (which may never reach this harness's entry).
+                out.append({"harness": h.get("name"), **r,
+                            "binary": _rung_binary(h, r.get("rung")),
+                            "lib_dirs": list(h.get("lib_dirs") or [])})
                 break
     return out
+
+
+def _rung_binary(h: dict, rung) -> str | None:
+    """The ASan build a confirmed rung replayed its input against."""
+    if rung == "smart-fuzz":
+        return h.get("fuzz_binary")
+    if rung == "concolic":
+        return h.get("replay_binary") or h.get("explore_binary")
+    return h.get("replay_binary") or h.get("fuzz_binary")

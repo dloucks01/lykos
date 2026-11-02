@@ -4,6 +4,7 @@ L2 primitive stage and the root-cause stage."""
 from __future__ import annotations
 
 import json
+import os
 import logging
 import shutil
 import tempfile
@@ -445,6 +446,23 @@ def replay_exe_for(ctx, target, input_sha):
     if sha is None and arts and not prefix:
         sha = arts[-1].sha256
     return (ctx.content.get_bytes(sha), "libfuzzer") if sha else (None, "")
+
+
+def harness_lib_dirs(ctx, target, input_sha) -> list:
+    """The shared-library dirs a stored harness needs to load (`libfuzzer-harness` meta), keeping
+    only the ones still on disk. A shared-linked ASan harness (a cmake project's fuzz build) cannot
+    even start without its project's .so files, so a replay that omits them reads as 'did not
+    reproduce'."""
+    from ...db.dao import ArtifactDAO, DynResultDAO
+    iso = next((d.isolation for d in DynResultDAO(ctx.conn).list_by_target(target.id)
+                if d.input_sha == input_sha and (d.isolation or "").startswith("libfuzzer/")), "")
+    prefix = iso.split("/", 1)[1] if "/" in iso else ""
+    if not prefix:
+        return []
+    for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
+        if a.kind == "libfuzzer-harness" and a.sha256.startswith(prefix):
+            return [d for d in ((a.meta or {}).get("lib_dirs") or []) if os.path.isdir(d)]
+    return []
 
 
 def env_var_from_argv(argv):

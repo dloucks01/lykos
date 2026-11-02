@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from pathlib import Path
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
@@ -248,7 +249,38 @@ def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> in
     return upgraded
 
 
-def _file_confirmed(ctx, target, r) -> int:
+def _replay_harness(ctx, target, r, static_by: dict) -> tuple:
+    """(isolation, lib_dirs) for replaying this confirmation: the binary that proved it, stored as a
+    `libfuzzer-harness` so `build_poc` replays THERE (`capture.replay_exe_for`). The proof ran on a
+    harness, not on the ingested program, and the input was tagged `source_confirm/<name>` -- which
+    no replay path reads -- so every PoC was replayed against the program and shipped unverified.
+
+    The STATIC ASan build of the same harness is preferred: it carries the project in-image, so the
+    bundle runs anywhere. A proof from the shared build is re-checked on it first."""
+    from .symbolic import directed_confirm as DC
+    binary, libs = r.get("binary"), list(r.get("lib_dirs") or [])
+    st = static_by.get(r.get("harness"))
+    if st and st != binary and r.get("input") is not None:
+        try:
+            if DC._asan_replay(st, r["input"], None, timeout=20.0).get("faulted"):
+                binary, libs = st, []
+        except Exception:                                # noqa: BLE001 -- keep the shared build
+            pass
+    elif st and st == binary:
+        libs = []
+    if not binary or not Path(binary).is_file():
+        return f"source_confirm/{r.get('harness', '?')}", libs
+    try:
+        sha = ctx.put_artifact("libfuzzer-harness", data=Path(binary).read_bytes(),
+                               meta={"harness": f"source_confirm {r.get('harness')}",
+                                     "target": target.sha256, "entry": r.get("harness"),
+                                     "lib_dirs": [str(d) for d in libs]})
+    except Exception:                                    # noqa: BLE001
+        return f"source_confirm/{r.get('harness', '?')}", libs
+    return f"libfuzzer/{sha[:12]}", libs
+
+
+def _file_confirmed(ctx, target, r, static_by=None) -> int:
     """File one ladder-confirmed bug: a CONFIRMED finding + a DynResult (so the exploit ladder can see
     it) + the reproducing input as an artifact, and CROSS-REFERENCE it against the static source
     candidates (a co-located, class-matching candidate is upgraded to confirmed). `r` is a
@@ -271,10 +303,11 @@ def _file_confirmed(ctx, target, r) -> int:
         "dedup_key": f"{cwe}:source_confirm:{key}", "function_addr": None, "site_addr": None,
         "site_detail": src_line,
         "evidence": [{"channel": "sanitizer", "detail": detail}]})
+    iso, _libs = _replay_harness(ctx, target, r, static_by or {})
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, input_sha=input_sha, input_mode="file", argv=["@@"],
         crashed=True, signal_name=(cls.get("class") or klass),
-        isolation=f"source_confirm/{harness}", defect_key=f"source_confirm:{key}",
+        isolation=iso, defect_key=f"source_confirm:{key}",
         note=f"{rung} confirmation: {klass}" + (f" at {src_line}" if src_line else "")
              + f" [{harness}]")
     # A static candidate at the SAME site with the SAME class is now dynamically proven -- link and
@@ -397,7 +430,8 @@ def source_confirm_stage(ctx) -> dict:
     proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
     upgraded = 0
     for r in proven:
-        upgraded += _file_confirmed(ctx, target, r)
+        upgraded += _file_confirmed(ctx, target, r,
+                                    {n: h["binary"] for n, h in rp_by.items() if h.get("binary")})
         ctx.progress(msg=f"CONFIRMED (non-fuzzing {r.get('rung')}): {r.get('class')} "
                          f"via {r.get('harness')}")
     # Surface the honest no-confirm account too: each rung that RAN and did not confirm, and each one

@@ -108,6 +108,8 @@ def build_poc_stage(ctx) -> dict:
     # unverified L0 -- the same mistake prompted delivery made, in a new place. The run that found
     # it recorded the harness in its isolation tag, so this reads the record.
     _harness, _kind = replay_exe_for(ctx, target, input_sha)
+    from .capture import harness_lib_dirs
+    _hlibs = harness_lib_dirs(ctx, target, input_sha) if _harness else []
     if _harness:
         exe = ctx.scratch() / "harness.bin"
         exe.write_bytes(_harness)
@@ -211,9 +213,12 @@ def build_poc_stage(ctx) -> dict:
         argv = pre
         for m in [mode] + [x for x in MODES if x != mode]:
             run_argv, stdin, run_env = _delivery(m)
+            if _hlibs:
+                # a shared-linked harness loads its project's .so files from these dirs
+                run_env = dict(run_env or {}, LD_LIBRARY_PATH=os.pathsep.join(_hlibs))
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
                               arch=target.arch, endianness=target.endianness, bits=target.bits,
-                              env_overrides=run_env, guard_page=_guard,
+                              env_overrides=run_env, guard_page=_guard, ro_binds=_hlibs,
                               rw_binds=(str(_input_slot.parent),) if m == "file" else ())
             tried.append(m if not pre else f"{m}+{' '.join(pre)}")
             # A SANITIZER FAULT IS A REPRODUCTION, so the sweep has to stop on it. This loop
