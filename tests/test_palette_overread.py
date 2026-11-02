@@ -98,6 +98,44 @@ int main(int argc, char **argv){
 """
 
 
+def test_disclosure_oracle_is_sound_and_forgery_proof():
+    """confirm_disclosure must fire ONLY on a target that leaks offset-dependent heap, and must
+    reject both a safe (clamping) target and an echo that cannot pass the negative control."""
+    # model the heap the over-read reaches: a byte at colmap_base + idx*3 that is NOT a palette
+    # entry and varies with idx (0xA0 ^ idx pattern).
+    def heap(idx):
+        return ((0xA0 ^ idx) & 0xFF, (idx * 3 + 5) & 0xFF, (idx * 7 + 9) & 0xFF)
+
+    def _palette_entry_for(gif):
+        # recover the in-bounds pixel index the constructor used and return its palette entry,
+        # mirroring gif_overindexed's palette formula so the control matches.
+        # (the test reads the index straight from the LZW the constructor emitted)
+        img = gif.index(b"\x2c", 13)
+        idx = _lzw_decode_min8(gif[img + 11:-1])[0]
+        return idx
+
+    def vulnerable(gif):
+        idx = _palette_entry_for(gif)
+        packed = gif[10]; tsz = 2 << (packed & 0x07)
+        if idx < tsz:
+            return ((idx * 17 + 1) & 0xFF, (idx * 29 + 7) & 0xFF, (idx * 43 + 13) & 0xFF)  # palette
+        return heap(idx)                                   # out of range -> heap disclosed
+
+    def safe(gif):                                          # clamps every index into the table
+        packed = gif[10]; tsz = 2 << (packed & 0x07)
+        idx = min(_palette_entry_for(gif), tsz - 1)
+        return ((idx * 17 + 1) & 0xFF, (idx * 29 + 7) & 0xFF, (idx * 43 + 13) & 0xFF)
+
+    def echo(_gif):                                         # returns a constant, unrelated to idx
+        return (1, 2, 3)
+
+    assert po.confirm_disclosure(vulnerable)["disclosed"] is True
+    sv = po.confirm_disclosure(safe)
+    assert sv["disclosed"] is False and sv["control_ok"] is True      # safe -> no false positive
+    ev = po.confirm_disclosure(echo)
+    assert ev["disclosed"] is False and ev["control_ok"] is False     # echo fails the control
+
+
 @pytest.mark.skipif(not (shutil.which("gcc") or shutil.which("cc")), reason="no C compiler")
 def test_the_constructed_index_reproduces_an_out_of_bounds_read(tmp_path):
     src = tmp_path / "v.c"; src.write_text(_VULN)

