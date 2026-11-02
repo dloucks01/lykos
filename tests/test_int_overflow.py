@@ -37,6 +37,30 @@ def test_unguarded_multiply_via_a_size_variable_is_flagged(tmp_path):
     assert len(_hits(root)) == 1
 
 
+def test_variable_times_a_literal_size_is_flagged(tmp_path):
+    """The commonest undersized-allocation shape is a variable times a LITERAL element size
+    (malloc(n * 16), malloc(count * 4), malloc(len << 2)) -- matching only var*var missed it. The
+    literal cannot be steered, but the variable can be driven large enough to wrap the product."""
+    for expr in ("n * 16", "16 * n", "n << 4", "n * 16u"):
+        root = _tree(tmp_path, {"v.c": f"void *f(unsigned n){{ return malloc({expr}); }}\n"})
+        hits = _hits(root)
+        assert len(hits) == 1 and hits[0]["cwe"] == "CWE-190", expr
+
+
+def test_a_literal_only_size_is_still_not_flagged(tmp_path):
+    """A product of pure constants cannot wrap from input -- precision must survive the literal
+    operand change."""
+    root = _tree(tmp_path, {"v.c": "void *f(void){ return malloc(4 * 8); }\n"})
+    assert _hits(root) == []
+
+
+def test_a_grow_by_one_is_not_a_wrappable_product(tmp_path):
+    """`mapSize + 1` is the safe dynamic-array grow idiom -- an additive step by a constant, not a
+    multiply/shift -- and must not be flagged (the additive path stays var+var only)."""
+    root = _tree(tmp_path, {"v.c": "void *f(unsigned mapSize){ return malloc(mapSize + 1); }\n"})
+    assert _hits(root) == []
+
+
 def test_a_size_max_guard_suppresses_the_finding(tmp_path):
     """The FreeRTOS fix idiom: `SIZE_MAX / a >= b` before the multiply."""
     root = _tree(tmp_path, {"v.c":
