@@ -43,7 +43,11 @@ CEILING: dict[str, str] = {
     "CWE-125": "leak", "CWE-126": "leak", "CWE-127": "leak", "CWE-200": "leak", "CWE-209": "leak",
     "CWE-201": "leak", "CWE-212": "leak", "CWE-457": "leak", "CWE-908": "leak", "CWE-522": "leak",
     "CWE-203": "leak", "CWE-643": "leak", "CWE-786": "leak", "CWE-788": "leak",
-    "CWE-129": "primitive", "CWE-823": "primitive", "CWE-822": "primitive", "CWE-119": "primitive",
+    # array-index / pointer-offset / indirect-call-through-field write primitives that the chain
+    # engine drives to a detonation-confirmed control-flow hijack (oob_construct / _oob_write_hijack /
+    # the heap_overflow branch). CWE-119 stays the honest generic-bounds primitive (read-or-write
+    # unknown, no specific write primitive).
+    "CWE-129": "rce", "CWE-823": "rce", "CWE-822": "rce", "CWE-119": "primitive",
     # availability -> dos
     "CWE-476": "dos", "CWE-617": "dos", "CWE-835": "dos", "CWE-400": "dos", "CWE-770": "dos",
     "CWE-369": "dos", "CWE-674": "dos", "CWE-401": "dos", "CWE-789": "dos", "CWE-248": "dos",

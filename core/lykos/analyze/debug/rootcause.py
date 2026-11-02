@@ -495,9 +495,13 @@ _ASAN_BY_ACCESS = {
 # undefined behaviour") threw that away and reported an out-of-bounds array write as a vague
 # medium. Matched in order, first hit wins; anything unrecognised still falls back to CWE-758.
 _UBSAN_CWE = (
-    # An out-of-bounds array access. UBSan does not say whether it was a read or a write, so this
-    # stays at the bounds PARENT class rather than claiming CWE-125/CWE-787 it cannot distinguish.
-    (r"\bindex\b.*\bout of bounds\b", "array-index-out-of-bounds", "CWE-119", "high"),
+    # An out-of-bounds array access: precisely an array-index violation, so classify it as CWE-129
+    # (improper validation of array index) -- the read/write-NEUTRAL array-index class UBSan actually
+    # detected -- rather than the vague CWE-119 bounds parent. This is more specific without claiming
+    # the read(CWE-125)/write(CWE-787) distinction UBSan does not give, and it lets the index-write
+    # chain (chain_primitive oob_write / oob_construct, both CWE-129 leads) attempt an L3; a read-only
+    # index bug simply fails that detonation-gated attempt and stays an honest L2.
+    (r"\bindex\b.*\bout of bounds\b", "array-index-out-of-bounds", "CWE-129", "high"),
     (r"\bvariable length array bound\b", "vla-bound-not-positive", "CWE-129", "medium"),
     (r"\b(?:signed|unsigned) integer overflow\b", "integer-overflow", "CWE-190", "high"),
     (r"\bnegation of .* cannot be represented\b", "integer-overflow", "CWE-190", "medium"),

@@ -48,6 +48,11 @@ _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow
            # indirect call through a field is the hijack this stage searches for -- the same two
            # routes the CWE-129 and CWE-122 leads take.
            "CWE-787": "oob_write", "CWE-822": "heap_overflow",
+           # An out-of-range pointer OFFSET (UBSan pointer-overflow) that lands a write at a computed
+           # address is a write-what-where by another name -- the same shape `_oob_write_hijack`
+           # already weaponizes by index -- so route it through the oob_write branch (detonation-
+           # gated: a non-write offset bug simply never confirms and stays an honest L2).
+           "CWE-823": "oob_write",
            # An integer overflow that UNDERSIZES an allocation IS a heap overflow by its arithmetic:
            # the heap_overflow branch's `menu.alloc_primers` already drives the count past the
            # integer width so the size computation wraps and the allocation is too small -- the only
@@ -77,7 +82,7 @@ _RECIPE_DETECTORS = ("chain_primitive", "oob_recipe", "recipe")
 #: CWE-762 (an invalid / mismatched free from `heap_monitor` / `memoracle` / the sanitizer root-cause
 #: names the bad-free primitive). Each is still DETONATION-gated downstream, so admitting a weak
 #: candidate as a lead cannot manufacture a finding -- it just gives the engine something to try.
-_CHAINABLE_CWE = ("CWE-129", "CWE-190", "CWE-590", "CWE-762")
+_CHAINABLE_CWE = ("CWE-129", "CWE-190", "CWE-590", "CWE-762", "CWE-823")
 
 
 def _p64(v: int) -> bytes:

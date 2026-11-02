@@ -42,6 +42,9 @@ def test_vclass_maps_every_primitive_cwe():
     assert chain._VCLASS["CWE-190"] == "heap_overflow"
     assert chain._VCLASS["CWE-590"] == "double_free"
     assert chain._VCLASS["CWE-762"] == "double_free"
+    # an out-of-range pointer offset is a write-what-where -> route through the oob_write branch
+    assert chain._VCLASS["CWE-823"] == "oob_write"
+    assert "CWE-823" in chain._CHAINABLE_CWE
 
 
 # --- lead admission: a NAMED primitive is chained on its CWE, not only its detector ----------------
@@ -92,6 +95,14 @@ def test_lead_finding_dynamic_still_outranks_a_static_candidate(monkeypatch):
                                   _F("CWE-415", "heap_trace", 0.9)])
     lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
     assert lead.cwe == "CWE-415" and lead.detector == "heap_trace"
+
+
+def test_lead_finding_admits_a_pointer_offset_overflow(monkeypatch):
+    # CWE-823 (UBSan pointer-overflow) names a write-what-where primitive; it must be admitted even
+    # though its only detector (rootcause) is not a dynamic lead detector.
+    _patch_findings(monkeypatch, [_F("CWE-823", "rootcause", 0.5)])
+    lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+    assert lead is not None and lead.cwe == "CWE-823"
 
 
 def test_lead_finding_excludes_recipe_rows_and_unknown_classes(monkeypatch):

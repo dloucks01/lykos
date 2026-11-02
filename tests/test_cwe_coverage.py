@@ -41,6 +41,16 @@ def test_invalid_free_classes_weaponize_to_rce():
     assert cc.weaponizable("CWE-190") == "rce"
 
 
+def test_array_index_and_pointer_primitives_reach_rce():
+    """CWE-129 (array-index write), CWE-822 (indirect call through a controlled field) and CWE-823
+    (out-of-range pointer offset) are driven to a detonation-confirmed control-flow hijack by the
+    chain engine, so their honest ceiling is code execution; CWE-119 stays the generic primitive."""
+    assert cc.weaponizable("CWE-129") == "rce"
+    assert cc.weaponizable("CWE-822") == "rce"
+    assert cc.weaponizable("CWE-823") == "rce"
+    assert cc.weaponizable("CWE-119") == "primitive"
+
+
 def test_capability_matrix_covers_all_named_classes():
     m = cc.capability_matrix()
     assert len(m) == len(CWE_NAMES)
