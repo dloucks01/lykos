@@ -1,6 +1,7 @@
 # Benchmark run outputs and extracted/built targets are reproducible -- never committed.
 runs/
 runs-*/
+runs-*.log
 */vuln/
 */fixed/
 */vuln-asan/
