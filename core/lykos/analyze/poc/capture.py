@@ -390,6 +390,19 @@ def plain_build_bytes(ctx, target):
     return None
 
 
+def variant_build_bytes(ctx, target, kind: str):
+    """Bytes of a stored build VARIANT of this target (`plain-blob`, `aflsan-blob`, ...) keyed to
+    the ingested binary's sha, or None. Same lookup as `plain_build_bytes`, for any kind."""
+    from ...db.dao import ArtifactDAO
+    try:
+        for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
+            if a.kind == kind and (a.meta or {}).get("binary_sha") in (None, target.sha256):
+                return ctx.content.get_bytes(a.sha256)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "no stored variant build")
+    return None
+
+
 def replay_exe_for(ctx, target, input_sha):
     """`(binary, kind)` for whatever actually consumes `input_sha`: a libFuzzer harness
     (`"libfuzzer"`), a sanitizer-variant build (`"sanitizer"`), or `(None, "")` when it is the

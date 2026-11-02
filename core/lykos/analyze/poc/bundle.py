@@ -146,6 +146,14 @@ def _setup_and_invoke(mode: str, argv, run_cmd=None, runtime: str = "native",
         # reason in `_PROMPT_REPLAY`: `read` takes whatever is available, so a bulk feed puts
         # field two's bytes inside field one and the target rejects them at its first gate.
         invoke = f'python3 ./replay_prompt.py {exe}' + (" " + pre if pre else "")
+    elif mode == "filename":
+        # The PAYLOAD IS THE INPUT FILE'S NAME (a program that pastes its argument filename into a
+        # shell command: jhead -rgt, CVE-2022-41751). ./input.bin is a valid file of the format
+        # the program wants; ./name.txt holds the crafted name. The name is read into a variable
+        # and only ever used inside "$n" -- a parameter expansion's RESULT is not re-expanded, so
+        # the replaying shell never runs the payload itself; only the target's own system() does.
+        setup += 'n=$(cat ./name.txt)\ncp ./input.bin "./$n"\n'
+        invoke = f'{exe}{" " + pre if pre else ""} "./$n"'
     elif mode == "socket":
         # A socket PoC cannot be a one-liner: the input only exists after the server is listening,
         # so the reproducer has to spawn the target, find its port and connect. Without this an
@@ -690,13 +698,36 @@ _SOCKET_REPLAY = br'''#!/usr/bin/env python3
 
 A socket input has no exec-time carrier -- it exists only once the server is listening -- so this
 cannot be a shell one-liner the way a stdin/argv/file/env PoC can. The port is discovered by
-diffing the listening set around the spawn, so no port has to be hard-coded. Authorized-use only.
+diffing the listening set around the spawn, so no port has to be hard-coded.
+
+./input.bin is either one raw payload, or a multi-message SESSION ("LYKOS-SESSION/1" then
+"<len>\n<bytes>" per message): the messages are sent IN ORDER over ONE connection (one datagram
+each for UDP), reading the server's reply between them -- the login/handshake prefix is what puts
+the server in the state where the last message is dangerous. A crash counts when the server dies
+on a fatal signal OR its stderr carries a crash report (a forked worker's sanitizer report or
+abort, while the listening parent survives). Like every other runner, it exits NON-ZERO on the
+fault: 128+signal when the server died by one, 134 when a worker's report is on stderr while the
+listener lives. 0 = the crash did not reproduce (or the server never listened -- said on stderr).
+Authorized-use only.
 """
-import socket, subprocess, sys, time
+import re, socket, subprocess, sys, tempfile, time
 
 EXE = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
 ARGS = sys.argv[2:]
-PAYLOAD = open("./input.bin", "rb").read()
+BLOB = open("./input.bin", "rb").read()
+MAGIC = b"LYKOS-SESSION/1\n"
+
+
+def messages(blob):
+    if not blob.startswith(MAGIC):
+        return [blob]
+    out, i = [], len(MAGIC)
+    while i < len(blob):
+        j = blob.index(b"\n", i)
+        n = int(blob[i:j])
+        out.append(blob[j + 1:j + 1 + n])
+        i = j + 1 + n
+    return out
 
 
 def listening():
@@ -713,35 +744,78 @@ def listening():
     return out
 
 
+def recv_some(s, wait=0.5):
+    s.settimeout(wait)
+    got = b""
+    try:
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            got += c
+            s.settimeout(0.05)
+    except OSError:
+        pass
+    return got
+
+
+FAULT = re.compile(rb"ERROR: AddressSanitizer|runtime error:|LYKOS-FAULT|\*\*\* stack smashing|"
+                   rb"double free or corruption|free\(\): invalid")
+MSGS = messages(BLOB)
+errf = tempfile.TemporaryFile()
 before = listening()
-proc = subprocess.Popen([EXE] + ARGS, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+proc = subprocess.Popen([EXE] + ARGS, stdout=subprocess.DEVNULL, stderr=errf)
 found = None
-for _ in range(50):
+for _ in range(80):
     time.sleep(0.1)
     new = listening() - before
     if new:
         found = sorted(new)[0]
         break
 if not found:
-    proc.kill(); sys.stderr.write("server never listened\n"); sys.exit(2)
+    proc.kill(); sys.stderr.write("server never listened: nothing was demonstrated\n"); sys.exit(0)
 proto, port = found
-print("server listening: %s port %d" % (proto.upper(), port))
+print("server listening: %s port %d; sending %d message(s)" % (proto.upper(), port, len(MSGS)))
 try:
     if proto == "tcp":
         s = socket.create_connection(("127.0.0.1", port), timeout=2)
-        s.sendall(PAYLOAD); s.close()
+        g = recv_some(s, 0.5)
+        if g:
+            print("<- %r" % g[:120])
+        for m in MSGS:
+            print("-> %r" % m[:120])
+            s.sendall(m)
+            r = recv_some(s)
+            if r:
+                print("<- %r" % r[:120])
+            if proc.poll() is not None:
+                break
+        s.close()
     else:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(PAYLOAD, ("127.0.0.1", port)); s.close()
+        for m in MSGS:
+            s.sendto(m, ("127.0.0.1", port))
+            time.sleep(0.1)
+        s.close()
 except OSError as e:
     print("send failed (%s) -- the server may already be gone" % e)
-time.sleep(0.6)
+time.sleep(1.0)
 rc = proc.poll()
+errf.seek(0)
+err = errf.read()
 if rc is None:
-    proc.kill(); sys.stderr.write("server survived: crash did not reproduce\n"); sys.exit(1)
-if rc < 0:
-    print("CRASHED: killed by signal %d" % -rc); sys.exit(0)
-sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(1)
+    proc.kill()
+if FAULT.search(err):
+    sys.stderr.write(err[-4000:].decode("latin-1", "replace"))
+    print("CRASHED: crash report on the server's stderr" +
+          (" (server exited %s)" % rc if rc is not None else " (a worker died; the listener lives)"))
+    sys.exit(128 - rc if (rc is not None and rc < 0) else 134)
+if rc is not None and (rc < 0 or rc > 128):
+    sig = -rc if rc < 0 else rc - 128
+    print("CRASHED: killed by signal %d" % sig); sys.exit(128 + sig)
+if rc is None:
+    sys.stderr.write("server survived: crash did not reproduce\n"); sys.exit(0)
+sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(0)
 '''
 
 

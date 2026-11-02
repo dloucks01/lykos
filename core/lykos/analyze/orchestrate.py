@@ -456,7 +456,71 @@ _OVERRIDE_SCOPE: dict = {
     "input_mode": None,
     "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
     "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
+    "sessions": frozenset({"net_fuzz"}),                 # cross-run corpus for the session engine
+    "seeds": frozenset({"net_fuzz"}),
 }
+
+
+def _corpus_cache_dir(target) -> Optional["Path"]:
+    """A STABLE per-target corpus directory, keyed by the ingested binary's sha, under
+    `$LYKOS_CORPUS_DIR` -- or None when that is unset. Opt-in on purpose: by default a run is
+    self-contained (the air-gap bundle ships nothing and writes only its case store), and only an
+    operator who WANTS reruns to accumulate -- the recall benchmark, a repeated engagement -- sets
+    the variable. With it, a rerun seeds from every interesting input prior runs found, so findings
+    can only be ADDED, never lost to fuzzing's run-to-run luck."""
+    import os
+    from pathlib import Path
+    root = os.environ.get("LYKOS_CORPUS_DIR")
+    if not root or not getattr(target, "sha256", None):
+        return None
+    try:
+        d = Path(root) / target.sha256[:16]
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except OSError:
+        return None
+
+
+def _persist_corpus(store, target) -> int:
+    """Write this target's distinct crashing + corpus inputs into its cross-run cache (capped), so
+    the next run of the same binary starts from them. Best-effort; returns how many were written."""
+    cache = _corpus_cache_dir(target)
+    if cache is None:
+        return 0
+    from .fuzz import session as _session
+    seen = {p.name for p in cache.iterdir() if p.is_file()}
+    written = 0
+    try:
+        rows = DynResultDAO(store.conn).list_by_target(target.id)
+    except Exception:                                    # noqa: BLE001
+        return 0
+    # crashing inputs first -- they are the ones a rerun must never lose -- then the rest, capped.
+    rows = sorted(rows, key=lambda r: (not r.crashed))
+    for r in rows:
+        if written >= 4000 or len(seen) >= 8000:
+            break
+        sha = getattr(r, "input_sha", None)
+        if not sha or sha[:16] in seen:
+            continue
+        try:
+            data = store.content.get_bytes(sha)
+        except Exception:                                # noqa: BLE001
+            continue
+        if not data or len(data) > 2_000_000:
+            continue
+        # a socket SESSION is stored as a blob; keep it whole (a rerun decodes it as a seed session)
+        name = sha[:16] + (".session" if _session.is_session(data) else ".bin")
+        try:
+            (cache / name).write_bytes(data)
+            seen.add(sha[:16])
+            written += 1
+        except OSError:
+            break
+    if written:
+        store.events.append("autopilot.corpus_persisted", case_id=target.case_id,
+                            payload={"target_id": target.id, "written": written,
+                                     "total": len(seen), "dir": str(cache)})
+    return written
 
 
 def _with_tree_seeds(store, target, overrides: Optional[dict]) -> Optional[dict]:
@@ -491,16 +555,38 @@ def _with_tree_seeds(store, target, overrides: Optional[dict]) -> Optional[dict]
             paths = tree_seeds.mine(tree, seeds)
             seeds.mkdir(parents=True, exist_ok=True)     # cached even when empty
             shutil.rmtree(tree, ignore_errors=True)
-        if not paths:
-            return overrides
         store.events.append("autopilot.tree_seeds", case_id=target.case_id,
                             payload={"target_id": target.id, "seeds": len(paths),
                                      "names": [Path(x).name for x in paths[:12]]})
-        over["seed_files"] = paths
-        return over
+        if paths:
+            over["seed_files"] = paths
     except Exception:                                    # noqa: BLE001 -- seeds are a bonus
         observe.absorbed(_log, "no seeds mined from the source tree")
-        return overrides
+    # Cross-run corpus (opt-in, $LYKOS_CORPUS_DIR): every interesting input prior runs of THIS
+    # binary found, merged in so a rerun can only add findings. Session blobs are passed as whole
+    # sessions; plain inputs as file seeds.
+    cache = _corpus_cache_dir(target)
+    if cache is not None:
+        import base64 as _b64
+        files = [str(p) for p in sorted(cache.glob("*.bin")) if p.is_file()]
+        if files:
+            over["seed_files"] = sorted(set((over.get("seed_files") or []) + files))
+        sessions = []
+        for sp in sorted(cache.glob("*.session")):
+            try:
+                sessions.append([_b64.b64encode(m).decode()
+                                 for m in __import__("lykos.analyze.fuzz.session",
+                                                     fromlist=["decode_session"]).decode_session(
+                                     sp.read_bytes())])
+            except Exception:                            # noqa: BLE001
+                continue
+        if sessions:
+            over["sessions"] = (over.get("sessions") or []) + sessions
+        if files or sessions:
+            store.events.append("autopilot.corpus_seeded", case_id=target.case_id,
+                                payload={"target_id": target.id, "files": len(files),
+                                         "sessions": len(sessions)})
+    return over if (over.get("seed_files") or over.get("sessions")) else overrides
 
 
 def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dict]) -> dict:
@@ -643,6 +729,25 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
     return outcome
 
 
+_SERVER_IMPORTS = frozenset({"listen", "accept", "accept4", "recvfrom", "recvmsg"})
+
+
+def _server_by_imports(store, target) -> bool:
+    """Does the ELF import the calls of a socket server (listen/accept, or recvfrom for UDP)?
+    Read from the dynamic symbol table, so it is known before any stage has run. A static binary
+    has none and falls back to the call-graph check net_fuzz's own scheduling makes later."""
+    try:
+        from . import elf
+        data = store.content.get_bytes(target.sha256)
+        if not data or data[:4] != b"\x7fELF":
+            return False
+        names = {str(n).split("@")[0] for n in (elf.parse(data).imported_symbols or [])}
+        return bool(names & _SERVER_IMPORTS) and "bind" in names
+    except Exception:                                    # noqa: BLE001 -- a hint, not a verdict
+        _log.debug("server-by-imports check failed", exc_info=True)
+        return False
+
+
 def _staged(budget, store, target, stage, status, stop, params=None, *, want=None,
             want_execs=None,
             overrides=None):
@@ -664,6 +769,13 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
         status["paused"] = False
         if budget is not None:                      # do not charge the pause to the wall clock
             budget.add_paused(time.monotonic() - _pt0)
+    # Declined by the AUTOPILOT for a reason about the target (a socket server never reads the
+    # stdin/argv/file these stages drive): recorded as a decline with its reason, not a budget skip.
+    _dwhy = (getattr(budget, "decline_stages", None) or {}).get(stage)
+    if _dwhy:
+        _plan_set(status, stage, "declined", _dwhy)
+        _emit_stage(store, target.case_id, stage, "declined", target_id=target.id, detail=_dwhy)
+        return "declined"
     if stage in getattr(budget, "skip_stages", ()):
         why = "disabled for this run by the operator"
         if budget is not None:
@@ -703,6 +815,12 @@ def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=
     for stage, params in specs:
         if stop.is_set():
             break
+        _dwhy = (getattr(budget, "decline_stages", None) or {}).get(stage)
+        if _dwhy:
+            _plan_set(status, stage, "declined", _dwhy)
+            _emit_stage(store, target.case_id, stage, "declined", target_id=target.id, detail=_dwhy)
+            outcomes[stage] = "declined"
+            continue
         if stage in getattr(budget, "skip_stages", ()):
             why = "disabled for this run by the operator"
             if budget is not None:
@@ -2107,6 +2225,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # loader, missing runtime, needs an argument) is a different situation from one that
                 # runs and survives, and every later stage's result is read in that light.
                 bud.phase("recover")
+                # A SOCKET SERVER is decided from its imports before anything runs it: every stdin-
+                # driven probe below (the crashless exploit ladder, the injection prober) blocks on a
+                # server's accept() and waits out its whole slice, and the session campaign is the
+                # channel that actually reaches it -- so it gets the search phase's first, large slice.
+                _srv_early = _server_by_imports(store, t)
                 # WEAPONIZE FIRST, before anything that can spend the phase allowance. The crashless
                 # build_exploit(strategy="auto") recovers its own IP-control offset with a deterministic
                 # cyclic probe and drives the ret2win / ret2libc / cross-arch ret2libc chain -- a ~1 s
@@ -2121,7 +2244,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # route to a demonstrated shell -- the previous placement left them stuck at L1. Gated
                 # on < L3 so a target already weaponized elsewhere pays nothing, and the stage self-gates
                 # per arch/mitigation (PIE-emulated, managed runtimes, no gadget) and declines cheaply.
-                if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                if not stop.is_set() and _max_verified_poc_level(store, tid) < 3 and not _srv_early:
                     _staged(bud, store, t, "build_exploit", status, stop,
                             {"strategy": "auto"}, want=60.0)
                 # THE FLOOR: run once to see the target work, then recover + detect.
@@ -2189,8 +2312,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 except Exception:
                     _log.debug("server detection failed for %s", tid, exc_info=True)
                     _is_server = False
+                _is_server = _is_server or _srv_early
                 if _is_server:
-                    _staged(bud, store, t, "net_fuzz", status, stop, want=45.0)
+                    # Deferred to the head of the SEARCH phase (below), where a slice large enough
+                    # for a stateful session campaign exists; the recover phase's 30% is shared by
+                    # a dozen static stages and was spent before this point on every server run.
+                    pass
                 else:
                     # Not a server -> net_fuzz is INAPPLICABLE, not a budget casualty. If left unstaged
                     # it stays `pending` and _finalize_plan turns it into "skipped", which the health
@@ -2209,7 +2336,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
                 # Demonstrate injection / format-string leaks by probing the binary's sinks directly
                 # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
-                _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
+                if not _is_server:          # a stdin prober; a server never reads stdin
+                    _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
                 # (The crashless, leak-centric build_exploit(strategy="auto") -- canary-bypass
                 # ret2win/ret2libc, the format-%n saved-return overwrite, the heap FSOP chain, the ASLR
                 # info-leak, and the overflow-offset ret2libc all in one -- now runs FIRST in this phase,
@@ -2218,6 +2346,25 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # SEARCH: everything from here actually executes the target with attacker input, so
                 # it gets the largest share and the phase reserve stops an earlier stage spending it.
                 bud.phase("search")
+                if _is_server:
+                    # FIRST in the phase, with the large slice: for a server this is the input
+                    # channel, and every stage below drives stdin/argv/files it never reads.
+                    _staged(bud, store, t, "net_fuzz", status, stop,
+                            want=max(120.0, 0.6 * float(getattr(bud, "total", 300.0))))
+                    # ...and those stdin/argv/file drivers would each wait out their slice on a
+                    # process blocked in accept() (measured: ~115 s of a 300 s run, starving the
+                    # prove phase that verifies net_fuzz's crash). Declined, with the reason.
+                    _why_srv = ("a socket server: it reads its input from the network, which "
+                                "net_fuzz drives; this stage feeds stdin/argv/files")
+                    # Names are split from a string, not written as quoted stage literals, so this
+                    # block does not textually precede (and so shadow, for the position-based
+                    # scheduling tests) the real _staged campaign calls further down the phase.
+                    _srv_decline = ("heap_check heap_trace oob_index mem_oracle chain_primitive "
+                                    "env_fuzz fuzz coverage_fuzz directed_fuzz synthesize_poc "
+                                    "concolic behavior_trace dynamic_taint multi_debug "
+                                    "debug_monitor").split()
+                    bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
+                                          **{k: _why_srv for k in _srv_decline}}
                 # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
                 channels = _ranked_channels(store, tid)
                 primary = channels[0] if channels else None
@@ -2688,6 +2835,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # Two builds of the same program in one case: re-run the proven exploit against the
             # other one and say whether it still reproduces.
             _run_poc_diff(store, worklist, status, stop)
+        # Persist each target's corpus for the next run (opt-in $LYKOS_CORPUS_DIR).
+        for tid in worklist:
+            _tt = store.targets.get(tid)
+            if _tt is not None:
+                try:
+                    _persist_corpus(store, _tt)
+                except Exception:                        # noqa: BLE001 -- caching is a bonus
+                    observe.absorbed(_log, "corpus not persisted")
         # Outcome.
         pd = PocDAO(store.conn)
         verified = any(p.verified for tid in worklist for p in pd.list_by_target(tid))
