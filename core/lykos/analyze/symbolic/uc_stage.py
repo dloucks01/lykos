@@ -171,13 +171,23 @@ def uc_symbolic_stage(ctx) -> dict:
     binp = Path(tempfile.mkdtemp(prefix="lykos-uc-", dir=str(ctx.scratch()))) / "uc_target.bin"
     binp.write_bytes(raw)
 
+    import time as _time
+    # A DEADLINE, not just a per-function share: the share has a 20 s floor, so 24 functions under
+    # a 180 s slice asked for 480 s -- measured on md4c, UC ran 239 s and the black-box fuzzer after
+    # it got 126 executions. Functions the clock does not reach are counted and said, not run.
+    deadline = _time.monotonic() + budget
     per = max(20, int(budget / max(1, len(names))))
     scanned = hijackable = 0
     dispatch: list = []
     src = None                                           # the archived source, fetched on demand
     ctx.progress(msg=f"UC-scanning {len(names)} undriven project function(s)")
-    for fn in names:
-        uc = uc_scan_function(binp, fn, timeout=per, ctx=ctx)
+    not_reached = 0
+    for i, fn in enumerate(names):
+        left = deadline - _time.monotonic()
+        if left < 12:
+            not_reached = len(names) - i
+            break
+        uc = uc_scan_function(binp, fn, timeout=int(min(per, left - 10)), ctx=ctx)
         if not uc.get("reached"):
             continue
         scanned += 1
@@ -196,6 +206,7 @@ def uc_symbolic_stage(ctx) -> dict:
             ctx.progress(msg=f"UC candidate (control-flow hijack, under-constrained): {fn}()")
     ctx.emit("uc_symbolic.done", payload={"supported": True, "functions": len(names),
              "scanned": scanned, "hijackable": hijackable,
+             "not_reached_for_budget": not_reached,
              # said, not hidden: these reached PC through a caller-supplied object
              "callback_dispatch_not_filed": dispatch[:16],
              "why": ("no input-byte parameter: the called pointer comes from an object the "
