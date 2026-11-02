@@ -1,0 +1,12 @@
+# Benchmark run outputs and extracted/built targets are reproducible -- never committed.
+runs/
+runs-*/
+*/vuln/
+*/fixed/
+*/vuln-asan/
+*/fixed-asan/
+*/pocs/
+*.tar.gz
+*.tgz
+*.tar.bz2
+summary.json

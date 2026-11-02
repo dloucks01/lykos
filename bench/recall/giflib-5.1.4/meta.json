@@ -1,0 +1,417 @@
+{
+  "id": "giflib-5.1.4",
+  "project": "giflib",
+  "version": "5.1.4",
+  "tree": "examples/vuln-targets/src/giflib-5.1.4",
+  "surface": "source",
+  "entry": {
+    "binary": "gif2rgb",
+    "argv": [
+      "@@"
+    ]
+  },
+  "note": "Vanilla upstream 5.1.4 (GIFLIB_RELEASE 4; util/gif2rgb.c still has the pre-ea8dbc5 'jub' typo, so none of the 5.1.5+ fixes are in it). Calling it a 'negative case' (examples/vuln-targets/README.md) is wrong: plain `gif2rgb @@` reaches the DumpScreen2RGB colormap over-read behind 3 CVEs. Several CVEs below are one defect filed more than once. Group A, gif2rgb.c:294, the default single-output path to stdout: CVE-2016-3977, CVE-2020-23922, CVE-2022-28506. Group B, gif2rgb.c:317, the three-file -o path: CVE-2023-48161, CVE-2024-45993, CVE-2025-31344. One crash at :294 or :317 therefore covers the whole group. Fix versions come from upstream NEWS. Utilities that read a GIF on stdin (giftool, gifcolor) have input=stdin and argv without @@. In the argv-input entries, argv gives the crashing command line.",
+  "cves": [
+    {
+      "id": "CVE-2016-3977",
+      "class": "heap-overflow-read",
+      "file": "util/gif2rgb.c",
+      "function": "DumpScreen2RGB",
+      "line": 294,
+      "binary": "gif2rgb",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "screen background index (SBackGroundColor, a raw byte) >= the colormap's ColorCount. GIF2RGB fills every screen row with it (line 389), and any pixel not covered by an image is then looked up as ColorMap->Colors[bg], reading past the calloc'd colormap.",
+      "fixed_in": "5.1.5 (commit ea8dbc5786862a3e16a5acfa3d24e2c2f608cd88, SF bug #87: background-color range check after the ColorMap==NULL check)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/87/",
+      "confidence": "high",
+      "note": "The fix is absent locally: no SBackGroundColor check after line 472. Debian's note confirms 5.1.4 is unpatched (5.1.4-0.4 wrongly dropped the patch). The pointer is formed at line 293 and the read happens at 294 (->Red). With -o the same bad index faults at line 317 instead. The 5.1.2 report says gif2rgb.c:531, a line number that does not map to 5.1.4."
+    },
+    {
+      "id": "CVE-2020-23922",
+      "class": "heap-overflow-read",
+      "file": "util/gif2rgb.c",
+      "function": "DumpScreen2RGB",
+      "line": 294,
+      "binary": "gif2rgb",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "decoded pixel index (or background index) >= ColorMap->ColorCount. In single-output mode, &ColorMap->Colors[GifRow[j]] is dereferenced with no bounds check.",
+      "fixed_in": "5.2.2 (SF #151; GifRow[j] >= ColorCount check in the OneFile loop)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/151/",
+      "confidence": "high",
+      "note": "Reported against 5.1.4 itself with ASan at gif2rgb.c:294:45 and `./util/gif2rgb @@`, which matches the local tree line for line. Same defect as CVE-2022-28506."
+    },
+    {
+      "id": "CVE-2022-28506",
+      "class": "heap-overflow-read",
+      "file": "util/gif2rgb.c",
+      "function": "DumpScreen2RGB",
+      "line": 294,
+      "binary": "gif2rgb",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "pixel index >= ColorMap->ColorCount, read via ColorMapEntry->Red in the OneFileFlag (stdout) loop",
+      "fixed_in": "5.2.2 (commit 368f28c0, SF #159 / merge request #11)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/159/",
+      "confidence": "high",
+      "note": "Reported on 5.2.1 at gif2rgb.c:298:45. The same unchecked loop sits at 5.1.4 line 293-294. SF #159 and #167 comments say it duplicates CVE-2020-23922."
+    },
+    {
+      "id": "CVE-2023-48161",
+      "class": "heap-overflow-read",
+      "file": "util/gif2rgb.c",
+      "function": "DumpScreen2RGB",
+      "line": 317,
+      "binary": "gif2rgb",
+      "argv": [
+        "-o",
+        "out",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "pixel/background index >= ColorCount in the three-file (.R/.G/.B) loop: &ColorMap->Colors[GifRow[j]] at line 316 is read at 317. That loop never got the 5.2.2 bounds check.",
+      "fixed_in": "6.1.1 (commit 7bbe8ea1a595bb7509ffa0a86b076e9b720e85af; the 5.2.2 fix covered only the one-file path)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/167/",
+      "confidence": "high",
+      "note": "Reached when -o is given without -1, i.e. OneFileFlag false. SF #167 comments reproduce it on 5.1.4. SF #105 reported this exact 5.1.4 line (gif2rgb.c:317), and its 5.1.5 'fix' only added a ColorMap NULL check. Writes out.R/.G/.B in the cwd."
+    },
+    {
+      "id": "CVE-2024-45993",
+      "class": "heap-overflow-read",
+      "file": "util/gif2rgb.c",
+      "function": "DumpScreen2RGB",
+      "line": 317,
+      "binary": "gif2rgb",
+      "argv": [
+        "-o",
+        "out",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "same three-file-path colormap over-read as CVE-2023-48161",
+      "fixed_in": "6.1.1 (commit 7bbe8ea1)",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2024-45993",
+      "confidence": "medium",
+      "note": "Filed against 5.2.2, PoC at gitlab.com/mthandazo/project-pov. On SF #167, Bogdan and Pipping found it hits the same DumpScreen2RGB three-file path and the same patch cures it. We did not see the PoC's own trace, so the mode (-o vs stdout) is inferred."
+    },
+    {
+      "id": "CVE-2025-31344",
+      "class": "heap-overflow-read",
+      "file": "util/gif2rgb.c",
+      "function": "DumpScreen2RGB",
+      "line": 317,
+      "binary": "gif2rgb",
+      "argv": [
+        "-o",
+        "out",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "three-file loop indexes ColorMap->Colors[GifRow[j]] without the ColorCount check (the 'incomplete fix for #159' report)",
+      "fixed_in": "6.1.1 (commit 7bbe8ea1a595bb7509ffa0a86b076e9b720e85af, SF #176/#187)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/176/",
+      "confidence": "high",
+      "note": "Duplicate of CVE-2023-48161, confirmed on SF #167/#176."
+    },
+    {
+      "id": "CVE-2023-39742",
+      "class": "null-deref",
+      "file": "util/getarg.c",
+      "function": "GAGetParmeters",
+      "line": 311,
+      "binary": "gif2rgb",
+      "argv": [
+        "-s"
+      ],
+      "input": "argv",
+      "trigger": "option that takes a numeric parameter given as the last argv word: sscanf(*((*argv)++)) runs on argv[argc]==NULL, so there is no argv_end check",
+      "fixed_in": "5.2.2 (commit 38e39296dea689c0ca972f6abb2e6cc180dfbd8f, SF #153; also SF #158, #166 case 1)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/166/",
+      "confidence": "high",
+      "note": "argv-only, so a GIF-file fuzzer cannot reach it. The faulting frame is libc sscanf/memchr; GAGetParmeters is the first project frame. 5.2.1 reports cite getarg.c:312 (off by one line). `gif2rgb -s 123` hits the same line on the second %d. Every util that uses GAGetArgs shares it (e.g. the Debian Mayhem reports 715960-715967 such as `gifbg -s`). Any %d/%u/%x/%F/%s option reaches the same switch; for 's' the NULL is stored rather than dereferenced."
+    },
+    {
+      "id": "CVE-2026-26740",
+      "class": "heap-overflow-write",
+      "file": "lib/egif_lib.c",
+      "function": "EGifGCBToExtension",
+      "line": 657,
+      "binary": "giftool",
+      "argv": [
+        "-d",
+        "1"
+      ],
+      "input": "stdin",
+      "trigger": "Graphics Control Extension (0x21 0xF9) whose data sub-block is shorter than 4 bytes, before an image. DGifSlurp stores it with ByteCount<4, then giftool -d/-u/-x calls EGifGCBToSavedExtension, which writes 4 bytes into ep->Bytes with EGifGCBToExtension.",
+      "fixed_in": "post-6.1.3 head (commit 061605081115bbfd7019bafc119a13b6f17fcf25, SF #199/#201)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/201/",
+      "confidence": "high",
+      "note": "The defective call is egif_lib.c:680 in EGifGCBToSavedExtension, which has no ByteCount>=4 check. The overflowing stores are at lines 657-659; 657 (GifExtension[1]) is the first out-of-bounds byte when ByteCount==1. ByteCount is >=1 because a 0-length first sub-block yields ExtData==NULL. giftool reads the GIF from stdin. -u yes and -x N reach it too."
+    },
+    {
+      "id": "giflib-sf-107",
+      "class": "div-by-zero",
+      "file": "util/giftext.c",
+      "function": "PrintCodeBlock",
+      "line": 332,
+      "binary": "giftext",
+      "argv": [
+        "-e",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "with -e (dump encoded codes), the end-of-image flush computes Percent = 100*CodeCount/NumBytes, where NumBytes = W*H*BitsPerPixel/8 can be 0 (e.g. a 1x1 image with a 2-color map, or a 0-width image)",
+      "fixed_in": "5.1.5 (commit 2337001bcbfa6ae6b0a1c6899194db4a4f969215, SF #107; the 'if (NumBytes > 0)' guard)",
+      "ref": "https://sourceforge.net/p/giflib/code/ci/2337001bcbfa6ae6b0a1c6899194db4a4f969215/",
+      "confidence": "high",
+      "note": "No CVE. The SF ticket page is gone (404), so the pin comes from the fix diff, which matches local lines 326-334 exactly."
+    },
+    {
+      "id": "giflib-sf-111",
+      "class": "null-deref",
+      "file": "util/giftext.c",
+      "function": "PrintCodeBlock",
+      "line": 331,
+      "binary": "giftext",
+      "argv": [
+        "-e",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "with -e, an image with neither a local nor a global color map: the flush branch reads GifFile->SColorMap->BitsPerPixel through NULL",
+      "fixed_in": "5.1.5 (commit b2b15d467e5d45982f2e85e0d393019b3ed4cc65, SF #111; 'else if (GifFile->SColorMap != NULL)')",
+      "ref": "https://sourceforge.net/p/giflib/code/ci/b2b15d467e5d45982f2e85e0d393019b3ed4cc65/",
+      "confidence": "high",
+      "note": "No CVE. The SF ticket is 404, so the pin comes from the fix diff. The statement spans 330-331, and the dereference is on 331."
+    },
+    {
+      "id": "giflib-sf-109",
+      "class": "null-deref",
+      "file": "util/giftool.c",
+      "function": "main",
+      "line": 562,
+      "binary": "giftool",
+      "argv": [],
+      "input": "stdin",
+      "trigger": "any slurpable GIF with no global color map (local maps only): GifMakeMapObject(GifFileIn->SColorMap->ColorCount, ...) dereferences NULL",
+      "fixed_in": "5.1.5 (commit b83b9d3ed288e237993dcf743cef98a1268ca6cd, SF #109)",
+      "ref": "https://sourceforge.net/p/giflib/code/ci/b83b9d3ed288e237993dcf743cef98a1268ca6cd/",
+      "confidence": "high",
+      "note": "No CVE. giftool reads the GIF from stdin, and no operation flag is needed."
+    },
+    {
+      "id": "giflib-sf-114",
+      "class": "null-deref",
+      "file": "util/gifclrmp.c",
+      "function": "main",
+      "line": 228,
+      "binary": "gifclrmp",
+      "argv": [
+        "-g",
+        "1.0",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "extension record whose first data sub-block has length 0, which makes DGifGetExtension return Extension==NULL. The pass-through then calls EGifPutExtensionBlock(..., Extension[0], ...).",
+      "fixed_in": "5.1.5 (commit 900d783def011e8d9f261db6839113425bf3334f, SF #114)",
+      "ref": "https://sourceforge.net/p/giflib/code/ci/900d783def011e8d9f261db6839113425bf3334f/",
+      "confidence": "medium",
+      "note": "No CVE. Needs a GIF output mode (-g/-l/-t) so the record loop runs with GifFileOut set, and without -i the file needs a global map (line 130). In the default save mode with -i N, the same loop hits assert(GifFileOut != NULL) at line 221 instead. The fix diff we saw covers line 228; the ticket says 'null dereferences' (plural), and the rest of the diff was cut off."
+    },
+    {
+      "id": "giflib-sf-136",
+      "class": "stack-overflow",
+      "file": "util/gifcolor.c",
+      "function": "main",
+      "line": 84,
+      "binary": "gifcolor",
+      "argv": [],
+      "input": "stdin",
+      "trigger": "more than 256 '%*3d %3d %3d %3d' colour lines on stdin: ScratchMap[256] (a stack array) is written at ScratchMap[ColorMapSize] with no bound",
+      "fixed_in": "5.2.0 (SF #136)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/136/",
+      "confidence": "high",
+      "note": "No CVE. The input is a text colour list, not a GIF. Lines 84-86 are the unbounded writes. The report (5.1.9) gives gifcolor.c:84, which matches the local tree."
+    },
+    {
+      "id": "giflib-sf-182",
+      "class": "stack-overflow",
+      "file": "util/gifbuild.c",
+      "function": "Icon2Gif",
+      "line": 242,
+      "binary": "gifbuild",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "gifbuild text input with a 'screen map' holding more than 94 '\\trgb R G B is C' lines: sscanf writes the key char to KeyTable[ColorMapSize] past GlobalColorKeys[PRINTABLES=94]. Past 256 lines, ColorMap[ColorMapSize] (line 245/254) overflows GlobalColorMap[256] as well.",
+      "fixed_in": "6.1.1 (SF #182; ColorMapSize >= 256 and >= PRINTABLES checks)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/182/",
+      "confidence": "high",
+      "note": "No CVE. The input is gifbuild's text 'icon' format, not a GIF. The ASan frame is the sscanf interceptor called from Icon2Gif; the sscanf call spans 242-243. Open SF #212 says the 6.1.1 check still comes after the sscanf write."
+    },
+    {
+      "id": "giflib-sf-181",
+      "class": "heap-overflow-read",
+      "file": "util/gifbuild.c",
+      "function": "Gif2Icon",
+      "line": 856,
+      "binary": "gifbuild",
+      "argv": [
+        "-d",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "gifbuild -d on a GIF whose colormap has fewer than 94 entries but whose raster holds pixel values >= 95 (LZW code size up to 8 is accepted regardless of map size): putchar(NameTable[ch]) reads past the 95-byte KeyLetters global",
+      "fixed_in": "6.1.1 (SF #181; index < PRINTABLES check in the raster dump)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/181/",
+      "confidence": "medium",
+      "note": "No CVE. The over-read is of a global/static array (KeyLetters) or argv memory, not the heap; the class is approximate (ASan says global-buffer-overflow). The reported PoC is `gifbuild -d -t H poc.gif` (1-char custom table, so lines 797/830/856 all over-read). The default-table variant shown here needs pixel >= 95 and was fixed by the same patch. No local map and no global map also gives ColorCount=0 and the same path."
+    },
+    {
+      "id": "giflib-sf-186",
+      "class": "int-overflow",
+      "file": "util/gifbuild.c",
+      "function": "Icon2Gif",
+      "line": 566,
+      "binary": "gifbuild",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "text input 'image' then 'image bits -100 by 1': malloc(sizeof(GifPixelType)*Width*Height) with a negative Width becomes a ~2^64 request",
+      "fixed_in": "6.1.1 (SF #186; Width/Height <= 0 and INT_MAX/SIZE_MAX checks)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/186/",
+      "confidence": "medium",
+      "note": "No CVE. Only a sanitizer turns this into a crash (ASan allocation-size-too-big). Without ASan, malloc returns NULL and gifbuild exits cleanly. The size_t arithmetic cannot wrap to a small positive value for in-range ints, so there is no real heap overflow."
+    },
+    {
+      "id": "giflib-sf-185",
+      "class": "int-overflow",
+      "file": "util/gifbg.c",
+      "function": "main",
+      "line": 235,
+      "binary": "gifbg",
+      "argv": [
+        "-s",
+        "-100",
+        "-100"
+      ],
+      "input": "argv",
+      "trigger": "negative -s width: malloc(sizeof(GifPixelType)*ImageWidth*2) becomes a ~2^64 request",
+      "fixed_in": "6.1.1 (SF #185)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/185/",
+      "confidence": "low",
+      "note": "No CVE. argv-only, with no input file at all. It crashes only under ASan's allocator; plain malloc returns NULL and GIF_EXIT runs. Reported at gifbg.c:247 in 6.x."
+    },
+    {
+      "id": "giflib-sf-170",
+      "class": "other",
+      "file": "util/giftext.c",
+      "function": "PrintExtBlock",
+      "line": 384,
+      "binary": "giftext",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "any GIF with an extension block: snprintf(&AsciiForm[CrntPlace], 3, ...) claims 3 bytes where only 2 remain at CrntPlace==15, so _FORTIFY_SOURCE=3 aborts ('buffer overflow detected')",
+      "fixed_in": "6.1.1 (SF #170, giftext-overflow.diff)",
+      "ref": "https://sourceforge.net/p/giflib/bugs/170/",
+      "confidence": "low",
+      "note": "No CVE. Not a real memory overwrite: the %c write is 2 bytes and fits. It is a crash only in a -D_FORTIFY_SOURCE=3 build (__snprintf_chk), and invisible to ASan. PrintPixelBlock (line 427, giftext -p) has the same pattern."
+    },
+    {
+      "id": "giflib-sf-192",
+      "class": "heap-overflow-read",
+      "file": "lib/gifalloc.c",
+      "function": "GifUnionColorMap",
+      "line": 148,
+      "binary": "gifbuild",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "gifbuild text whose 'screen map' is all 'rgb 0 0 0', then 'include <gif with a global map>': the 'back CrntSlot down past {0,0,0}' loop runs to CrntSlot==0 and reads ColorIn1->Colors[-1]",
+      "fixed_in": "6.1.3 (commit d0d160046f9e956646cf45bb472a0cd4e28dcc6e, SF #192; CrntSlot lower-bound check)",
+      "ref": "https://sourceforge.net/p/giflib/code/ci/d0d160046f9e956646cf45bb472a0cd4e28dcc6e/",
+      "confidence": "low",
+      "note": "No CVE. The SF ticket is login-gated, so the pin comes from the commit message ('missing CrntSlot lower bound check') plus local code. Reaching it needs a second, existing GIF file named in the text (include %s), which a single-file fuzz input cannot supply on its own."
+    },
+    {
+      "id": "giflib-sf-203",
+      "class": "null-deref",
+      "file": "lib/gifalloc.c",
+      "function": "GifUnionColorMap",
+      "line": 129,
+      "binary": "gifbuild",
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "gifbuild text with a screen map, then 'include <gif with no global color map>': GifUnionColorMap(GifFileOut->SColorMap, Inclusion->SColorMap=NULL, ...) reads ColorIn2->ColorCount",
+      "fixed_in": "post-6.1.3 head (commit 8abe475b7dde75961ea46b9cb69aa7d658d002f3, SF #203)",
+      "ref": "https://sourceforge.net/p/giflib/code/ci/8abe475b7dde75961ea46b9cb69aa7d658d002f3/",
+      "confidence": "low",
+      "note": "No CVE. The ticket body is login-gated, and NULL ColorIn2 via gifbuild.c:318 is our inference from local code. The read sits in the MAX() expansion spanning lines 128-129. Like sf-192, it needs a second GIF file referenced by name."
+    }
+  ],
+  "excluded": [
+    {
+      "id": "CVE-2019-15133",
+      "reason": "Not in 5.1.4. The DGifSlurp check here is `Width < 0 && Height < 0 && Width > INT_MAX/Height` (dgif_lib.c:1102-1103), so the division only runs when Height<0, which a 16-bit unsigned GifWord can never be. The FPE came from commit e6a3b6b (SF #104, 5.1.5 era), which changed && to ||, and was fixed in 5.1.8 by 799eb6a (<= 0). A Height==0 image is caught harmlessly by DGifGetLine's PixelCount underflow check (line 456)."
+    },
+    {
+      "id": "CVE-2018-11490",
+      "reason": "A sam2p cgif.c bug (RunningCode reached 32772 there). In giflib 5.1.4, DGifDecompressInput caps RunningCode at LZ_MAX_CODE+2 (dgif_lib.c:1026), so Prefix[RunningCode-2] at line 899-900 is at most Prefix[4095], inside Prefix[LZ_MAX_CODE+1]. The upstream 08438a5 check (5.1.5) is defensive here, and Debian/Ubuntu patched 5.1.4 anyway."
+    },
+    {
+      "id": "CVE-2018-11489",
+      "reason": "A sam2p cgif.c CrntPrefix index bug. giflib 5.1.4 already bounds CrntPrefix <= LZ_MAX_CODE in the trace loop (dgif_lib.c:883-891) and in DGifGetPrefixChar (936)."
+    },
+    {
+      "id": "CVE-2021-40633",
+      "reason": "Memory leak / OOM in gif2rgb (SF #157), not crash-class. Huge logical screens (65535x65535) do cause multi-GB allocations and output in GIF2RGB (lines 380-396), which a fuzzer may flag as OOM or timeout."
+    },
+    {
+      "id": "CVE-2026-23868",
+      "reason": "A double free in GifMakeSavedImage (gifalloc.c:347-381, shallow memcpy then FreeLastSavedImage on an error path). The code is present in 5.1.4, but the error path needs an allocation failure. GifMakeMapObject cannot fail here because file colormaps are always a power of two, and the raster realloc repeats a size that already succeeded in DGifSlurp, so only real OOM triggers it. Fixed 6.1.2 (f5b7267)."
+    },
+    {
+      "id": "CVE-2016-3177",
+      "reason": "gifcolor UAF/double-free from the duplicate EGifCloseFile (SF #83). Fixed in 5.1.3, so not present in 5.1.4."
+    },
+    {
+      "id": "CVE-2015-7555",
+      "reason": "giffix heap overflow in 5.1.1 (SF #71). Fixed in 5.1.2."
+    },
+    {
+      "id": "TEMP-0820594-BC6826",
+      "reason": "Debian #820594 / SF #82, gif2rgb zero-width out-of-bounds. Fixed by 4cc68b3 before 5.1.4; the local gif2rgb.c:370 has the SWidth/SHeight==0 check."
+    },
+    {
+      "id": "giflib-sf-193",
+      "reason": "Double free in DGifDecreaseImageCounter (6.1.3). That function does not exist in 5.1.4; it was introduced with the 2019 header/allocation split (c68d5b)."
+    },
+    {
+      "id": "giflib-sf-194..197",
+      "reason": "Fixed in gif_font.c drawing helpers (GifDrawText8x8 etc.). No 5.1.4 util calls them (gifecho/gifcolor index GifAsciiTable8x8 directly), so they are not reachable from the util programs."
+    },
+    {
+      "id": "giflib-sf-177",
+      "reason": "giftool getbool prints sp->name (NULL) on a bad -i/-u value (giftool.c:65). Argv-only, and glibc prints '(null)' rather than crashing."
+    },
+    {
+      "id": "giflib-sf-184",
+      "reason": "Uninitialized buffer in DumpScreen2RGB. An info/MSan issue, not a crash."
+    }
+  ],
+  "binary_path": "examples/vuln-targets/bin/gif2rgb_x86-64"
+}

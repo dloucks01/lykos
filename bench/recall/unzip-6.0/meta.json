@@ -1,0 +1,325 @@
+{
+  "id": "unzip-6.0",
+  "project": "Info-ZIP UnZip",
+  "version": "6.0",
+  "tree": "examples/vuln-targets/src/unzip60",
+  "surface": "source",
+  "entry": {
+    "binary": "unzip",
+    "argv": [
+      "-t",
+      "@@"
+    ]
+  },
+  "cves": [
+    {
+      "id": "CVE-2014-8139",
+      "class": "heap-overflow-read",
+      "file": "extract.c",
+      "function": "TestExtraField",
+      "line": 2162,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "EF_PKVMS (0x0004) extra field with block length < 4: crc32() is called over (ebLen-4) -> huge unsigned length, reading far past the extra-field heap buffer",
+      "fixed_in": "Debian cve-2014-8139-crc-overflow.patch; upstream SMS 2014-12 fix (oCERT-2014-011)",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2014-8139",
+      "confidence": "high",
+      "note": "case EF_PKVMS: makelong(ef+EB_HEADSIZE) (line 2161) and crc32(..., ebLen-4) (line 2162); the over-read itself happens inside crc32() in crc32.c. TestExtraField only runs in test mode (-t)."
+    },
+    {
+      "id": "CVE-2014-8140",
+      "class": "heap-overflow-write",
+      "file": "extract.c",
+      "function": "test_compr_eb",
+      "line": 2224,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "compressed extra field (EF_OS2/EF_ACL/EF_MAC3/EF_BEOS/EF_NTSD) declaring uncompressed size eb_ucsize == 0: malloc(0) then memextract() writes the inner data into the 0-byte buffer",
+      "fixed_in": "Debian cve-2014-8140-test-compr-eb.patch",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2014-8140",
+      "confidence": "high",
+      "note": "Defective size check is lines 2224-2226 (the eb_ucsize==0 case is not rejected); the out-of-bounds write lands in memextract() STORED memcpy, extract.c:2285 (deflated inner data is bounded by memflush). Reached only via TestExtraField (-t)."
+    },
+    {
+      "id": "CVE-2014-8141",
+      "class": "heap-overflow-read",
+      "file": "process.c",
+      "function": "getZip64Data",
+      "line": 1915,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "header with 0xFFFFFFFF size/offset fields plus a too-short EF_PKSZ64 (0x0001) block: makeint64()/makelong() read 8/4 bytes past the end of the malloc'd extra field",
+      "fixed_in": "Debian cve-2014-8141-getzip64data.patch",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2014-8141",
+      "confidence": "high",
+      "note": "Unchecked reads at process.c:1915, 1919, 1923 (makeint64) and 1927 (makelong). Called from fileio.c:2298 do_string(EXTRA_FIELD) for every central/local header, so -l/-v/-Z/extraction reach it too. getZip64Data is compiled unconditionally (present in process.o)."
+    },
+    {
+      "id": "CVE-2014-9636",
+      "class": "heap-overflow-write",
+      "file": "extract.c",
+      "function": "test_compr_eb",
+      "line": 2236,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "compressed extra field whose inner method is STORED and whose declared uncompressed size is smaller than the stored data: buffer malloc'd to eb_ucsize, memextract memcpy copies (eb_size-compr_offset-6) bytes",
+      "fixed_in": "Debian cve-2014-9636-test-compr-eb.patch; upstream SMS 2015-02-10",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2014-9636",
+      "confidence": "high",
+      "note": "Fix adds a STORED csize==ucsize check in test_compr_eb before the memextract() call at line 2236; the actual overflowing write is memextract() memcpy at extract.c:2285 (same sink as CVE-2014-8140 and Debian #1142906). -t only."
+    },
+    {
+      "id": "CVE-2014-9913",
+      "class": "stack-overflow",
+      "file": "list.c",
+      "function": "list_files",
+      "line": 342,
+      "argv": [
+        "-l",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "central-directory entry with an unknown compression method >= 1000: sprintf(&methbuf[4], \"%03u\", method) writes up to 6 bytes into the 4 remaining bytes of char methbuf[8]",
+      "fixed_in": "Debian cve-2014-9913-unzip-buffer-overflow.patch (6.0-21); infozip bug #27",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2014-9913",
+      "confidence": "high",
+      "note": "Executed for both -l and -v (list_files). Not reached by the default -t entry. With _FORTIFY_SOURCE the overflow becomes a __sprintf_chk abort; plain -O build gives a 1-2 byte stack smash."
+    },
+    {
+      "id": "CVE-2018-18384",
+      "class": "stack-overflow",
+      "file": "list.c",
+      "function": "list_files",
+      "line": 383,
+      "argv": [
+        "-l",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "entry whose csize/ucsize relation makes ratio() return a huge (or INT_MIN-like) per-mille: sprintf(cfactorstr, \"%c%d%%\", sgn, cfactor) overflows char cfactorstr[10]",
+      "fixed_in": "Debian increase-size-of-cfactorstr.patch (6.0-11, cfactorstr[10] -> [12])",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2018-18384",
+      "confidence": "high",
+      "note": "Buffer declared list.c:100; per-entry sprintf at line 383 and the totals sprintf at line 465 (tot_ucsize vs tot_csize) both overflow. e.g. ucsize=1, csize=0xFFFFFFFF. Executed for -l and -v."
+    },
+    {
+      "id": "CVE-2016-9844",
+      "class": "stack-overflow",
+      "file": "zipinfo.c",
+      "function": "zi_short",
+      "line": 1924,
+      "argv": [
+        "-Z",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "entry with unknown compression method >= 1000: sprintf(&methbuf[1], \"%03u\", method) overflows char methbuf[5] in the short zipinfo listing",
+      "fixed_in": "Debian cve-2016-9844-zipinfo-buffer-overflow.patch (6.0-21); LP #1643750",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2016-9844",
+      "confidence": "high",
+      "note": "zipinfo mode: `unzip -Z @@` == `zipinfo @@` (default short format, zi_short). Not reached by -t."
+    },
+    {
+      "id": "CVE-2015-7696",
+      "class": "heap-overflow-read",
+      "file": "crypt.c",
+      "function": "decrypt",
+      "line": 468,
+      "argv": [
+        "-P",
+        "x",
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "encrypted entry (gp flag bit 0) with compressed size < 12: the 12-byte encryption-header loop keeps calling NEXTBYTE past the entry's data, driving G.csize negative and causing a heap over-read / bad state downstream",
+      "fixed_in": "Debian cve-2015-7696.patch; RHBZ#1260944",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2015-7696",
+      "confidence": "medium",
+      "note": "Fix (check NEXTBYTE==EOF) is at crypt.c:468; the fault itself manifests downstream (readbyte()/inflate reading with negative csize), so the ASan top frame may not be crypt.c. CRYPT=1 in the main unzip build. -P avoids the interactive prompt; the header is read before the password check so any password works. Related non-CVE fix in the same RH bug: extract.c:1259 csiz_decrypted -= 12 unsigned underflow (Debian fix-integer-underflow-csiz-decrypted.patch)."
+    },
+    {
+      "id": "CVE-2015-7697",
+      "class": "infinite-loop",
+      "file": "extract.c",
+      "function": "UZbunzip2",
+      "line": 2780,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "bzip2-method (12) entry with empty compressed data: the final BZ2_bzDecompress loop never reaches BZ_STREAM_END",
+      "fixed_in": "Debian cve-2015-7697.patch; RHBZ#1260944",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2015-7697",
+      "confidence": "high",
+      "note": "UZbunzip2 is inside #ifdef USE_BZIP2 (extract.c:2689-2820). linux_noasm does not set -DUSE_BZIP2 (D_USE_BZ2 commented out; bzip2/ dir has no library sources; no UZbunzip2 symbol in extract.o) -> NOT COMPILED in this build; a bzip2 entry just gets 'unsupported compression method'.",
+      "in_build": false
+    },
+    {
+      "id": "CVE-2018-1000035",
+      "class": "heap-overflow-write",
+      "file": "fileio.c",
+      "function": "UzpPassword",
+      "line": 1592,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "encrypted entry with a very long (~4K) name of non-printable bytes: sprintf(prompt, \"[%s] %s password: \", FnFilter1(zipfn), FnFilter2(entry)) overflows the malloc(2*FILNAMSIZ+15) prompt buffer (fnfilter expands non-printables to ^X)",
+      "fixed_in": "Debian cve-2018-1000035-unzip-buffer-overflow.patch (6.0-22)",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2018-1000035",
+      "confidence": "medium",
+      "note": "Requires interactive password prompting, i.e. NO -P (with -P the prompt is never built). The overflow happens while building the prompt, before reading from /dev/tty. FILNAMSIZ=PATH_MAX (4096), so the filtered archive-path + entry-name must exceed 8207 bytes; a longer archive path makes it easier."
+    },
+    {
+      "id": "CVE-2021-4217",
+      "class": "null-deref",
+      "file": "process.c",
+      "function": "getUnicodeData",
+      "line": 2010,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Unicode Path extra field (0x7075) processed while G.filename_full is NULL: crc32(..., strlen(G.filename_full)) dereferences NULL",
+      "fixed_in": "Ubuntu 6.0-26ubuntu3.1 / LP#1957077 CVE-2021-4217.patch (Nils Bars); Debian marks unimportant/unfixed",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2021-4217",
+      "confidence": "medium",
+      "note": "Requires UNICODE_SUPPORT (getUnicodeData is inside #ifdef UNICODE_SUPPORT, process.c:1941); linux_noasm does not run unix/configure, so UNICODE_SUPPORT is not defined -> NOT COMPILED in this build (no getUnicodeData symbol in process.o). Patch also hardens fileio.c do_string short-read.",
+      "in_build": false
+    },
+    {
+      "id": "CVE-2022-0529",
+      "class": "heap-overflow-write",
+      "file": "process.c",
+      "function": "wide_to_local_string",
+      "line": 2491,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Unicode Path extra field with many characters that wctomb() cannot convert: each is replaced by an escape string via unbounded strcat() into a buffer sized wsize*MB_CUR_MAX+1",
+      "fixed_in": "Debian cve-2022-0529-and-cve-2022-0530.patch; Debian bug 1010355",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2022-0529",
+      "confidence": "medium",
+      "note": "Two unbounded strcat sites: line 2491 (non-escape_all branch, default) and line 2481 (escape_all, -UU style). Requires UNICODE_SUPPORT + UNICODE_WCHAR -> NOT COMPILED in linux_noasm build (no configure run; wide_to_local_string absent from process.o).",
+      "in_build": false
+    },
+    {
+      "id": "CVE-2022-0530",
+      "class": "null-deref",
+      "file": "process.c",
+      "function": "wide_to_local_string",
+      "line": 2447,
+      "argv": [
+        "-t",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Unicode Path extra field with invalid UTF-8: utf8_to_wide_string() returns NULL and utf8_to_local_string() (line 2544) passes it to wide_to_local_string, whose length loop dereferences NULL",
+      "fixed_in": "Debian cve-2022-0529-and-cve-2022-0530.patch",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2022-0530",
+      "confidence": "high",
+      "note": "Missing NULL check is in utf8_to_local_string (process.c:2543-2544); the deref is line 2447. Caller fileio.c:2341. Requires UNICODE_SUPPORT -> NOT COMPILED in linux_noasm build.",
+      "in_build": false
+    },
+    {
+      "id": "DEBIAN-1142906",
+      "class": "heap-overflow-write",
+      "file": "extract.c",
+      "function": "memextract",
+      "line": 2285,
+      "argv": [
+        "-a",
+        "-o",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "VMS-host entry (version_made_by hi byte 2) with EF_IZVMS (0x000C) block, FAB signature, cmptype BCDEFL, small usiz and inner method STORED: extract_izvms_block mallocs usiz, memextract memcpy copies csiz-6 bytes",
+      "fixed_in": "Debian can-2026-2034442.patch (6.0-31, 6.0-29+deb13u1, 6.0-28+deb12u1); Paul Marquess",
+      "ref": "https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1142906",
+      "confidence": "medium",
+      "note": "NO CVE assigned (reporter's 'CAN-2026-2034442', 'pending MITRE'; Debian tracker TEMP-1142906-2C6C79). Path: flush() (textmode, needs -a and real extraction, not -t) -> is_vms_varlen_txt (fileio.c:1177) -> extract_izvms_block (extract.c:2422) -> memextract STORED memcpy line 2285. VMS_TEXT_CONV is on by default for non-VMS non-SFX (unzpriv.h:80) and extract_izvms_block is in extract.o -> COMPILED. Same memcpy sink as CVE-2014-8140/9636."
+    },
+    {
+      "id": "DEBIAN-1142905",
+      "class": "stack-overflow",
+      "file": "zipinfo.c",
+      "function": "zi_long",
+      "line": 1707,
+      "argv": [
+        "-Z",
+        "-v",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "EF_SMARTZIP (0x4d63) extra field of exactly 64 bytes with 'dZip' magic and length byte ef_ptr[32] > 31: filenameBuf[ef_ptr[32]] = '\\0' writes up to 224 bytes past char filenameBuf[32]",
+      "fixed_in": "Debian can-2026-2034443.patch (6.0-30, 6.0-29+deb13u1)",
+      "ref": "https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1142905",
+      "confidence": "medium",
+      "note": "NO CVE assigned (reporter's 'CAN-2026-2034443'; Debian TEMP-1142905-081994, 'crash in CLI tool, no security impact'). Single NUL byte stack write; only in verbose zipinfo (zi_long). Compiled in."
+    },
+    {
+      "id": "DEBIAN-1142904",
+      "class": "heap-overflow-read",
+      "file": "process.c",
+      "function": "ef_scan_for_izux",
+      "line": 2907,
+      "argv": [
+        "-o",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "EF_IZUNIX3 (0x7875) block of length 7 with uid_size=200: gid_size read at EB_HEADSIZE+uid_size+2 and read_ux3_value() read far past the extra field",
+      "fixed_in": "Debian can-2026-2034440.patch (6.0-30, 6.0-29+deb13u1)",
+      "ref": "https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1142904",
+      "confidence": "medium",
+      "note": "NO CVE assigned (reporter's 'CAN-2026-2034440'; Debian TEMP-1142904-117334). Code is inside #ifdef IZ_HAVE_UXUIDGID (process.c:2897), which nothing in vanilla unix/Makefile linux_noasm defines (reporter built with -DIZ_HAVE_UXUIDGID; read_ux3_value absent from process.o) -> NOT COMPILED in this build. Path when compiled: extraction close_outfile -> get_extattribs -> ef_scan_for_izux.",
+      "in_build": false
+    }
+  ],
+  "note": "Vanilla 6.0 built with `make -f unix/Makefile linux_noasm` (no unix/configure): CRYPT, USE_DEFLATE64, VMS_TEXT_CONV compiled in; UNICODE_SUPPORT/UNICODE_WCHAR, USE_BZIP2, IZ_HAVE_UXUIDGID not compiled in (entries with in_build=false). CVE-2014-8140, CVE-2014-9636 and DEBIAN-1142906 all fault at the same memcpy in memextract (extract.c:2285); distinguish by caller. The list.c/zipinfo.c methbuf sprintf overflows are 1-2 byte stack smashes that only abort under _FORTIFY_SOURCE or ASan.",
+  "excluded": [
+    {
+      "id": "CVE-2015-1315",
+      "reason": "charset_to_intern comes from the distro iconv patch; not in vanilla 6.0 (Debian: not-affected)."
+    },
+    {
+      "id": "CVE-2018-1000031/32/33/34",
+      "reason": "affect only the 6.10c22 beta."
+    },
+    {
+      "id": "CVE-2019-13232",
+      "reason": "zip bomb (overlapping entries), not a crash."
+    },
+    {
+      "id": "CVE-2008-0888, CVE-2005-4667, CVE-2005-2475, CVE-2005-0602, CVE-2003-0282",
+      "reason": "5.x bugs fixed before 6.0."
+    },
+    {
+      "id": "zipgrep injection (CVE-2022-1271-alike)",
+      "reason": "no CVE assigned for unzip; unix/zipgrep escapes |, & and \\ before its sed; shell script, not native code."
+    },
+    {
+      "id": "csiz_decrypted integer underflow (extract.c:1259)",
+      "reason": "Debian fix-integer-underflow-csiz-decrypted.patch; same RH bug as CVE-2015-7696, no separate CVE, no clear crash."
+    }
+  ],
+  "binary_path": "examples/vuln-targets/bin/unzip_x86-64"
+}
