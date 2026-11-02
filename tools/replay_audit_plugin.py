@@ -27,6 +27,13 @@ REPORT = os.environ.get("LYKOS_REPLAY_REPORT", "/tmp/replay_audit.jsonl")
 
 @pytest.fixture(autouse=True)
 def _replay_l3_bundles(request):
+    # Connect the `lykos` log so a stage warning during the sweep is timestamped and attributed,
+    # not dropped to `logging.lastResort`. Imported here, not at module top: the plugin is loaded
+    # with PYTHONPATH=tools, and `lykos` is importable only once tests/conftest.py has put core/
+    # on the path. Configured inside a test (not at pytest_configure) so pytest's own root
+    # handlers already exist and observe keeps propagation on. Idempotent after the first call.
+    from lykos import observe
+    observe.configure()
     # Requested BEFORE the test, so this fixture tears down before `store` does.
     store = request.getfixturevalue("store") if "store" in request.fixturenames else None
     yield

@@ -106,7 +106,7 @@ def _reaches(exe, stdin_bytes, vaddr, argv, env_over, timeout) -> bool:
                 os.execve(exe, [exe] + [str(a) for a in argv], env)
             else:
                 os.execv(exe, [exe] + [str(a) for a in argv])
-        except Exception:
+        except Exception:  # forked child before exec: no logger to reach; exit 127 is the parent's signal
             pass
         os._exit(127)
     # ---- parent ----
@@ -198,7 +198,7 @@ def _reaches_rt(exe, win_off, tb, make_payload, argv, leak_timeout, timeout, _ex
             for fd in (r_in, w_in, r_out, w_out):
                 os.close(fd)
             os.execv(exe, [exe] + [str(a) for a in argv])
-        except Exception:
+        except Exception:  # forked child before exec: no logger to reach; exit 127 is the parent's signal
             pass
         os._exit(127)
     # ---- parent ----

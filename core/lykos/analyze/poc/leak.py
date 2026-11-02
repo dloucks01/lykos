@@ -1906,7 +1906,7 @@ def _fmt_pie_bp(exe, win_off, tb, read_cap, gate_prefixes, loop_exit, base_argv,
                 for fd in (rin_r, rin_w, rout_r, rout_w):
                     os.close(fd)
                 os.execv(exe, [exe] + argv)
-            except Exception:
+            except Exception:  # forked child before exec: no logger to reach; exit 127 is the parent's signal
                 pass
             os._exit(127)
         os.close(rin_r); os.close(rout_w)

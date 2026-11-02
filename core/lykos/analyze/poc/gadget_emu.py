@@ -261,7 +261,7 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
     def _is_cflow(ins):
         try:
             return bool(set(ins.groups) & _CFLOW)
-        except Exception:
+        except Exception:  # capstone without group detail: not provably control-flow, the emulation still runs it
             return False
     segs = segments if segments is not None else [(0, len(data), 0)]
 

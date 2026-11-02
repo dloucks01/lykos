@@ -2127,7 +2127,7 @@ def _length_unreadable_cmp(ins, length_regs):
         for pc in i.get("pcode") or []:
             try:
                 mnem, _insk, outk, toks = _parse(pc)
-            except Exception:
+            except Exception:  # a p-code line this parser does not model carries no taint; skip it
                 continue
             if mnem == "CBRANCH":
                 if j == n - 1 and len(toks) >= 3 and _key(toks[2]) in boundt:
