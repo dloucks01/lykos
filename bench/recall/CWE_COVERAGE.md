@@ -28,7 +28,7 @@ means a working, validated demonstration, never a candidate:
 
 | CWE | name | detect | mechanism | demo | gap → next mechanism |
 |-----|------|:--:|:--:|:--:|------|
-| 121 | stack buffer overflow | ✓ | synthesize_poc, x64frame, rop_solver | **L2** (ncompress) | reach-behind-parser (jhead/giflib/unzip) + L2→L3 ROP; **format-aware trigger placement** |
+| 121 | stack buffer overflow | ✓ | synthesize_poc, x64frame, rop_solver, **zip_overflow (ZIP)** | **L2** (ncompress) + **L1 wired (unzip, pipeline)** | zip_overflow: a valid ZIP whose central-dir `compression_method`≥1000 overflows `methbuf[8]` at unzip list.c:342 (CVE-2014-9913), reproduced via format-aware placement behind the ZIP parser, no fuzzing — honest L1 for THIS bug (a 1–2 byte ASCII digit overrun cannot reach the saved return address). L2→L3 ROP needs a control-grade overflow (ncompress is L2, honest no-gadget ceiling); the class reaches L3 via rop_solver on a target that overwrites the saved frame. Next: the `EF_SMARTZIP` extra-field overlong-index write (DEBIAN-1142905, controlled offset → L2) |
 | 787 | out-of-bounds write | ✓ | oob_construct, chain_primitive | **L2** (ncompress) | PIE-indexed write needs a leak first; wire the leak→write chain |
 | 125 | out-of-bounds read | ✓ | palette_overread (GIF), chain_primitive._oob_read_disclose | **L1 wired (giflib, pipeline) + L3 standalone** | GIF palette over-read: L1 demonstrated in the real pipeline (gif2rgb.c:294, CVE-2016-3977, no fuzzing); L3 disclosure oracle proven standalone on plain gif2rgb, wired for source targets. md4c's is a 1-byte over-read hidden by parser slack → honest L1 ceiling for THAT instance (no useful disclosure); needs other indexed formats (JPEG/PNG palette) next |
 | 122 | heap buffer overflow | ✓ | heap, heap_groom | — | drive narrowed heap-overflow candidate to groom→hijack |
@@ -80,8 +80,11 @@ means a working, validated demonstration, never a candidate:
 
 1. **Format-aware trigger placement** — embed the trigger (overlong field / out-of-range index /
    oversized count) into a *valid* container field, so a directed stage reaches a sink behind a
-   parser. First instance: `palette_overread` (GIF/CWE-125). Generalize to JPEG/ZIP/PNG/BMP and to
-   the CWE-121/787/190 shapes. Unblocks the reach-behind-parser misses on jhead/giflib/unzip.
+   parser. Instances landed: `palette_overread` (GIF/CWE-125, over-read→disclosure) and
+   `zip_overflow` (ZIP/CWE-121, central-dir `compression_method`→stack overflow, CVE-2014-9913).
+   Both confirmed against a real ASan build reaching the exact sink, no fuzzing. Generalize next to
+   JPEG (jhead EXIF/GPS over-reads) / PNG / BMP and to the CWE-787/190 shapes. This is what unblocks
+   the reach-behind-parser misses on jhead/giflib/unzip that `synthesize_poc` (raw blob) cannot.
 2. **Smart-first scheduling** — directed/synthesis stages run first with guaranteed budget; blind
    fuzzing becomes a small, last, narrowed top-up. Measured need: unzip's `synthesize_poc` ran
    "out of time" after ~300s of `coverage_fuzz`+`directed_fuzz`+`fuzz`.

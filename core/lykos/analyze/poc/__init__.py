@@ -24,6 +24,9 @@ from .stage import BUILD_POC_STAGE, enqueue_build_poc  # noqa: F401
 from .stage import register as _register
 from .synthesize_stage import SYNTH_STAGE, enqueue_synthesize  # noqa: F401
 from .synthesize_stage import register as _register_synth
+from .zip_overflow_stage import STAGE as ZIPFLOW_STAGE  # noqa: F401
+from .zip_overflow_stage import enqueue_zip_overflow  # noqa: F401
+from .zip_overflow_stage import register as _register_zipflow
 
 
 def register() -> None:
@@ -35,5 +38,6 @@ def register() -> None:
     _register_synth()
     _register_inject()
     _register_palette()
+    _register_zipflow()
     _register_secret()
     _register_cve_poc()

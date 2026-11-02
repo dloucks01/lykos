@@ -2382,7 +2382,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     _srv_decline = ("heap_check heap_trace oob_index mem_oracle chain_primitive "
                                     "env_fuzz fuzz coverage_fuzz directed_fuzz synthesize_poc "
                                     "concolic behavior_trace dynamic_taint multi_debug "
-                                    "debug_monitor palette_overread").split()
+                                    "debug_monitor palette_overread zip_overflow").split()
                     bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
                                           **{k: _why_srv for k in _srv_decline}}
                 # FIRST in the search phase, before any blind fuzzer: a DIRECTED, deterministic,
@@ -2393,6 +2393,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # blind campaign (the smart-first rule); it self-skips on a non-GIF target in ~0 s.
                 if not _is_server:
                     _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
+                    # Same smart-first rule for a narrowed ZIP field sink (a compression-method
+                    # stack overflow -- unzip / CVE-2014-9913): a valid over-method ZIP reproduces
+                    # the stack-buffer-overflow WRITE behind the ZIP parser (L1), no campaign. It
+                    # self-skips on a non-ZIP target in ~0 s.
+                    _staged(bud, store, t, "zip_overflow", status, stop, want=20.0)
                 # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
                 channels = _ranked_channels(store, tid)
                 primary = channels[0] if channels else None
