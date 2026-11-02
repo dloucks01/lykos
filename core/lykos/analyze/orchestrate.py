@@ -2284,6 +2284,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 if not _srv_early:
                     _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
                     _staged(bud, store, t, "png_overread", status, stop, want=20.0)
+                    _staged(bud, store, t, "bmp_overread", status, stop, want=20.0)
                     _staged(bud, store, t, "zip_overflow", status, stop, want=20.0)
                     _staged(bud, store, t, "jpeg_overread", status, stop, want=20.0)
                 # THE FLOOR: run once to see the target work, then recover + detect.
@@ -2401,8 +2402,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     _srv_decline = ("heap_check heap_trace oob_index mem_oracle chain_primitive "
                                     "env_fuzz fuzz coverage_fuzz directed_fuzz synthesize_poc "
                                     "concolic behavior_trace dynamic_taint multi_debug "
-                                    "debug_monitor palette_overread png_overread zip_overflow "
-                                    "jpeg_overread").split()
+                                    "debug_monitor palette_overread png_overread bmp_overread "
+                                    "zip_overflow jpeg_overread").split()
                     bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
                                           **{k: _why_srv for k in _srv_decline}}
                 # (The directed format triggers palette_overread / zip_overflow / jpeg_overread now

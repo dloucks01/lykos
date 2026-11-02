@@ -20,6 +20,9 @@ from .palette_overread_stage import register as _register_palette
 from .png_overread_stage import STAGE as PNGREAD_STAGE  # noqa: F401
 from .png_overread_stage import enqueue_png_overread  # noqa: F401
 from .png_overread_stage import register as _register_pngread
+from .bmp_overread_stage import STAGE as BMPREAD_STAGE  # noqa: F401
+from .bmp_overread_stage import enqueue_bmp_overread  # noqa: F401
+from .bmp_overread_stage import register as _register_bmpread
 from .poc_diff import POC_DIFF_STAGE, enqueue_poc_diff  # noqa: F401
 from .poc_diff import register as _register_poc_diff
 from .primitive_stage import PRIMITIVE_STAGE, enqueue_primitive  # noqa: F401
@@ -45,6 +48,7 @@ def register() -> None:
     _register_inject()
     _register_palette()
     _register_pngread()
+    _register_bmpread()
     _register_zipflow()
     _register_jpegread()
     _register_secret()

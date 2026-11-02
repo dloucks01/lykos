@@ -109,6 +109,7 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("synthesize_injection", "Injection probes", "target", "..analyze.poc", "enqueue_inject"),
     StageSpec("palette_overread", "Palette over-read (directed)", "target", "..analyze.poc", "enqueue_palette_overread", no_params=True),
     StageSpec("png_overread", "PNG palette over-read (directed)", "target", "..analyze.poc", "enqueue_png_overread", no_params=True),
+    StageSpec("bmp_overread", "BMP palette over-read (directed)", "target", "..analyze.poc", "enqueue_bmp_overread", no_params=True),
     StageSpec("zip_overflow", "ZIP field overflow (directed)", "target", "..analyze.poc", "enqueue_zip_overflow", no_params=True),
     StageSpec("jpeg_overread", "JPEG EXIF over-read (directed)", "target", "..analyze.poc", "enqueue_jpeg_overread", no_params=True),
     StageSpec("fuzz", "Black-box fuzzing", "target", "..analyze.fuzz", "enqueue_fuzz"),
