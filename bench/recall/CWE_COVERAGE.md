@@ -139,7 +139,11 @@ so wiring never manufactures a finding):
 
 - **Lever 1 (reach/depth) — format-aware placement** extended to PNG and BMP palette over-reads
   (`png_overread`, `bmp_overread`: L1 ASan READ + L3 forgery-proof disclosure), joining GIF/ZIP/JPEG.
-  Remaining: TIFF; wire the purpose-built-but-unwired `directed_reach_pie` for memory sinks.
+  Remaining: TIFF (low marginal value -- TIFF palette images are rare and libtiff bounds-checks the
+  ColorMap). NOTE on `directed_reach_pie`: its "reach a memory sink behind a menu" capability is
+  already provided by `chain_primitive`'s own menu-sequence driving (`_search_hijack`/`_pie_run`);
+  the only new coverage it adds is menu-gated stack-OOB in `oob_construct`, whose proven
+  entry-channel delivery would need the menu model threaded in -- a narrow, risky change deferred.
 - **Lever 2 (disclosure -> consume)** — `_pie_run` now recovers the base with `allow_single=True`
   (a lone unique-page-offset image pointer, forgery-proof), and the confirmed-disclosure chains run
   as the PIE-hijack fallback (extracting the ASLR-defeat leak as its own poc-backed CWE-200 L3)
@@ -149,10 +153,14 @@ so wiring never manufactures a finding):
   CWE-119 UBSan "index out of bounds" reclassified to the precise CWE-129; CWE-129/822/823 moved to
   the rce ceiling. CWE-822 has a consumer (heap_overflow branch).
 - **Bucket B (detect-only orphans)** — CWE-1284 (negative-size-param) routed to the heap-overflow
-  chain. Remaining: new detectors for the native classes NOT yet named (CWE-805 buffer-access-with-
-  incorrect-length, CWE-763 free-not-at-start, CWE-908 uninit-resource, CWE-682 incorrect-calc,
-  CWE-754/755 exceptional-condition) + a demonstration corpus for the implemented-undemonstrated
-  classes (457/362/401/369/476/835/674/409/918/798).
+  chain; **CWE-761 (free of a non-start pointer)** given a new low-FP source detector (free of a
+  pointer-arithmetic or address-of expression) and routed to the invalid-free tcache engine (dos ->
+  rce). The other surveyed natives are covered-adjacent, not new detectors: CWE-805 (memcpy/strncpy
+  with a bad length) is handled by `assert_guard` (assert-only bounds) + `cpg_scan` (CWE-120), and a
+  general "memcpy with any computed length" detector is exactly the high-FP shape the precision pass
+  warns against; CWE-908 is the MSan/457 path; CWE-682 is the parent of the already-detected 190/191
+  children; CWE-754/755 overlap the detected CWE-252. Remaining: a demonstration corpus for the
+  implemented-undemonstrated classes (457/362/401/369/476/835/674/409/918/798).
 - **Fuzz-smart rule** — the plateau/zero-progress bail is now ON by default (not only converge runs),
   twice as patient (idle tail >= 2x productive head), fail-open; opt out with {"plateau": False}.
 - **Measurement** — `cwe_coverage.run_matrix(findings, pocs)` now reports the best PoC LEVEL (L0..L3)
