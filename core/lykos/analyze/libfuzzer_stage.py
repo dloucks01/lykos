@@ -354,6 +354,18 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     cache_dir = (corpus_root / spec["id"]) if corpus_root is not None else None
     kept = _load_corpus(cache_dir, pool=corpus_root)
     corpus = kept + [c for c in corpus if c not in kept]
+    # The operator's seeds, or the ones mined from the project's own tests (`tree_seeds`): real
+    # inputs of the format, which the in-process engine never had -- `seed_files` reached the
+    # out-of-process fuzzers only.
+    for fp in ((ctx.params or {}).get("seed_files") or [])[:64]:
+        try:
+            q = Path(fp)
+            if q.is_file() and q.stat().st_size <= (1 << 20):
+                data = q.read_bytes()
+                if data not in corpus:
+                    corpus.append(data)
+        except OSError:
+            continue
     # Always prime with a few GENERIC over-long inputs: a plain stack overflow (strcpy/memcpy/sprintf
     # into a small array) is then hit on the FIRST replay instead of left to the mutator to grow an
     # input large enough -- which a short, CPU-contended campaign may not do in time. Cheap, and it

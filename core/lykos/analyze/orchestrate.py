@@ -454,9 +454,53 @@ def _looks_packed(store, target) -> bool:
 _OVERRIDE_SCOPE: dict = {
     "argv": None,                                        # None = every stage
     "input_mode": None,
-    "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz"}),
-    "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz"}),
+    "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
+    "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
 }
+
+
+def _with_tree_seeds(store, target, overrides: Optional[dict]) -> Optional[dict]:
+    """`overrides` plus seeds mined from the target's own source tree (`analyze.tree_seeds`), when
+    the operator supplied none. The fuzzers read them through the same `seed_files` channel an
+    operator's `--seed` uses, so a source project is seeded from the inputs it ships -- md4c's
+    `test/fuzz-input/` -- instead of only when someone passes them by hand. Mined once per tree
+    into the case directory (the materialised tree is scratch); best-effort, never blocking."""
+    over = dict(overrides or {})
+    if over.get("seed_files") or over.get("seed_dir"):
+        return overrides
+    try:
+        from .source_lookup import source_project_for
+        art = source_project_for(store.conn, target)
+        if art is None:
+            return overrides
+        import shutil
+        from pathlib import Path
+        base = Path(store.dir) / "mined-seeds" / art.sha256[:12]
+        seeds = base / "seeds"
+        if seeds.is_dir():
+            paths = sorted(str(p) for p in seeds.iterdir() if p.is_file())
+        else:
+            import io
+            import tarfile
+            from . import tree_seeds
+            tree = base / "tree"
+            tree.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(fileobj=io.BytesIO(store.content.get_bytes(art.sha256)),
+                              mode="r:gz") as tf:
+                tf.extractall(tree, filter="data")
+            paths = tree_seeds.mine(tree, seeds)
+            seeds.mkdir(parents=True, exist_ok=True)     # cached even when empty
+            shutil.rmtree(tree, ignore_errors=True)
+        if not paths:
+            return overrides
+        store.events.append("autopilot.tree_seeds", case_id=target.case_id,
+                            payload={"target_id": target.id, "seeds": len(paths),
+                                     "names": [Path(x).name for x in paths[:12]]})
+        over["seed_files"] = paths
+        return over
+    except Exception:                                    # noqa: BLE001 -- seeds are a bonus
+        observe.absorbed(_log, "no seeds mined from the source tree")
+        return overrides
 
 
 def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dict]) -> dict:
@@ -1973,8 +2017,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # back to this budget for the stages after them.
                 if converge and budget_seconds is None:
                     eff_budget = _CONVERGENCE_CEILING_SECONDS
-                bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages,
-                                            pause=pause)
+                bud = budget_mod.CaseBudget(eff_budget,
+                                            overrides=_with_tree_seeds(store, t, overrides),
+                                            skip_stages=skip_stages, pause=pause)
                 status["budget"] = bud.spent()                # serializable; refreshed as we go
                 if not t.file_type:
                     _staged(bud, store, t, "ingest_triage", status, stop)
