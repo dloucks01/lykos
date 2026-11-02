@@ -1087,10 +1087,29 @@ def primitive_stage(ctx) -> dict:
         # control marker) then go exactly where the filler was. Unstructured inputs minimize to a
         # single run and frame as a whole (b"", b""), i.e. exactly the old behaviour.
         min_cap = _capture_for(mode)
+        # THE SAME DEFECT, not any fault. "Still faults" alone let a 1,914-byte md4c crash
+        # (heap-buffer-overflow READ at md4c.c:2315, found through a synthesized md_parse driver)
+        # minimise to ONE byte that aborts for some other reason -- and every experiment below then
+        # ran on an input that no longer reaches the defect: no sanitizer report, no out-of-bounds
+        # verdict, "no primitive", L1. On a sanitizer build the minimised input must give the same
+        # class at the same source line; on a plain build the same signal in the same code page.
+        _san_min = (not emulated) and aflpp.is_sanitizer_build(target_bytes)
+        _orig_rep = (_detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+                     if _san_min and len(orig) > 64 else None)
+        _orig_cap = min_cap(orig) if (len(orig) > 64 and not emulated and not _orig_rep) else {}
 
         def _still_faults(b):
+            if _orig_rep:
+                r = _detonate_for_report(ctx, target, exe, mode, base_argv, b, timeout)
+                return bool(r) and r.get("class") == _orig_rep.get("class") \
+                    and r.get("source") == _orig_rep.get("source")
             c = min_cap(b)
-            return bool(c.get("ok") and c.get("signal_name"))
+            if not (c.get("ok") and c.get("signal_name")):
+                return False
+            pc0, pc1 = _orig_cap.get("pc"), c.get("pc")
+            if _orig_cap.get("signal_name") and c.get("signal_name") != _orig_cap["signal_name"]:
+                return False
+            return pc0 is None or pc1 is None or (int(pc0) >> 12) == (int(pc1) >> 12)
         # Native only: minimization is up to `cap` detonations, cheap under ptrace but far too slow
         # over a qemu gdbstub (each exec is a full emulated run), where it would blow the stage's
         # budget. Cross-arch keeps the raw crash input, exactly as before.

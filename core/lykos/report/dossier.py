@@ -210,6 +210,28 @@ def _place(argv: list, carrier: str) -> list:
 
 
 # --------------------------------------------------------------------------- one dossier
+_SRC_EV = re.compile(r"\bat ([\w./+-]+\.\w+:\d+)(?:\s+(?:through|in|via)\s+([A-Za-z_]\w*))?")
+_SRC_DEDUP = re.compile(r":([\w./+-]+\.\w+:\d+)$")
+
+
+def _source_from_evidence(f: dict) -> "tuple[str | None, str | None]":
+    """(file:line, function|None) for a finding whose location a sanitizer stderr did not carry.
+
+    Read from the "sanitizer" evidence line a stage wrote ("...reproduced heap-buffer-overflow at
+    md4c.c:2315 through md_parse()...") first, then from the dedup key's trailing file:line
+    (CWE-125:libfuzzer:md4c.c:2315). Nothing is invented: both are a stage's own record."""
+    for e in f.get("evidence") or []:
+        if e.get("channel") != "sanitizer":
+            continue
+        m = _SRC_EV.search(e.get("detail") or "")
+        if m:
+            return m.group(1), m.group(2)
+    m = _SRC_DEDUP.search(f.get("dedup_key") or "")
+    if m:
+        return m.group(1), None
+    return None, None
+
+
 def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
     from ..db.dao import DynResultDAO
     pocs = [p for p in f.get("pocs") or [] if p.get("verified")] or (f.get("pocs") or [])
@@ -244,8 +266,14 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
         p = cx.events_of("primitive.done").get(r.id)
         if p:
             prim = p
-    av = (prim or {}).get("address_verdict") or {}
-    pv = (prim or {}).get("primitive") or {}
+    av = (prim or {}).get("address_verdict")
+    av = av if isinstance(av, dict) else {}
+    # `primitive.done` reports the primitive as a DICT for the register/memory verdicts but as a
+    # bare TYPE STRING for the out-of-bounds verdict ("oob-read"); treat a string as "no dict to
+    # read fields from" rather than calling .get on it (which discarded the whole dossier -- and
+    # with it the defect's source line -- for every OOB finding).
+    pv = (prim or {}).get("primitive")
+    pv = pv if isinstance(pv, dict) else {}
     stderr = ""
     for d in dyns:
         b = cx.bytes_of(d.stderr_sha)
@@ -283,6 +311,18 @@ def _dossier(cx: _Case, t: dict, f: dict, fns) -> dict:
         fr = san["frames"][0]
         loc["source"] = f'{fr["file"]}:{fr["line"]}' + (f' in {fr["fn"]}' if fr["fn"] else "")
         loc["stack"] = [f'{x["fn"]} ({x["file"]}:{x["line"]})' for x in san["frames"]]
+    if "source" not in loc:
+        # No sanitizer stderr survived (a libFuzzer-harness crash does not store one), but the
+        # defect's file:line IS recorded -- in the "sanitizer" evidence line a stage wrote
+        # ("...reproduced <class> at md4c.c:2315 through md_parse()...") and in the dedup key
+        # (CWE-125:libfuzzer:md4c.c:2315). Recover it so the dossier -- and anything scoring it --
+        # can see where the bug is, rather than reporting a demonstrated crash with no location.
+        src, sfn = _source_from_evidence(f)
+        if src:
+            loc["source"] = src + (f" in {sfn}" if sfn and " in " not in src else "")
+            loc.setdefault("stack", [f'{sfn or ""} ({src})'.strip()])
+            if sfn and "function" not in loc:
+                loc["function"] = sfn
 
     # how it is triggered and reproduced
     exe = t.get("filename") or "target"
