@@ -339,7 +339,14 @@ def synthesize_injection_stage(ctx) -> dict:
                         break
                 if hit:
                     break
-        if hit is None and not _over() and spec.get("cwe") in ("CWE-78", "CWE-134"):   # 4. CONCOLIC
+        if hit is None and not _over() and spec.get("cwe") == "CWE-78":       # 4. THE FILENAME
+            # The payload is the input file's NAME: a program that pastes the path it was given into
+            # a shell command (jhead -rgt, CVE-2022-41751). A valid file of the program's format,
+            # named with the payload, under each of its own flags; confirmed by a split marker only
+            # an executing shell joins (filename_inject's docstring).
+            ctx.progress(msg=f"probing {name} (payload in the input file's name)")
+            hit = _filename_channel(ctx, target, exe, timeout, _deadline, p)
+        if hit is None and not _over() and spec.get("cwe") in ("CWE-78", "CWE-134"):   # 5. CONCOLIC
             # A sink behind a VALUE GUARD (a magic number / byte compare) that no option sequence
             # passes: symbolically solve a stdin that reaches it (angr hypo driver, scoped under
             # MemoryMax), then substitute our forgery-proof payload into the solved sink argument.
@@ -717,6 +724,47 @@ def _concolic_consume(out, spec, payloads, marker, exe, target, timeout):
     return None
 
 
+def _help_text(exe, target, timeout) -> str:
+    """What the program says about its options: its output for no arguments, -h and --help."""
+    out = []
+    for argv in ([], ["-h"], ["--help"]):
+        try:
+            r = sandbox.run(exe, argv=argv, timeout=min(5.0, timeout), arch=target.arch,
+                            endianness=target.endianness, bits=target.bits)
+            out.append(((r.stdout or b"") + b"\n" + (r.stderr or b"")).decode("latin-1", "ignore"))
+        except Exception:                                # noqa: BLE001 -- discovery is best effort
+            continue
+    return "\n".join(out)[:200000]
+
+
+def _filename_channel(ctx, target, exe, timeout, deadline, p):
+    """The filename-carried command injection probe; a `hit` for `_finalize`, or None."""
+    from ...db.dao import StringDAO
+    from .. import invocation
+    from . import filename_inject as fni
+    strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id, limit=20000)
+               if s.value]
+    found = invocation.discover(strings, help_text=_help_text(exe, target, timeout))
+    marker = _marker()
+
+    def _run(argv, cwd_dir):
+        try:
+            r = sandbox.run(exe, argv=argv, timeout=timeout, arch=target.arch,
+                            endianness=target.endianness, bits=target.bits,
+                            rw_binds=(str(cwd_dir),))
+        except Exception:                                # noqa: BLE001 -- one failed probe
+            return b""
+        return (r.stdout or b"") + b"\n" + (r.stderr or b"")
+    got = fni.probe(_run, strings, found, marker=marker,
+                    given_seeds=list(p.get("seed_files") or []), deadline=deadline,
+                    workdir=ctx.scratch() / "fninj")
+    if not got:
+        return None
+    return {"payload": got["name"], "mode": "filename", "signal": None, "out": got["out"],
+            "marker": marker, "argv_base": got["prefix"], "nav": b"", "stdin": None,
+            "seed": got["seed"]}
+
+
 def _finalize(ctx, target, target_bytes, spec, hit):
     payload = hit["payload"]
     pb = payload if isinstance(payload, bytes) else payload.encode()
@@ -726,6 +774,10 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     # a bundle that replays to a clean exit.
     nav = hit.get("nav") or b""
     delivered = hit.get("stdin") if mode == "stdin" and hit.get("stdin") else pb
+    extra = None
+    if mode == "filename":
+        # the FILE is the valid seed; the payload is its NAME (bundle.py: mode "filename")
+        delivered, extra = hit["seed"], {"name.txt": pb}
     input_sha = ctx.put_artifact("inject-input", data=delivered)
     # Record the ACTUAL base argv that delivered the payload (the discovered flags / `@@`), not a
     # bare re-derivation: dropping it produced a bundle that a replayer could not reproduce for any
@@ -734,6 +786,11 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     shown = pb.decode("latin-1")[:80]
     detail = (f"{spec['title']} confirmed at runtime via {mode}: payload {shown!r} produced the "
               f"expected effect (no fuzzing)")
+    if mode == "filename":
+        detail = (f"{spec['title']} confirmed at runtime: a valid input file NAMED {shown!r}"
+                  + (f", passed with {' '.join(run_argv)}" if run_argv else "")
+                  + ", made the program run the command in its name -- the shell joined the "
+                  "split marker, which no echo of the name can produce (no fuzzing)")
     if nav:
         detail += (f" -- reached by navigating first with {nav.decode('latin-1')!r} "
                    "(the sink is behind a menu branch / input gate)")
@@ -749,7 +806,8 @@ def _finalize(ctx, target, target_bytes, spec, hit):
             "tool_version": TOOL_VERSION}
     if nav:
         meta["navigation"] = nav.decode("latin-1")
-    data = bundle.build(target_bytes, delivered, meta, b"", mode, run_argv, "none")
+    data = bundle.build(target_bytes, delivered, meta, b"", mode, run_argv, "none",
+                        extra_files=extra)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": level})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
@@ -774,7 +832,7 @@ def _finalize(ctx, target, target_bytes, spec, hit):
         PocDAO(ctx.conn).set_finding(poc_id, fid)
     # The operator-runnable deliverable: a standalone command-injection script (proven -- the marker
     # ran in the sandbox). Best-effort, alongside the bundle.
-    if spec.get("cwe") == "CWE-78":
+    if spec.get("cwe") == "CWE-78" and mode != "filename":
         _emit_injection_script(ctx, target, spec, mode, nav, proven=True)
     return {"cwe": spec["cwe"], "mode": mode, "bundle": bundle_sha, "input_sha": input_sha,
             "level": level, "bases": {k: v for k, v in bases.items()
