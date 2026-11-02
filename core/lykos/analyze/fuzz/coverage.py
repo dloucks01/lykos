@@ -304,6 +304,18 @@ def coverage_stage(ctx) -> dict:
         # word alone.
         from ..poc.capture import plain_build_bytes
         _plain = plain_build_bytes(ctx, target)
+        # The "plain" build must ACTUALLY be uninstrumented. A source project is built in place, so a
+        # prior sanitizer build can leave objects/binaries the plain build relinks -- handing us a
+        # sanitizer ELF mislabelled as plain. Fuzzing THAT under AFL/qemu reserves the ~20 TB ASan
+        # shadow and OOM-kills the host (measured on unzip: a 24 GB scope OOM in coverage_fuzz).
+        # Verify, and refuse it if it is sanitizer-instrumented -- the sandbox path covers the
+        # sanitizer build under rlimits, so nothing is lost but the host OOM.
+        if _plain is not None and aflpp.is_sanitizer_build(_plain):
+            ctx.emit("coverage.build_choice", payload={
+                "build": "rejected", "note": "the 'plain' build was sanitizer-instrumented (a "
+                "shared-tree in-place rebuild inherited the sanitizer objects); not fuzzed under "
+                "AFL/qemu (its ~20 TB shadow OOM-kills the host). The sandbox fuzzers cover it."})
+            _plain = None
     if aflpp.is_sanitizer_build(_blob) and _plain is None:
         note = ("sanitizer build: not fuzzed under AFL (its shadow memory is incompatible with "
                 "AFL's memory model) and no uninstrumented build of the source was available. "
