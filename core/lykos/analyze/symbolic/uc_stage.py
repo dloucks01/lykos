@@ -111,13 +111,30 @@ def callback_dispatch_only(params) -> bool:
 
 
 def _source_params(src, fn):
-    """`fn`'s declared parameters from the archived source tree `src`, or None without one."""
+    """`fn`'s declared parameters from the archived source tree `src`, or None without one.
+
+    STATIC functions included: `defs_index` lists only what a harness can call, and md4c's
+    renderer callbacks are all `static int enter_block_callback(...)` -- the exact functions this
+    question is about -- so the lookup missed every one and the CWE-94 leads were still filed."""
     if not src:
         return None
     try:
-        from ..libfuzzer import defs_index
+        from pathlib import Path as _P
+        from ..libfuzzer import defs_index, resolve_params, split_params, typedef_map
         hit = defs_index(src).get(fn)
-        return list(hit[1]) if hit else None
+        if hit:
+            return list(hit[1])
+        pat = re.compile(r"(?:^|\n)[^\n;{}#]*?\b" + re.escape(fn)
+                         + r"[ \t]*\(((?:[^;{}()]|\([^;{}()]*\))*)\)[ \t]*(?:\r?\n[ \t]*)?\{")
+        for p in sorted(_P(src).rglob("*.c"))[:4000]:
+            try:
+                txt = p.read_text(errors="ignore")
+            except OSError:
+                continue
+            m = pat.search(txt)
+            if m:
+                return resolve_params(split_params(m.group(1)), typedef_map(src))
+        return None
     except Exception:                                    # noqa: BLE001 -- no source, no claim
         return None
 
