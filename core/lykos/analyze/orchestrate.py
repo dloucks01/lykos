@@ -2267,6 +2267,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 if not stop.is_set() and _max_verified_poc_level(store, tid) < 3 and not _srv_early:
                     _staged(bud, store, t, "build_exploit", status, stop,
                             {"strategy": "auto"}, want=60.0)
+                # DIRECTED FORMAT TRIGGERS, also weaponize-first and for the SAME measured reason as
+                # build_exploit above: these are deterministic, one-shot, format-aware proofs for a
+                # narrowed container sink (a GIF palette over-read -- gif2rgb / CVE-2016-3977; a ZIP
+                # compression-method stack overflow -- unzip / CVE-2014-9913; a JPEG/EXIF heap
+                # over-read -- jhead / CVE-2020-26208, 2018-6612, 2020-6625). Each constructs a VALID
+                # container whose one malformed field reaches the sink behind the parser, reproduces
+                # the fault (L1), and -- for the palette -- discloses heap to the output (L3). They
+                # cost ~seconds on the matching format and self-skip in ~0 s otherwise, so they run
+                # HERE, ahead of the heavy recover stages (disassemble/detect_cwe/synthesize_injection
+                # can overspend the whole recover allowance -- measured: a 63 s injection probe at a
+                # 200 s budget starved the search phase to 0, where these used to live). The
+                # smart-first rule, applied at the phase that always runs first. Not gated on level:
+                # they find bugs build_exploit does not. Skipped for a socket server (file-argv
+                # triggers are not its input channel).
+                if not _srv_early:
+                    _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
+                    _staged(bud, store, t, "zip_overflow", status, stop, want=20.0)
+                    _staged(bud, store, t, "jpeg_overread", status, stop, want=20.0)
                 # THE FLOOR: run once to see the target work, then recover + detect.
                 _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
                 # Recover + detect.
@@ -2386,24 +2404,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                                     "jpeg_overread").split()
                     bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
                                           **{k: _why_srv for k in _srv_decline}}
-                # FIRST in the search phase, before any blind fuzzer: a DIRECTED, deterministic,
-                # one-shot trigger for a narrowed format sink (a GIF palette over-read -- gif2rgb /
-                # CVE-2016-3977). It constructs a valid over-indexed GIF, reproduces the heap
-                # over-read (L1), and discloses heap to the output (L3) -- no campaign. Placed ahead
-                # of coverage_fuzz/directed_fuzz/fuzz so a deterministic proof is never starved by a
-                # blind campaign (the smart-first rule); it self-skips on a non-GIF target in ~0 s.
-                if not _is_server:
-                    _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
-                    # Same smart-first rule for a narrowed ZIP field sink (a compression-method
-                    # stack overflow -- unzip / CVE-2014-9913): a valid over-method ZIP reproduces
-                    # the stack-buffer-overflow WRITE behind the ZIP parser (L1), no campaign. It
-                    # self-skips on a non-ZIP target in ~0 s.
-                    _staged(bud, store, t, "zip_overflow", status, stop, want=20.0)
-                    # Same for a narrowed JPEG/EXIF over-read sink (jhead -- CVE-2020-26208 /
-                    # 2018-6612 / 2020-6625): a valid JPEG with one malformed EXIF field reproduces
-                    # the heap over-read behind the parser (L1), no campaign. Self-skips on a
-                    # non-JPEG target in ~0 s.
-                    _staged(bud, store, t, "jpeg_overread", status, stop, want=20.0)
+                # (The directed format triggers palette_overread / zip_overflow / jpeg_overread now
+                # run at the HEAD of the recover phase -- weaponize-first -- so an overspending
+                # recover never starves them; they used to live here and were skipped at 0 budget.)
                 # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
                 channels = _ranked_channels(store, tid)
                 primary = channels[0] if channels else None
