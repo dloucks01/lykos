@@ -326,6 +326,12 @@ def coverage_stage(ctx) -> dict:
     # strings) get AFL INSIDE the parser instead of bouncing off its front door, which is the whole
     # difference between the 0.7% edge coverage a blind seed reaches and a campaign that climbs.
     seeds = [base64.b64decode(x) for x in p.get("seeds", [])]
+    # The operator's --seed files and the seeds mined from a source tree arrive as `seed_files`,
+    # which this stage never read: the autopilot scoped them to coverage_fuzz and AFL started from
+    # format guesses anyway -- on jhead, without the three real camera JPEGs the operator supplied.
+    from .stage import _load_external_seeds
+    seeds += [s for s in _load_external_seeds({"seed_files": p.get("seed_files"),
+                                               "seed_dir": p.get("seed_dir")}) if s]
     seeds += format_aware_seeds(ctx, target)
     seeds += list(_DEFAULT_SEEDS)
     seen, uniq = set(), []                       # dedupe, keep order (format seeds first)
@@ -590,9 +596,14 @@ def coverage_stage(ctx) -> dict:
         _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
     except Exception:
         observe.absorbed(_log, "continuing")
+    _asserts: list = []
     _att = _log_afl_campaign(ctx, alog, out_dir, stats, exe=exe, mode=mode, target=target,
                              replay_argv=replay_argv, exec_timeout=exec_timeout,
-                             seconds=seconds, workfile=workfile)
+                             seconds=seconds, workfile=workfile, assert_cands=_asserts)
+    if _asserts:
+        _file_afl_assertions(ctx, target, fd, exe=exe, mode=mode, workfile=workfile,
+                             exec_timeout=exec_timeout, replay_argv=replay_argv, seeds=seeds,
+                             cands=_asserts, plain=_plain is not None)
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
                                        "unique": len(seen_crashes), "confirmed": confirmed,
                                        "attempts": _brief(_att), "isolation": _iso})
@@ -623,8 +634,43 @@ def _brief(att: dict) -> dict:
 _QUEUE_REPLAY_CAP = 300           # saved inputs replayed through our runner, at most
 
 
+def _file_afl_assertions(ctx, target, fd, *, exe, mode, workfile, exec_timeout, replay_argv,
+                         seeds, cands, plain: bool) -> int:
+    """Verify reachable assertions AFL's queue tripped and file them (CWE-617), with the same
+    differential the black-box campaign uses: the input asserts again ALONE with the same message,
+    and a benign seed runs without it. Returns how many were filed."""
+    from .stage import _file_assertion, _verify_assertion, assertion_message
+    control = None
+    for sd in seeds[:16]:
+        try:
+            _a, r = run_input(exe, mode, workfile, exec_timeout, target.arch, sd,
+                              base_argv=list(replay_argv), endianness=target.endianness,
+                              bits=target.bits)
+        except Exception:                                # noqa: BLE001 -- try the next seed
+            continue
+        if not r.crashed and not r.timed_out and not assertion_message(r.stderr):
+            control = (sd, list(replay_argv), False)
+            break
+    if control is None:
+        return 0                                         # no differential possible: file nothing
+    filed = 0
+    for data, msg in cands[:2]:
+        res = _verify_assertion(exe, mode, workfile, exec_timeout, target,
+                                (data, list(replay_argv), False, msg), control)
+        if res is None:
+            continue
+        try:
+            _file_assertion(ctx, target, fd, mode=mode, data=data, prefix=list(replay_argv),
+                            res=res, msg=msg + (" [uninstrumented build]" if plain else ""),
+                            detector="coverage_fuzz")
+            filed += 1
+        except Exception:                                # noqa: BLE001 -- advisory
+            observe.absorbed(_log, "AFL assertion not filed")
+    return filed
+
+
 def _log_afl_campaign(ctx, alog, out_dir, stats, *, exe, mode, target, replay_argv, exec_timeout,
-                      seconds, workfile) -> dict:
+                      seconds, workfile, assert_cands: list | None = None) -> dict:
     """Fold what AFL kept into the attempt log and finish it. Never raises (advisory).
 
     * every queue entry (the corpus: imported seeds + inputs AFL kept for new coverage), with
@@ -659,6 +705,15 @@ def _log_afl_campaign(ctx, alog, out_dir, stats, *, exe, mode, target, replay_ar
                 alog.record_result(d, r, phase="afl-queue", note=m.get("op") or
                                    ("seed" if "orig" in m else None))
                 replayed += 1
+                # A queue entry that trips the program's own consistency check: md4c's MD_ASSERT
+                # prints and exit(1)s, which AFL does not save as a crash at all -- this replay is
+                # the only place the campaign ever sees it (see fuzz.stage.assertion_message).
+                if assert_cands is not None and len(assert_cands) < 4 and not r.crashed \
+                        and not r.timed_out and r.exit_code not in (0, None):
+                    from .stage import assertion_message
+                    _am = assertion_message(r.stderr)
+                    if _am and all(c[1] != _am for c in assert_cands):
+                        assert_cands.append((d, _am))
             batch.clear()
 
         for f, meta in queue:
