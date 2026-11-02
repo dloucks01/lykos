@@ -187,6 +187,7 @@ def _cmd_analyze(args) -> int:
         _print_scorecard(card)
         findings = [f for f in FindingDAO(store.conn).list_by_target(t.id)]
         _print_findings(findings)
+        _print_distinct(store, case.id)
         # THE DELIVERABLE. A verified PoC is a self-contained tarball with the target, the input
         # and a runner script -- and the run never said it existed, let alone where. Anyone who
         # wanted the thing the tool is for had to know that artifacts live in the case directory
@@ -662,6 +663,22 @@ def _print_findings(findings) -> None:
               f"{(f.title or '')[:52]:<52} {f.detector or ''}")
     demod = [f for f in findings if f.state in ("confirmed", "poc-backed")]
     print(f"\n  {len(demod)} demonstrated, {len(findings) - len(demod)} detected only.")
+
+
+def _print_distinct(store, case_id) -> None:
+    """The report's own count of distinct DEFECTS, beside the row count above. One defect is often
+    several rows -- the crash, root_cause's classification, a static detector that predicted the
+    same instruction, a PoC replay -- and the CLI said '2 demonstrated' for jhead's one bug while
+    the report said 1."""
+    try:
+        from .report.model import build_report
+        nar = (build_report(store, case_id) or {}).get("narrative") or {}
+    except Exception:                                    # noqa: BLE001 -- a summary line only
+        return
+    ds = [d for t in nar.get("targets") or [] for d in t.get("dossiers") or []]
+    if ds:
+        print(f"  = {len(ds)} distinct demonstrated vulnerabilit{'y' if len(ds) == 1 else 'ies'}: "
+              + "; ".join(f'{d.get("title")} [{d.get("severity")}]' for d in ds[:6]))
 
 
 def build_parser() -> argparse.ArgumentParser:
