@@ -1248,6 +1248,65 @@ def _file_hang(ctx, target, fd, *, mode, data, prefix, hang, control, exec_timeo
     return input_sha
 
 
+#: A program's OWN consistency check firing on attacker input. glibc's assert() aborts (SIGABRT, a
+#: crash every engine already sees), but many projects install their own handler that prints and
+#: exit()s -- md4c's MD_ASSERT prints "Assertion '1 == 0' failed" and exits 1, which every engine
+#: filed as an ordinary error exit while AFL hit it twice on md4c.c:5531.
+_ASSERT_RE = re.compile(rb"(Assertion [`'\"].{0,200}?[`'\"] failed|assertion failed[^\n]{0,160}|"
+                        rb"ASSERT(?:ION)? FAILED[^\n]{0,160}|failed assertion[^\n]{0,160})",
+                        re.I)
+
+
+def assertion_message(stderr) -> Optional[str]:
+    m = _ASSERT_RE.search(stderr or b"")
+    return m.group(0).decode("latin-1", "ignore").strip()[:200] if m else None
+
+
+def _verify_assertion(exe, mode, workfile, exec_timeout, target, cand, control):
+    """Re-run the asserting input ALONE and the benign control: the assertion must fire again with
+    the same message, and the control must run without it. Returns the candidate's result or None."""
+    kw = {"endianness": target.endianness, "bits": target.bits}
+    c_data, c_prefix, c_guard = control
+    h_data, h_prefix, h_guard, msg = cand
+    try:
+        _a, c = run_input(exe, mode, workfile, exec_timeout, target.arch, c_data,
+                          base_argv=c_prefix, guard_page=c_guard, **kw)
+        if assertion_message(c.stderr) or c.crashed or sandbox.did_not_run(c.isolation):
+            return None
+        _a, h = run_input(exe, mode, workfile, exec_timeout, target.arch, h_data,
+                          base_argv=h_prefix, guard_page=h_guard, **kw)
+    except Exception:                                    # noqa: BLE001 -- a check, never a finding
+        observe.absorbed(_log, "assertion not re-verified")
+        return None
+    if sandbox.did_not_run(h.isolation) or assertion_message(h.stderr) != msg:
+        return None
+    return h
+
+
+def _file_assertion(ctx, target, fd, *, mode, data, prefix, res, msg, detector) -> str:
+    """A re-verified reachable assertion: CWE-617, the program aborts its own consistency check on
+    attacker input -- a denial of service, and evidence of a state its authors held impossible."""
+    input_sha = ctx.put_artifact("fuzz-crash-input", data=data)
+    DynResultDAO(ctx.conn).insert(target.id, target.case_id, run_id=ctx.run_id,
+                                  input_sha=input_sha, input_mode=mode, argv=list(prefix),
+                                  exit_code=res.exit_code, crashed=False,
+                                  isolation=res.isolation, duration_ms=res.duration_ms,
+                                  note=f"reachable assertion: {msg}")
+    key = re.sub(r"0x[0-9a-f]+|\d+", "N", msg)[:120]
+    fd.upsert(target.id, target.case_id, {
+        "cwe": "CWE-617", "title": f"Reachable assertion: {msg[:80]}", "severity": "medium",
+        "detector": detector, "state": "confirmed", "confidence": 0.9,
+        "dedup_key": f"CWE-617:assert:{key}", "function_addr": None, "site_addr": None,
+        "evidence": [{"channel": "dynamic", "input_sha": input_sha, "input_mode": mode,
+                      "argv": list(prefix),
+                      "detail": (f"input {input_sha[:12]} ({len(data)}B via {mode}) makes the "
+                                 f"program fail its own consistency check ({msg}) and exit "
+                                 f"{res.exit_code}; re-run alone it fails the same way, while a "
+                                 f"benign input runs without it -- a reachable assertion "
+                                 f"(denial of service)")}]})
+    return input_sha
+
+
 #: The campaign's event prefix -> the autopilot stage (engine) it runs as.
 _ENGINE_OF_PREFIX = {"fuzz": "fuzz", "directed": "directed_fuzz", "harness": "boundary_fuzz"}
 
@@ -1481,6 +1540,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # Hang capture (see `_HANG_MIN_EXECS`): a benign control, the first few timed-out inputs.
     hang_control = None
     hang_cands: list = []
+    assert_cands: list = []
+    assert_sha = None
     hang_timeouts = 0
     hang_checks = 0
     hang_sha = None
@@ -1613,8 +1674,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     hang_timeouts += 1
                     if hang_sha is None and len(hang_cands) < _HANG_CANDIDATES:
                         hang_cands.append((data, list(run_argv), guard_eff))
-                elif hang_control is None and not res.crashed and not res.timed_out:
+                elif hang_control is None and not res.crashed and not res.timed_out \
+                        and not assertion_message(res.stderr):
                     hang_control = (data, list(run_argv), guard_eff)
+                if (not res.crashed and not res.timed_out and assert_sha is None
+                        and len(assert_cands) < 4 and res.exit_code not in (0, None)):
+                    _am = assertion_message(res.stderr)
+                    if _am and all(c[3] != _am for c in assert_cands):
+                        assert_cands.append((data, list(run_argv), guard_eff, _am))
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
@@ -1790,6 +1857,19 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     gain_exec, gain_t = execs, time.time() - t_start
                 except Exception:                    # noqa: BLE001 -- never break the campaign
                     observe.absorbed(_log, "hang not filed")
+        if assert_cands and assert_sha is None and hang_control is not None \
+                and deadline - time.time() > 2 * exec_timeout + 1.0:
+            _ac = assert_cands.pop(0)
+            _r = _verify_assertion(exe, mode, workfile, exec_timeout, target, _ac, hang_control)
+            execs += 2
+            if _r is not None:
+                try:
+                    assert_sha = _file_assertion(ctx, target, fd, mode=mode, data=_ac[0],
+                                                 prefix=_ac[1], res=_r, msg=_ac[3],
+                                                 detector=detector)
+                    gain_exec, gain_t = execs, time.time() - t_start
+                except Exception:                    # noqa: BLE001 -- never break the campaign
+                    observe.absorbed(_log, "assertion not filed")
         # An ERROR LOOP: the program "ran" as far as the sandbox is concerned, but the loader refused
         # it every time (missing .so, wrong interpreter -> exit 127). Without this the campaign spent
         # its whole budget re-proving it -- measured: 3,100 attempts across fuzz + directed on one
