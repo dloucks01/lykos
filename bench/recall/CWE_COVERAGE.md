@@ -30,7 +30,7 @@ means a working, validated demonstration, never a candidate:
 |-----|------|:--:|:--:|:--:|------|
 | 121 | stack buffer overflow | ✓ | synthesize_poc, x64frame, rop_solver | **L2** (ncompress) | reach-behind-parser (jhead/giflib/unzip) + L2→L3 ROP; **format-aware trigger placement** |
 | 787 | out-of-bounds write | ✓ | oob_construct, chain_primitive | **L2** (ncompress) | PIE-indexed write needs a leak first; wire the leak→write chain |
-| 125 | out-of-bounds read | ✓ | chain_primitive._oob_read_disclose, palette_overread | **L1** (md4c, giflib) | **format-parsed over-read → L3 disclosure** (differential controlled-read oracle) |
+| 125 | out-of-bounds read | ✓ | palette_overread (GIF), chain_primitive._oob_read_disclose | **L1 wired (giflib, pipeline) + L3 standalone** | GIF palette over-read: L1 demonstrated in the real pipeline (gif2rgb.c:294, CVE-2016-3977, no fuzzing); L3 disclosure oracle proven standalone on plain gif2rgb, wired for source targets. md4c's is a 1-byte over-read hidden by parser slack → honest L1 ceiling for THAT instance (no useful disclosure); needs other indexed formats (JPEG/PNG palette) next |
 | 122 | heap buffer overflow | ✓ | heap, heap_groom | — | drive narrowed heap-overflow candidate to groom→hijack |
 | 119/788/126/127/124 | bounds errors | ✓ | (shared w/ 787/125) | L2 (ncompress 119) | fold into 787/125 mechanisms |
 | 416 | use-after-free | ✓ | heap, aaheg | ? | prove on a real UAF target (none in bench yet) |
