@@ -1390,7 +1390,11 @@ def _cmd_cwe_coverage(args: argparse.Namespace) -> int:
                       file=sys.stderr)
                 return 2
             findings = FindingDAO(store.conn).list_by_case(hit[0].id)
-            run = cc.run_matrix(findings)
+            # PoC rows carry the L0..L3 level; join them (by finding) so the scorecard reports the
+            # best LEVEL reached per class, not only the finding's confidence state.
+            pocs = [{"finding_id": r[0], "level": r[1]} for r in store.conn.execute(
+                "SELECT finding_id, level FROM poc WHERE case_id=?", (hit[0].id,)).fetchall()]
+            run = cc.run_matrix(findings, pocs)
         finally:
             store.close()
     if args.json:

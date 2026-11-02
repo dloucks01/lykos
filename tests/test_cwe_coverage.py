@@ -51,6 +51,31 @@ def test_array_index_and_pointer_primitives_reach_rce():
     assert cc.weaponizable("CWE-119") == "primitive"
 
 
+def test_run_matrix_scores_the_best_poc_level_per_class():
+    """With PoC rows joined in, the run matrix reports the best L0..L3 level each class reached and
+    counts the classes driven to a validated L3 -- the scorecard that makes 'every class to L3' a
+    tracked number, distinct from the finding's confidence state."""
+    findings = [
+        {"id": "f1", "cwe": "CWE-787", "state": "poc-backed", "dedup_key": "a"},
+        {"id": "f2", "cwe": "CWE-125", "state": "poc-backed", "dedup_key": "b"},
+        {"id": "f3", "cwe": "CWE-476", "state": "confirmed", "dedup_key": "c"},
+    ]
+    pocs = [
+        {"finding_id": "f1", "level": "L1"}, {"finding_id": "f1", "level": "L3"},  # best = L3
+        {"finding_id": "f2", "level": "L1"},                                       # best = L1
+        {"finding_id": "x", "level": "L3"},                                        # orphan -> ignored
+    ]
+    run = cc.run_matrix(findings, pocs)
+    by = {e["cwe"]: e for e in run["rows"]}
+    assert by["CWE-787"]["best_level"] == "L3"
+    assert by["CWE-125"]["best_level"] == "L1"
+    assert by["CWE-476"]["best_level"] is None          # a finding with no PoC has no level
+    assert run["l3_classes"] == ["CWE-787"] and run["l3_class_count"] == 1
+    # backward compatible: no pocs -> no levels, no crash
+    r2 = cc.run_matrix(findings)
+    assert r2["l3_class_count"] == 0 and all(e["best_level"] is None for e in r2["rows"])
+
+
 def test_capability_matrix_covers_all_named_classes():
     m = cc.capability_matrix()
     assert len(m) == len(CWE_NAMES)
