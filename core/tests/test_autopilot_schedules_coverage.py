@@ -27,7 +27,7 @@ def test_coverage_sweep_runs_after_grounding():
 
 def test_core_source_stages_all_scheduled():
     seq = set(_staged_sequence())
-    for stage in ("detect_cwe", "wire_flow", "param_sink", "lifecycle_scan", "intwidth_scan", "grounding", "coverage_sweep", "confirm", "drivable_confirm", "weaponize_plan", "triage"):
+    for stage in ("detect_cwe", "wire_flow", "param_sink", "lifecycle_scan", "intwidth_scan", "grounding", "coverage_sweep", "confirm", "drivable_confirm", "weaponize_plan", "triage", "attack_path"):
         assert stage in seq, f"{stage} fell out of the autopilot schedule"
 
 
@@ -43,3 +43,10 @@ def test_weaponize_plan_is_always_run():
     drops its weaponization analysis. (Regression: a fresh FreeRDP run starved it on late targets.)"""
     from lykos.analyze import orchestrate
     assert "weaponize_plan" in orchestrate._ALWAYS_RUN, "weaponize_plan is budget-exempt"
+
+
+def test_attack_path_is_always_run():
+    """attack_path composes the findings into a full path; a cheap offline finalizer like
+    weaponize_plan/triage, it must be budget-exempt so late targets keep their path."""
+    from lykos.analyze import orchestrate
+    assert "attack_path" in orchestrate._ALWAYS_RUN

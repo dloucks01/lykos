@@ -654,7 +654,7 @@ _EXEC_BOUNDED = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz",
 #: coverage ledger (completeness proof) and triage (the resolved disposition for every finding). They
 #: are the point of the run's accounting; skipping them for budget would discard it. ~7s each, no
 #: execution. Exempted from the budget-slice skip (given a small guaranteed slice).
-_ALWAYS_RUN = frozenset({"coverage_sweep", "triage", "weaponize_plan"})
+_ALWAYS_RUN = frozenset({"coverage_sweep", "triage", "weaponize_plan", "attack_path"})
 
 
 def _run_target_stage(store, target, stage, status, stop, params=None, *,
@@ -2932,6 +2932,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # "triage" evidence note. Runs last so poc-backed states are final; cheap/offline.
                 if not stop.is_set():
                     _staged(bud, store, t, "triage", status, stop, want=10.0)
+                # CHAIN THE FINDINGS into a full attacker path: the capability-graph search over all
+                # findings (+ their PoC rungs) -> the deepest entry->...->objective path, each edge a
+                # real finding. The cross-linking spine the report renders as a narrative. Runs after
+                # triage so the rungs are final; cheap/offline/budget-exempt.
+                if not stop.is_set():
+                    _staged(bud, store, t, "attack_path", status, stop, want=10.0)
                 # Explain a static-only outcome: a memory-corruption defect was found but no runtime
                 # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
                 # leaving a bare "static" that reads like "nothing to see".
