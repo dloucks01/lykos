@@ -241,6 +241,100 @@ def test_pie_leak_chain_declines_the_patched_target(pie_heapsafe_bin):
         shutil.rmtree(wd, ignore_errors=True)
 
 
+def _pie_steered_src(copy_len: str) -> str:
+    """A menu-driven PIE target with NO bare pointer-printing leak option -- the only disclosure is a
+    STEERED out-of-bounds read (option 3 prints arr[i] for any i; arr is adjacent to a global table
+    of function pointers, so an OOB index discloses an image pointer). So `_pie_leak_chain`'s bare
+    leak finds nothing and only the in-process steered-read relocate (`_pie_leak_write_chain`) can
+    reach the win. Parameterised by the edit's copy length for a byte-identical negative control."""
+    return (r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ puts("FLAG{pie-steered-chain}"); fflush(stdout); _exit(42); }
+void hello(void){ puts("hi"); }
+long arr[8] = {1,2,3,4,5,6,7,8};
+void (*cbs[3])(void) = {hello, hello, hello};   /* image pointers adjacent to arr: the OOB-read leak */
+struct obj { char buf[32]; void (*fn)(void); };
+static struct obj *o;
+/* LINE-based scalar read (one line per call) so the option and a following index do not collide in
+   one greedy read; the edit's overflow bytes are a separate raw read. */
+static long num(void){ char b[32]; int n=0; char ch;
+  while(n<31 && read(0,&ch,1)==1 && ch!='\n') b[n++]=ch; b[n]=0; return strtol(b,0,0); }
+int main(void){
+  setvbuf(stdout,0,_IONBF,0);
+  o=malloc(sizeof *o); o->fn=hello;
+  for(;;){
+    switch(num()){
+      case 1: o=malloc(sizeof *o); o->fn=hello; break;
+      case 2: { char b[64]; int k=read(0,b,64); if(k<0)k=0; memcpy(o->buf,b,""" + copy_len + r"""); } break;
+      case 3: { long i=num(); printf("%ld\n", arr[i]); } break;   /* STEERED OOB read -- no bare leak */
+      case 4: o->fn(); break;
+      case 5: return 0;
+    }
+  }
+}
+""")
+
+
+_PIE_STEERED = _pie_steered_src("k")
+_PIE_STEERED_SAFE = _pie_steered_src("k>(int)sizeof o->buf?(int)sizeof o->buf:k")
+
+
+@pytest.fixture
+def pie_steered_bin(tmp_path_factory):
+    return _build_pie_heap(tmp_path_factory, "piesteered", _PIE_STEERED)
+
+
+@pytest.fixture
+def pie_steered_safe_bin(tmp_path_factory):
+    return _build_pie_heap(tmp_path_factory, "piesteeredsafe", _PIE_STEERED_SAFE)
+
+
+def test_pie_leak_write_chain_steers_an_oob_read_and_hijacks(pie_steered_bin):
+    """Lever 2, the full in-process PIE relocate: with no bare-option leak, steer the out-of-bounds
+    READ (option 3) to disclose an image pointer, recover the base LIVE in the same process, and
+    relocate the win over the adjacent fn pointer -- confirmed by the flag under a negative control.
+    The bare-option `_pie_leak_chain` must find nothing here (there is no spontaneous pointer)."""
+    import types as _t
+    wd = Path(tempfile.mkdtemp(prefix="piesteer-"))
+    try:
+        tb = pie_steered_bin.read_bytes()
+        win_vaddr = elf_functions(tb)["win"]
+        opts, model = ["1", "2", "3", "4", "5"], {"2": ["str"], "3": ["idx"]}
+        # the bare-option leak chain finds no spontaneous pointer here
+        assert chain._pie_leak_chain(_FakeCtx(), tb, str(pie_steered_bin), ("win", win_vaddr),
+                                     opts=opts, model=model, width=None, workdir=wd) is None
+        hit = chain._pie_leak_write_chain(_FakeCtx(), _t.SimpleNamespace(), tb,
+                                          str(pie_steered_bin), ("win", win_vaddr),
+                                          opts=opts, model=model, width=None, workdir=wd)
+        assert hit is not None, "steered-OOB-read in-process relocate not confirmed"
+        read_opt, ridx, writer, off, trig, base = hit
+        assert read_opt == "3" and writer == "2" and off == 32
+        assert base and base % 0x1000 == 0
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def test_pie_leak_write_chain_declines_the_bounds_checked_target(pie_steered_safe_bin):
+    """Negative control: the SAME target with the edit bounded to the buffer cannot reach the
+    adjacent fn pointer, so the steered-read relocate must NOT confirm -- a None here is the missing
+    overflow alone (leak option, win and every path are still present)."""
+    import types as _t
+    wd = Path(tempfile.mkdtemp(prefix="piesteersafe-"))
+    try:
+        tb = pie_steered_safe_bin.read_bytes()
+        win_vaddr = elf_functions(tb)["win"]
+        hit = chain._pie_leak_write_chain(_FakeCtx(), _t.SimpleNamespace(), tb,
+                                          str(pie_steered_safe_bin), ("win", win_vaddr),
+                                          opts=["1", "2", "3", "4", "5"],
+                                          model={"2": ["str"], "3": ["idx"]}, width=None, workdir=wd)
+        assert hit is None, f"bounds-checked target wrongly confirmed a hijack: {hit}"
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
 def test_pie_repro_script_reproduces_standalone(pie_heapwin_bin):
     """The bundled reproducer is a real, runnable ASLR defeat: it recovers the base from the
     target's own symbols and re-drives the hijack to print the flag."""

