@@ -83,6 +83,8 @@ STAGES: tuple[StageSpec, ...] = (
               "enqueue_oob_write_scan", no_params=True),
     StageSpec("grounding", "Ground findings (precision + peer reachability)", "target",
               "..analyze.grounding_stage", "enqueue_grounding", no_params=True),
+    StageSpec("coverage_sweep", "Coverage ledger (every function x every CWE)", "target",
+              "..analyze.coverage_sweep_stage", "enqueue_coverage_sweep", no_params=True),
     StageSpec("confirm", "Confirm real+reachable findings, then weaponize", "target",
               "..analyze.verify_stage", "enqueue_verify", no_params=True),
     StageSpec("source_sink_scan", "Tainted-sink scan", "target", "..analyze.fingerprint", "enqueue_source_sink_scan", no_params=True),
