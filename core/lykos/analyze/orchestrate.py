@@ -2338,6 +2338,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # Recover + detect.
                 _staged(bud, store, t, "disassemble", status, stop)
                 _staged(bud, store, t, "detect_cwe", status, stop)
+                # wire-value->dangerous-use flow detector (depth add): the pattern behind every
+                # confirmed bug; cheap/offline, runs with the other static detectors.
+                _staged(bud, store, t, "wire_flow", status, stop, want=15.0)
                 # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
                 # 10-20 min and would starve the core sequence under a bounded budget (observed:
                 # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it

@@ -67,6 +67,8 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("dynamic_run", "Baseline execution", "target", "..analyze.dynamic", "enqueue_dynamic"),
     StageSpec("disassemble", "Disassemble", "target", "..analyze.disassemble", "enqueue_disassemble", no_params=True),
     StageSpec("detect_cwe", "Static detectors", "target", "..analyze.detect", "enqueue_detect", no_params=True),
+    StageSpec("wire_flow", "Wire-value -> dangerous-use flow (div/index/seek/size)", "target",
+              "..analyze.wire_flow_stage", "enqueue_wire_flow", no_params=True),
     StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
               "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
               on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "
