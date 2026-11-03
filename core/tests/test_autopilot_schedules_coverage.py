@@ -27,7 +27,7 @@ def test_coverage_sweep_runs_after_grounding():
 
 def test_core_source_stages_all_scheduled():
     seq = set(_staged_sequence())
-    for stage in ("detect_cwe", "grounding", "coverage_sweep", "confirm", "triage"):
+    for stage in ("detect_cwe", "codeql", "grounding", "coverage_sweep", "confirm", "triage"):
         assert stage in seq, f"{stage} fell out of the autopilot schedule"
 
 

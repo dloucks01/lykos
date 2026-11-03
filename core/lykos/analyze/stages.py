@@ -67,6 +67,8 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("dynamic_run", "Baseline execution", "target", "..analyze.dynamic", "enqueue_dynamic"),
     StageSpec("disassemble", "Disassemble", "target", "..analyze.disassemble", "enqueue_disassemble", no_params=True),
     StageSpec("detect_cwe", "Static detectors", "target", "..analyze.detect", "enqueue_detect", no_params=True),
+    StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
+              "..analyze.codeql_stage", "enqueue_codeql", no_params=True),
     # --- Case-scoped linking (interleaved in the plan where it runs) --------------------------
     StageSpec("whole_system", "Whole-system emulation", "case", "..analyze.link", "enqueue_whole_system"),
     StageSpec("ipc_model", "IPC model", "case", "..analyze.link", "enqueue_ipc", no_params=True),

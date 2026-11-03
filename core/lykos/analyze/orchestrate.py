@@ -2329,6 +2329,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # Recover + detect.
                 _staged(bud, store, t, "disassemble", status, stop)
                 _staged(bud, store, t, "detect_cwe", status, stop)
+                # CodeQL CPG/dataflow (F3, doc 60): interprocedural source->sink taint the pattern
+                # detectors + srctaint-lite cannot give; findings carry their dataflow path. Heavy
+                # (builds a DB once, cached) and fully budget-gated + graceful-skip, so it never
+                # blocks a run; runs after detect so its results join the same grounding/triage.
+                _staged(bud, store, t, "codeql", status, stop, want=120.0)
                 _staged(bud, store, t, "cve_scan", status, stop)
                 # Known-CVE scan of a built-from-source project's declared dependencies + vendored
                 # headers -- versions that never survive into the compiled binary's banners.

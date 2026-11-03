@@ -54,10 +54,23 @@ reach + dataflow.
   F3, `srctaint` fallback) so a DRIVABLE disposition requires the dangerous operand be
   attacker-tainted. Done when: triage downgrades a reachable-but-untainted sink (the rfx case) and
   keeps a reachable-tainted one, test-pinned.
-- **F5 — Confirmation harness-synth as a stage.** Auto-drive the reachable exported codec/channel
-  parsers (dispatcher_harness + decoder fuzzing) on the instrumented build; confirm via the 0-FP
-  gate. Done when: a run fuzzes the reachable parser surface and files any fault as a poc-backed
-  finding, bounded (no marathon).
+- **F5 — Confirmation, NON-FUZZING FIRST.** For each DRIVABLE sink, confirm in this order, stopping
+  at the first success: (a) STATIC dataflow proof (CodeQL source→sink path from F3 + bounds/taint) —
+  no execution; (b) directed CONCOLIC/SYMBOLIC solve (angr/UC/hypothesis loop) that CONSTRUCTS an
+  input reaching the sink with a triggering value — AEG-style, no blind search; (c) a CONSTRUCTED
+  PoC (doc 58 provenance "constructed") from the solved input + a synth harness; (d) ONLY THEN
+  bounded fuzzing as the additive fallback, on the reachable surface, via the 0-FP gate. Rationale
+  (operator, standing): non-fuzzing-first is the priority; fuzzing is the path of least resistance I
+  must not default to. Done when: a run attempts (a)->(d) in order on the drivable set and files a
+  constructed PoC where the solver succeeds, falling back to bounded fuzz only after.
+
+  Note on why this is the hard layer (operator asked "why is this difficult"): looking at all code
+  and matching CWEs (coverage sweep + CodeQL) is tractable and DONE; the difficulty is step 3 of
+  reach->taint->SOLVE-exact-input->harness->oracle. Solving the exact attacker input that threads
+  every guard/length-check/state to the sink is undecidable in general and expensive in practice --
+  no complete push-button method exists (hence the industry uses fuzzing AND symbolic, both
+  incomplete). The honest target is therefore every finding RESOLVED: a constructed/fuzzed PoC OR a
+  specific, named dead-end -- never "a PoC for every finding", which is not soundly achievable.
 - **F6 — Gap self-audit.** A check that flags, each run, any registered capability not applied in
   the pipeline (so a built technique can't sit in a drawer). Done when: it lists unwired
   capabilities in the scorecard.
