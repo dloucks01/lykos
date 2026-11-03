@@ -206,29 +206,53 @@ def synth_confirm_stage(ctx) -> dict:
         return {"metrics": {"supported": False}}
 
     from pathlib import Path
+    from . import driver_synth as DS
     from .symbolic import dwarfline
     per = max(30, int(budget / max(1, len(cands))))
     input_size = int(p.get("input_size") or 4096)
-    synthesized = confirmed = upgraded = 0
-    ctx.progress(msg=f"synthesizing drivers for {len(cands)} candidate function(s)")
+    synthesized = confirmed = upgraded = stream_synth = 0
+    # STREAM-AWARE fallback (driver_synth): a protocol/format parser reads attacker bytes through a
+    # project STREAM object and writes an opaque context -- a signature the plain (buf,size)
+    # synthesizer rejects, so those parsers never reach a confirmation rung. Detect the project's
+    # stream idiom ONCE (the scan is bounded but not free), and only then is the fallback attempted.
+    idiom = DS.detect_stream_idiom(src)
+    ctx.progress(msg=f"synthesizing drivers for {len(cands)} candidate function(s)"
+                 + (f" (stream idiom: {idiom.name})" if idiom else ""))
     for fn, bn, line in cands:
         out = Path(ctx.scratch()) / f"synthdrv_{fn[:40]}.bin"
+        lib_dirs = None
         try:
             b = LF.build_libfuzzer(src, out, harness_fn=fn, timeout=max(60, per))
         except Exception:                                    # noqa: BLE001 -- unsynthesizable fn
-            continue
+            b = {"ok": False}
         if not b.get("ok") or not b.get("binary"):
-            continue                                         # not a synthesizable signature / no link
+            # The plain synthesizer could not build a (buf,size) driver for this signature. If the
+            # project has a stream idiom and this function is stream-synthesisable + exported, build
+            # a stream-aware driver instead -- the half that reaches real parsers. Sound downstream:
+            # the ladder's ASan replay + negative control is the only thing that confirms.
+            if idiom is None:
+                continue
+            try:
+                b = LF.build_stream_synth(src, out, fn=fn, sanitize=True, timeout=max(60, per))
+            except Exception:                                # noqa: BLE001
+                b = {"ok": False}
+            if not b.get("ok") or not b.get("binary"):
+                continue
+            stream_synth += 1
+            lib_dirs = b.get("lib_dirs")
         synthesized += 1
         # The EXPLORE build: the same synthesized driver with libFuzzer instrumentation only (no
         # ASan), which the concolic rung explores -- angr is confused by ASan's shadow memory.
         # Best-effort: if it does not build, concolic reuses the ASan binary (slower, still sound).
         explore = None
+        ep = Path(ctx.scratch()) / f"synthdrv_{fn[:40]}.explore.bin"
         try:
-            eb = LF.build_libfuzzer(src, Path(ctx.scratch()) / f"synthdrv_{fn[:40]}.explore.bin",
-                                    harness_fn=fn, timeout=max(60, per), sanitize=False)
+            eb = LF.build_libfuzzer(src, ep, harness_fn=fn, timeout=max(60, per), sanitize=False)
+            if not eb.get("ok") and idiom is not None:       # stream-synth explore (clean) variant
+                eb = LF.build_stream_synth(src, ep, fn=fn, sanitize=False, timeout=max(60, per))
             if eb.get("ok"):
                 explore = eb.get("binary")
+                lib_dirs = lib_dirs or eb.get("lib_dirs")
         except Exception:                                    # noqa: BLE001
             explore = None
         explore = explore or b["binary"]
@@ -242,7 +266,7 @@ def synth_confirm_stage(ctx) -> dict:
             targets = []
         harness = {"name": f"synth:{fn}", "explore_binary": explore,
                    "replay_binary": b["binary"], "fuzz_binary": b["binary"],
-                   "lib_dirs": b.get("lib_dirs"), "input_size": input_size,
+                   "lib_dirs": lib_dirs or b.get("lib_dirs"), "input_size": input_size,
                    "harness_fn": "LLVMFuzzerTestOneInput",
                    "target_syms": None if targets else [fn],
                    "targets": targets or None, "seeds": [b"A" * 64]}
@@ -266,9 +290,13 @@ def synth_confirm_stage(ctx) -> dict:
             ctx.progress(msg=f"CONFIRMED via synthesized driver ({res.get('rung')}): "
                              f"{res.get('class')} in {fn}()")
     ctx.emit("synth_confirm.done", payload={"supported": True, "candidates": len(cands),
-             "synthesized": synthesized, "confirmed": confirmed, "upgraded": upgraded})
-    ctx.progress(pct=100, msg=f"synth drivers: {synthesized} built, {confirmed} confirmed")
-    return {"metrics": {"supported": True, "synthesized": synthesized, "confirmed": confirmed,
+             "synthesized": synthesized, "stream_synth": stream_synth,
+             "stream_idiom": idiom.name if idiom else None,
+             "confirmed": confirmed, "upgraded": upgraded})
+    ctx.progress(pct=100, msg=f"synth drivers: {synthesized} built "
+                 f"({stream_synth} stream-aware), {confirmed} confirmed")
+    return {"metrics": {"supported": True, "synthesized": synthesized,
+                        "stream_synth": stream_synth, "confirmed": confirmed,
                         "upgraded": upgraded}}
 
 

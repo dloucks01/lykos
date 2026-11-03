@@ -2436,6 +2436,151 @@ def _cmake_cached(cache, root, timeout):
     return res
 
 
+def _cmake_build_dir(root, sanitize: bool) -> Path:
+    """The config-keyed cmake build dir `cmake_build_harnesses` writes for the SHARED build of this
+    sanitize config (the name is deterministic, so a standalone driver can find the build's
+    compile_commands.json and shared libraries without re-deriving them)."""
+    return Path(root) / f"_lykos_cmake_sh_{'asan' if sanitize else 'clean'}"
+
+
+def _cmake_compile_flags(build_dir, *, prefer: str | None = None) -> list:
+    """The `-I`/`-D`/`-isystem` flags the project's OWN build used to compile a translation unit,
+    read from `build_dir/compile_commands.json`. A synthesized driver compiled with these sees the
+    exact include graph and config defines the library was built with -- the generated config
+    headers (FreeRDP's `winpr/config.h`), the private include dirs, `-DFREERDP_EXPORTS`, etc. --
+    which a hand-guessed flag set cannot reproduce. `prefer` (a path substring, e.g. the parser's
+    own library dir) picks a TU from that library so its private include dirs are present."""
+    import json as _json
+    import shlex as _shlex
+    try:
+        cc = _json.loads((Path(build_dir) / "compile_commands.json").read_text())
+    except (OSError, ValueError):
+        return []
+    tus = [e for e in cc if str(e.get("file", "")).endswith((".c", ".cc", ".cpp", ".cxx"))]
+    if not tus:
+        return []
+    pick = (next((e for e in tus if prefer and prefer in e["file"]), None)) or tus[0]
+    args = _shlex.split(pick["command"]) if "command" in pick else list(pick.get("arguments", []))
+    flags, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "-isystem" and i + 1 < len(args):
+            flags += [a, args[i + 1]]
+            i += 2
+            continue
+        if a.startswith(("-I", "-D", "-isystem")):
+            flags.append(a)
+        i += 1
+    return flags
+
+
+def _exported_symbol(libs, fn: str) -> bool:
+    """True when `fn` is a DEFINED, dynamically-exported symbol of one of the built shared libs.
+    A standalone driver links the parser from the library's `.so`, so a `static` function (not in
+    the dynamic symbol table) cannot be driven this way -- reported honestly rather than forced."""
+    pat = re.compile(r"^[0-9a-fA-F]+\s+[TtWw]\s+" + re.escape(fn) + r"$", re.M)
+    for lib in libs or ():
+        try:
+            r = subprocess.run(["nm", "-D", "--defined-only", str(lib)],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if pat.search(r.stdout or ""):
+            return True
+    return False
+
+
+def build_stream_synth(root, out: Path, *, fn: str, sanitize: bool = True,
+                       timeout: int = 600, cache: "BuildCache | None" = None) -> dict:
+    """Synthesize and build a STREAM-AWARE libFuzzer driver for a parser the plain `(buf,size)`
+    synthesizer rejects -- a function that reads attacker bytes THROUGH a project stream object
+    (e.g. FreeRDP's `wStream`) and writes an opaque context/out struct (`analyze/driver_synth`).
+    Those signatures are the norm in a protocol/format library and the reason a whole-library fuzz
+    of the few shipped harnesses reaches almost nothing: the vulnerable parsers have no driver.
+
+    This needs the project's CMAKE build -- the generated config headers, the shared libraries and
+    the exact compile flags -- so it is a cmake-only path (reusing the shared build
+    `cmake_build_harnesses` already produced). Returns {ok, binary, lib_dirs, harness, log}, shaped
+    like `build_libfuzzer` so `synth_confirm` can run the SAME confirmation ladder on it.
+
+    0-FP boundary -- builds ONLY when all three hold, and declines honestly (never forces) otherwise:
+      1. the project has a detectable stream idiom (`detect_stream_idiom`);
+      2. `fn`'s signature is stream-synthesisable (a byte-delivery param, no callbacks);
+      3. `fn` is an EXPORTED symbol of a built shared library (a static parser cannot be linked
+         from a standalone driver -- that one needs in-tree-harness driving instead).
+    The confirmation itself stays sound downstream: the ladder's ASan replay counts a fault only on
+    a parsed sanitizer class with a passing negative control, so a defensive `WINPR_ASSERT` abort
+    (no sanitizer report) never confirms, and a zeroed-context null-deref that fires on every input
+    fails the negative control.
+    """
+    from . import driver_synth as DS
+    root = Path(root).resolve()
+    idiom = DS.detect_stream_idiom(root)
+    if idiom is None:
+        return {"ok": False, "binary": None, "log": "no project stream idiom detected"}
+    try:
+        params = fn_params(root, fn)
+    except Exception:                                        # noqa: BLE001 -- unreadable signature
+        params = []
+    if not params or not DS.synthesisable(params, idiom):
+        return {"ok": False, "binary": None,
+                "log": f"{fn}: signature is not stream-synthesisable"}
+    cc = _clang(False)
+    if not cc:
+        return {"ok": False, "binary": None, "log": "clang not found"}
+    cres = _cmake_cached(cache, root, timeout) if sanitize else cmake_build_harnesses(
+        root, timeout=timeout, sanitize=False, shared=True)
+    if not cres or not cres.get("ok"):
+        return {"ok": False, "binary": None,
+                "log": "cmake build unavailable: " + ((cres or {}).get("log") or "")[-400:]}
+    libs = cres.get("libraries") or _collect_cmake_libraries(_cmake_build_dir(root, sanitize))
+    lib_dirs = cres.get("lib_dirs") or []
+    if not _exported_symbol(libs, fn):
+        return {"ok": False, "binary": None,
+                "log": (f"{fn} is not an exported symbol of a built shared library; a static "
+                        f"parser cannot be driven by a standalone harness (needs in-tree-harness "
+                        f"driving instead)")}
+    hdr = _declared_in_header(root, fn)
+    hdr_name = hdr.name if hdr is not None else None
+    extra_inc = ["-I" + str(hdr.parent)] if hdr is not None else []
+    def_file = fn_def_file(root, fn)
+    prefer = None
+    if def_file is not None:
+        try:
+            prefer = "/" + def_file.parent.relative_to(root).as_posix() + "/"
+        except ValueError:
+            prefer = None
+    flags = _cmake_compile_flags(_cmake_build_dir(root, sanitize), prefer=prefer)
+    libnames = []
+    for lib in libs:
+        m = re.match(r"lib(.+?)\.so", Path(lib).name)
+        if m and ("-l" + m.group(1)) not in libnames:
+            libnames.append("-l" + m.group(1))
+    if not libnames:
+        return {"ok": False, "binary": None, "log": "no shared library to link the parser from"}
+    san = ["-fsanitize=fuzzer,address"] if sanitize else ["-fsanitize=fuzzer"]
+    tmp = Path(tempfile.mkdtemp(prefix="lykos-ssyn-"))
+    try:
+        drv = tmp / "stream_driver.c"
+        drv.write_text(DS.synth_stream_harness(fn, params, idiom, header=hdr_name))
+        cmd = ([cc, "-g", "-O1", "-fno-omit-frame-pointer", *san, *flags, *extra_inc,
+                str(drv), "-o", str(out)]
+               + ["-L" + str(d) for d in lib_dirs] + libnames
+               + ["-Wl,-rpath," + str(d) for d in lib_dirs])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"ok": False, "binary": None, "log": f"driver compile could not run: {e!r}"}
+        if r.returncode != 0 or not Path(out).exists():
+            return {"ok": False, "binary": None,
+                    "log": f"stream driver for {fn}() failed to compile:\n" + (r.stderr or "")[-1500:]}
+        return {"ok": True, "binary": str(out), "lib_dirs": [str(d) for d in lib_dirs],
+                "harness": f"stream-synth driver for {fn}() via {idiom.name}",
+                "log": f"built stream-synth driver for {fn}() ({idiom.name})"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=None) -> dict:
     srcs = _sources(root, exclude_main=True)
     # Compile THE LIBRARY the entry point belongs to, not the whole repository. Building every

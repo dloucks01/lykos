@@ -19,11 +19,53 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
 
 from . import concolic as _concolic
+
+#: A GENUINE sanitizer MEMORY-SAFETY error banner. ASan prints exactly one of these `ERROR:
+#: AddressSanitizer: <kind>` lines for a real memory fault; the kind list is ASan's own. This is the
+#: sound signal -- NOT the bare substring "AddressSanitizer", which also appears when ASan merely
+#: annotates an unrelated SIGABRT (e.g. an abort() from an assertion), and NOT a libFuzzer "deadly
+#: signal" line, which a plain abort() also produces.
+_ASAN_MEMERR = re.compile(
+    r"ERROR: AddressSanitizer: ("
+    r"heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|"
+    r"heap-use-after-free|stack-use-after-return|stack-use-after-scope|use-after-poison|"
+    r"dynamic-stack-buffer-overflow|container-overflow|"
+    r"SEGV|negative-size-param|allocation-size-too-big|calloc-overflow|"
+    r"double-free|attempting free|invalid-free|requested allocation size|stack-overflow)")
+
+#: A crash that is a DELIBERATE assertion / abort(), not a memory-safety bug. FreeRDP (and any
+#: project built with verbose asserts) aborts on malformed input BY DESIGN -- `WINPR_ASSERT`,
+#: libc `__assert_fail`, a `[FATAL] ... assert` log line. That is at most a reachable-assertion DoS
+#: (CWE-617), never a memory-corruption PoC, so it must not confirm a memory-safety finding. Only
+#: suppresses when there is NO genuine memory-error banner (a real overflow that also trips an assert
+#: on the way down is still a real overflow).
+_ASSERT_ABORT = re.compile(
+    r"winpr_int_assert|__assert_fail|Assertion\s+.*failed|\bSIGABRT\b|"
+    r"\babort\b|\[FATAL\][^\n]*assert", re.I)
+
+
+def _memory_fault(rep: str, cls: dict | None) -> bool:
+    """Whether `rep` is a GENUINE memory-safety / UB sanitizer fault -- the only thing that may
+    confirm a memory-safety finding. True when a parsed ASan class exists, or a real ASan
+    memory-error banner / UBSan runtime error is present; and NOT when the crash is only a
+    deliberate assertion/abort with no such banner. This is the 0-FP gate: a `WINPR_ASSERT` abort
+    (a DoS-by-design on malformed input) reaches the parser through a synthesized driver and would
+    otherwise be mis-counted as a crash -- for nearly every parser in a verbose-assert project."""
+    rep = rep or ""
+    hard = bool(cls) or bool(_ASAN_MEMERR.search(rep)) \
+        or "SUMMARY: UndefinedBehaviorSanitizer" in rep or "runtime error:" in rep
+    if not hard:
+        return False
+    # a genuine memory-error banner wins even if an assert also fired; a bare assert/abort does not.
+    if _ASSERT_ABORT.search(rep) and not (bool(cls) or _ASAN_MEMERR.search(rep)):
+        return False
+    return True
 
 
 def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -> dict:
@@ -51,9 +93,11 @@ def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -
         except OSError:
             pass
     cls = parse_asan_report(rep) or {}
-    # An ASan-reported fault is the sound signal (a parsed sanitizer class, or the banner). The
-    # return code alone is NOT trusted -- libFuzzer can exit non-zero for benign reasons.
-    faulted = bool(cls) or "AddressSanitizer" in rep or "SUMMARY: UndefinedBehaviorSanitizer" in rep
+    # An ASan-reported MEMORY-SAFETY fault is the sound signal -- a parsed class or a real
+    # `ERROR: AddressSanitizer: <kind>` / UBSan banner, and NOT a deliberate assertion/abort (which
+    # a verbose-assert project trips on malformed input by design). The return code alone is NOT
+    # trusted -- libFuzzer exits non-zero for benign reasons too. See `_memory_fault`.
+    faulted = _memory_fault(rep, cls)
     return {"faulted": faulted, "report": rep, "source": cls.get("source"),
             "cls": cls.get("class") or cls.get("cwe")}
 
@@ -243,8 +287,8 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
         for cr in res.get("crashes", []):
             rep = cr.get("report") or ""
             cls = parse_asan_report(rep) or {}
-            if not (cls or "AddressSanitizer" in rep):
-                continue                                     # oom/timeout artifact, not a fault
+            if not _memory_fault(rep, cls):
+                continue                                     # oom/timeout/assert-abort, not a mem fault
             neg = _asan_replay(fuzz_binary, b"", lib_dirs, timeout=min(30.0, timeout))
             if neg["faulted"]:
                 out["reason"] = "negative control (empty input) also faulted -- not attributable"
