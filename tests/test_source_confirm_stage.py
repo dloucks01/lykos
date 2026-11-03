@@ -137,10 +137,11 @@ def test_the_build_phase_shares_one_deadline_and_the_ladder_takes_what_remains(s
     assert ladder_kw[-1].get("deadline") is not None, "ladder must get a hard overall deadline"
 
 
-def test_in_surface_memory_findings_get_a_nonfuzzing_recipe(store):
-    """Non-fuzzing-first: an in-surface memory-corruption finding whose srctaint is NOT provably
-    strong (the FreeRDP case -- multi-layer flow) still earns a reachability-grounded recipe, so the
-    engagement carries a deliverable without any fuzzing. Off-surface findings do not."""
+def test_every_weaponizable_candidate_gets_a_potential_poc_recipe(store):
+    """The operator's bar -- no finding is bare. EVERY candidate in a weaponizable class earns a
+    reachability-grounded potential-PoC recipe, on OR off the fuzzed surface: in-surface is reached
+    through the shipped harness, off-surface by synthesizing a driver to its enclosing function. The
+    surface still ranks them (in-surface boosted), it just no longer gates the deliverable."""
     from types import SimpleNamespace
     from lykos.analyze import source_confirm_stage as SC
     from lykos.db.dao import FindingDAO, TargetDAO
@@ -157,9 +158,41 @@ def test_in_surface_memory_findings_get_a_nonfuzzing_recipe(store):
     ctx = SimpleNamespace(conn=store.conn, put_artifact=lambda *a, **k: "x" * 64)
     ranked = SC._rank_by_surface(ctx, t, {"geometry.c"})     # only geometry.c is on the surface
     assert ranked["in_surface"] == 1 and ranked["off_surface"] == 1
-    assert ranked["surface_recipes"] == 1                    # the in-surface CWE-190, not the off one
-    recs = [f for f in fd.list_by_target(t.id) if f.detector == "surface_recipe"]
-    assert len(recs) == 1 and recs[0].cwe == "CWE-190" and recs[0].state == "corroborated"
+    assert ranked["surface_recipes"] == 2                    # BOTH get a potential PoC now
+    recs = sorted((f for f in fd.list_by_target(t.id) if f.detector == "surface_recipe"),
+                  key=lambda f: f.cwe)
+    assert [r.cwe for r in recs] == ["CWE-190", "CWE-787"]
+    assert all(r.state == "corroborated" for r in recs)
+    # the off-surface one names the synthesized-driver reach step as its missing technique
+    off = [f for f in fd.list_by_target(t.id)
+           if f.detector == "surface_recipe" and f.cwe == "CWE-787"][0]
+    blob = " ".join(e.get("detail", "") for e in (off.evidence or []))
+    assert "synth" in blob.lower()
+
+
+def test_merged_duplicates_are_skipped_by_the_floor(store):
+    """A `merged` duplicate (a non-representative dedup site) must NOT get its own recipe, and must
+    not be re-upserted back to candidate -- the representative carries the potential PoC."""
+    from types import SimpleNamespace
+    from lykos.analyze import source_confirm_stage as SC
+    from lykos.db.dao import FindingDAO, TargetDAO
+    c = store.cases.create("merged")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "e" * 64)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, c.id, {"cwe": "CWE-190", "title": "dup site", "severity": "medium",
+              "detector": "int_overflow", "state": "candidate", "confidence": 0.4,
+              "dedup_key": "io:dup", "evidence": [{"channel": "source", "detail": "x.c:9: n*w"}]})
+    # force it to the merged state the dedup stage would set
+    import json
+    import time
+    store.conn.execute("UPDATE finding SET state='merged', evidence_json=? WHERE dedup_key=?",
+                       (json.dumps([{"channel": "source", "detail": "x.c:9: n*w"}]), "io:dup"))
+    store.conn.commit()
+    ctx = SimpleNamespace(conn=store.conn, put_artifact=lambda *a, **k: "x" * 64)
+    ranked = SC._rank_by_surface(ctx, t, {"x.c"})
+    assert ranked["surface_recipes"] == 0                    # no recipe for a merged duplicate
+    still = fd.list_by_target(t.id)
+    assert [f.state for f in still if f.dedup_key == "io:dup"] == ["merged"]   # stays merged
 
 
 # ---- a confirmation is replayed against the binary that proved it ------------------------------

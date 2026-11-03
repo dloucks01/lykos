@@ -216,6 +216,11 @@ def _attack_surface(harness_bins, lib_dirs) -> set:
 #: bytes -- grounding the recipe even when srctaint cannot trace the multi-layer flow to the operand
 #: (which is why FreeRDP's CWE-190/787 sinks are reachable but not taint-"strong", so the
 #: strong-only source-recipe floor emitted nothing for them).
+#: Per weaponizable class: (technique label, target ceiling). The potential-PoC floor fires for
+#: EVERY candidate in this map -- on OR off the fuzzed surface -- so no finding is left bare: the bar
+#: is "every finding has a potential PoC that is then proven out or honestly dead-ended". The memory
+#: classes (190/787/...) plus the DoS/logic classes a source scan flags (617 reachable assertion,
+#: 134 format string, 78 command injection, 22 path traversal).
 _SURFACE_REC = {
     "CWE-190": ("integer-overflow allocation -> undersized buffer -> heap overflow", "L2"),
     "CWE-787": ("out-of-bounds write (saved-pointer / adjacent-object overwrite)", "L2"),
@@ -226,36 +231,57 @@ _SURFACE_REC = {
     "CWE-125": ("out-of-bounds read -> information disclosure", "L1"),
     "CWE-416": ("use-after-free -> controlled reclaimed object", "L2"),
     "CWE-415": ("double free -> allocator-metadata corruption", "L2"),
+    "CWE-617": ("reachable assertion -> process abort (denial of service)", "L1"),
+    "CWE-134": ("format string -> %n write-what-where / %s,%p disclosure", "L2"),
+    "CWE-78": ("OS command injection via shell metacharacters", "L2"),
+    "CWE-22": ("path traversal -> read/write outside the intended directory", "L1"),
 }
 
 
-def _surface_recipe(ctx, target, cwe: str, file: str, line: int) -> bool:
-    """File a NON-FUZZING, reachability-grounded exploitation recipe for an in-surface
-    memory-corruption finding -- a deliverable the operator carries, grounded by the fact the sink
-    is compiled into an in-tree fuzz harness (so it processes attacker bytes), independent of
-    whether srctaint proved the flow. Corroborated, never a verified PoC, so it inflates nothing.
+def _surface_recipe(ctx, target, cwe: str, file: str, line: int, *, on_surface: bool = True) -> bool:
+    """File a NON-FUZZING, reachability-grounded potential-PoC recipe for a candidate finding -- the
+    deliverable the operator carries so NO finding is bare. Corroborated, never a verified PoC, so it
+    inflates nothing; the confirmation ladder / class weaponizers prove out the ones they can and the
+    rest stay honest dead-ends naming the missing technique.
+
+    `on_surface` picks the grounding: in-surface means the sink's file is compiled into an in-tree
+    fuzz harness (the parser reaching it processes attacker bytes); OFF-surface means no shipped
+    harness drives it -- but that is no longer a dead end, because a driver can be SYNTHESIZED to the
+    sink's enclosing function (driver_synth), which is the reach step the missing_technique names.
     Returns True when a recipe was filed."""
     spec = _SURFACE_REC.get(cwe)
     if not spec:
         return False
     tech, lvl = spec
     from .poc import recipe
+    if on_surface:
+        ground = (f"{cwe} at {file}:{line} is in a file compiled into an in-tree fuzz harness, so the "
+                  f"parser reaching it processes attacker-controlled bytes: {tech}. Grounded by "
+                  "attack-surface reachability (not a proven srctaint flow).")
+        reach_step = f"drive the in-tree harness whose parser reaches {file}:{line} to an input that hits it"
+        missing = ("an input that reaches this sink through the harness (the ladder), then the class "
+                   "weaponizer on the confirmed crash")
+    else:
+        ground = (f"{cwe} at {file}:{line} is NOT on the fuzzed attack surface (no shipped harness "
+                  f"drives its file), so a driver is SYNTHESIZED to its enclosing function to reach "
+                  f"it (driver_synth): {tech}. Grounded by synthesizable reachability.")
+        reach_step = (f"synthesize a driver to the function enclosing {file}:{line} (driver_synth), "
+                      f"delivering the fuzz bytes through the project stream idiom")
+        missing = ("a synthesized driver that reaches this sink's enclosing function (driver_synth), "
+                   "then the ladder + the class weaponizer on the confirmed crash")
     fid = recipe.file_recipe(
         ctx, target, cwe=cwe, technique=tech, target_level=lvl, severity="high",
         detector="surface_recipe", dedup_key=f"recipe:{cwe}:surface:{file}:{line}",
-        title=f"Exploitation recipe (attacker-reachable): {tech} at {file}:{line}",
-        summary=(f"{cwe} at {file}:{line} is in a file compiled into an in-tree fuzz harness, so the "
-                 f"parser reaching it processes attacker-controlled bytes: {tech}. Grounded by "
-                 "attack-surface reachability (not a proven srctaint flow)."),
-        why_not_executed=("static source + attack-surface reachability; no crash reproduced in this "
-                          "slice -- the exact primitive/offset needs the confirmed crash the "
-                          "confirmation ladder produces when given budget"),
-        steps=[f"drive the in-tree harness whose parser reaches {file}:{line} to an input that hits it",
+        title=f"Potential PoC ({'attacker-reachable' if on_surface else 'synth-reachable'}): "
+              f"{tech} at {file}:{line}",
+        summary=ground,
+        why_not_executed=("static source + reachability; no crash reproduced in this slice -- the "
+                          "exact primitive/offset needs the confirmed crash the confirmation ladder "
+                          "produces when the sink is driven"),
+        steps=[reach_step,
                "confirm the fault under ASan (the ladder: template / concolic / reach-gated fuzz)",
                f"weaponize the confirmed primitive to its class impact ({tech})"],
-        grounded=True,
-        missing_technique=("an input that reaches this sink through the harness (the ladder), then "
-                           "the class weaponizer on the confirmed crash"))
+        grounded=True, missing_technique=missing)
     return fid is not None
 
 
@@ -268,6 +294,11 @@ def _rank_by_surface(ctx, target, surface) -> dict:
     inc = outc = recs = 0
     for f in fd.list_by_target(target.id):
         if f.detector not in _RANKABLE_DETECTORS:
+            continue
+        # DEDUP respected: a `merged` duplicate is a non-representative site of a bug whose
+        # representative gets the recipe -- skip it (re-upserting it would also undo dedup, since
+        # upsert recomputes state back up from its verdicts).
+        if (f.state or "candidate") == "merged":
             continue
         base, fp, ln = None, None, None
         for e in (f.evidence or []):
@@ -283,18 +314,21 @@ def _rank_by_surface(ctx, target, surface) -> dict:
             inc += 1
             detail = "on the fuzzed attack surface (its file is compiled into an in-tree fuzz harness)"
             newconf = min(0.9, (f.confidence or 0.0) + 0.15)
-            # NON-FUZZING deliverable: an in-surface memory-corruption finding that has not been
-            # confirmed gets a reachability-grounded recipe, so the engagement carries a concrete
-            # artifact for it even when no fuzzing reproduced it (the non-fuzzing-first rule).
-            if (f.cwe in _SURFACE_REC and ln and f.state not in ("confirmed", "poc-backed")
-                    and _surface_recipe(ctx, target, f.cwe, base, ln)):
-                recs += 1
         else:
             outc += 1
             detail = ("off the fuzzed attack surface (its file is not compiled into any in-tree fuzz "
                       "harness -- e.g. a build tool, example, or platform-specific client); lower "
                       "remote-reachability priority, not dismissed")
             newconf = f.confidence or 0.0
+        # POTENTIAL-PoC FLOOR -- the operator's bar: EVERY distinct bug carries a potential PoC, so
+        # no finding is bare. On-surface is reached through the shipped harness; off-surface is
+        # reached by SYNTHESIZING a driver to the sink's enclosing function (driver_synth). Filed for
+        # a representative candidate in a weaponizable class that is not already proven. Non-fuzzing,
+        # corroborated -- the ladder / class weaponizers prove out the ones they can.
+        if (f.cwe in _SURFACE_REC and ln
+                and (f.state or "candidate") not in ("confirmed", "poc-backed")
+                and _surface_recipe(ctx, target, f.cwe, base, ln, on_surface=on)):
+            recs += 1
         fd.upsert(target.id, target.case_id, {
             "cwe": f.cwe, "title": f.title, "severity": f.severity or "medium",
             "detector": f.detector, "dedup_key": f.dedup_key, "state": f.state,
@@ -430,6 +464,13 @@ def source_confirm_stage(ctx) -> dict:
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "no source tree for this target"})
         return {"metrics": {"supported": False}}
+    # DEDUP FIRST (the operator's pipeline: dedup -> build potential PoCs -> prove out). Collapse the
+    # raw per-SITE candidates into DISTINCT bugs (CWE + enclosing function) so the floor files ONE
+    # potential PoC per bug and the prover drives each function once instead of N times. Non-reps are
+    # set to `merged` (kept, pointed at their representative), so later steps skip the duplicates.
+    from . import dedup as _dedup
+    dd = _dedup.dedup_findings(ctx, target, src)
+    ctx.emit("dedup.done", payload=dd)
     if not LF.find_harnesses(src, limit=1):
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "no in-tree libFuzzer harness to drive the parser"})
