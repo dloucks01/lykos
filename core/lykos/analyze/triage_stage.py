@@ -61,6 +61,44 @@ def _finding_dict(f) -> dict:
             "function_addr": f.function_addr, "site_addr": f.site_addr}
 
 
+_LOC = __import__("re").compile(r'([A-Za-z0-9_./-]+\.[ch]):(\d+)')
+_OP = __import__("re").compile(r"index '([^']+)'|arithmetic \(([^)]+)\)|'([^']+)'")
+
+
+def _operand_tainted(fdict, textlookup) -> "bool | None":
+    """Whether the attacker controls the dangerous operand at the sink. True when a CodeQL
+    source->sink dataflow path reaches it (proven taint). Else, srctaint on the operand at the cited
+    line: strong -> True, weak/none -> False, unparseable -> None (undecided)."""
+    ev = fdict.get("evidence") or []
+    # CodeQL proved a source->sink dataflow path -> attacker-tainted.
+    if any(isinstance(e, dict) and e.get("channel") == "codeql-dataflow" for e in ev):
+        return True
+    if textlookup is None:
+        return None
+    src = next((str(e.get("detail")) for e in ev
+                if isinstance(e, dict) and e.get("channel") == "source"), "")
+    m = _LOC.search(src)
+    op = _OP.search(src)
+    if not m or not op:
+        return None
+    operand = op.group(1) or op.group(2) or op.group(3)
+    txt = textlookup(m.group(1))
+    if not txt:
+        return None
+    try:
+        from .fingerprint import srctaint
+        lines = txt.splitlines()
+        st, _link = srctaint.any_untrusted_strength(
+            lines, int(m.group(2)) - 1, [srctaint.base_ident(operand) or operand, operand])
+        if st == "strong":
+            return True
+        if st == "weak" or st is None:
+            return False
+    except Exception:                                    # noqa: BLE001
+        return None
+    return None
+
+
 def triage_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -73,6 +111,7 @@ def triage_stage(ctx) -> dict:
     poc_fids = {p.finding_id for p in pd.list_by_target(target.id) if p.finding_id and p.verified}
     root = _source_root(ctx, target) if source_project_for(ctx.conn, target) else None
     lookup = grounding.make_source_lookup(root) if root else None
+    textlookup = grounding.make_file_text_lookup(root) if root else None
     bits = target.bits or 64
 
     dispositions = []
@@ -95,8 +134,9 @@ def triage_stage(ctx) -> dict:
             g = grounding.ground_finding(fdict, source_lookup=lookup, bits=bits)
             grounded = bool(g.get("grounded", True))
             verdict = g.get("verdict") if not grounded else "undecided"
+        tainted = _operand_tainted(fdict, textlookup)
         d = finding_triage.triage_finding(cwe=f.cwe, state=f.state, has_poc=(f.id in poc_fids),
-                                  grounded=grounded, verdict=verdict)
+                                  grounded=grounded, verdict=verdict, tainted=tainted)
         dispositions.append((f.id, d))
         reasons.setdefault(d.status, 0)
         reasons[d.status] += 1

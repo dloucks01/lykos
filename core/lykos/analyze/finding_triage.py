@@ -39,6 +39,7 @@ CEILING_ = "ceiling"
 OFF_SURFACE = "off-surface"
 FALSE_POSITIVE = "false-positive"
 NEEDS_TECHNIQUE = "needs-technique"
+UNTAINTED = "untainted"            # reachable, but the attacker does not control the dangerous value
 
 
 @dataclass
@@ -49,61 +50,56 @@ class Disposition:
 
 
 def triage_finding(*, cwe: "str | None", state: "str | None", has_poc: bool,
-                   grounded: bool, verdict: "str | None") -> Disposition:
-    """Resolve one finding. Inputs: its CWE, lifecycle state, whether a PoC exists, and grounding's
-    (grounded, verdict). Returns the single disposition, with a specific reason."""
+                   grounded: bool, verdict: "str | None", tainted: "bool | None" = None) -> Disposition:
+    """Resolve one finding to a disposition. A PoC is a small script/input that EXPLOITS the finding
+    (a traversal that escapes the dir, a command that runs, an input that crashes or corrupts) -- it
+    need not be an ASan detonation. So the CWE class sets the PoC's IMPACT (rce/dos/leak/logic), not
+    whether a PoC exists: anything attacker-reachable with an attacker-controlled dangerous value is
+    DRIVABLE (a script PoC is constructible). The only true dead-ends are not-a-bug, not-reachable,
+    and attacker-doesn't-control-the-value.
+
+    Inputs: the CWE, lifecycle state, whether a PoC exists, grounding's (grounded, verdict), and
+    `tainted` -- whether the attacker controls the dangerous operand (True from a proven dataflow
+    path / strong taint, False when it is a constant/bounded local, None when undecided)."""
     if has_poc or state == "poc-backed":
-        return Disposition(CONFIRMED, "has a validated PoC")
+        return Disposition(CONFIRMED, "has a PoC")
 
     if not grounded:
         return Disposition(FALSE_POSITIVE,
                            f"grounding disproved it ({verdict or 'not a reachable defect'})")
 
     ceiling = CEILING.get(cwe or "", "unknown")
+    impact = {"rce": "memory-corruption/RCE-capable", "primitive": "corruption primitive",
+              "leak": "info-disclosure", "dos": "denial-of-service", "logic": "logic/traversal/injection",
+              "unknown": "unknown-impact"}.get(ceiling, ceiling)
 
-    # NO reachability verdict from grounding (a recipe/derived finding grounding did not process).
-    # Honesty: do NOT optimistically call it drivable -- a drivable claim needs a reachability basis.
-    # Its reachability must be decided first; name that as the specific next step.
+    # reachability not yet decided (a recipe/derived finding with no verdict) -> decide it first.
     if verdict in (None, "undecided"):
-        if ceiling == "logic":
-            return Disposition(CEILING_, "logic/traversal/crypto class: finding is the impact")
-        if ceiling in ("leak", "dos"):
-            return Disposition(CEILING_, f"class tops out at {ceiling} by nature")
         return Disposition(NEEDS_TECHNIQUE,
-                           f"memory-corruption class ({cwe}) but grounding assigned NO reachability "
-                           f"verdict (recipe/derived finding): decide reachability before driving",
-                           action="run taint/call-graph reachability on this sink; if reached, it "
-                                  "becomes drivable, else off-surface")
+                           f"no reachability verdict yet ({cwe}, {impact}): decide reachability first",
+                           action="run call-graph reachability + taint on this sink (source_reach + "
+                                  "CodeQL/srctaint); if reached+tainted it becomes drivable")
 
-    # off the attacker surface: real code, but not reached under the malicious-peer threat model.
+    # not on the attacker-reachable surface -> no remote PoC (honest dead-end with the reason).
     if verdict == "off-surface-candidate":
-        if ceiling in ("rce", "primitive"):
-            return Disposition(OFF_SURFACE,
-                               "memory-corruption class but its code is not on the attacker-reachable "
-                               "surface (e.g. a local/CLI path); reachable only if a caller exposes it")
-        return Disposition(OFF_SURFACE, f"not on the attacker surface; class ceiling is {ceiling}")
+        return Disposition(OFF_SURFACE,
+                           f"not on the attacker-reachable surface ({impact} class); reachable only "
+                           f"if a caller exposes it (e.g. a local/CLI path)")
 
-    # grounded + (on-surface or reachability-unknown): classify by the weaponization ceiling.
-    if ceiling == "logic":
-        return Disposition(CEILING_,
-                           "logic/auth/crypto/traversal class: the finding IS the impact (reaching "
-                           "the sink); no memory PoC exists by nature -- the recipe is the deliverable")
-    if ceiling == "leak":
-        return Disposition(CEILING_, "out-of-bounds READ class: tops out at information disclosure; "
-                                     "an enabler for another bug's L3, not a memory-control PoC")
-    if ceiling == "dos":
-        return Disposition(CEILING_, "availability class (assert/abort/exhaustion): tops out at DoS; "
-                                     "a reachable-assert PoC is the deliverable, not RCE")
-    if ceiling in ("rce", "primitive"):
-        tag = "reachable" if verdict == "exploitable-candidate" else "reachability-unknown"
-        return Disposition(DRIVABLE,
-                           f"memory-corruption class ({cwe}), {tag}: attempt a harness-confirm PoC",
-                           action="synthesize a harness that reaches the sink on the "
-                                  "ASan-instrumented build and drive it (exported entry, or "
-                                  "expose_static+rebuild for a static/dispatcher-gated sink)")
-    return Disposition(NEEDS_TECHNIQUE,
-                       f"class {cwe} (ceiling {ceiling}) has no automated confirmation path yet",
-                       action="name and build the missing detector/confirmation technique")
+    # reachable, but the attacker does NOT control the dangerous value (constant/bounded local --
+    # the rfx_differential case): genuinely not exploitable, not just 'no technique'.
+    if tainted is False:
+        return Disposition(UNTAINTED,
+                           f"reachable but the dangerous operand is not attacker-controlled "
+                           f"(constant/bounded local) -- no PoC exists for {cwe}")
+
+    # reachable + (tainted True or taint-unknown): a script PoC is constructible. Impact = the class.
+    tag = "attacker-tainted" if tainted else "taint-unknown"
+    return Disposition(DRIVABLE,
+                       f"reachable + {tag} ({cwe}, impact: {impact}): construct a PoC",
+                       action="build a script/input that drives the attacker-controlled value to the "
+                              "sink and demonstrates the effect (dataflow-guided; concolic/symbolic "
+                              "solve first, bounded fuzz only as fallback)")
 
 
 def ledger(dispositions: list) -> dict:
