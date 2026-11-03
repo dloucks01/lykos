@@ -2110,6 +2110,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         # are skipped for budget rather than silently extending the run. budget_seconds=None (the
         # web/API path and converge) keeps the per-target size-scaled default -- no explicit ceiling.
         _run_deadline = (time.monotonic() + budget_seconds) if budget_seconds else None
+        #: the targets the operator HANDED (not siblings discovered mid-run); they get the reserved
+        #: majority of a whole-run budget (budget.PRIMARY_SHARE).
+        _primary = set(target_ids)
         _budget_skipped: list = []
         done_tids: set = set()
         wi = 0
@@ -2163,11 +2166,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
                                      min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
                 else:
-                    # whole-run ceiling, shared evenly over the targets still to do (this one
-                    # included), so the run as a whole cannot exceed `budget_seconds`.
+                    # Whole-run ceiling, WEIGHTED toward the handed PRIMARY target(s). The operator
+                    # pointed at one thing; a source project then fans out to the executables it
+                    # built (FreeRDP: the source root + 8 harness/library siblings that are the SAME
+                    # code), and an even split starved the source target that actually carries the
+                    # findings (1/9 of the clock -> the detectors never finished). So the primaries
+                    # share a reserved majority of the time LEFT and the siblings share the rest;
+                    # once the deadline passes, the remaining targets are skipped. The run as a whole
+                    # still cannot exceed `budget_seconds`.
                     _left = max(0.0, _run_deadline - time.monotonic())
-                    _todo = 1 + len(set(worklist[wi:]) - done_tids)
-                    eff_budget = max(budget_mod.FLOOR_SECONDS, _left / _todo)
+                    _remaining = [x for x in worklist[wi - 1:] if x not in done_tids]
+                    _rp = [x for x in _remaining if x in _primary] or ([tid] if tid in _primary else [])
+                    _rs = [x for x in _remaining if x not in _primary]
+                    _prim_pool = _left * (budget_mod.PRIMARY_SHARE if _rs else 1.0)
+                    if tid in _primary:
+                        eff_budget = max(budget_mod.FLOOR_SECONDS, _prim_pool / max(1, len(_rp)))
+                    else:
+                        eff_budget = max(budget_mod.FLOOR_SECONDS,
+                                         (_left - _prim_pool) / max(1, len(_rs)))
                 # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
                 # operator's intent is "keep going until coverage plateaus". The slider's minutes are
                 # that ceiling when given; with none, use a high default (6h) so a long campaign is

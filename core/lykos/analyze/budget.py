@@ -118,6 +118,14 @@ FLOOR_SECONDS = 12.0
 #: on the formats here. Lower it if a stage demonstrably finds things below it.
 FLOOR_EXECS = 1_000
 
+#: Of a WHOLE-RUN budget, the fraction reserved for the operator's HANDED (primary) targets, split
+#: among them; the discovered siblings share the rest. The operator pointed at one thing, and a
+#: source project fans out to the executables it built (the SAME code) -- an even split starved the
+#: source target that carries the findings (measured on FreeRDP: 1 of 9 targets, the source root,
+#: got 1/9 of the clock and its detectors never finished). 0.7 gives the primary the majority while
+#: still giving each sibling a quick pass. See run_case_autopilot's per-target share.
+PRIMARY_SHARE = 0.7
+
 #: Default per-target wall clock when the caller names none. Chosen so the search phase gets a
 #: few hundred seconds -- enough for tens of thousands of executions at the measured rate --
 #: rather than the 30 seconds the stage defaults gave it.
