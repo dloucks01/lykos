@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import re
+import shutil
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,31 +30,52 @@ LF_CORPUS_UNITS = 2000
 
 
 def _materialize_source(ctx, target) -> Path | None:
-    """Recover the target's source into a scratch directory: the archived source-project tree, or a
-    single source-code file. None when the target was not built from source."""
-    d = ctx.scratch() / "src"
-    d.mkdir(parents=True, exist_ok=True)
+    """Recover the target's source into a STABLE per-target directory: the archived source-project
+    tree, or a single source-code file. None when the target was not built from source.
+
+    STABLE, not per-job. `ctx.scratch()` is a fresh mkdtemp per STAGE, so extracting there made every
+    stage re-extract the tree AND rebuild its cmake harnesses from scratch: `source_confirm` builds
+    FreeRDP (~90s), then `synth_confirm` got a ~30s prove slice, could not rebuild it, and
+    driver-synth synthesized 0 drivers. Keyed by the source archive's sha under the (exec-capable)
+    scratch base, the tree -- and the expensive `_lykos_cmake_*` build written into it -- is built
+    ONCE and reused by later stages, and across runs of the same target. Published atomically (a
+    marker file), so a crash mid-extract or a concurrent stage never leaves a half-tree in use."""
     proj = source_project_for(ctx.conn, target)
-    if proj:
-        try:
+    sp = proj or source_project_for(ctx.conn, target, kind="source-code")
+    if sp is None:
+        return None
+    try:
+        base = ctx._scratch_base()
+    except Exception:                                    # noqa: BLE001
+        base = None
+    base = base or tempfile.gettempdir()
+    d = Path(base) / f"lykos-src-{sp.sha256[:16]}"
+    marker = d / ".lykos-extracted"
+    if marker.is_file():
+        return d                                         # already materialized (+ possibly built)
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)             # a partial tree from a crash: start clean
+    tmp = Path(tempfile.mkdtemp(prefix="lykos-srcx-", dir=base))
+    try:
+        if proj:
             with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),
                               mode="r:gz") as tf:
                 # filter="data" rejects absolute/.. members AND symlink/hardlink escapes (a naive
                 # name check misses a symlink member pointing outside, then a file written through
                 # it) -- the attacker-supplied source tree must not escape the scratch dir.
-                tf.extractall(d, filter="data")
-            return d
-        except Exception:                                # noqa: BLE001
-            return None
-    single = source_project_for(ctx.conn, target, kind="source-code")
-    if single:
-        try:
-            fn = (single.meta or {}).get("filename") or "a.c"
-            (d / Path(fn).name).write_bytes(ctx.content.path(single.sha256).read_bytes())
-            return d
-        except Exception:                                # noqa: BLE001
-            return None
-    return None
+                tf.extractall(tmp, filter="data")
+        else:
+            fn = (sp.meta or {}).get("filename") or "a.c"
+            (tmp / Path(fn).name).write_bytes(ctx.content.path(sp.sha256).read_bytes())
+        (tmp / ".lykos-extracted").write_text("1")
+    except Exception:                                    # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    try:
+        os.replace(tmp, d)                               # atomic publish; fails if d now exists
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)           # a concurrent stage published it first
+    return d if marker.is_file() else None
 
 
 def _corpus_cache(ctx, target):
