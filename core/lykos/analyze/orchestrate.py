@@ -2968,6 +2968,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # Two builds of the same program in one case: re-run the proven exploit against the
             # other one and say whether it still reproduces.
             _run_poc_diff(store, worklist, status, stop)
+            # The case-scoped stages above (ipc_model / cross_taint / whole_system) file PER-TARGET
+            # findings AFTER each target's own triage already ran, so those findings would otherwise
+            # keep a bare `candidate` state with no disposition -- violating the "every finding
+            # resolves" invariant (a fresh FreeRDP run left 14 ipc_taint CWE-78 unresolved this way).
+            # Sweep triage once more over each target to resolve them. triage is _ALWAYS_RUN
+            # (budget-exempt), cheap and offline, and idempotent on already-noted findings.
+            for _tid in worklist:
+                if stop.is_set():
+                    break
+                _tt = store.targets.get(_tid)
+                if _tt is not None:
+                    _staged(bud, store, _tt, "triage", status, stop, want=10.0)
         # Persist each target's corpus for the next run (opt-in $LYKOS_CORPUS_DIR).
         for tid in worklist:
             _tt = store.targets.get(tid)
