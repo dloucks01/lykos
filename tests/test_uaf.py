@@ -48,6 +48,17 @@ def test_a_normal_free_is_not_mistaken_for_a_non_start_free(tmp_path):
         assert not [x for x in _hits(root) if x["cwe"] == "CWE-761"], expr
 
 
+def test_a_method_call_named_free_is_not_a_libc_free(tmp_path):
+    """0-FP (exposed by FreeRDP's urbdrc channel): `obj->iface.free(&obj->iface)` is a FUNCTION-
+    POINTER method call whose argument is the object's own address, NOT libc free() of a non-start
+    pointer. A `.`/`->` member access before the name is the tell -- it must not be flagged CWE-761
+    (nor CWE-415/416 by the double-free/UAF scan)."""
+    for expr in ("dev->iface.free(&dev->iface)", "pdev->iface.free(&pdev->iface)",
+                 "obj.free(&obj)", "o->free(o + 1)"):
+        root = _tree(tmp_path, {"v.c": f"void f(void){{ {expr}; }}\n"})
+        assert not _hits(root), expr
+
+
 def test_use_after_free_deref_is_flagged(tmp_path):
     root = _tree(tmp_path, {"v.c": "void f(obj*o){\n free(o);\n o->next = 0;\n}\n"})
     h = _hits(root)

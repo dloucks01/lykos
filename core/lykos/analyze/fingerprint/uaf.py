@@ -36,9 +36,13 @@ _MAX_SOURCE_RECIPES = 64
 
 _IDENT = r"[A-Za-z_]\w*"
 # the deallocators, across libc / kernel / FreeRTOS / glib / C++ (`delete p;`). The captured group
-# is the pointer expression being freed.
+# is the pointer expression being freed. `_NOT_METHOD` rejects a deallocator name reached through a
+# member access -- `obj.free(&obj)` / `dev->iface.free(&dev->iface)` is a FUNCTION-POINTER METHOD
+# call (its arg is the object's own address), NOT libc free(); matching it free-of-non-start
+# false-positived across FreeRDP's urbdrc channel. A `.` / `->` right before the name is the tell.
+_NOT_METHOD = r"(?<![.>])"
 _FREE_NAMES = (r"free|cfree|kfree|kvfree|vfree|vPortFree|pvPortFree|g_free|OPENSSL_free|CRYPTO_free")
-_FREE = re.compile(rf"\b(?:{_FREE_NAMES})\s*\(\s*({_IDENT})\s*\)")
+_FREE = re.compile(rf"{_NOT_METHOD}\b(?:{_FREE_NAMES})\s*\(\s*({_IDENT})\s*\)")
 _DELETE = re.compile(rf"\bdelete\s*(?:\[\s*\])?\s+({_IDENT})\s*;")
 # CWE-761: free of a pointer that is NOT the allocation start. Two syntactically distinctive, very
 # low-FP shapes -- you can only free the exact value malloc returned:
@@ -50,8 +54,8 @@ _BASE = rf"{_IDENT}(?:\s*(?:->|\.)\s*{_IDENT}|\s*\[[^\]]*\])*"
 # the arithmetic operator is a `+` or a `-` that is NOT the `-` of a `->` member access (so
 # free(p->next) / free(list->head) are NOT mistaken for `p` minus `>next`).
 _ARITH_OP = r"(?:\+|-(?!>))"
-_FREE_ARITH = re.compile(rf"\b(?:{_FREE_NAMES})\s*\(\s*({_BASE}\s*{_ARITH_OP}\s*[^;)]+?)\s*\)")
-_FREE_ADDROF = re.compile(rf"\b(?:{_FREE_NAMES})\s*\(\s*(&\s*{_BASE}[^;)]*?)\s*\)")
+_FREE_ARITH = re.compile(rf"{_NOT_METHOD}\b(?:{_FREE_NAMES})\s*\(\s*({_BASE}\s*{_ARITH_OP}\s*[^;)]+?)\s*\)")
+_FREE_ADDROF = re.compile(rf"{_NOT_METHOD}\b(?:{_FREE_NAMES})\s*\(\s*(&\s*{_BASE}[^;)]*?)\s*\)")
 def _assigns(line: str, var: str) -> bool:
     return re.search(rf"(?<![=!<>])\b{re.escape(var)}\s*=(?!=)", line) is not None
 
