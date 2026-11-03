@@ -68,7 +68,9 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("disassemble", "Disassemble", "target", "..analyze.disassemble", "enqueue_disassemble", no_params=True),
     StageSpec("detect_cwe", "Static detectors", "target", "..analyze.detect", "enqueue_detect", no_params=True),
     StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
-              "..analyze.codeql_stage", "enqueue_codeql", no_params=True),
+              "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
+              on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "
+                        "-- auto-scheduling it in a bounded run starves the core sequence"),
     # --- Case-scoped linking (interleaved in the plan where it runs) --------------------------
     StageSpec("whole_system", "Whole-system emulation", "case", "..analyze.link", "enqueue_whole_system"),
     StageSpec("ipc_model", "IPC model", "case", "..analyze.link", "enqueue_ipc", no_params=True),
