@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from .dispatcher_harness import _functions, _split_params
 from .wire_flow import _strip_comments, _bounded, _USES
+from . import value_range
 
 
 #: divisor operand names that are never-zero container/crypto invariants (not attacker-zeroable),
@@ -84,6 +85,8 @@ def find_param_sinks(src: str) -> list:
                         continue
                     if use == "divisor" and _INVARIANT_DIVISOR.search(operand):
                         continue                         # container/crypto invariant, never zero
+                    if use == "divisor" and not value_range.can_be_zero(operand, body):
+                        continue                         # interval engine proves non-zero
                     # ignore the operand being a mere pointer passed through (not arithmetic/index):
                     # the _USES regexes already require a divisor/index/seek/size/len context.
                     ln = body[:mm.start()].count("\n")

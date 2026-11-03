@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from . import value_range
+
 _OUTBOUND = ("_send", "_write", "_encode", "send_", "write_", "_compress")
 _GUARD = ("CheckAndLogRequiredLength", "CheckAndLogRequiredCapacity")
 
@@ -64,6 +66,10 @@ def determine(body: str, operand: str, cwe: str, fn: str) -> Verdict:
     if any(g in body for g in _GUARD) and re.search(re.escape(base), body):
         # a length guard naming the operand before the read/seek
         return Verdict("FP-bounded", f"a length guard covers {base!r} before the access")
+    # CWE-369: the interval engine can prove a divisor is never zero (e.g. built from a constant,
+    # or guarded to a non-zero range) -- a sound bound the regex guards above would miss.
+    if cwe == "CWE-369" and not value_range.can_be_zero(base, body):
+        return Verdict("FP-bounded", f"interval analysis proves divisor {base!r} is never zero")
     # a context/struct field not read from the wire here -> managed elsewhere (stateful)
     if ("->" in op or "." in op) and not _reads_from_wire(body, op):
         return Verdict("needs-state", f"operand {op!r} is a context/struct field set elsewhere: "

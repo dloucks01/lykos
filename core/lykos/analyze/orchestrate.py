@@ -2920,6 +2920,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # constructed PoCs flip those findings to CONFIRMED in the final ledger.
                 if not stop.is_set():
                     _staged(bud, store, t, "drivable_confirm", status, stop, want=20.0)
+                # WEAPONIZE THE CONFIRMED PRIMITIVES into concrete TTP chains (heap-groom / UAF-reclaim
+                # / format write-what-where per finding; leak->write ASLR defeat + RCE primitive-graph
+                # verdict for the target). Consumes the weaponize_advanced planners so every memory
+                # ceiling NAMES the next technique instead of reading as a wall. Cheap/offline; runs
+                # after drivable_confirm (the worklist is settled) and before triage.
+                if not stop.is_set():
+                    _staged(bud, store, t, "weaponize_plan", status, stop, want=10.0)
                 # RESOLVE THE LEDGER: every remaining finding gets a disposition (confirmed / drivable
                 # / off-surface / false-positive / untainted / needs-technique), written back as a
                 # "triage" evidence note. Runs last so poc-backed states are final; cheap/offline.

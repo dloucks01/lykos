@@ -30,6 +30,7 @@ import re
 from dataclasses import dataclass
 
 from .dispatcher_harness import _functions
+from . import value_range
 
 _READ = re.compile(r"\bStream_Read_U?INT(?:8|16|32|64)\s*\(\s*\w+\s*,\s*([A-Za-z_][\w.\->]*)")
 _ASSIGN = re.compile(r"\b([A-Za-z_]\w*)\s*=\s*([^;]+);")
@@ -113,6 +114,8 @@ def find_wire_flows(src: str) -> list:
                     continue
                 if _bounded(body, var, mm.start()):
                     continue
+                if use == "divisor" and not value_range.can_be_zero(base, body):
+                    continue                         # interval engine proves the divisor is non-zero
                 ln = body[:mm.start()].count("\n")
                 out.append(WireFlow(function=name, var=base, use=use, cwe=cwe,
                                     line_hint=body.splitlines()[ln].strip()[:90] if ln < len(body.splitlines()) else ""))
