@@ -88,8 +88,13 @@ def triage_stage(ctx) -> dict:
         if gm is not None:
             grounded, verdict = gm
         else:
+            # No authoritative verdict (recipe/derived finding grounding did not process). Try a
+            # context-free recompute; if it still can't decide a surface, mark the verdict UNDECIDED
+            # so triage does NOT optimistically call it drivable (honesty: a drivable claim needs a
+            # reachability basis). A recompute that proves it FP still wins.
             g = grounding.ground_finding(fdict, source_lookup=lookup, bits=bits)
-            grounded, verdict = bool(g.get("grounded", True)), g.get("verdict")
+            grounded = bool(g.get("grounded", True))
+            verdict = g.get("verdict") if not grounded else "undecided"
         d = finding_triage.triage_finding(cwe=f.cwe, state=f.state, has_poc=(f.id in poc_fids),
                                   grounded=grounded, verdict=verdict)
         dispositions.append((f.id, d))

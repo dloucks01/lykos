@@ -61,6 +61,20 @@ def triage_finding(*, cwe: "str | None", state: "str | None", has_poc: bool,
 
     ceiling = CEILING.get(cwe or "", "unknown")
 
+    # NO reachability verdict from grounding (a recipe/derived finding grounding did not process).
+    # Honesty: do NOT optimistically call it drivable -- a drivable claim needs a reachability basis.
+    # Its reachability must be decided first; name that as the specific next step.
+    if verdict in (None, "undecided"):
+        if ceiling == "logic":
+            return Disposition(CEILING_, "logic/traversal/crypto class: finding is the impact")
+        if ceiling in ("leak", "dos"):
+            return Disposition(CEILING_, f"class tops out at {ceiling} by nature")
+        return Disposition(NEEDS_TECHNIQUE,
+                           f"memory-corruption class ({cwe}) but grounding assigned NO reachability "
+                           f"verdict (recipe/derived finding): decide reachability before driving",
+                           action="run taint/call-graph reachability on this sink; if reached, it "
+                                  "becomes drivable, else off-surface")
+
     # off the attacker surface: real code, but not reached under the malicious-peer threat model.
     if verdict == "off-surface-candidate":
         if ceiling in ("rce", "primitive"):

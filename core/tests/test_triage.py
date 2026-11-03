@@ -46,6 +46,13 @@ def test_dos_class_is_ceiling():
     assert d.status == CEILING_ and "DoS" in d.reason
 
 
+def test_no_reachability_verdict_is_not_drivable():
+    # a memory-class finding with NO reachability verdict must NOT be called drivable (honesty).
+    d = triage_finding(cwe="CWE-787", state="candidate", has_poc=False, grounded=True,
+                       verdict="undecided")
+    assert d.status == NEEDS_TECHNIQUE and "reachability" in d.reason.lower()
+
+
 def test_unknown_class_needs_technique():
     d = triage_finding(cwe="CWE-99999", state="candidate", has_poc=False, grounded=True,
                        verdict="reachability-unknown")
