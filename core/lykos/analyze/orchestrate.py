@@ -2892,6 +2892,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # now that crashes/PoCs for this target exist.
                 if not stop.is_set():
                     _staged(bud, store, t, "cve_corroborate", status, stop, want=30.0)
+                # RESOLVE THE LEDGER: every remaining finding gets a disposition (confirmed / drivable
+                # / ceiling / off-surface / false-positive / needs-technique), written back as a
+                # "triage" evidence note. Runs last so poc-backed states are final; cheap/offline.
+                if not stop.is_set():
+                    _staged(bud, store, t, "triage", status, stop, want=10.0)
                 # Explain a static-only outcome: a memory-corruption defect was found but no runtime
                 # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
                 # leaving a bare "static" that reads like "nothing to see".
