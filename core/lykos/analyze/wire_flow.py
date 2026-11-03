@@ -48,7 +48,7 @@ _USES = [
     ("divisor", "CWE-369", lambda v: re.compile(r"[/%]\s*" + re.escape(v) + r"\b")),
     ("seek",    "CWE-125", lambda v: re.compile(r"\bStream_Seek\s*\(\s*\w+\s*,\s*" + re.escape(v) + r"\b")),
     ("index",   "CWE-129", lambda v: re.compile(r"\[\s*" + re.escape(v) + r"\s*\]")),
-    ("size",    "CWE-190", lambda v: re.compile(r"\b(?:malloc|calloc|realloc|alloca)\s*\([^;]*\b" + re.escape(v) + r"\b")),
+    ("size",    "CWE-190", lambda v: re.compile(r"\b(?:malloc|realloc|alloca)\s*\([^;]*\b" + re.escape(v) + r"\b")),
     ("length",  "CWE-120", lambda v: re.compile(r"\b(?:memcpy|memmove)\s*\([^;]*,\s*" + re.escape(v) + r"\s*\)")),
 ]
 
@@ -67,6 +67,9 @@ def _bounded(body: str, var: str, use_pos: int) -> bool:
                  r"(?:return|goto|break|continue|WLog)", pre):
         return True
     if re.search(r"if\s*\(\s*!?\s*" + re.escape(base) + r"\s*\)", pre):     # `if (!var) ...` null/zero guard
+        return True
+    # a bound of the form `if (var < ARRAYSIZE(...)|COUNT|<CONST>) <use>` (index guards)
+    if re.search(r"\b" + re.escape(base) + r"\s*(?:<|<=)\s*(?:ARRAYSIZE|ARRAY_SIZE|[A-Z_]+_COUNT|[A-Z_]*MAX[A-Z_]*|\w*[Cc]ount|sizeof|\d+)", pre):
         return True
     # `var % N` / `var & MASK` immediately bounds an index use
     if re.search(r"\b" + re.escape(base) + r"\s*[%&]\s*\w+", body[:use_pos + 40]):
