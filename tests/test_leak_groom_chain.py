@@ -98,3 +98,32 @@ def test_groom_without_the_overwrite_does_not_reach_win(pie_heap):
         make_payload=lambda _b, _w: heap_groom._groom_stream(plan, _spec(), _w, negative=True),
         timeout=15.0)
     assert not reached
+
+
+def test_menuspec_from_opmodel_encodes_bytes():
+    """Declarative op-model -> correct wire bytes (the form an analyst/params supply)."""
+    model = {
+        "alloc_buf": {"prefix_hex": "41", "size": "u32le"},
+        "alloc_obj": {"prefix_hex": "4f"},
+        "edit_buf":  {"prefix_hex": "45", "len": "u32le", "data": True},
+        "trigger":   {"prefix_hex": "54"},
+    }
+    spec = heap_groom.menuspec_from_opmodel(model)
+    assert spec.alloc_buf(24) == b"A" + struct.pack("<I", 24)
+    assert spec.alloc_obj() == b"O"
+    assert spec.edit_buf(b"\x90\x90") == b"E" + struct.pack("<I", 2) + b"\x90\x90"
+    assert spec.trigger() == b"T"
+
+
+def test_try_leak_groom_detonates_from_opmodel(pie_heap):
+    """The one-call orchestrator (what the engine stage invokes) drives the chain to L3 from a
+    declarative op-model."""
+    tb = pie_heap.read_bytes()
+    model = {
+        "alloc_buf": {"prefix_hex": "41", "size": "u32le"},
+        "alloc_obj": {"prefix_hex": "4f"},
+        "edit_buf":  {"prefix_hex": "45", "len": "u32le", "data": True},
+        "trigger":   {"prefix_hex": "54"},
+    }
+    assert heap_groom.try_leak_groom(str(pie_heap), buf_request=24, win_off=_win_off(str(pie_heap)),
+                                     target_bytes=tb, opmodel=model, timeout=15.0)

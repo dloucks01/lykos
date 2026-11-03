@@ -13,6 +13,7 @@ leak, which stays analyst-gated). Deterministic. """
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import struct
@@ -242,6 +243,17 @@ def chain_primitive_stage(ctx) -> dict:
             return {}
     except Exception:                                      # noqa: BLE001 -- best-effort; fall through
         observe.absorbed(_log, "stack-oob construct skipped")
+
+    # doc 60 frontier: LEAK -> GROOM -> CONTROL for a heap OOB-write on a PIE target. Composes the
+    # adjacent-overflow groom with the PIE two-stage leak oracle to overwrite an adjacent victim's
+    # function pointer with the runtime win (defeating ASLR via the disclosed pointer). Fires when
+    # the groom op-model is available (analyst params today; victim-fptr op-model discovery is the
+    # named next step); on success files a poc-backed L3 and this function is done.
+    if vclass == "oob_write" and pie and ctx.params.get("lg_opmodel"):
+        lg = _leak_groom_chain(ctx, target, target_bytes, lead, win, ctx.params)
+        if lg:
+            ctx.progress(pct=100, msg="leak->groom->control: L3 confirmed (ASLR defeated)")
+            return lg
 
     # Without a reachable win, a HIJACK has nothing to point at -- but an arbitrary WRITE does not
     # need one. A write-what-where plus the arbitrary read that comes with it leaks the libc base
@@ -1804,6 +1816,90 @@ def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, wr
     ctx.progress(pct=100, msg=f"L3 CONFIRMED (PIE): leak {leak_opt} -> base -> {win_name}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "pie": True, "off": off}}
+
+
+def _leak_groom_chain(ctx, target, target_bytes, lead, win, p):
+    """LEAK -> GROOM -> CONTROL, auto-wired (doc-60 frontier). For a heap OOB-write lead on a PIE
+    target that discloses a pointer, compose the adjacent-overflow groom with the PIE two-stage leak
+    oracle (heap_groom.try_leak_groom): overwrite the adjacent victim's function pointer with the
+    runtime win, confirmed by an INT3 oracle + negative control. Fires only when the groom op-model
+    is available -- an analyst-supplied declarative op-model (params.lg_opmodel + lg_buf_request;
+    optional lg_win_off / lg_obj_fptr_off) today; op-model DISCOVERY for the victim-fptr object is
+    the named next step. Returns a result dict on a confirmed L3, else None (caller falls through to
+    the recipe path, which names the missing op-model)."""
+    opmodel = p.get("lg_opmodel")
+    buf_request = p.get("lg_buf_request")
+    if not opmodel or not buf_request:
+        return None
+    win_off = p.get("lg_win_off")
+    win_name = "win"
+    if win_off is None and win is not None:
+        win_name, win_off = win[0], win[1]
+    if win_off is None:
+        return None
+    obj_off = int(p.get("lg_obj_fptr_off", 0))
+    try:
+        from . import heap_groom
+        wd = ctx.scratch() / "leakgroom"
+        wd.mkdir(parents=True, exist_ok=True)
+        exe = wd / "target"
+        ctx.content.stage_target(target, exe.parent, exe.name)
+        os.chmod(exe, 0o755)
+        ok = heap_groom.try_leak_groom(str(exe), buf_request=int(buf_request), win_off=int(win_off),
+                                       target_bytes=target_bytes, opmodel=opmodel,
+                                       obj_fptr_off=obj_off)
+    except Exception:                                        # noqa: BLE001 -- best-effort; never sink the stage
+        _log.debug("leak-groom chain errored", exc_info=True)
+        return None
+    if not ok:
+        return None
+    return _file_leak_groom_l3(ctx, target, lead, win_name=win_name, win_off=int(win_off),
+                               obj_off=obj_off, buf_request=int(buf_request))
+
+
+def _file_leak_groom_l3(ctx, target, lead, *, win_name, win_off, obj_off, buf_request):
+    """File a confirmed leak->groom->control chain as an L3 verified PoC."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": "heap oob-write -> adjacent fptr overwrite (PIE leak-relocated)",
+            "target": win_name, "win_off": hex(win_off), "buf_request": buf_request,
+            "obj_fptr_off": obj_off, "tool_version": TOOL_VERSION}
+    note = (f"working PIE heap exploit (leak -> groom -> control): recovered the image base from a "
+            f"disclosed pointer, groomed two adjacent chunks, overflowed a {buf_request}-byte buffer "
+            f"into the next chunk's function pointer at +{obj_off}, overwriting it with "
+            f"base+{win_off:#x} ({win_name}); the call transferred control there. Confirmed by an "
+            f"INT3 oracle at the runtime win under a passing negative control (the short overflow, "
+            f"one word shy of the pointer, does NOT reach win) -- a real ASLR defeat.")
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), b"", meta, b"", "stdin", [],
+                        None, primitive={"type": "oob_write", "target": win_name, "offset": obj_off,
+                                         "confirmed": True, "note": "leak-groom PIE"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=None, bundle_sha=bundle_sha)
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe, "title": "Control-flow hijack (demonstrated): L3 heap leak-groom chain",
+            "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:leak_groom:{target.id}", "site_detail": win_name,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": "Control-flow hijack (heap, PIE/ASLR defeated)",
+                "status": "demonstrated", "detail": note,
+                "proof": {"type": "bundle", "sha": bundle_sha, "note": note}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=note)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": "oob_write",
+             "technique": "leak_groom", "win": win_name, "off": obj_off, "pie": True,
+             "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED (leak-groom): base -> {win_name}")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": "oob_write",
+                        "technique": "leak_groom", "pie": True}}
 
 
 def _heap_leak_repro_script(win_addr, roles, trig, target, safe) -> bytes:
