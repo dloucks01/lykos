@@ -2368,6 +2368,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # after the static + detect + secret detectors and after disassemble (it needs the
                 # call graph for reachability); cheap and offline.
                 _staged(bud, store, t, "grounding", status, stop, want=15.0)
+                # COVERAGE LEDGER: prove every function was checked against every static CWE, and
+                # account for the catalog. Cheap/offline string work; files a finding only for a
+                # genuine hole (unparsed source file / catalog-missing CWE), so a clean run is silent.
+                _staged(bud, store, t, "coverage_sweep", status, stop, want=10.0)
                 # POPULATE THE CONFIRMED RUNG, then weaponize it. grounding just annotated every
                 # finding with its real-vs-FP + attacker-reachability verdict; verify reads that and
                 # promotes corroborated + real + reachable findings to `confirmed` (a sound, no-exec
