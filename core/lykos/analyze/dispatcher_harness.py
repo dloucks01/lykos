@@ -73,13 +73,34 @@ def _functions(src: str) -> list:
         ret, name, params = m.group(3), m.group(4), m.group(5)
         if name in ("if", "for", "while", "switch", "sizeof", "return", "do"):
             continue
-        # brace-match the body from the opening '{'
+        # brace-match the body from the opening '{', skipping braces inside string/char literals
+        # and comments (a '}' in a format string or a '/* */' otherwise overshoots and swallows the
+        # rest of the file into one giant body -- the dominant lifecycle false-positive driver).
         i = m.end() - 1
-        depth, j = 0, i
-        while j < len(src):
-            if src[j] == "{":
+        depth, j, n = 0, i, len(src)
+        while j < n:
+            ch = src[j]
+            if ch == "/" and j + 1 < n and src[j + 1] == "/":          # line comment
+                j = src.find("\n", j)
+                if j < 0:
+                    break
+            elif ch == "/" and j + 1 < n and src[j + 1] == "*":        # block comment
+                e = src.find("*/", j + 2)
+                j = (e + 2) if e >= 0 else n
+                continue
+            elif ch == '"' or ch == "'":                               # string / char literal
+                q = ch
+                j += 1
+                while j < n:
+                    if src[j] == "\\":
+                        j += 2
+                        continue
+                    if src[j] == q:
+                        break
+                    j += 1
+            elif ch == "{":
                 depth += 1
-            elif src[j] == "}":
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
                     break
