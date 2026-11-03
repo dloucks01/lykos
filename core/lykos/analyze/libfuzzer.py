@@ -2176,6 +2176,21 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
             # ELF, which the concolic rung needs -- angr loads the harness with auto_load_libs=False, so
             # a parser left in a .so would never be explored.
             f"-DBUILD_SHARED_LIBS={'ON' if shared else 'OFF'}", "-DCMAKE_BUILD_TYPE=Debug"]
+    if sanitize:
+        # FORCE ASan via the compiler/linker flags, not only the project's own WITH_SANITIZE_ADDRESS
+        # option. A project may gate that option behind its own compiler detection and SILENTLY skip
+        # it: FreeRDP wraps `add_compile_options(-fsanitize=address)` in
+        # `if(CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_GNUCC)`, a NON-STANDARD variable unset when
+        # the compiler is passed by path -- so the whole library built with NO address instrumentation
+        # and every heap overflow inside it was invisible (the fuzzers and the ladder found nothing on
+        # FreeRDP for this reason, not for lack of bugs). Appending the flags to CMAKE_*_FLAGS applies
+        # them to every translation unit and the shared libraries regardless of the project's guard;
+        # clang de-duplicates if the project also adds them. Only on the ASan build -- the clean
+        # EXPLORE build must stay un-instrumented for angr.
+        _asan = "-fsanitize=address -fno-omit-frame-pointer -g"
+        base += [f"-DCMAKE_C_FLAGS={_asan}", f"-DCMAKE_CXX_FLAGS={_asan}",
+                 "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address",
+                 "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address"]
     preload = _find_fuzz_preload(root)
     if preload:
         base += ["-C", str(preload)]
