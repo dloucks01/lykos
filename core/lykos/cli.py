@@ -158,9 +158,16 @@ def _cmd_analyze(args) -> int:
         print(f"budget   {args.budget:g}s   case {case_dir}")
         status: dict = {"state": "starting"}
         stop = threading.Event()
+        # --no-fuzz: skip the sampling campaigns (blind + coverage-guided), leaving the non-fuzzing
+        # pipeline -- static detection, dedup, the potential-PoC floor, and the solve/construct
+        # prove-out rungs (concolic / template / driver synthesis / construction). Non-fuzzing is the
+        # primary deliverable; this makes a run exercise it without any campaign spending the clock.
+        from .analyze import budget as _budget_mod
+        _skip = _budget_mod.SAMPLER_STAGES if getattr(args, "no_fuzz", False) else None
         th = threading.Thread(target=run_case_autopilot,
                               args=(case_dir, case.id, [t.id], status, stop, args.budget,
                                     over),
+                              kwargs={"skip_stages": _skip},
                               daemon=True)
         th.start()
         # `--budget N` has to mean something to the person who typed it, so this is a hard
@@ -798,6 +805,10 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("--out", default=None,
                     help="where to write verified PoC bundles (default: the current directory)")
     an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
+    an.add_argument("--no-fuzz", action="store_true",
+                    help="skip the sampling campaigns (blind + coverage-guided fuzzing); run the "
+                         "non-fuzzing pipeline only -- static detection, dedup, the potential-PoC "
+                         "floor, and the solve/construct prove-out rungs")
     an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
     an.set_defaults(func=_cmd_analyze)
 

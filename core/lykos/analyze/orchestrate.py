@@ -2065,12 +2065,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        skip_stages=None, pause=None) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
 
-    `budget_seconds` is the wall clock EACH TARGET gets, divided among the phases by
-    `budget.CaseBudget` (default `budget.DEFAULT_TARGET_BUDGET`). Before this the pipeline had no
-    budget of its own: stage timeouts were absolute and generous (3600s for two of them), so a
-    single stage could outlast the whole run and everything after it never executed. Measured on
-    stock /usr/bin binaries, three runs out of four ended inside one stage with a third of the
-    pipeline unreached -- see the table in `budget.py`.
+    `budget_seconds` is the WHOLE-RUN wall-clock ceiling, shared across the case's targets: each
+    target gets an even share of the time LEFT (so early finishers hand slack to later ones) and,
+    once the clock is spent, the remaining targets are skipped for budget. A source project that
+    builds N executables therefore runs within `budget_seconds`, not N x it. Per target the share is
+    divided among the phases by `budget.CaseBudget`. `budget_seconds=None` (the web/API path, and
+    converge) keeps the per-target size-scaled default instead -- no explicit ceiling. Before any of
+    this the pipeline had no budget of its own: stage timeouts were absolute and generous (3600s for
+    two), so a single stage could outlast the whole run and everything after it never executed.
     """
     store = CaseStore(case_dir)
     # Operator run-env from the GUI/API overrides, set once for this run: a target-libraries
@@ -2100,12 +2102,26 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         for _sib in store.targets.list_by_case(case_id):
             if _sib.id not in worklist:
                 worklist.append(_sib.id)
+        # --budget is a WHOLE-RUN ceiling, not per target. Before this, `budget_seconds` was handed
+        # to EACH target's CaseBudget, so a source project that built N executables ran up to N x
+        # budget -- an hour-budget FreeRDP run took far longer because it has many targets. A global
+        # deadline is now the hard backstop, and each target gets an even share of the time LEFT, so
+        # early finishers hand their slack to later targets and, once the clock is spent, the rest
+        # are skipped for budget rather than silently extending the run. budget_seconds=None (the
+        # web/API path and converge) keeps the per-target size-scaled default -- no explicit ceiling.
+        _run_deadline = (time.monotonic() + budget_seconds) if budget_seconds else None
+        _budget_skipped: list = []
         done_tids: set = set()
         wi = 0
         while wi < len(worklist):
             tid = worklist[wi]
             wi += 1
             if stop.is_set():
+                break
+            if _run_deadline is not None and time.monotonic() >= _run_deadline:
+                # the whole-run budget is spent: skip every target still on the worklist rather
+                # than extend the run past the ceiling the operator set.
+                _budget_skipped = [x for x in worklist[wi - 1:] if x not in done_tids]
                 break
             if tid in done_tids:
                 continue
@@ -2142,11 +2158,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # run came back with only static findings. An explicit --budget / budget_seconds always
                 # wins; this only fills the "caller sent nothing" case. (CLI passes an explicit default,
                 # so it is unaffected; this is the web/API path.)
-                eff_budget = budget_seconds
-                if eff_budget is None:
+                if budget_seconds is None:
                     _mb = (t.size or 0) / 1_000_000.0
                     eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
                                      min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
+                else:
+                    # whole-run ceiling, shared evenly over the targets still to do (this one
+                    # included), so the run as a whole cannot exceed `budget_seconds`.
+                    _left = max(0.0, _run_deadline - time.monotonic())
+                    _todo = 1 + len(set(worklist[wi:]) - done_tids)
+                    eff_budget = max(budget_mod.FLOOR_SECONDS, _left / _todo)
                 # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
                 # operator's intent is "keep going until coverage plateaus". The slider's minutes are
                 # that ceiling when given; with none, use a high default (6h) so a long campaign is
@@ -2871,6 +2892,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             except Exception as _exc:                   # noqa: BLE001 -- isolate, then record
                 _target_failed(store, case_id, tid, _exc, status)
                 continue
+        # Honest account when the whole-run budget ran out before every target was analysed: the
+        # operator set a ceiling, so this is expected, not a failure -- name the skipped targets.
+        if _budget_skipped:
+            status["targets_skipped_for_budget"] = [
+                (store.targets.get(x).filename if store.targets.get(x) else x)
+                for x in _budget_skipped]
+            _log.info("whole-run budget spent; %d target(s) skipped for budget",
+                      len(_budget_skipped))
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
         # components are exactly such a set).
         if len(worklist) > 1 and not stop.is_set():
