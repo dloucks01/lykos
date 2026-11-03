@@ -89,6 +89,8 @@ STAGES: tuple[StageSpec, ...] = (
               "..analyze.coverage_sweep_stage", "enqueue_coverage_sweep", no_params=True),
     StageSpec("confirm", "Confirm real+reachable findings, then weaponize", "target",
               "..analyze.verify_stage", "enqueue_verify", no_params=True),
+    StageSpec("drivable_confirm", "Confirm drivable findings (non-fuzzing first; constructed PoCs)",
+              "target", "..analyze.drivable_confirm", "enqueue_drivable_confirm", no_params=True),
     StageSpec("triage", "Resolve every finding to a disposition (PoC / ceiling / dead-end)", "target",
               "..analyze.triage_stage", "enqueue_triage", no_params=True),
     StageSpec("source_sink_scan", "Tainted-sink scan", "target", "..analyze.fingerprint", "enqueue_source_sink_scan", no_params=True),

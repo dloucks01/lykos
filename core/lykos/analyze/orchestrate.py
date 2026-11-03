@@ -2897,8 +2897,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # now that crashes/PoCs for this target exist.
                 if not stop.is_set():
                     _staged(bud, store, t, "cve_corroborate", status, stop, want=30.0)
+                # CONFIRM DRIVABLE, NON-FUZZING FIRST (F5, doc 60): construct a script PoC for the
+                # drivable findings (injection/traversal payloads from the dataflow; concolic plan
+                # for memory classes), fuzzing only as the additive fallback. Runs before triage so
+                # constructed PoCs flip those findings to CONFIRMED in the final ledger.
+                if not stop.is_set():
+                    _staged(bud, store, t, "drivable_confirm", status, stop, want=20.0)
                 # RESOLVE THE LEDGER: every remaining finding gets a disposition (confirmed / drivable
-                # / ceiling / off-surface / false-positive / needs-technique), written back as a
+                # / off-surface / false-positive / untainted / needs-technique), written back as a
                 # "triage" evidence note. Runs last so poc-backed states are final; cheap/offline.
                 if not stop.is_set():
                     _staged(bud, store, t, "triage", status, stop, want=10.0)

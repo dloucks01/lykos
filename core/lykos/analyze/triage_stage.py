@@ -107,8 +107,11 @@ def triage_stage(ctx) -> dict:
     pd = PocDAO(ctx.conn)
     findings = fd.list_by_target(target.id)
 
-    # the PoC set (finding_ids with a verified PoC) + grounding's source lookup as a FALLBACK only.
-    poc_fids = {p.finding_id for p in pd.list_by_target(target.id) if p.finding_id and p.verified}
+    # the PoC set: a finding has a PoC if ANY poc row points at it -- a detonated (verified) one OR
+    # an analysis-CONSTRUCTED script PoC (doc 58 provenance; the operator's definition: a small
+    # script/input that exploits the finding, not necessarily an ASan detonation).
+    poc_fids = {p.finding_id for p in pd.list_by_target(target.id)
+                if p.finding_id and (p.verified or (p.provenance or "") == "constructed")}
     root = _source_root(ctx, target) if source_project_for(ctx.conn, target) else None
     lookup = grounding.make_source_lookup(root) if root else None
     textlookup = grounding.make_file_text_lookup(root) if root else None
