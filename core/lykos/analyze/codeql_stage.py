@@ -138,16 +138,28 @@ def codeql_stage(ctx) -> dict:
     suite = _suite()
     if not suite:
         return {"metrics": {"codeql": "skipped (no cpp query suite installed)"}}
+    # run the installed suite PLUS lykos' custom per-CWE queries for the FreeRDP classes (gap 2):
+    # wire->divisor and wire->unbounded-alloc, which model the interprocedural flows the default
+    # suite does not. Passed as additional query specs; a custom-query failure must not sink the run.
+    custom = os.path.join(os.path.dirname(__file__), "codeql_queries")
+    specs = [suite] + ([custom] if os.path.isdir(custom) else [])
     try:
-        r = subprocess.run(["codeql", "database", "analyze", db, suite,
+        r = subprocess.run(["codeql", "database", "analyze", db, *specs,
+                            "--additional-packs", os.path.expanduser("~/.codeql/packages"),
                             "--format=sarifv2.1.0", "--output", sarif, "--threads=4"],
                            capture_output=True, text=True, timeout=1800)
         if r.returncode != 0 or not os.path.isfile(sarif):
-            return {"metrics": {"codeql": f"skipped (analyze failed: {r.stderr[-120:]})"}}
+            # retry with the suite alone (a custom query may not compile on this CodeQL version).
+            r = subprocess.run(["codeql", "database", "analyze", db, suite,
+                                "--format=sarifv2.1.0", "--output", sarif, "--threads=4"],
+                               capture_output=True, text=True, timeout=1800)
+            if r.returncode != 0 or not os.path.isfile(sarif):
+                return {"metrics": {"codeql": f"skipped (analyze failed: {r.stderr[-120:]})"}}
     except Exception as e:                               # noqa: BLE001
         return {"metrics": {"codeql": f"skipped (analyze error: {e})"}}
     n = ingest_sarif(sarif, FindingDAO(ctx.conn), target, root=root.rstrip("/") + "/")
-    return {"metrics": {"codeql_findings": n, "db_reused": reused, "suite": os.path.basename(suite)}}
+    return {"metrics": {"codeql_findings": n, "db_reused": reused, "suite": os.path.basename(suite),
+                        "custom_queries": len([q for q in os.listdir(custom) if q.endswith(".ql")]) if os.path.isdir(custom) else 0}}
 
 
 register_stage(CODEQL_STAGE, codeql_stage, resource_class="heavy",
