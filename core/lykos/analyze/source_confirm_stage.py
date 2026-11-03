@@ -356,9 +356,19 @@ def source_confirm_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("source_confirm requires a target_id")
+    import time as _time
     p = ctx.params or {}
     budget = float(p.get("max_seconds") or p.get("seconds") or 600)
     input_size = int(p.get("input_size") or 1024)
+    # ONE wall-clock deadline for the whole stage. Without it the time accounting was additive by
+    # SLICE but unbounded in sum: each of up to four `cmake_build_harnesses` calls defaulted its own
+    # deadline to timeout*4 (libfuzzer.py), so the builds alone could run ~4x the budget, then the
+    # ladder added 0.6x more -- which is how this stage blew its worker hard deadline on a huge tree
+    # (FreeRDP). Now the builds SHARE one absolute deadline and the ladder gets only what remains.
+    _t0 = _time.monotonic()
+
+    def _remaining() -> float:
+        return budget - (_time.monotonic() - _t0)
 
     src = _materialize_source(ctx, target)
     if src is None:
@@ -375,13 +385,21 @@ def source_confirm_stage(ctx) -> dict:
     # static link needs unavailable deps (FreeRDP's static OpenSSL cascade), and that rung then simply
     # does not run. The SMART-FUZZ rung needs an ASan SHARED build, which succeeds where static does
     # not -- so it is always attempted, and is the floor that covers the projects concolic cannot.
+    # The build PHASE shares one absolute deadline (~55% of the stage budget): per-build `timeout` is
+    # a soft per-build cap, but the shared `_build_deadline` is the hard bound, so four builds cannot
+    # sum past it -- once it passes, a later build gets ~0 time and bails fast rather than running its
+    # own timeout*4. The ladder gets the remaining ~40% (below).
     bslice = max(60, int(budget * 0.25))
+    _build_deadline = _time.time() + max(120.0, budget * 0.55)
     ctx.progress(msg="building in-tree harnesses (static clean+ASan for concolic, shared ASan for fuzz)")
     # Config-keyed build dirs (the default): the shared-ASan fuzz build is shared with libfuzzer_stage
     # (built once, not twice); the static explore/replay builds are distinct configs with their own dirs.
-    explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice)
-    replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice)
-    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice)
+    explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice,
+                                       deadline=_build_deadline)
+    replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice,
+                                      deadline=_build_deadline)
+    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice,
+                                     deadline=_build_deadline)
     # When the STATIC explore link fails (FreeRDP's -dev cascade) but the shared build works, build a
     # SHARED-CLEAN explore so concolic still runs: angr explores it with the project's own .so
     # force-loaded (auto_load_libs stays off, so system libs stay stubbed). This is the concolic
@@ -389,7 +407,8 @@ def source_confirm_stage(ctx) -> dict:
     explore_sh = None
     if not explore["ok"] and fuzzb["ok"]:
         ctx.progress(msg="static explore link failed; building shared-clean explore for concolic")
-        explore_sh = LF.cmake_build_harnesses(src, shared=True, sanitize=False, timeout=bslice)
+        explore_sh = LF.cmake_build_harnesses(src, shared=True, sanitize=False, timeout=bslice,
+                                              deadline=_build_deadline)
     if not (explore["ok"] or fuzzb["ok"]):
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "could not build harnesses for confirmation (neither static nor shared linked)",
@@ -463,9 +482,19 @@ def source_confirm_stage(ctx) -> dict:
     surface = _attack_surface(surf_bins, fuzzb.get("lib_dirs") if fuzzb["ok"] else None) if surf_bins else set()
     ranked = _rank_by_surface(ctx, target, surface) if surface else {"in_surface": 0, "off_surface": 0}
 
-    per = max(30, int((budget * 0.6) / max(1, len(harnesses))))
+    # The ladder gets what the build phase left (never the fixed 0.6*budget that, added to an
+    # overrunning build phase, blew the hard deadline). Each harness's rung is bounded by the share
+    # of the REMAINING wall-clock; if almost nothing is left, skip the ladder and say so rather than
+    # start a concolic/fuzz rung that cannot finish in time.
     attempts: list = []
-    proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
+    _left = _remaining()
+    if _left < 45:
+        proven = []
+        ctx.progress(msg=f"ladder skipped: {int(_left)}s of the {int(budget)}s budget left after "
+                         f"building {len(harnesses)} harness(es) -- not enough for a confirmation rung")
+    else:
+        per = max(20, int((_left * 0.9) / max(1, len(harnesses))))
+        proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
     upgraded = 0
     for r in proven:
         upgraded += _file_confirmed(ctx, target, r,

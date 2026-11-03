@@ -5,6 +5,7 @@ materializes the tree, builds the clean + ASan static harnesses, runs the ladder
 the gate), and files a CONFIRMED finding + a DynResult the exploit ladder can see -- a proven,
 non-fuzzing PoC with a reproducing input."""
 import shutil
+import time
 
 import pytest
 
@@ -90,6 +91,44 @@ def test_source_confirm_stage_files_confirmed_poc(store, tmp_path):
     prefix = drs[0].isolation.split("/", 1)[1]
     assert any(a.kind == "libfuzzer-harness" and a.sha256.startswith(prefix)
                for a in store.artifacts.list_by_case(t.case_id))
+
+
+def test_the_build_phase_shares_one_deadline_and_the_ladder_takes_what_remains(store, tmp_path,
+                                                                               monkeypatch):
+    """Regression for the wedge on a huge tree (FreeRDP): the stage must bound its TOTAL wall-clock,
+    not give each of four builds its own timeout*4 deadline. Pin that every build gets the SAME
+    absolute `deadline`, and that when the build phase spends the budget the ladder is SKIPPED
+    rather than started with time it cannot finish in."""
+    from lykos.analyze import libfuzzer as LF
+    from lykos.analyze.symbolic import directed_confirm as DC
+    from lykos.analyze import source_confirm_stage as SC
+    from lykos.analyze.ingest import ingest
+
+    proj = tmp_path / "proj"
+    _mk(proj)
+    t = ingest(store, store.cases.create("scbudget").id, proj, filename="proj")
+
+    deadlines, ladder_called = [], []
+    monkeypatch.setattr(SC, "_materialize_source", lambda ctx, target: proj)
+    monkeypatch.setattr(LF, "find_harnesses", lambda root, limit=1: [proj / "h.c"])
+
+    def fake_build(root, *, shared, sanitize, timeout, deadline=None, **kw):
+        deadlines.append(deadline)
+        time.sleep(0.4)                                  # consume the (tiny) budget
+        return {"ok": True, "log": "", "lib_dirs": [],
+                "harnesses": [{"name": "h", "source": str(proj / "h.c"), "binary": str(proj / "h")}]}
+    monkeypatch.setattr(LF, "cmake_build_harnesses", fake_build)
+    monkeypatch.setattr(DC, "confirm_ladder",
+                        lambda *a, **k: ladder_called.append(k.get("timeout_per")) or [])
+
+    from types import SimpleNamespace
+    ctx = SimpleNamespace(conn=store.conn, target_id=t.id, params={"max_seconds": 1},
+                          emit=lambda *a, **k: None, progress=lambda **k: None)
+    SC.source_confirm_stage(ctx)
+    built = [d for d in deadlines if d is not None]
+    assert built and len(set(built)) == 1, f"builds must share ONE deadline, got {deadlines}"
+    # with a 1s budget spent by the (0.4s each) builds, the ladder must have been skipped
+    assert not ladder_called, "ladder ran despite the budget being spent on builds"
 
 
 # ---- a confirmation is replayed against the binary that proved it ------------------------------
