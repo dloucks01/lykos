@@ -42,11 +42,12 @@ def attack_path_stage(ctx) -> dict:
     if not path.steps:
         return {"metrics": {"attack_path": "no composable path from the findings"}}
 
-    # STAGED DETONATION: a reached-RCE memory path is not just a composition claim -- drive it to a
-    # demonstrated end-to-end exploit. Reflect an existing detonation (chain_primitive's leak->groom
-    # L3), or, when the leak and write edges were not composed upstream, detonate the path here via
-    # the same leak->groom chain keyed off the path's write edge. Best-effort; never sinks the stage.
-    deto = _detonate_rce_path(ctx, target, path)
+    # STAGED DETONATION: a reached path is not just a composition claim -- drive it to a demonstrated
+    # exploit. Dispatched by objective: a memory RCE path via the leak->groom chain (detonated L3); an
+    # injection objective (cmd/sql/file) via a constructed payload (L1); a DoS by the crash finding it
+    # already carries. Best-effort; never sinks the stage, and stays honest ("recipe ceiling") when
+    # no detonator applies here.
+    deto = _detonate_path(ctx, target, path)
 
     rendered = attack_path.format_path(path)
     rendered += f"\n[{deto['status'] or 'not detonated'}] end-to-end: {deto['detail']}"
@@ -78,14 +79,68 @@ _WRITE_CWES = {"CWE-787", "CWE-122", "CWE-120", "CWE-121", "CWE-124", "CWE-131",
                "CWE-129", "CWE-416", "CWE-415", "CWE-822", "CWE-823"}
 
 
-def _detonate_rce_path(ctx, target, path) -> dict:
-    """For a reached-RCE path, return its end-to-end demonstration status:
-      {"status": "reflected"|"detonated"|None, "detail": str}.
-    'reflected' when a verified L3 already exists (chain_primitive detonated the leak->groom tail);
-    'detonated' when we drive it here (the cross-finding composition chain_primitive's single-lead
-    logic may have missed); None when not a detonatable RCE path. Never raises."""
-    if not (path.reached and path.objective == attack_path.RCE):
-        return {"status": None, "detail": "not a reached-RCE path"}
+def _detonate_path(ctx, target, path) -> dict:
+    """Dispatch a reached path to the detonator for its objective and return the demonstration
+    status {"status": "reflected"|"detonated"|"constructed"|None, "detail": str}. Extensible: each
+    objective maps to the mechanism that proves THAT kind of attack (memory->chain, injection->
+    payload, dos->the crash). Never raises."""
+    if not path.reached:
+        return {"status": None, "detail": "no objective reached from the attacker's entry"}
+    obj = path.objective
+    if obj == attack_path.RCE:
+        return _detonate_memory_rce(ctx, target, path)
+    if obj in (attack_path.CMD, attack_path.SQL, attack_path.FILE):
+        return _construct_injection(ctx, target, path, obj)
+    if obj == attack_path.DOS:
+        return _reflect_dos(ctx, target)
+    return {"status": None, "detail": f"no detonator wired for objective {obj}"}
+
+
+#: CWE -> the injection objective it reaches directly (the last edge of a cmd/sql/file path).
+_INJECTION_CWE = {attack_path.CMD: {"CWE-78", "CWE-77", "CWE-88"},
+                  attack_path.SQL: {"CWE-89"}, attack_path.FILE: {"CWE-22", "CWE-23", "CWE-98"}}
+
+
+def _construct_injection(ctx, target, path, obj) -> dict:
+    """Injection/traversal objective: the exploit is a CONSTRUCTED payload (doc-58 provenance
+    'constructed'), not a memory detonation. Reflect an existing PoC, else construct the class
+    payload and file it at L1 so the path's objective edge is demonstrated by a concrete trigger."""
+    try:
+        from ..db.dao import FindingDAO, PocDAO
+        from . import drivable_confirm
+        want = _INJECTION_CWE.get(obj, set())
+        edge = next((f for f in FindingDAO(ctx.conn).list_by_target(target.id)
+                     if (f.cwe or "") in want), None)
+        if edge is None:
+            return {"status": None, "detail": f"{obj}: no injection finding to construct from"}
+        if any(p.finding_id == edge.id and p.verified for p in PocDAO(ctx.conn).list_by_target(target.id)):
+            return {"status": "reflected", "detail": f"{obj}: injection PoC already verified"}
+        poc = drivable_confirm.construct_payload(edge.cwe)
+        if not poc:
+            return {"status": None, "detail": f"{obj}: no constructor for {edge.cwe}"}
+        PocDAO(ctx.conn).insert(target.id, target.case_id, finding_id=edge.id, level="L1",
+                                provenance="constructed", signal_name=f"attack_path:{obj}")
+        return {"status": "constructed",
+                "detail": f"{obj}: constructed payload {poc['payload']!r} -- {poc['effect']}"}
+    except Exception:                                        # noqa: BLE001
+        return {"status": None, "detail": f"{obj}: construction skipped"}
+
+
+def _reflect_dos(ctx, target) -> dict:
+    """A DoS path is demonstrated by the crash the run already has (a verified crash/abort PoC or a
+    dyn_result fault). Reflect it; otherwise it is a static ceiling."""
+    try:
+        from ..db.dao import PocDAO
+        if any(p.verified for p in PocDAO(ctx.conn).list_by_target(target.id)):
+            return {"status": "reflected", "detail": "dos: a verified crash PoC demonstrates it"}
+    except Exception:                                        # noqa: BLE001
+        pass
+    return {"status": None, "detail": "dos: no reproduced crash (static ceiling)"}
+
+
+def _detonate_memory_rce(ctx, target, path) -> dict:
+    """Memory RCE path: reflect chain_primitive's leak->groom L3, or detonate it here keyed off the
+    strongest concrete write primitive. 'reflected' / 'detonated' / None. Never raises."""
     try:
         from ..db.dao import PocDAO
         if any(p.verified and (p.level or "") == "L3" for p in PocDAO(ctx.conn).list_by_target(target.id)):

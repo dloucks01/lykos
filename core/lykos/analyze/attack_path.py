@@ -118,7 +118,11 @@ def find_attack_path(findings, *, start=(REACH,), pocs=None) -> AttackPath:
             if fid not in best_level or _rank(lvl) > _rank(best_level[fid]):
                 best_level[fid] = lvl
 
-    # candidate finding edges (dedup by (cwe, function) -- one edge per distinct primitive)
+    # candidate finding edges (dedup by (cwe, function) -- one edge per distinct primitive). An
+    # edge's preconditions are REFINED per finding: a post-auth sink also requires AUTH, and a
+    # per-channel reach requirement (reach:<channel>) models a surface the attacker must first be
+    # on. So an unauthenticated attacker cannot use a post-auth write until an auth-bypass finding
+    # (or supplied credentials in `start`) grants AUTH -- the gate shows up in the path.
     cand = {}
     for f in findings:
         cwe = _get(f, "cwe")
@@ -126,6 +130,7 @@ def find_attack_path(findings, *, start=(REACH,), pocs=None) -> AttackPath:
         if edge is None:
             continue
         fn = _get(f, "function") or _get(f, "site_detail") or ""
+        edge = _refine_requires(edge, f)
         key = (cwe, fn)
         if key not in cand:
             cand[key] = (edge, f)
@@ -162,6 +167,42 @@ def find_attack_path(findings, *, start=(REACH,), pocs=None) -> AttackPath:
     path_steps = _steps_for(steps, objective) if objective else steps
     return AttackPath(objective=objective, reached=objective is not None,
                       steps=path_steps, gained_caps=frozenset(caps))
+
+
+import re as _re
+
+#: a function/title that reads as an authenticated/privileged context -> the sink is post-auth. The
+#: keyword is bounded by non-LETTERS (not \b) so it matches inside identifiers like
+#: `admin_update_handler` / `post_auth_read` where an underscore would defeat \b.
+_AUTH_CONTEXT = _re.compile(r"(?<![a-zA-Z])(?:authenticated|post[_-]?auth|logged[_-]?in|admin|"
+                            r"session|privileged)(?![a-zA-Z])", _re.I)
+#: CWEs that are themselves the auth bypass -- never gated behind auth.
+_AUTH_BYPASS_CWES = {"CWE-287", "CWE-306", "CWE-862", "CWE-863", "CWE-639", "CWE-284"}
+
+
+def _refine_requires(edge: "Edge", f) -> "Edge":
+    """Augment an edge's preconditions from the finding: an explicit `requires` list wins; else a
+    post-auth sink (an `auth_required`/`post_auth` flag, or an authenticated-context function/title)
+    requires AUTH; a `channel` field adds a reach:<channel> precondition. Auth-bypass CWEs are never
+    gated behind AUTH (they are how AUTH is obtained)."""
+    explicit = _get(f, "requires")
+    if explicit:
+        return Edge(frozenset(explicit), edge.gains, edge.label, edge.technique)
+    req = set(edge.requires)
+    cwe = (_get(f, "cwe") or "").strip()
+    chan = _get(f, "channel")
+    if chan:
+        req.add(f"reach:{chan}")
+    if cwe not in _AUTH_BYPASS_CWES:
+        if _get(f, "auth_required") or _get(f, "post_auth"):
+            req.add(AUTH)
+        else:
+            ctx = f"{_get(f, 'function') or ''} {_get(f, 'site_detail') or ''} {_get(f, 'title') or ''}"
+            if _AUTH_CONTEXT.search(ctx):
+                req.add(AUTH)
+    if req == set(edge.requires):
+        return edge
+    return Edge(frozenset(req), edge.gains, edge.label, edge.technique)
 
 
 _LEVEL_ORDER = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}

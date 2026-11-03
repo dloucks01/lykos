@@ -56,3 +56,53 @@ def test_format_path_renders_entry_and_objective():
 def test_no_findings_no_path():
     path = ap.find_attack_path([])
     assert not path.reached and path.steps == []
+
+
+# --- richer preconditions: auth gate + per-channel reach ---
+
+def test_post_auth_write_is_gated_without_auth():
+    """A write in an authenticated context is NOT usable by an unauthenticated attacker: without an
+    auth-bypass the path cannot gain `write`, so RCE is gated."""
+    findings = [{"cwe": "CWE-125", "function": "disclose", "id": "f1"},
+                {"cwe": "CWE-787", "function": "admin_update_handler", "id": "f2"}]
+    path = ap.find_attack_path(findings)
+    assert ap.WRITE not in path.gained_caps and not path.reached
+
+
+def test_auth_bypass_unlocks_post_auth_write_to_rce():
+    """An auth-bypass finding grants AUTH, which unlocks the post-auth write; combined with a leak
+    the full chain reaches RCE -- a genuine multi-vuln path (bypass -> leak -> write -> RCE)."""
+    findings = [{"cwe": "CWE-287", "function": "check_login", "id": "f0"},
+                {"cwe": "CWE-125", "function": "disclose", "id": "f1"},
+                {"cwe": "CWE-787", "function": "admin_update_handler", "id": "f2"}]
+    path = ap.find_attack_path(findings)
+    assert path.reached and path.objective == ap.RCE
+    assert ap.AUTH in path.gained_caps and ap.WRITE in path.gained_caps
+    cwes = [s.cwe for s in path.steps if s.cwe]
+    assert "CWE-287" in cwes   # the bypass is on the path
+
+
+def test_supplied_credentials_in_start_unlock_post_auth():
+    """When the attacker is given credentials (AUTH in the start set), a post-auth sink is reachable
+    without an in-band bypass."""
+    findings = [{"cwe": "CWE-125", "function": "disclose", "id": "f1"},
+                {"cwe": "CWE-787", "function": "admin_update_handler", "id": "f2"}]
+    path = ap.find_attack_path(findings, start=(ap.REACH, ap.AUTH))
+    assert path.reached and path.objective == ap.RCE
+
+
+def test_per_channel_reach_requirement():
+    """A finding on a channel the attacker is not yet on requires reach:<channel> first."""
+    findings = [{"cwe": "CWE-78", "function": "run", "id": "f1", "channel": "ipc"}]
+    gated = ap.find_attack_path(findings)                      # only generic reach
+    assert not gated.reached
+    on = ap.find_attack_path(findings, start=(ap.REACH, "reach:ipc"))
+    assert on.reached and on.objective == ap.CMD
+
+
+def test_explicit_requires_override():
+    """A finding can declare its own preconditions, overriding the defaults."""
+    findings = [{"cwe": "CWE-787", "function": "w", "id": "f1", "requires": [ap.REACH]},
+                {"cwe": "CWE-125", "function": "d", "id": "f2", "requires": [ap.REACH]}]
+    path = ap.find_attack_path(findings)
+    assert path.reached and path.objective == ap.RCE
