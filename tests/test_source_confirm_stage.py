@@ -137,6 +137,31 @@ def test_the_build_phase_shares_one_deadline_and_the_ladder_takes_what_remains(s
     assert ladder_kw[-1].get("deadline") is not None, "ladder must get a hard overall deadline"
 
 
+def test_in_surface_memory_findings_get_a_nonfuzzing_recipe(store):
+    """Non-fuzzing-first: an in-surface memory-corruption finding whose srctaint is NOT provably
+    strong (the FreeRDP case -- multi-layer flow) still earns a reachability-grounded recipe, so the
+    engagement carries a deliverable without any fuzzing. Off-surface findings do not."""
+    from types import SimpleNamespace
+    from lykos.analyze import source_confirm_stage as SC
+    from lykos.db.dao import FindingDAO, TargetDAO
+    c = store.cases.create("surf")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "d" * 64)
+    fd = FindingDAO(store.conn)
+    # a CWE-190 in a file ON the fuzzed surface, and a CWE-787 OFF it -- both merely `candidate`
+    fd.upsert(t.id, c.id, {"cwe": "CWE-190", "title": "int-overflow alloc", "severity": "medium",
+              "detector": "int_overflow", "state": "candidate", "confidence": 0.45,
+              "dedup_key": "io:on", "evidence": [{"channel": "source", "detail": "geometry.c:120: realloc()"}]})
+    fd.upsert(t.id, c.id, {"cwe": "CWE-787", "title": "oob write", "severity": "medium",
+              "detector": "oob_write", "state": "candidate", "confidence": 0.45,
+              "dedup_key": "ow:off", "evidence": [{"channel": "source", "detail": "buildtool.c:9: arr[i]="}]})
+    ctx = SimpleNamespace(conn=store.conn, put_artifact=lambda *a, **k: "x" * 64)
+    ranked = SC._rank_by_surface(ctx, t, {"geometry.c"})     # only geometry.c is on the surface
+    assert ranked["in_surface"] == 1 and ranked["off_surface"] == 1
+    assert ranked["surface_recipes"] == 1                    # the in-surface CWE-190, not the off one
+    recs = [f for f in fd.list_by_target(t.id) if f.detector == "surface_recipe"]
+    assert len(recs) == 1 and recs[0].cwe == "CWE-190" and recs[0].state == "corroborated"
+
+
 # ---- a confirmation is replayed against the binary that proved it ------------------------------
 def test_the_ladder_names_the_binary_each_rung_proved_on():
     from lykos.analyze.symbolic.directed_confirm import _rung_binary

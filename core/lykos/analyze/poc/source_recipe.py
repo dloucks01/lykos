@@ -114,17 +114,23 @@ def _prose(cwe: str, fn: str, arg_s: str, file: str, line: int, src: str) -> tup
 
 
 def file_source_recipe(ctx, target, *, cwe: str, fn: str, arg: str, file: str, line: int,
-                       taint: dict, lead=None) -> Optional[int]:
-    """File a corroborated source-level recipe for one tainted finding. `taint` is the data-flow
-    link dict ({"via","source"}) the scanner proved syntactically. `fn`/`arg` are the operation and
-    its subject (sink+argument, allocator+size, free/use+pointer). Returns the recipe id, or None."""
+                       taint: "dict | None", lead=None, grounded_note: "str | None" = None
+                       ) -> Optional[int]:
+    """File a corroborated source-level recipe for one finding. `taint` is the data-flow link dict
+    ({"via","source"}) the scanner proved syntactically -- or None when the grounding is NOT a
+    proven srctaint flow but a different one the caller states (e.g. the finding's file is compiled
+    into an in-tree fuzz harness, so the parser that reaches it processes attacker bytes). `fn`/`arg`
+    are the operation and its subject. Returns the recipe id, or None."""
     spec = _WEAPON.get(cwe if cwe != "CWE-415" else "CWE-416")
     if spec is None:
         return None
     payload, technique, level, mode = spec
     arg_s = " ".join((arg or "").split())[:60]
-    src = taint.get("source", "an untrusted source")
-    via = taint.get("via", "data flow")
+    # taint may be None (a reachability-grounded recipe, not a proven-flow one): fall back to the
+    # caller's grounding note rather than crashing on taint.get().
+    taint = taint or {}
+    src = taint.get("source") or grounded_note or "an attacker-reachable input"
+    via = taint.get("via", "reachability")
     summary, why, steps = _prose(cwe, fn, arg_s, file, line, src)
     return recipe.file_recipe(
         ctx, target, cwe=cwe, technique=technique, target_level=level, severity="high",

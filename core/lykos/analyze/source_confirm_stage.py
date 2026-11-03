@@ -210,20 +210,69 @@ def _attack_surface(harness_bins, lib_dirs) -> set:
     return files
 
 
+#: Per memory-corruption class, the non-fuzzing recipe technique + the rung it would reach. These
+#: are the classes for which a REACHABILITY-GROUNDED recipe is meaningful: the finding sits in a
+#: file compiled into an in-tree fuzz harness, so the parser that reaches it processes attacker
+#: bytes -- grounding the recipe even when srctaint cannot trace the multi-layer flow to the operand
+#: (which is why FreeRDP's CWE-190/787 sinks are reachable but not taint-"strong", so the
+#: strong-only source-recipe floor emitted nothing for them).
+_SURFACE_REC = {
+    "CWE-190": ("integer-overflow allocation -> undersized buffer -> heap overflow", "L2"),
+    "CWE-787": ("out-of-bounds write (saved-pointer / adjacent-object overwrite)", "L2"),
+    "CWE-122": ("heap buffer overflow (adjacent chunk / allocator-metadata overwrite)", "L2"),
+    "CWE-121": ("stack buffer overflow (saved-return overwrite)", "L2"),
+    "CWE-120": ("unbounded copy -> buffer overflow", "L2"),
+    "CWE-129": ("unchecked array index -> out-of-bounds read/write", "L2"),
+    "CWE-125": ("out-of-bounds read -> information disclosure", "L1"),
+    "CWE-416": ("use-after-free -> controlled reclaimed object", "L2"),
+    "CWE-415": ("double free -> allocator-metadata corruption", "L2"),
+}
+
+
+def _surface_recipe(ctx, target, cwe: str, file: str, line: int) -> bool:
+    """File a NON-FUZZING, reachability-grounded exploitation recipe for an in-surface
+    memory-corruption finding -- a deliverable the operator carries, grounded by the fact the sink
+    is compiled into an in-tree fuzz harness (so it processes attacker bytes), independent of
+    whether srctaint proved the flow. Corroborated, never a verified PoC, so it inflates nothing.
+    Returns True when a recipe was filed."""
+    spec = _SURFACE_REC.get(cwe)
+    if not spec:
+        return False
+    tech, lvl = spec
+    from .poc import recipe
+    fid = recipe.file_recipe(
+        ctx, target, cwe=cwe, technique=tech, target_level=lvl, severity="high",
+        detector="surface_recipe", dedup_key=f"recipe:{cwe}:surface:{file}:{line}",
+        title=f"Exploitation recipe (attacker-reachable): {tech} at {file}:{line}",
+        summary=(f"{cwe} at {file}:{line} is in a file compiled into an in-tree fuzz harness, so the "
+                 f"parser reaching it processes attacker-controlled bytes: {tech}. Grounded by "
+                 "attack-surface reachability (not a proven srctaint flow)."),
+        why_not_executed=("static source + attack-surface reachability; no crash reproduced in this "
+                          "slice -- the exact primitive/offset needs the confirmed crash the "
+                          "confirmation ladder produces when given budget"),
+        steps=[f"drive the in-tree harness whose parser reaches {file}:{line} to an input that hits it",
+               "confirm the fault under ASan (the ladder: template / concolic / reach-gated fuzz)",
+               f"weaponize the confirmed primitive to its class impact ({tech})"],
+        grounded=True,
+        missing_technique=("an input that reaches this sink through the harness (the ladder), then "
+                           "the class weaponizer on the confirmed crash"))
+    return fid is not None
+
+
 def _rank_by_surface(ctx, target, surface) -> dict:
     """Annotate the static source findings + recipes by whether their file is on the fuzzed attack
     surface. IN-surface findings are boosted (more actionable: the fuzzer actually exercises that
     file) and annotated; OUT-of-surface ones are annotated only -- never hidden or penalised, so a
     real bug off the fuzzed path is still reported, just lower in the ranking. Returns counts."""
     fd = FindingDAO(ctx.conn)
-    inc = outc = 0
+    inc = outc = recs = 0
     for f in fd.list_by_target(target.id):
         if f.detector not in _RANKABLE_DETECTORS:
             continue
-        base = None
+        base, fp, ln = None, None, None
         for e in (f.evidence or []):
             if e.get("channel") in ("source", "recipe-source"):
-                fp, _ = _parse_loc(e.get("detail"))
+                fp, ln = _parse_loc(e.get("detail"))
                 if fp:
                     base = os.path.basename(fp)
                     break
@@ -234,6 +283,12 @@ def _rank_by_surface(ctx, target, surface) -> dict:
             inc += 1
             detail = "on the fuzzed attack surface (its file is compiled into an in-tree fuzz harness)"
             newconf = min(0.9, (f.confidence or 0.0) + 0.15)
+            # NON-FUZZING deliverable: an in-surface memory-corruption finding that has not been
+            # confirmed gets a reachability-grounded recipe, so the engagement carries a concrete
+            # artifact for it even when no fuzzing reproduced it (the non-fuzzing-first rule).
+            if (f.cwe in _SURFACE_REC and ln and f.state not in ("confirmed", "poc-backed")
+                    and _surface_recipe(ctx, target, f.cwe, base, ln)):
+                recs += 1
         else:
             outc += 1
             detail = ("off the fuzzed attack surface (its file is not compiled into any in-tree fuzz "
@@ -245,7 +300,7 @@ def _rank_by_surface(ctx, target, surface) -> dict:
             "detector": f.detector, "dedup_key": f.dedup_key, "state": f.state,
             "confidence": newconf, "channel": "attack-surface",
             "evidence": [{"channel": "attack-surface", "detail": detail}]})
-    return {"in_surface": inc, "off_surface": outc}
+    return {"in_surface": inc, "off_surface": outc, "surface_recipes": recs}
 
 
 def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> int:
