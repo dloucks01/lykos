@@ -59,7 +59,7 @@ def _bounded(body: str, var: str, use_pos: int) -> bool:
     pre = body[:use_pos]
     # the standard length guard, OR any custom helper whose name says it checks a length/bound and
     # names this var (e.g. license_check_stream_length(.., cbScope, ..)) -- parsers wrap their checks.
-    if re.search(r"(?:CheckAndLogRequiredLength(?:OfSize)?|_check_\w*length|check_stream_length|"
+    if re.search(r"(?:CheckAndLogRequiredLength\\w*|_check_\w*length|check_stream_length|"
                  r"RequiredLength|_ensure_\w*|_validate_\w*)\s*\([^;]*\b" + re.escape(base) + r"\b", pre):
         return True
     # an explicit comparison guard on the var that returns/breaks/gotos (incl. `>= CONST`)
