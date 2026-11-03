@@ -180,6 +180,35 @@ def _file_confirmed(ctx, target, fn: str, res: dict, *, from_uc: bool = False,
     return _crossref_static(ctx, target, src_line, cwe, input_sha, f"synth:{fn}")
 
 
+def _file_dos(ctx, target, fn: str, res: dict, *, driver_sha: str | None = None) -> int:
+    """Capability #1 -- file a confirmed remote-DoS PoC (CWE-617 reachable assertion / CWE-248
+    uncaught fatal crash) from a synthesized driver. A reachable assertion driven by attacker bytes
+    terminates the process: a real, reproducible denial of service, weaker than memory corruption
+    but a genuine finding with a concrete input and a passing empty-input negative control. Filed
+    poc-backed at medium (DoS, not RCE)."""
+    cwe = res.get("dos_class") or "CWE-248"
+    title = ("reachable assertion -> abort (remote DoS)" if cwe == "CWE-617"
+             else "uncaught fatal signal (remote DoS)")
+    input_sha = ctx.put_artifact("synth-confirm-input", data=res.get("input") or b"")
+    detail = (f"proven via a SYNTHESIZED driver for {fn}(): a concrete input drove a {cwe} "
+              f"process-terminating fault ({title}), reproduced with a passing empty-input negative "
+              f"control (input {input_sha[:12]}). Denial of service, not memory corruption; the "
+              f"driver calls {fn}() with attacker-controlled input and reachability from a specific "
+              f"caller is not separately proven here.")
+    FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        "cwe": cwe, "title": f"{title} (confirmed via synthesized driver for {fn})",
+        "severity": "medium", "detector": TOOL, "state": "poc-backed", "confidence": 0.85,
+        "dedup_key": f"{cwe}:synth_confirm_dos:{fn}", "site_detail": fn,
+        "evidence": [{"channel": "dynamic-confirm", "detail": detail}]})
+    DynResultDAO(ctx.conn).insert(
+        target.id, target.case_id, input_sha=input_sha, input_mode="file", argv=["@@"],
+        crashed=True, signal_name=cwe,
+        isolation=(f"libfuzzer/{driver_sha[:12]}" if driver_sha else f"synth_confirm/{fn}"),
+        defect_key=f"synth_confirm_dos:{fn}",
+        note=f"synthesized-driver DoS confirmation: {title}")
+    return 1
+
+
 def synth_confirm_stage(ctx) -> dict:
     from . import libfuzzer as LF
     from .symbolic import directed_confirm as DC
@@ -210,7 +239,7 @@ def synth_confirm_stage(ctx) -> dict:
     from .symbolic import dwarfline
     per = max(30, int(budget / max(1, len(cands))))
     input_size = int(p.get("input_size") or 4096)
-    synthesized = confirmed = upgraded = stream_synth = 0
+    synthesized = confirmed = upgraded = stream_synth = dos_confirmed = 0
     # STREAM-AWARE fallback (driver_synth): a protocol/format parser reads attacker bytes through a
     # project STREAM object and writes an opaque context -- a signature the plain (buf,size)
     # synthesizer rejects, so those parsers never reach a confirmation rung. Detect the project's
@@ -272,11 +301,7 @@ def synth_confirm_stage(ctx) -> dict:
                    "targets": targets or None, "seeds": [b"A" * 64]}
         attempts: list = []
         proven = DC.confirm_ladder([harness], timeout_per=per, ctx=ctx, attempts_out=attempts)
-        if proven:
-            res = proven[0]
-            confirmed += 1
-            # KEEP THE DRIVER: it is half the reproducer (see libfuzzer_stage) -- the ASan build every
-            # rung replayed the proving input against.
+        for res in proven:
             driver_sha = None
             try:
                 driver_sha = ctx.put_artifact(
@@ -285,6 +310,17 @@ def synth_confirm_stage(ctx) -> dict:
                           "entry": f"{fn}()", "synthesized": True})
             except Exception:                                # noqa: BLE001 -- the finding still stands
                 driver_sha = None
+            if res.get("impact") == "dos":
+                # Capability #1 DoS lane: a reachable assertion / fatal signal is a confirmed remote
+                # DoS PoC (CWE-617/248), not memory corruption -- filed poc-backed at medium.
+                dos_confirmed += 1
+                upgraded += _file_dos(ctx, target, fn, res, driver_sha=driver_sha)
+                ctx.progress(msg=f"CONFIRMED (DoS {res.get('dos_class')}) via synthesized driver "
+                                 f"for {fn}()")
+                continue
+            confirmed += 1
+            # KEEP THE DRIVER: it is half the reproducer (see libfuzzer_stage) -- the ASan build every
+            # rung replayed the proving input against.
             upgraded += _file_confirmed(ctx, target, fn, res, from_uc=fn in uc_fns,
                                         driver_sha=driver_sha)
             ctx.progress(msg=f"CONFIRMED via synthesized driver ({res.get('rung')}): "
@@ -292,7 +328,7 @@ def synth_confirm_stage(ctx) -> dict:
     ctx.emit("synth_confirm.done", payload={"supported": True, "candidates": len(cands),
              "synthesized": synthesized, "stream_synth": stream_synth,
              "stream_idiom": idiom.name if idiom else None,
-             "confirmed": confirmed, "upgraded": upgraded})
+             "confirmed": confirmed, "dos_confirmed": dos_confirmed, "upgraded": upgraded})
     ctx.progress(pct=100, msg=f"synth drivers: {synthesized} built "
                  f"({stream_synth} stream-aware), {confirmed} confirmed")
     return {"metrics": {"supported": True, "synthesized": synthesized,

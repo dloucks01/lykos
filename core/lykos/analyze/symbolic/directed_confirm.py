@@ -68,6 +68,32 @@ def _memory_fault(rep: str, cls: dict | None) -> bool:
     return True
 
 
+#: A crash that is a DENIAL OF SERVICE, not memory corruption: a reachable assertion/abort, an
+#: unhandled fatal signal, or a libFuzzer "deadly signal" with no memory-error banner. A reachable
+#: WINPR_ASSERT (or libc assert / __stack_chk_fail / abort) driven by attacker input terminates the
+#: process -- a real remote DoS (CWE-617 reachable assertion) whose reproducer is the input. This is
+#: the SECOND confirmation lane: the thing `_memory_fault` deliberately rejects is itself a valid
+#: (lower-severity) finding, so it must not be thrown away -- it is captured here instead.
+_DOS_SIGNAL = re.compile(
+    r"\bSIGABRT\b|\bSIGSEGV\b|\bSIGFPE\b|\bSIGILL\b|\bSIGBUS\b|"
+    r"libFuzzer: deadly signal|runtime error:|ERROR: libFuzzer: timeout|"
+    r"__stack_chk_fail|stack smashing detected")
+
+
+def _dos_class(rep: str) -> "str | None":
+    """Classify a non-memory-safety crash as a DoS, or None. A reachable assertion/abort is the
+    common FreeRDP case (always-on WINPR_ASSERT) and maps to CWE-617; a bare fatal signal maps to
+    CWE-248 (uncaught exception / crash). Returns the CWE string, or None when the report shows no
+    process-terminating fault. Memory-safety faults are NOT reported here -- they belong to
+    `_memory_fault` (the stronger finding), so callers check that first."""
+    rep = rep or ""
+    if _ASSERT_ABORT.search(rep):
+        return "CWE-617"                                 # reachable assertion -> abort
+    if _DOS_SIGNAL.search(rep):
+        return "CWE-248"                                 # uncaught fatal signal / crash
+    return None
+
+
 def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -> dict:
     """Run the ASan harness on one input (as libFuzzer's single-file replay) and report the fault.
     Returns {faulted, report, source, cls}."""
@@ -98,8 +124,12 @@ def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -
     # a verbose-assert project trips on malformed input by design). The return code alone is NOT
     # trusted -- libFuzzer exits non-zero for benign reasons too. See `_memory_fault`.
     faulted = _memory_fault(rep, cls)
+    # DoS lane: a non-memory crash (reachable assertion / fatal signal) is still a real fault --
+    # captured so the DoS confirmation rung can turn it into a CWE-617/248 PoC. Memory faults take
+    # precedence (the stronger finding), so `dos` is reported only when it is NOT a memory fault.
+    dos = None if faulted else _dos_class(rep)
     return {"faulted": faulted, "report": rep, "source": cls.get("source"),
-            "cls": cls.get("class") or cls.get("cwe")}
+            "cls": cls.get("class") or cls.get("cwe"), "dos": dos}
 
 
 def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFuzzerTestOneInput",
@@ -275,7 +305,8 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
     empty-input negative control. Returns the concolic_confirm result shape with rung="smart-fuzz"."""
     from ..libfuzzer import run_libfuzzer
     out = {"confirmed": False, "input": None, "report": None, "source": None, "class": None,
-           "rung": "smart-fuzz", "reason": None, "execs": 0}
+           "rung": "smart-fuzz", "reason": None, "execs": 0,
+           "confirmed_dos": False, "dos_class": None, "impact": None}
     own_wd = workdir is None
     wd = Path(tempfile.mkdtemp(prefix="lykos-sf-")) if own_wd else Path(workdir)
     try:
@@ -284,11 +315,16 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
                             corpus=corpus, lib_dirs=lib_dirs)
         out["execs"] = int(res.get("execs") or 0)            # honest telemetry: did the harness run?
         from ..debug.rootcause import parse_asan_report
+        dos_cand = None                                      # first DoS crash, used only if no mem fault
         for cr in res.get("crashes", []):
             rep = cr.get("report") or ""
             cls = parse_asan_report(rep) or {}
             if not _memory_fault(rep, cls):
-                continue                                     # oom/timeout/assert-abort, not a mem fault
+                if dos_cand is None:                         # DoS lane: keep the first reachable abort/
+                    dcw = _dos_class(rep)                    # signal as a fallback (memory wins if found)
+                    if dcw:
+                        dos_cand = (cr.get("input"), rep, dcw)
+                continue                                     # not a mem fault; try next crash
             neg = _asan_replay(fuzz_binary, b"", lib_dirs, timeout=min(30.0, timeout))
             if neg["faulted"]:
                 out["reason"] = "negative control (empty input) also faulted -- not attributable"
@@ -296,6 +332,17 @@ def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096
             out.update(confirmed=True, input=cr.get("input"), report=rep, source=cls.get("source"))
             out["class"] = cls.get("class") or cls.get("cwe")
             return out
+        # No memory fault, but a reachable assertion / fatal signal -> a confirmed DoS (CWE-617/248),
+        # gated by the same negative control: the empty input must NOT also DoS, so the crash is
+        # attributable to the fuzzed bytes rather than a broken harness.
+        if dos_cand is not None:
+            neg = _asan_replay(fuzz_binary, b"", lib_dirs, timeout=min(30.0, timeout))
+            if not neg["faulted"] and not neg.get("dos"):
+                out.update(confirmed_dos=True, input=dos_cand[0], report=dos_cand[1],
+                           dos_class=dos_cand[2], impact="dos")
+                out["reason"] = f"reachable {dos_cand[2]} (remote DoS); no memory-safety fault"
+                return out
+            out["reason"] = "DoS crash but the negative control also crashed -- not attributable"
         # Distinguish "ran and found nothing" from "could not launch the harness" -- 0 executions
         # means the binary never fuzzed (a run/link problem), which must NOT read as a clean no-find.
         if out["execs"] <= 1:
@@ -363,6 +410,7 @@ def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=
             r = r or {"confirmed": False, "rung": "?", "skipped": True, "reason": "no result"}
             if attempts_out is not None:
                 outcome = ("confirmed" if r.get("confirmed") else
+                           "confirmed-dos" if r.get("confirmed_dos") else
                            "error" if r.get("error") else
                            "skipped" if r.get("skipped") else "no-confirm")
                 rec = {"harness": h.get("name"), "rung": r.get("rung", "?"), "outcome": outcome,
@@ -383,6 +431,18 @@ def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=
                             "binary": _rung_binary(h, r.get("rung")),
                             "lib_dirs": list(h.get("lib_dirs") or [])})
                 break
+            if r.get("confirmed_dos"):
+                # The DoS lane: a reachable assertion / fatal signal. A weaker finding than a memory
+                # fault, so it never short-circuits the ladder (a later rung may still find memory
+                # corruption), but it IS collected as a confirmed CWE-617/248 PoC, deduped per
+                # (harness, dos_class).
+                dkey = ("dos", h.get("name"), r.get("dos_class"))
+                if dkey not in seen:
+                    seen.add(dkey)
+                    out.append({"harness": h.get("name"), **r,
+                                "binary": _rung_binary(h, r.get("rung")),
+                                "lib_dirs": list(h.get("lib_dirs") or [])})
+                # do not break: keep trying rungs for a stronger (memory) confirmation
     return out
 
 
