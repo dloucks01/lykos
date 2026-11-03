@@ -35,3 +35,10 @@ def test_alternate_path_stages_still_exist():
     # keep the allowlist honest: every allowlisted name must still be a real registered stage.
     names = {s.name for s in stages.STAGES}
     assert _ALTERNATE_PATH <= names, f"stale allowlist entries: {_ALTERNATE_PATH - names}"
+
+
+def test_offline_finalizers_always_run():
+    """coverage_sweep + triage must be budget-exempt finalizers (skipping them discards the run's
+    accounting). Guards the _ALWAYS_RUN set."""
+    from lykos.analyze import orchestrate
+    assert {"coverage_sweep", "triage"} <= orchestrate._ALWAYS_RUN

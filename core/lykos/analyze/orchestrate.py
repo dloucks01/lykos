@@ -650,6 +650,11 @@ _WORKER_MARGIN = 1.25
 #: Stages whose own default caps EXECUTIONS as well as time. The count is a runaway guard, not
 #: a campaign size -- see budget.EXEC_CEILING.
 _EXEC_BOUNDED = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz"})
+#: Cheap, offline, pure-bookkeeping finalizers that MUST run regardless of remaining budget -- the
+#: coverage ledger (completeness proof) and triage (the resolved disposition for every finding). They
+#: are the point of the run's accounting; skipping them for budget would discard it. ~7s each, no
+#: execution. Exempted from the budget-slice skip (given a small guaranteed slice).
+_ALWAYS_RUN = frozenset({"coverage_sweep", "triage"})
 
 
 def _run_target_stage(store, target, stage, status, stop, params=None, *,
@@ -670,6 +675,10 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
     secs = None
     if budget is not None:
         secs = budget.slice(stage, want, want_execs=want_execs)
+        if secs <= 0.0 and stage in _ALWAYS_RUN:
+            # a cheap offline finalizer (coverage ledger / triage): run it anyway on a small fixed
+            # slice -- the run's accounting depends on it, and it does no execution.
+            secs = max(want or 10.0, 10.0)
         if secs <= 0.0:
             # Saying this is the point: "we ran out of time before this stage" and "this stage
             # found nothing" are different outcomes that used to look identical in a report.
