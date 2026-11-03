@@ -195,6 +195,24 @@ def menuspec_from_opmodel(model: dict) -> MenuSpec:
     )
 
 
+#: the straight-line (no-menu) op-model: the target self-allocates the overflow buffer and the victim
+#: object and self-triggers the call around a SINGLE input read, so the only driven op is the raw
+#: overflow write. This is the common real shape (read(0,buf,N) then obj->fp()) and needs NO analyst
+#: op templates -- discovery uses it directly.
+STRAIGHTLINE_OPMODEL = {"alloc_buf": {}, "alloc_obj": {}, "edit_buf": {"data": True}, "trigger": {}}
+
+
+def tcache_buf_requests(max_request: int = 512) -> list:
+    """Candidate overflow-buffer request sizes -- one (smallest) request per distinct tcache size
+    class up to `max_request`. The bounded search space for the groom distance when the overflowed
+    buffer's allocation size is not known statically; the sound detonation oracle confirms the right
+    one (a wrong distance simply does not reach win), so this never manufactures a hit."""
+    seen: dict = {}
+    for req in range(1, max_request + 1):
+        seen.setdefault(request2size(req), req)
+    return [seen[s] for s in sorted(seen)]
+
+
 def try_leak_groom(exe: str, *, buf_request: int, win_off: int, target_bytes: bytes,
                    opmodel: dict, obj_fptr_off: int = 0, argv: Optional[list] = None,
                    timeout: float = 12.0) -> bool:

@@ -249,7 +249,7 @@ def chain_primitive_stage(ctx) -> dict:
     # function pointer with the runtime win (defeating ASLR via the disclosed pointer). Fires when
     # the groom op-model is available (analyst params today; victim-fptr op-model discovery is the
     # named next step); on success files a poc-backed L3 and this function is done.
-    if vclass == "oob_write" and pie and ctx.params.get("lg_opmodel"):
+    if pie and vclass in ("oob_write", "heap_overflow"):
         lg = _leak_groom_chain(ctx, target, target_bytes, lead, win, ctx.params)
         if lg:
             ctx.progress(pct=100, msg="leak->groom->control: L3 confirmed (ASLR defeated)")
@@ -1823,38 +1823,69 @@ def _leak_groom_chain(ctx, target, target_bytes, lead, win, p):
     target that discloses a pointer, compose the adjacent-overflow groom with the PIE two-stage leak
     oracle (heap_groom.try_leak_groom): overwrite the adjacent victim's function pointer with the
     runtime win, confirmed by an INT3 oracle + negative control. Fires only when the groom op-model
-    is available -- an analyst-supplied declarative op-model (params.lg_opmodel + lg_buf_request;
-    optional lg_win_off / lg_obj_fptr_off) today; op-model DISCOVERY for the victim-fptr object is
-    the named next step. Returns a result dict on a confirmed L3, else None (caller falls through to
-    the recipe path, which names the missing op-model)."""
-    opmodel = p.get("lg_opmodel")
-    buf_request = p.get("lg_buf_request")
-    if not opmodel or not buf_request:
-        return None
+    is available. Two sources, in order: (1) an analyst-supplied declarative op-model
+    (params.lg_opmodel + lg_buf_request); (2) AUTO-DISCOVERY for the common straight-line shape --
+    a heap_fptr_call (CWE-822) finding gives the victim's function-pointer offset, the target
+    self-allocates+self-triggers around one input read (STRAIGHTLINE_OPMODEL), and the overflow
+    buffer's request size is found by a bounded sweep the sound oracle confirms. Optional overrides:
+    lg_win_off / lg_obj_fptr_off. Returns a result dict on a confirmed L3, else None."""
+    from . import heap_groom
     win_off = p.get("lg_win_off")
     win_name = "win"
     if win_off is None and win is not None:
         win_name, win_off = win[0], win[1]
     if win_off is None:
         return None
-    obj_off = int(p.get("lg_obj_fptr_off", 0))
+
+    opmodel = p.get("lg_opmodel")
+    if opmodel and p.get("lg_buf_request"):
+        obj_off = int(p.get("lg_obj_fptr_off", 0))
+        candidates = [int(p["lg_buf_request"])]            # analyst path: the exact size
+    else:
+        # AUTO-DISCOVERY: the straight-line heap-overflow -> fptr -> call shape. Needs a heap_fptr
+        # call site to give the victim object's function-pointer offset; without one there is no
+        # inline fptr to groom onto, so decline (not this technique).
+        obj_off = _discover_fptr_offset(ctx, target, lead)
+        if obj_off is None:
+            return None
+        opmodel = heap_groom.STRAIGHTLINE_OPMODEL
+        candidates = ([int(p["lg_buf_request"])] if p.get("lg_buf_request")
+                      else heap_groom.tcache_buf_requests())
+        obj_off = int(p.get("lg_obj_fptr_off", obj_off))
+
     try:
-        from . import heap_groom
         wd = ctx.scratch() / "leakgroom"
         wd.mkdir(parents=True, exist_ok=True)
         exe = wd / "target"
         ctx.content.stage_target(target, exe.parent, exe.name)
         os.chmod(exe, 0o755)
-        ok = heap_groom.try_leak_groom(str(exe), buf_request=int(buf_request), win_off=int(win_off),
-                                       target_bytes=target_bytes, opmodel=opmodel,
-                                       obj_fptr_off=obj_off)
+        for br in candidates:                              # sweep; the oracle confirms the real one
+            if heap_groom.try_leak_groom(str(exe), buf_request=br, win_off=int(win_off),
+                                         target_bytes=target_bytes, opmodel=opmodel,
+                                         obj_fptr_off=obj_off):
+                return _file_leak_groom_l3(ctx, target, lead, win_name=win_name,
+                                           win_off=int(win_off), obj_off=obj_off, buf_request=br)
     except Exception:                                        # noqa: BLE001 -- best-effort; never sink the stage
         _log.debug("leak-groom chain errored", exc_info=True)
-        return None
-    if not ok:
-        return None
-    return _file_leak_groom_l3(ctx, target, lead, win_name=win_name, win_off=int(win_off),
-                               obj_off=obj_off, buf_request=int(buf_request))
+    return None
+
+
+def _discover_fptr_offset(ctx, target, lead):
+    """The victim object's function-pointer offset for the groom, discovered from a heap_fptr_call
+    (CWE-822) finding -- `call [reg+off]` where reg is a heap object. Returns the integer offset
+    (0 when the call is through [reg] with no displacement), or None when no such site was found."""
+    from ...db.dao import FindingDAO
+    cands = [lead] if (lead and (lead.detector == "heap_fptr_call" or lead.cwe == "CWE-822")) else []
+    cands += [f for f in FindingDAO(ctx.conn).list_by_target(target.id)
+              if f.detector == "heap_fptr_call" or f.cwe == "CWE-822"]
+    for f in cands:
+        for ev in (f.evidence or []):
+            m = re.search(r"\b\w+\s*\+\s*0x([0-9a-fA-F]+)", (ev.get("detail") or ""))
+            if m:
+                return int(m.group(1), 16)
+        if cands:                                          # a call through [reg] with no displacement
+            return 0
+    return None
 
 
 def _file_leak_groom_l3(ctx, target, lead, *, win_name, win_off, obj_off, buf_request):
