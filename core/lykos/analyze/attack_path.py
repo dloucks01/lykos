@@ -69,9 +69,12 @@ _e(["CWE-369", "CWE-617", "CWE-400", "CWE-401", "CWE-476", "CWE-835"], [REACH], 
 _TECH_EDGES = [
     Edge(frozenset([WRITE, LEAK]), frozenset([PC]), "overwrite a code pointer with a leaked address",
          technique=True),
-    Edge(frozenset([WRITE, AUTH]), frozenset([PC]), "privileged write -> code-pointer overwrite",
-         technique=True),
     Edge(frozenset([PC]), frozenset([RCE]), "PC control -> shell/ROP (RCE)", technique=True),
+    # DATA-ORIENTED (DOP): a write need not hijack control flow -- overwriting a security-decision
+    # variable makes the program's OWN code take the privileged path. CFI-immune and LEAK-free, so a
+    # write primitive can reach AUTH (unlocking post-auth sinks) with no gadget and no disclosure.
+    Edge(frozenset([WRITE]), frozenset([AUTH]),
+         "data-only: overwrite a security-decision variable (DOP) -> privileged state", technique=True),
 ]
 
 
@@ -84,6 +87,7 @@ class Step:
     function: "str | None"
     level: "str | None"      # best PoC rung backing the finding edge (L0..L3), if any
     technique: bool
+    requires: tuple = ()     # capabilities this step consumed (for the backward slice)
 
 
 @dataclass
@@ -150,7 +154,8 @@ def find_attack_path(findings, *, start=(REACH,), pocs=None) -> AttackPath:
                 fid = _get(f, "id")
                 steps.append(Step(gained=tuple(sorted(new)), label=edge.label, cwe=cwe,
                                   finding_id=fid, function=fn or None,
-                                  level=best_level.get(fid), technique=False))
+                                  level=best_level.get(fid), technique=False,
+                                  requires=tuple(sorted(edge.requires))))
                 progress = True
         # technique edges
         for edge in _TECH_EDGES:
@@ -158,7 +163,8 @@ def find_attack_path(findings, *, start=(REACH,), pocs=None) -> AttackPath:
                 new = edge.gains - caps
                 caps |= edge.gains
                 steps.append(Step(gained=tuple(sorted(new)), label=edge.label, cwe=None,
-                                  finding_id=None, function=None, level=None, technique=True))
+                                  finding_id=None, function=None, level=None, technique=True,
+                                  requires=tuple(sorted(edge.requires))))
                 progress = True
 
     reached = [o for o in _OBJECTIVES if o in caps]
@@ -213,19 +219,16 @@ def _rank(lvl):
 
 
 def _steps_for(steps, objective):
-    """Backward slice: keep the steps whose gained capabilities are needed to reach `objective`,
-    following technique-edge prerequisites back to the finding edges that supply them."""
+    """Backward slice: keep only the steps on the path to `objective`. Walk the steps in reverse,
+    keep any that produced a currently-needed capability, and add that step's own preconditions
+    (`requires`) to the need set -- so the edges that supplied a kept step's prerequisites (an
+    auth-bypass feeding a post-auth write, a DOP write->auth feeding a post-auth sink) are kept too."""
     need = {objective}
     keep = []
     for st in reversed(steps):
         if set(st.gained) & need:
             keep.append(st)
-            # a technique step needs its prerequisite capabilities; approximate by re-adding all
-            # non-objective capabilities it consumed (the fixpoint guarantees they were produced).
-            for e in _TECH_EDGES:
-                if set(e.gains) & set(st.gained):
-                    need |= set(e.requires)
-            need |= {c for c in st.gained if c not in _OBJ_RANK}
+            need |= set(st.requires)
     return list(reversed(keep))
 
 

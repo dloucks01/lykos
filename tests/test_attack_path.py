@@ -106,3 +106,18 @@ def test_explicit_requires_override():
                 {"cwe": "CWE-125", "function": "d", "id": "f2", "requires": [ap.REACH]}]
     path = ap.find_attack_path(findings)
     assert path.reached and path.objective == ap.RCE
+
+
+def test_dop_write_unlocks_post_auth_data_only():
+    """DOP novel edge: a write primitive unlocks a post-auth sink via a data-only flag flip (no
+    leak, no PC control). A post-auth command-injection becomes reachable once a write exists."""
+    findings = [{"cwe": "CWE-787", "function": "overflow", "id": "w"},
+                {"cwe": "CWE-78", "function": "admin_exec", "id": "c"}]   # cmd sink is post-auth
+    # without any write, the post-auth cmd sink is gated:
+    gated = ap.find_attack_path([{"cwe": "CWE-78", "function": "admin_exec", "id": "c"}])
+    assert not gated.reached
+    # with a write, the DOP edge grants AUTH data-only -> the post-auth cmd sink is reachable:
+    path = ap.find_attack_path(findings)
+    assert path.reached and path.objective == ap.CMD
+    assert ap.AUTH in path.gained_caps
+    assert any(s.technique and "data-only" in s.label for s in path.steps)
