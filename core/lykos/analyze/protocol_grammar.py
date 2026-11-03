@@ -17,8 +17,11 @@ from __future__ import annotations
 import re
 import struct
 
-#: `Stream_Read_UINT<W>(s, var)` and `Stream_Read_INT<W>` -> a fixed-width little-endian field.
-_READ_INT = re.compile(r"\bStream_Read_U?INT(8|16|32|64)\s*\(\s*\w+\s*,\s*([A-Za-z_]\w*)")
+#: `Stream_Read_UINT<W>(s, var)` and `Stream_Read_INT<W>` -> a fixed-width little-endian field. The
+#: destination may be a struct member (`pdu.bitmapDataLength`, `hdr->len`), so the whole dotted/arrow
+#: name is captured -- otherwise `pdu.surfaceId` and `pdu.bitmapDataLength` both collapse to `pdu`,
+#: making distinct fields indistinguishable and a per-field override impossible.
+_READ_INT = re.compile(r"\bStream_Read_U?INT(8|16|32|64)\s*\(\s*\w+\s*,\s*([A-Za-z_][\w.\->]*)")
 #: `Stream_Read(s, dst, len)` -> a variable blob whose length is the 3rd argument (a prior field).
 _READ_BLOB = re.compile(r"\bStream_Read\s*\(\s*\w+\s*,\s*[^,]+,\s*([^)]+)\)")
 #: `Stream_Seek_UINT<W>(s)` / `Stream_Seek(s, n)` -> skipped (reserved/ignored) bytes.
