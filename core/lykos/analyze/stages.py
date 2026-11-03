@@ -71,6 +71,10 @@ STAGES: tuple[StageSpec, ...] = (
               "..analyze.wire_flow_stage", "enqueue_wire_flow", no_params=True),
     StageSpec("param_sink", "Interprocedural wire -> param-sink flow", "target",
               "..analyze.param_sink_stage", "enqueue_param_sink", no_params=True),
+    StageSpec("lifecycle_scan", "Use-after-free / double-free (type-state)", "target",
+              "..analyze.lifecycle_stage", "enqueue_lifecycle_scan", no_params=True),
+    StageSpec("intwidth_scan", "Integer signedness/width misuse", "target",
+              "..analyze.intwidth_stage", "enqueue_intwidth_scan", no_params=True),
     StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
               "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
               on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "

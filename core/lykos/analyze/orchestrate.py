@@ -2344,6 +2344,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # interprocedural param-sink flows (depth): catches cross-function wire->sink
                 # bugs the intraprocedural detectors miss (the DSP divide-by-zero class); precise.
                 _staged(bud, store, t, "param_sink", status, stop, want=15.0)
+                _staged(bud, store, t, "lifecycle_scan", status, stop, want=15.0)
+                _staged(bud, store, t, "intwidth_scan", status, stop, want=15.0)
                 # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
                 # 10-20 min and would starve the core sequence under a bounded budget (observed:
                 # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it
