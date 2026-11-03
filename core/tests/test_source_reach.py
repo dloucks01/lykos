@@ -15,3 +15,13 @@ def test_name_based_entry(tmp_path):
     (tmp_path/"b.c").write_text('int foo_recv(void){ return bar(); }\nint bar(void){return 0;}\n')
     reach,_,entries = source_reach.reachable_from_wire(str(tmp_path))
     assert "foo_recv" in entries and "bar" in reach
+
+
+def test_callback_registered_fn_is_entry(tmp_path):
+    (tmp_path/"cb.c").write_text(
+        'static int audin_receive_formats(void* c){ return helper2(); }\n'
+        'static int helper2(void){ return 0; }\n'
+        'void setup(ctx* c){ c->ReceiveFormats = audin_receive_formats; }\n')
+    reach,_a,entries = source_reach.reachable_from_wire(str(tmp_path))
+    assert "audin_receive_formats" in entries   # wired into a callback table -> indirect entry
+    assert "helper2" in reach                    # and its callees are reachable

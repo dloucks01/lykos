@@ -42,6 +42,7 @@ def build_call_graph(root: str) -> "tuple[dict, set]":
     Over-approximate (name-based callee resolution, generous entries)."""
     adj: dict = {}
     entries: set = set()
+    registered: set = set()                              # functions wired into a callback table
     for dp, _d, files in os.walk(root):
         for fn in files:
             if not fn.endswith(_SRC_EXT):
@@ -59,7 +60,23 @@ def build_call_graph(root: str) -> "tuple[dict, set]":
                 adj.setdefault(name, set()).update(callees)
                 if _WIRE.search(body) or _WIRE_NAME.search(name):
                     entries.add(name)
+            # callback-table registration: `ctx->Handler = fn` / `.recv = fn,` -- fn is invoked
+            # indirectly by the framework, so it is an entry the static call graph otherwise misses.
+            for cm in _CALLBACK_REG.finditer(src):
+                registered.add(cm.group(1))
+    # a registered function that is actually DEFINED here, and is a wire-handler by name, is a
+    # genuine indirect entry (FreeRDP's ReceiveX / recv / process callbacks).
+    defined = set(adj)
+    for r in registered:
+        if r in defined and (_WIRE_NAME.search(r) or _CALLBACK_HANDLER.search(r)):
+            entries.add(r)
     return adj, entries
+
+
+#: `->field = fn` or `.field = fn` (optionally &fn) wiring a function into a callback table.
+_CALLBACK_REG = re.compile(r"(?:->|\.)\s*[A-Za-z_]\w*\s*=\s*&?\s*([A-Za-z_]\w{3,})\s*[,;]")
+#: handler-ish names worth treating as indirect entries even without a wire token in the name.
+_CALLBACK_HANDLER = re.compile(r"(receive|handler|callback|_cb$|^on_|_on_|dispatch|incoming)", re.I)
 
 
 def reachable_from_wire(root: str) -> "tuple[set, dict, set]":
