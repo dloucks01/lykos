@@ -108,27 +108,33 @@ def test_the_build_phase_shares_one_deadline_and_the_ladder_takes_what_remains(s
     _mk(proj)
     t = ingest(store, store.cases.create("scbudget").id, proj, filename="proj")
 
-    deadlines, ladder_called = [], []
+    from types import SimpleNamespace
+    deadlines, ladder_kw = [], []
     monkeypatch.setattr(SC, "_materialize_source", lambda ctx, target: proj)
     monkeypatch.setattr(LF, "find_harnesses", lambda root, limit=1: [proj / "h.c"])
 
-    def fake_build(root, *, shared, sanitize, timeout, deadline=None, **kw):
+    def fake_build(sleep, root, *, shared, sanitize, timeout, deadline=None, **kw):
         deadlines.append(deadline)
-        time.sleep(0.4)                                  # consume the (tiny) budget
+        time.sleep(sleep)
         return {"ok": True, "log": "", "lib_dirs": [],
                 "harnesses": [{"name": "h", "source": str(proj / "h.c"), "binary": str(proj / "h")}]}
-    monkeypatch.setattr(LF, "cmake_build_harnesses", fake_build)
-    monkeypatch.setattr(DC, "confirm_ladder",
-                        lambda *a, **k: ladder_called.append(k.get("timeout_per")) or [])
+    monkeypatch.setattr(DC, "confirm_ladder", lambda *a, **k: ladder_kw.append(dict(k)) or [])
 
-    from types import SimpleNamespace
-    ctx = SimpleNamespace(conn=store.conn, target_id=t.id, params={"max_seconds": 1},
-                          emit=lambda *a, **k: None, progress=lambda **k: None)
-    SC.source_confirm_stage(ctx)
+    # (1) tiny budget spent by the builds -> the ladder is SKIPPED, and the builds SHARE one deadline
+    monkeypatch.setattr(LF, "cmake_build_harnesses", lambda *a, **k: fake_build(0.4, *a, **k))
+    SC.source_confirm_stage(SimpleNamespace(conn=store.conn, target_id=t.id, params={"max_seconds": 1},
+                                            emit=lambda *a, **k: None, progress=lambda **k: None))
     built = [d for d in deadlines if d is not None]
     assert built and len(set(built)) == 1, f"builds must share ONE deadline, got {deadlines}"
-    # with a 1s budget spent by the (0.4s each) builds, the ladder must have been skipped
-    assert not ladder_called, "ladder ran despite the budget being spent on builds"
+    assert not ladder_kw, "ladder ran despite the budget being spent on builds"
+
+    # (2) ample budget, instant builds -> the ladder RUNS and is handed a hard overall deadline
+    deadlines.clear()
+    monkeypatch.setattr(LF, "cmake_build_harnesses", lambda *a, **k: fake_build(0.0, *a, **k))
+    SC.source_confirm_stage(SimpleNamespace(conn=store.conn, target_id=t.id, params={"max_seconds": 120},
+                                            emit=lambda *a, **k: None, progress=lambda **k: None))
+    assert ladder_kw, "ladder did not run on an ample budget"
+    assert ladder_kw[-1].get("deadline") is not None, "ladder must get a hard overall deadline"
 
 
 # ---- a confirmation is replayed against the binary that proved it ------------------------------

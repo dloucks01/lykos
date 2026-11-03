@@ -279,7 +279,8 @@ def _rung_smartfuzz(h, *, timeout, ctx):
 _LADDER = (_rung_template, _rung_concolic, _rung_smartfuzz)
 
 
-def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=None) -> list:
+def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=None,
+                   deadline: float | None = None) -> list:
     """Run the non-fuzzing confirmation ladder over a set of harness descriptors and return the
     CONFIRMED bugs. Each harness is {name, explore_binary, replay_binary?, lib_dirs?, input_size?,
     harness_fn?, targets?}. For each harness the rungs are tried smartest-first; the first that
@@ -289,13 +290,29 @@ def confirm_ladder(harnesses, *, timeout_per: int = 120, ctx=None, attempts_out=
 
     If `attempts_out` is a list, every rung attempt is appended to it as
     {harness, rung, outcome: confirmed|no-confirm|skipped|error, reason, execs?} -- the honest account
-    of what ran, what was skipped and why, so a '0 confirmed' is never silent about its cause."""
+    of what ran, what was skipped and why, so a '0 confirmed' is never silent about its cause.
+
+    `deadline` (an absolute time.monotonic() value) is the HARD overall budget: the ladder runs
+    multiple rungs across every harness, so without it their sum (harnesses x rungs x timeout_per)
+    overruns the caller's slice. Once the deadline passes the remaining harnesses/rungs are skipped
+    (recorded as such), and each rung's timeout is clamped to the time that is actually left."""
+    import time as _t
     out: list = []
     seen: set = set()
     for h in harnesses:
+        if deadline is not None and _t.monotonic() >= deadline:
+            if attempts_out is not None:
+                attempts_out.append({"harness": h.get("name"), "rung": "ladder",
+                                     "outcome": "skipped", "reason": "stage time budget reached"})
+            continue
         for rung in _LADDER:
+            if deadline is not None and _t.monotonic() >= deadline:
+                break
+            per = timeout_per
+            if deadline is not None:
+                per = max(5, min(timeout_per, int(deadline - _t.monotonic())))
             try:
-                r = rung(h, timeout=timeout_per, ctx=ctx)
+                r = rung(h, timeout=per, ctx=ctx)
             except Exception as e:                           # noqa: BLE001 -- a rung must never abort
                 r = {"confirmed": False, "rung": getattr(rung, "__name__", "?").replace("_rung_", ""),
                      "reason": f"error: {e}", "error": True}

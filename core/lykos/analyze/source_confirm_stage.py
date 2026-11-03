@@ -389,8 +389,13 @@ def source_confirm_stage(ctx) -> dict:
     # a soft per-build cap, but the shared `_build_deadline` is the hard bound, so four builds cannot
     # sum past it -- once it passes, a later build gets ~0 time and bails fast rather than running its
     # own timeout*4. The ladder gets the remaining ~40% (below).
-    bslice = max(60, int(budget * 0.25))
-    _build_deadline = _time.time() + max(120.0, budget * 0.55)
+    # The build phase gets at most ~55% of the budget -- and NEVER more than the budget itself. A
+    # fixed floor here was the bug that wedged FreeRDP: max(120, 0.55*budget) handed four builds a
+    # 120s deadline on an 86s slice, so the stage ran ~180s on an 86s budget and the lease lapsed.
+    # With a small slice the builds now fail fast and the stage reports it could not build in time.
+    _build_budget = budget * 0.55
+    bslice = max(30, int(_build_budget))
+    _build_deadline = _time.time() + _build_budget
     ctx.progress(msg="building in-tree harnesses (static clean+ASan for concolic, shared ASan for fuzz)")
     # Config-keyed build dirs (the default): the shared-ASan fuzz build is shared with libfuzzer_stage
     # (built once, not twice); the static explore/replay builds are distinct configs with their own dirs.
@@ -493,8 +498,13 @@ def source_confirm_stage(ctx) -> dict:
         ctx.progress(msg=f"ladder skipped: {int(_left)}s of the {int(budget)}s budget left after "
                          f"building {len(harnesses)} harness(es) -- not enough for a confirmation rung")
     else:
+        # The ladder runs MULTIPLE rungs across ALL harnesses; without an overall deadline their
+        # sum (harnesses x rungs x per) blew the budget. Give it a hard absolute deadline so it
+        # stops once the remaining wall-clock is spent -- each rung is still bounded by `per`, and
+        # the ladder skips the rest once the deadline passes.
         per = max(20, int((_left * 0.9) / max(1, len(harnesses))))
-        proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
+        proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts,
+                                   deadline=_time.monotonic() + _left * 0.95)
     upgraded = 0
     for r in proven:
         upgraded += _file_confirmed(ctx, target, r,
