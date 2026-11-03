@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from ..db.dao import FindingDAO, PocDAO, TargetDAO
 from ..jobs.registry import register_stage
-from . import grounding, finding_triage
+from . import grounding, finding_triage, taint_reach
 from .grounding_stage import _source_root
 from .source_lookup import source_project_for
 
@@ -61,6 +61,10 @@ def _finding_dict(f) -> dict:
             "function_addr": f.function_addr, "site_addr": f.site_addr}
 
 
+#: C/C++ keywords a best-effort enclosing-function parse can mistake for a function name (e.g. the
+#: C++ keyword `this`); never a real sink function, so they must not be treated as resolved.
+_NOT_A_FUNCTION = frozenset({"this", "if", "for", "while", "switch", "return", "sizeof", "do",
+                             "else", "case", "new", "delete", "static", "const", "struct"})
 _LOC = __import__("re").compile(r'([A-Za-z0-9_./-]+\.[ch]):(\d+)')
 _OP = __import__("re").compile(r"index '([^']+)'|arithmetic \(([^)]+)\)|'([^']+)'")
 
@@ -116,6 +120,16 @@ def triage_stage(ctx) -> dict:
     lookup = grounding.make_source_lookup(root) if root else None
     textlookup = grounding.make_file_text_lookup(root) if root else None
     bits = target.bits or 64
+    # Source attacker-reachable closure, so a finding grounding never processed (a recipe/derived
+    # finding) still gets a REAL reachability verdict here instead of falling to "needs-technique".
+    reach = defined = None
+    if root is not None:
+        try:
+            from . import source_reach
+            reach, _adj, _entries = source_reach.reachable_from_wire(str(root))
+            defined = set(_adj)
+        except Exception:                                # noqa: BLE001
+            reach = defined = None
 
     dispositions = []
     reasons: dict = {}
@@ -130,13 +144,30 @@ def triage_stage(ctx) -> dict:
         if gm is not None:
             grounded, verdict = gm
         else:
-            # No authoritative verdict (recipe/derived finding grounding did not process). Try a
-            # context-free recompute; if it still can't decide a surface, mark the verdict UNDECIDED
-            # so triage does NOT optimistically call it drivable (honesty: a drivable claim needs a
-            # reachability basis). A recompute that proves it FP still wins.
+            # No authoritative verdict (recipe/derived finding grounding did not process). First a
+            # context-free recompute -- a proof it is FP still wins. Otherwise DECIDE reachability
+            # ourselves from the source call graph (the technique that resolves the "needs-technique"
+            # recipe findings): resolve the enclosing function and check the attacker-reachable
+            # closure -> exploitable-candidate if reached, off-surface-candidate if definitely not.
             g = grounding.ground_finding(fdict, source_lookup=lookup, bits=bits)
             grounded = bool(g.get("grounded", True))
-            verdict = g.get("verdict") if not grounded else "undecided"
+            if not grounded:
+                verdict = g.get("verdict")
+            elif reach is not None:
+                fn = taint_reach.name_of_finding({**fdict, "target_id": target.id},
+                                                 conn=ctx.conn, source_lookup=textlookup)
+                if fn in _NOT_A_FUNCTION:                  # a C/C++ keyword mis-parsed as a name
+                    fn = None
+                if fn and fn in reach:
+                    verdict = "exploitable-candidate"
+                elif fn and defined and fn in defined:
+                    verdict = "off-surface-candidate"      # resolved + defined but not reached
+                else:
+                    # a derived/chained recipe with no resolvable source sink of its own: its
+                    # reachability is that of its base finding, which must be linked to decide it.
+                    verdict = "undecided"
+            else:
+                verdict = "undecided"
         tainted = _operand_tainted(fdict, textlookup)
         d = finding_triage.triage_finding(cwe=f.cwe, state=f.state, has_poc=(f.id in poc_fids),
                                   grounded=grounded, verdict=verdict, tainted=tainted)
