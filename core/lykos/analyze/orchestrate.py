@@ -654,7 +654,7 @@ _EXEC_BOUNDED = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz",
 #: coverage ledger (completeness proof) and triage (the resolved disposition for every finding). They
 #: are the point of the run's accounting; skipping them for budget would discard it. ~7s each, no
 #: execution. Exempted from the budget-slice skip (given a small guaranteed slice).
-_ALWAYS_RUN = frozenset({"coverage_sweep", "triage"})
+_ALWAYS_RUN = frozenset({"coverage_sweep", "triage", "weaponize_plan"})
 
 
 def _run_target_stage(store, target, stage, status, stop, params=None, *,
