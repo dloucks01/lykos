@@ -113,11 +113,58 @@ function BacklogPane({ backlog }) {
   </div>`;
 }
 
+// The ATTACK PATH pane: the capability-graph chain that composes multiple findings into one
+// attacker path, entry -> step -> ... -> objective. Mirrors the report's "Full attack path": each
+// step is a real finding edge (or a weaponization technique edge) carrying the rung it is
+// demonstrated at. This is the cross-link over the flat finding list.
+const _CAP_COLOR = { reach: "#607d8b", auth: "#8e44ad", leak: "#2980b9", read: "#2980b9",
+  write: "#e67e22", pc: "#c0392b", rce: "#c0392b", cmd_exec: "#c0392b", sql_exec: "#c0392b",
+  file_read: "#16a085", dos: "#7f8c8d" };
+function _rungBadge(st) {
+  const lvl = st.level || (st.technique ? "technique" : "candidate");
+  const bg = /^L3$/.test(lvl) ? "#c0392b" : /^L[12]$/.test(lvl) ? "#e67e22"
+    : lvl === "technique" ? "#8e44ad" : "#9aa7b0";
+  return html`<span class="ap-rung" style=${`background:${bg}`}>${lvl}</span>`;
+}
+function AttackPathPane({ finding }) {
+  if (!finding) return html`<div class="pane-pad muted">No attack path composed on this run.</div>`;
+  const ev = (finding.evidence || []);
+  let steps = [];
+  const sj = ev.find((e) => e.channel === "attack-path-steps");
+  if (sj) { try { steps = JSON.parse(sj.detail); } catch (e) { steps = []; } }
+  const rendered = (ev.find((e) => e.channel === "attack-path") || {}).detail || "";
+  const m = rendered.match(/\n\[(reflected|detonated|constructed|not detonated)\] end-to-end: (.*)$/s);
+  const detoClass = m && m[1] !== "not detonated" ? "ap-deto-ok" : "ap-deto-no";
+  const chip = (cap) => html`<span class="ap-cap" style=${`background:${_CAP_COLOR[cap] || "#555"}`}>${cap}</span>`;
+  return html`<div class="ap-pane">
+    <h2 class="ap-h">Full attack path</h2>
+    <p class="ap-sub">The deepest attacker path the findings compose — each step a real finding (or a
+      weaponization <i>technique</i> edge), carrying how far it is demonstrated. This is which bugs
+      chain, in what order, and what each buys the attacker.</p>
+    <div class="ap-flow">
+      <div class="ap-node ap-entry">entry<br/><small>attacker can reach the surface</small></div>
+      ${steps.map((st) => html`<div class="ap-arrow">▼</div>
+        <div class="ap-step">
+          <div class="ap-caps">${(st.gained || []).map(chip)} ${_rungBadge(st)}</div>
+          <div class="ap-label">${st.label}</div>
+          ${st.cwe ? html`<div class="ap-src">${st.cwe}${st.function ? " · " + st.function : ""}</div>`
+            : html`<div class="ap-src ap-tech">weaponization step</div>`}
+        </div>`)}
+      <div class="ap-arrow">▼</div>
+      <div class=${"ap-node ap-obj"}>${finding.title || "objective"}</div>
+    </div>
+    ${m ? html`<div class=${"ap-deto " + detoClass}><b>end-to-end:</b> ${m[1]} — ${m[2]}</div>` : null}
+  </div>`;
+}
+
 function App() {
   const [, force] = useState(0);
   useEffect(() => { const u = subscribe(() => force((n) => n + 1)); loadCases(); return u; }, []);
   const s = store;
-  const findings = s.findings;
+  // the attack-path finding is a meta row (the composed chain) -- surfaced in its own tab, not the
+  // flat findings list.
+  const apFinding = (s.findings || []).find((x) => x.detector === "attack_path");
+  const findings = (s.findings || []).filter((x) => x.detector !== "attack_path");
   // cluster into issues, rank clusters by their representative
   const clusters = cluster(findings, s.pocs).sort((a, b) => {
     const x = findingScore(a.rep, s.pocs), y = findingScore(b.rep, s.pocs);
@@ -149,6 +196,8 @@ function App() {
         <button class=${"tab" + (s.view === "finding" ? " on" : "")} onClick=${() => setView("finding")} disabled=${!sel}>Finding</button>
         <button class=${"tab" + (s.view === "backlog" ? " on" : "")} onClick=${() => setView("backlog")}
           title="findings not yet at a validated PoC + the technique to build next">Backlog${s.backlog && s.backlog.count ? html` <span class="tab-badge">${s.backlog.count}</span>` : null}</button>
+        ${apFinding ? html`<button class=${"tab" + (s.view === "attack" ? " on" : "")} onClick=${() => setView("attack")}
+          title="the multi-vulnerability chain: entry -> ... -> objective">Attack path${apFinding.state === "poc-backed" ? html` <span class="tab-badge" style="background:#c0392b">✓</span>` : null}</button>` : null}
       </div>
     </header>
     ${s.error ? html`<div class="err">${s.error}</div>` : null}
@@ -163,7 +212,9 @@ function App() {
           : html`<div class="pane-pad muted">no findings match</div>`}</div>
       </aside>
       <section class="pane">
-        ${s.view === "backlog"
+        ${s.view === "attack"
+          ? html`<${AttackPathPane} finding=${apFinding} />`
+          : s.view === "backlog"
           ? html`<${BacklogPane} backlog=${s.backlog} />`
           : s.view === "finding" && sel
           ? html`<${DetailPane} finding=${sel} pocs=${s.pocs} advice=${s.advice} related=${selC ? selC.members : []} />`

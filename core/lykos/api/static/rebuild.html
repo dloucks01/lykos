@@ -303,6 +303,30 @@
   .meta b { color:var(--tx2); }
 
   @media (max-width:880px){ .body{ grid-template-columns:1fr; } .list{ max-height:42vh; } .xrefs{ grid-template-columns:1fr; } }
+
+  /* attack-path pane */
+  .ap-pane { padding:24px 30px; }
+  .ap-h { font-size:17px; margin:0 0 4px; color:var(--tx); }
+  .ap-sub { color:var(--tx2); font-size:12px; max-width:720px; margin:0 0 18px; }
+  .ap-flow { display:flex; flex-direction:column; align-items:flex-start; gap:4px; }
+  .ap-node { padding:8px 14px; border-radius:8px; font-weight:600; color:var(--tx);
+             background:var(--raised-2); border:1px solid #2a3340; }
+  .ap-node small { font-weight:400; color:var(--tx2); }
+  .ap-entry { border-left:3px solid var(--accent); }
+  .ap-obj { border-left:3px solid #c0392b; background:#2a1416; }
+  .ap-arrow { color:var(--tx3); margin-left:18px; font-size:11px; }
+  .ap-step { background:var(--raised); border:1px solid #242c38; border-radius:8px;
+             padding:9px 13px; min-width:340px; }
+  .ap-caps { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:3px; }
+  .ap-cap { color:#fff; font-size:10.5px; font-weight:700; padding:1px 8px; border-radius:10px; }
+  .ap-rung { color:#fff; font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:4px;
+             text-transform:uppercase; letter-spacing:.03em; }
+  .ap-label { font-size:12.5px; color:var(--tx); }
+  .ap-src { font-size:11px; color:var(--tx2); font-family:ui-monospace,monospace; }
+  .ap-src.ap-tech { font-style:italic; font-family:var(--ui); color:#a98fd0; }
+  .ap-deto { margin-top:18px; padding:10px 14px; border-radius:8px; font-size:12px; max-width:720px; }
+  .ap-deto-ok { background:#102a16; border:1px solid #1f5a2f; color:#9be0ad; }
+  .ap-deto-no { background:#2a2410; border:1px solid #5a4f1f; color:#e0d49b; }
 </style>
 </head>
 <body>
