@@ -116,6 +116,66 @@ def solve_integrity_gate(runner: Callable[[bytes], bytes], seed: bytes, *, pass_
     return lay, lay.apply(seed)
 
 
+# ---- runtime input-to-state OFFSET LOCALIZATION (colorization) ----------------------------------
+# The static dictionary plants a magic value but not WHERE it must go; a fuzzer then sweeps offsets.
+# REDQUEEN localizes the offset directly via input-to-state correspondence: run a COLORIZED input
+# (every window self-identifying), and when a comparison operand equals a colorized window you know
+# exactly which input offset reached that comparison -> place the recovered constant there, not by a
+# sweep. lykos already CAPTURES both comparison operands (extract_secrets hooks strcmp/memcmp/..),
+# so this consumes those observations -- no new instrumentation.
+_COLOR_TAG = 0xC0DE0000
+
+
+def colorize(n: int) -> bytes:
+    """A length-n colorized input: each 4-byte window at a 4-aligned offset o encodes o as
+    (_COLOR_TAG | o) little-endian, so any 4+ bytes of it observed in a comparison decode back to
+    their source offset. Tag bytes stay printable-ish and collision-free for offsets < 0x10000."""
+    out = bytearray()
+    o = 0
+    while len(out) < n:
+        out += struct.pack("<I", (_COLOR_TAG | (o & 0xFFFF)))
+        o += 4
+    return bytes(out[:n])
+
+
+def decode_offset(observed: bytes) -> Optional[int]:
+    """If `observed` contains a colorized dword, return the input offset it came from, else None."""
+    b = bytes(observed or b"")
+    for i in range(0, len(b) - 3):
+        v = struct.unpack_from("<I", b, i)[0]
+        if (v & 0xFFFF0000) == _COLOR_TAG:
+            return (v & 0xFFFF) - i                        # subtract the position within the window
+    return None
+
+
+def localize(observations) -> list:
+    """Given comparison observations [(probe_operand_bytes, expected_bytes), ...] captured while the
+    target ran on a COLORIZED input, return [(offset, expected), ...]: for each comparison whose
+    probe-side operand is a colorized window, the exact input offset the compared bytes came from and
+    the value the program expected there. The fuzzer then places `expected` at `offset` -- input-to-
+    state replacement, no sweep. Deterministic."""
+    out = []
+    seen = set()
+    for probe, expected in observations:
+        off = decode_offset(probe)
+        if off is not None and off >= 0 and (off, bytes(expected)) not in seen:
+            seen.add((off, bytes(expected)))
+            out.append((off, bytes(expected)))
+    return out
+
+
+def place(seed: bytes, placements) -> bytes:
+    """Apply input-to-state replacements [(offset, value), ...] to a seed (extending if needed)."""
+    b = bytearray(seed)
+    for off, val in placements:
+        if off < 0:
+            continue
+        if off + len(val) > len(b):
+            b.extend(b"\x00" * (off + len(val) - len(b)))
+        b[off:off + len(val)] = val
+    return bytes(b)
+
+
 def repaired_corpus_seeds(exe: str, seeds, *, run, max_seeds: int = 8, max_off: int = 64):
     """Fuzz-campaign booster: for each seed that an integrity gate rejects, learn a checksum/length
     layout and return the repaired seed so the fuzzer starts EXPLORING behind the gate. The past-gate

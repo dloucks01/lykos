@@ -64,3 +64,23 @@ def test_no_gate_returns_none():
     # a runner that always accepts -> nothing to repair
     layout, _ = i2s.solve_integrity_gate(lambda d: b"ok", b"abcdef", pass_marker=b"PARSED-OK")
     assert layout is None
+
+
+# ---- runtime input-to-state offset localization (colorization) ----
+def test_colorize_decode_roundtrip():
+    buf = i2s.colorize(64)
+    # a comparison observed 4 bytes from offset 8 of the colorized input -> decode recovers 8
+    assert i2s.decode_offset(buf[8:12]) == 8
+    assert i2s.decode_offset(buf[40:48]) == 40
+    assert i2s.decode_offset(b"not-colorized!!") is None
+
+
+def test_localize_maps_comparison_to_offset_and_value():
+    buf = i2s.colorize(64)
+    # the target compared our bytes at offset 8 against the magic "PASS" (captured by extract_secrets)
+    observations = [(buf[8:12], b"PASS"), (b"random", b"ignored")]
+    placements = i2s.localize(observations)
+    assert (8, b"PASS") in placements
+    # applying the placement puts the magic at the right offset -- no sweep
+    out = i2s.place(b"\x00" * 64, placements)
+    assert out[8:12] == b"PASS"
