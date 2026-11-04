@@ -39,6 +39,16 @@ _VALIDATION_RE = re.compile(r'(?i)(check|valid|within|bound|ensure|verify|requir
                             r'RequiredLength|RequiredCapacity|RemainingLength)')
 
 
+def _is_wrapper(body: str) -> bool:
+    """A trivial delegator -- a body that is essentially a single `return other(...)` (optionally a
+    couple of asserts/locals). Such a function 'omits' every guard because the real logic lives in the
+    callee, so flagging it is a false positive (e.g. rts_read_pdu_header -> rts_read_pdu_header_ex)."""
+    inner = body.strip().lstrip("{").rstrip("}")
+    stmts = [s.strip() for s in inner.split(";")
+             if s.strip() and not s.strip().startswith(("//", "/*", "*", "WINPR_ASSERT", "WLog"))]
+    return len(stmts) == 1 and stmts[0].startswith("return ") and "(" in stmts[0]
+
+
 def _family_key(name: str) -> str:
     """Prefix family key: everything up to the last underscore-delimited segment. So
     `gdi_SurfaceCommand_ClearCodec` -> `gdi_SurfaceCommand`, keeping siblings together."""
@@ -84,6 +94,8 @@ def find_missing_sibling_guards(text: str, *, min_family: int = 3, min_siblings:
             for g in gs:
                 usage[g].add(n)
         for n, body, ln in members:
+            if _is_wrapper(body):                              # a delegator omits guards vacuously
+                continue
             for g, users in usage.items():
                 if n in users or len(users) < min_siblings:
                     continue

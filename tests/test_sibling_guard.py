@@ -48,3 +48,15 @@ def test_small_family_ignored():
 def test_family_key():
     assert _family_key("gdi_SurfaceCommand_ClearCodec") == "gdi_SurfaceCommand"
     assert _family_key("rdpgfx_recv_wire_to_surface_2_pdu") == "rdpgfx_recv_wire_to_surface_2"
+
+
+def test_skips_trivial_wrapper():
+    # a 1-line delegator must not be flagged for "omitting" a guard its siblings have.
+    src = """
+    static int h_one(ctx* c, cmd* m) { if (!validate(c, m)) return -1; work(c, m); return 0; }
+    static int h_two(ctx* c, cmd* m) { if (!validate(c, m)) return -1; work(c, m); return 0; }
+    static int h_three(ctx* c, cmd* m) { if (!validate(c, m)) return -1; work(c, m); return 0; }
+    static int h_four(ctx* c, cmd* m) { return h_four_ex(c, m, FALSE); }
+    """
+    hits = find_missing_sibling_guards(src)
+    assert not any(h["fn"] == "h_four" for h in hits)
