@@ -68,7 +68,18 @@ def main():
         return 2
     print(f"tracking real python pid={pid} (unit={unit})", flush=True)
     t0 = time.time()
-    while os.path.isdir(f"/proc/{pid}"):
+
+    def _alive(p):
+        # A zombie keeps /proc/<pid> until its (reparented) parent reaps it, so dir-existence
+        # alone hangs forever on a completed run. Treat state Z (defunct) as exited.
+        try:
+            st = open(f"/proc/{p}/stat").read()
+            state = st[st.rfind(")") + 2]
+        except (OSError, IndexError):
+            return False
+        return state != "Z"
+
+    while _alive(pid):
         time.sleep(15)
     dur = int(time.time() - t0)
     db = os.path.join(cs, "case.db")
