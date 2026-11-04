@@ -3096,9 +3096,12 @@ _KEEP_GOING_REPLAYS = 64
 
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
                   corpus: list | None = None, lib_dirs: list | None = None,
-                  keep_going: bool = False, fork: int = 1) -> dict:
+                  keep_going: bool = False, fork: int = 1, rss_limit_mb: int = 2048,
+                  launcher: list | None = None) -> dict:
     """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
-    Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed."""
+    Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed.
+    `rss_limit_mb` is libFuzzer's own per-process RSS cap; `launcher` is an optional argv prefix the
+    fuzzing process runs under (e.g. a memory-capped `systemd-run --user --scope -p MemoryMax=...`)."""
     workdir = Path(workdir)
     art = workdir / "lf-artifacts"
     art.mkdir(parents=True, exist_ok=True)
@@ -3115,7 +3118,7 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         env["LD_LIBRARY_PATH"] = os.pathsep.join(        # project's .so dirs to load
             [str(d) for d in lib_dirs] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     argv = [str(binary), str(corpus_dir), f"-max_total_time={seconds}", f"-max_len={max_len}",
-            f"-artifact_prefix={art}/", "-print_final_stats=1", "-rss_limit_mb=2048",
+            f"-artifact_prefix={art}/", "-print_final_stats=1", f"-rss_limit_mb={int(rss_limit_mb)}",
             # Close the TARGET's stderr during execution. A chatty target that logs per input (FreeRDP's
             # WLog prints a connection-state ERROR on every input) floods stderr and throttles the
             # campaign to a crawl -- measured on FreeRDP's TestFuzzCoreClient: ~0.2 effective exec/s and
@@ -3131,7 +3134,8 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
     crashes = []
     before = set(art.iterdir())
     try:
-        r = _run_group(argv, timeout=seconds + 30, env=env, cwd=str(workdir))
+        r = _run_group([str(a) for a in (launcher or [])] + argv, timeout=seconds + 30, env=env,
+                       cwd=str(workdir))
         out = (r.stderr or "") + (r.stdout or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stderr or b"").decode("latin-1", "ignore") if isinstance(e.stderr, bytes) else (e.stderr or "")

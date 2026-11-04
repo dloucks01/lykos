@@ -8,8 +8,11 @@ harnesses -- the OSS-Fuzz-style hammer that can surface novel memory bugs blind 
 Run it deliberately; it can take a long time.
 
 Harnesses run IN PARALLEL (each in its own workdir), and each uses `fork` libFuzzer sub-processes, so
-a machine's cores are actually used -- a real campaign, not a single-core crawl. Crashes go through
-lykos's run_libfuzzer pipeline (replay + fault-signature dedup), not a raw harvest.
+a machine's cores are actually used -- a real campaign, not a single-core crawl. Concurrency is
+BOUNDED (min(#harnesses, cpu_count//4), or 4 when that is unknown), and each harness's libFuzzer runs
+under a memory-capped `systemd-run --user --scope -p MemoryMax=...` when available, plus libFuzzer's
+own -rss_limit_mb per process -- N ASan harnesses x `fork` children can otherwise exhaust RAM.
+Crashes go through lykos's run_libfuzzer pipeline (replay + fault-signature dedup), not a raw harvest.
 
 Usage:
   python3 tools/deep_decoder_fuzz.py <source_tree> [harness_substrings] [seconds_per_harness] [out_dir] [fork_per_harness]
@@ -17,6 +20,8 @@ Usage:
 """
 import glob
 import os
+import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,6 +30,38 @@ from pathlib import Path
 # make `lykos` importable no matter the cwd (a script run by absolute path does not get core/ on path)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core"))
 from lykos.analyze import libfuzzer as LF   # noqa: E402
+
+
+def _mem_total_mb():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 8192
+
+
+def _concurrency(n_built):
+    cpus = os.cpu_count() or 0
+    return max(1, min(n_built, (cpus // 4) or 4))
+
+
+def _memcap_launcher(scope_mb):
+    """argv prefix running a process in a MemoryMax-capped transient user scope, or [] (graceful
+    fallback: libFuzzer's -rss_limit_mb still applies) when systemd-run/a user manager is absent."""
+    if not shutil.which("systemd-run"):
+        return []
+    probe = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={scope_mb}M", "true"]
+    try:
+        if subprocess.run(probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=20).returncode != 0:
+            return []
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={scope_mb}M",
+            "-p", "MemorySwapMax=0"]
 
 
 def main():
@@ -68,7 +105,15 @@ def main():
         print(f"[deepfuzz]   built {hid} in {int(time.time()-t0)}s", flush=True)
         built.append((spec, out, b))
 
-    print(f"\n[deepfuzz] fuzzing {len(built)} harnesses in parallel, {secs}s each, fork={fork}\n", flush=True)
+    workers = _concurrency(len(built))
+    # memory: give the concurrent campaigns ~60% of RAM between them; each scope holds the libFuzzer
+    # parent + `fork` children, so libFuzzer's per-process cap is the scope budget split fork+1 ways
+    scope_mb = max(1024, int(_mem_total_mb() * 0.6) // workers)
+    rss_mb = max(512, min(2048, scope_mb // (max(1, fork) + 1)))
+    launcher = _memcap_launcher(scope_mb)
+    print(f"\n[deepfuzz] fuzzing {len(built)} harnesses, {workers} at a time, {secs}s each, fork={fork}, "
+          f"MemoryMax={scope_mb}M/harness{'' if launcher else ' (systemd-run unavailable: rss-limit only)'}, "
+          f"rss_limit_mb={rss_mb}\n", flush=True)
 
     def _runone(spec, out, b):
         hid = spec.get("id", "?")
@@ -76,11 +121,12 @@ def main():
         wd.mkdir(parents=True, exist_ok=True)
         binary = b.get("binary") or out        # build returns the runnable path; `out` isn't created
         r = LF.run_libfuzzer(binary, wd, seconds=secs, corpus=seeds or None,
-                             lib_dirs=b.get("lib_dirs"), keep_going=True, fork=fork)
+                             lib_dirs=b.get("lib_dirs"), keep_going=True, fork=fork,
+                             rss_limit_mb=rss_mb, launcher=launcher)
         return spec, r
 
     total = 0
-    with ThreadPoolExecutor(max_workers=max(1, len(built))) as ex:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(_runone, *x) for x in built]
         for fut in as_completed(futs):
             spec, r = fut.result()

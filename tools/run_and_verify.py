@@ -13,6 +13,7 @@ Usage: run_and_verify.py <source_or_binary> <case_store_dir> [--budget N] [--nam
 """
 import argparse
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -39,6 +40,26 @@ def real_pid(case_store, timeout=90):
     return None
 
 
+def this_run_rows(db, prior_ids, launched_at):
+    """(runs, done_stages, findings, pocs) for THIS run only: analysis_run rows not present before
+    launch and created at/after it, and the findings/pocs those runs' cases created or re-touched
+    since launch -- so a reused case store's earlier rows never vouch for a crashed run."""
+    with sqlite3.connect(db) as c:
+        runs = [(rid, case, st, status) for rid, case, st, status, created in c.execute(
+            "select id, case_id, stage, status, created_at from analysis_run")
+            if rid not in prior_ids and (created or 0) >= launched_at]
+        done = {st for _rid, _case, st, status in runs if status == "done"}
+        cases = sorted({case for _rid, case, _st, _status in runs})
+        findings = pocs = 0
+        if cases:
+            marks = ",".join("?" * len(cases))
+            findings = c.execute(f"select count(*) from finding where case_id in ({marks}) "
+                                 f"and updated_at >= ?", (*cases, launched_at)).fetchone()[0]
+            pocs = c.execute(f"select count(*) from poc where case_id in ({marks}) "
+                             f"and created_at >= ?", (*cases, launched_at)).fetchone()[0]
+    return runs, done, findings, pocs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("target")
@@ -52,8 +73,20 @@ def main():
     out = os.path.join(cs, "run.out")
     err = os.path.join(cs, "run.err")
     core = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core")
-    inner = (f"cd {core} && python3 -m lykos.cli analyze {a.target!r} --budget {a.budget} "
-             f"--case-store {cs!r} --name {a.name} > {out!r} 2> {err!r}")
+    q = shlex.quote                                          # POSIX-shell quoting (not Python repr)
+    inner = (f"cd {q(core)} && python3 -m lykos.cli analyze {q(a.target)} --budget {int(a.budget)} "
+             f"--case-store {q(cs)} --name {q(a.name)} > {q(out)} 2> {q(err)}")
+    db = os.path.join(cs, "case.db")
+    # A REUSED case store already holds a previous run's rows (incl. its triage/attack_path); the
+    # verdict must be about THIS run only: snapshot the pre-existing run ids + the launch time.
+    prior_ids = set()
+    if os.path.exists(db):
+        try:
+            with sqlite3.connect(db) as c0:
+                prior_ids = {r[0] for r in c0.execute("select id from analysis_run")}
+        except sqlite3.Error:
+            prior_ids = set()
+    launched_at = int(time.time())
     unit = f"lykos-{a.name}-{int(time.time())}"
     if shutil.which("systemd-run"):
         cmd = ["systemd-run", "--user", "--scope", "-p", f"MemoryMax={a.mem}",
@@ -82,17 +115,13 @@ def main():
     while _alive(pid):
         time.sleep(15)
     dur = int(time.time() - t0)
-    db = os.path.join(cs, "case.db")
     if not os.path.exists(db):
         print(f"FAIL: no case.db after {dur}s")
         return 3
-    c = sqlite3.connect(db)
-    runs = c.execute("select stage,status from analysis_run").fetchall()
-    done = {s for s, st in runs if st == "done"}
-    findings = c.execute("select count(*) from finding").fetchone()[0]
-    pocs = c.execute("select count(*) from poc").fetchone()[0]
+    runs, done, findings, pocs = this_run_rows(db, prior_ids, launched_at)
     terminal_ran = bool({"triage", "attack_path"} & done)
-    print(f"duration={dur}s  stages_done={len(done)}  findings={findings}  pocs={pocs}  "
+    print(f"this run: runs={len(runs)} (ignored {len(prior_ids)} prior)  duration={dur}s  "
+          f"stages_done={len(done)}  findings={findings}  pocs={pocs}  "
           f"terminal_stage_ran={terminal_ran}", flush=True)
     ok = terminal_ran and findings > 0
     print("VERIFIED COMPLETE" if ok else "INCOMPLETE/INVALID -- investigate", flush=True)
