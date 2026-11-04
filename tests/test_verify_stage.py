@@ -143,3 +143,31 @@ def test_non_rce_confirmed_finding_is_not_weaponized(store, case):
     V.verify_stage(ctx)
     assert _state(fd, t, "trav") == "confirmed"
     assert not ctx.stored
+
+
+def test_advisory_and_rollup_findings_are_never_confirmed(store, case):
+    """Binary recall run 2026-11-04: with binary reach fixed, `dangerous_api` roll-ups ("calloc --
+    check the count/size are not attacker-controlled", one row for ~300 sprintf sites) passed all
+    three legs on a single intra-procedural taint hit and were CONFIRMED + given weaponization
+    recipes. An advisory names an API to review; a roll-up's dataflow leg is one site of many."""
+    fd = FindingDAO(store.conn)
+    t = _target(store, case)
+    _file(fd, t, cwe="CWE-789", key="adv", state="corroborated", grounded=True, reachable=True,
+          detector="dangerous_api", title="calloc -- check the count/size are not attacker-controlled")
+    # a roll-up from a non-advisory detector: many pattern sites + one taint channel
+    _file(fd, t, cwe="CWE-120", key="roll", state="corroborated", grounded=True, reachable=True,
+          detector="stack_frame")
+    fid = fd.id_for_dedup(t.id, "roll")
+    fd.upsert(t.id, t.case_id, {"cwe": "CWE-120", "title": "CWE-120 defect", "severity": "high",
+                                "detector": "stack_frame", "state": "corroborated",
+                                "confidence": 0.5, "dedup_key": "roll",
+                                "evidence": [{"channel": "pattern", "detail": f"call to sprintf() at {a}"}
+                                             for a in ("0x401000", "0x401200", "0x401400")]})
+    assert fid
+    # a single-site, real, reachable, dataflow-backed finding still confirms
+    _file(fd, t, cwe="CWE-787", key="one", state="corroborated", grounded=True, reachable=True,
+          detector="tainted_deref")
+    V.promote(fd, t, "run-test")
+    assert _state(fd, t, "adv") == "corroborated"
+    assert _state(fd, t, "roll") == "corroborated"
+    assert _state(fd, t, "one") == "confirmed"
