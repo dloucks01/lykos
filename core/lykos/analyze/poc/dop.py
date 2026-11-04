@@ -100,6 +100,62 @@ _PRIV_ACTION = _re.compile(r"(?<![a-zA-Z])(system|exec|popen|setuid|setgid|seteu
                            r"passwd|token)(?![a-zA-Z])", _re.I)
 
 
+#: a size/length/count variable that bounds a copy or loop -- a write that enlarges it overflows.
+_BOUND_VAR = _re.compile(r"(?:^|[^A-Za-z_])(len|length|size|count|num|n|nbytes|cb|cch|total|cap|"
+                         r"capacity|limit|max|datalen|buflen)(?:[^A-Za-z]|$)", _re.I)
+_COPY_SINK = _re.compile(r"\b(memcpy|memmove|memset|copy|read|recv|strncpy|strncat|while|for)\b")
+
+
+def find_dop_bounds(src: str):
+    """Bounds/length DOP targets: a STORED size/length field used as a copy or loop bound that a
+    data-only write could enlarge to force an out-of-bounds access -- the data-only analogue of an
+    integer bug (no control-flow hijack, the program's own copy runs with a corrupted length). We
+    require the bound to be a STRUCT FIELD (corruptible in memory, not a fresh local) used in a
+    copy/loop context. Returns [{var, line, hint}]."""
+    out = []
+    lines = src.splitlines()
+    for i, ln in enumerate(lines):
+        if not _COPY_SINK.search(ln):
+            continue
+        # a struct-field length operand in the copy/loop: base->len / base.size
+        for m in _re.finditer(r"\b([A-Za-z_]\w*(?:->|\.)[A-Za-z_]\w*)", ln):
+            field = m.group(1)
+            leaf = _re.split(r"->|\.", field)[-1]
+            if _BOUND_VAR.search(leaf):
+                out.append({"var": field, "line": i + 1, "hint": ln.strip()[:90]})
+                break
+    seen, uniq = set(), []
+    for d in out:
+        k = (d["var"], d["line"])
+        if k not in seen:
+            seen.add(k); uniq.append(d)
+    return uniq
+
+
+def stitch_plan(write_desc: str, target: dict) -> dict:
+    """FlowStitch-style data-only chain: compose a WRITE primitive with a discovered DOP target into
+    one ordered plan -- stitch the write's reachable address to the target variable, so driving the
+    write corrupts exactly that decision/bound and the program's own code produces the impact. Pure;
+    `target` is a find_dop_targets/find_dop_bounds entry plus a 'kind' (auth|bounds|buffer)."""
+    kind = target.get("kind", "auth")
+    var = target.get("var", "<var>")
+    if kind == "bounds":
+        effect = f"enlarge '{var}' -> the guarded copy/loop runs out of bounds (data-only overflow)"
+        value = "a large value (> the real buffer size)"
+    elif kind == "buffer":
+        effect = f"fill '{var}' with attacker bytes -> the sink consumes them (data-only injection)"
+        value = "the attacker payload"
+    else:
+        effect = f"flip '{var}' truthy -> the program takes the privileged branch (data-only auth)"
+        value = "a non-zero value"
+    return {"ttp": "flowstitch-data-only", "kind": kind, "target_var": var,
+            "steps": [f"drive the write primitive ({write_desc}) to reach &{var}",
+                      f"write {value} over '{var}'",
+                      f"let the program's own code run: {effect}"],
+            "note": "no control-flow hijack, CFI-immune; the impact is the program taking its own "
+                    "guarded path with a corrupted decision/bound (FlowStitch, USENIX'15)."}
+
+
 def find_dop_targets(src: str):
     """Source-side DOP discovery: a SECURITY-DECISION variable whose value chooses between a guarded
     (privileged) path and a denied one -- the thing a memory write flips in a data-only attack. We

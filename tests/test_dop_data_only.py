@@ -96,3 +96,24 @@ def test_find_dop_targets_ignores_plain_conditionals():
     }
     """
     assert dop.find_dop_targets(src) == []
+
+
+def test_find_dop_bounds_length_field():
+    """Bounds DOP target: a stored length field used as a copy bound that a write could enlarge."""
+    src = """
+    void copy_rec(rec_t* r, char* dst) {
+        memcpy(dst, r->data, r->datalen);   /* r->datalen is a corruptible bound */
+        for (int i = 0; i < hdr->count; i++) use(i);
+    }
+    """
+    b = dop.find_dop_bounds(src)
+    vars_ = {t["var"] for t in b}
+    assert "r->datalen" in vars_ and "hdr->count" in vars_
+
+
+def test_stitch_plan_composes_write_and_target():
+    p = dop.stitch_plan("heap OOB write", {"var": "is_admin", "kind": "auth"})
+    assert p["ttp"] == "flowstitch-data-only" and p["kind"] == "auth"
+    assert any("privileged branch" in s for s in p["steps"])
+    pb = dop.stitch_plan("oob write", {"var": "r->len", "kind": "bounds"})
+    assert "out of bounds" in " ".join(pb["steps"])

@@ -59,10 +59,20 @@ def dop_scan_stage(ctx) -> dict:
                     "cwe": "CWE-840", "severity": "medium", "state": "candidate",
                     "detector": "dop_target", "stage": DOP_SCAN_STAGE,
                     "title": f"data-only hijack surface: decision var '{t['var']}' gates a privileged path",
-                    "dedup_key": f"dop:{rel}:{t['var']}:{t['line']}",
+                    "dedup_key": f"dop:auth:{rel}:{t['var']}:{t['line']}",
                     "evidence": [{"channel": "dop-target",
                                   "detail": f"{rel}:{t['line']}: a write that flips '{t['var']}' takes the "
-                                            f"privileged branch with no control-flow hijack (DOP). {t['hint']}"}]})
+                                            f"privileged branch with no control-flow hijack (DOP, kind=auth). {t['hint']}"}]})
+                n += 1
+            for t in dop.find_dop_bounds(src):
+                fd.upsert(target.id, target.case_id, {
+                    "cwe": "CWE-840", "severity": "medium", "state": "candidate",
+                    "detector": "dop_target", "stage": DOP_SCAN_STAGE,
+                    "title": f"data-only hijack surface: length/bound '{t['var']}' controls a copy/loop",
+                    "dedup_key": f"dop:bounds:{rel}:{t['var']}:{t['line']}",
+                    "evidence": [{"channel": "dop-target",
+                                  "detail": f"{rel}:{t['line']}: a write that enlarges '{t['var']}' makes the copy/loop "
+                                            f"run out of bounds with no control-flow hijack (DOP, kind=bounds). {t['hint']}"}]})
                 n += 1
     return {"metrics": {"dop_targets": n}}
 

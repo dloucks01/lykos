@@ -84,3 +84,13 @@ def test_localize_maps_comparison_to_offset_and_value():
     # applying the placement puts the magic at the right offset -- no sweep
     out = i2s.place(b"\x00" * 64, placements)
     assert out[8:12] == b"PASS"
+
+
+def test_localized_seeds_from_observations():
+    buf = i2s.colorize(64)
+    obs = [(buf[8:12], b"PASS"), (buf[20:24], b"GO")]
+    seeds = i2s.localized_seeds(b"\x00" * 64, obs)
+    assert any(s[8:12] == b"PASS" for s in seeds)
+    assert any(s[20:22] == b"GO" for s in seeds)
+    # the combined seed applies both
+    assert any(s[8:12] == b"PASS" and s[20:22] == b"GO" for s in seeds)

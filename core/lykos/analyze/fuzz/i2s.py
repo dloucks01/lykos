@@ -164,6 +164,20 @@ def localize(observations) -> list:
     return out
 
 
+def localized_seeds(seed: bytes, observations) -> list:
+    """Convenience: from comparison observations captured on a COLORIZED run, produce localized seed
+    variants with each recovered constant placed at its decoded offset (input-to-state replacement).
+    One seed per distinct placement plus one with all placements applied. The fuzzer consumes these
+    the way it consumes the dispatch/gate seeds."""
+    placements = localize(observations)
+    out = []
+    for pl in placements:
+        out.append(place(seed, [pl]))
+    if len(placements) > 1:
+        out.append(place(seed, placements))
+    return out
+
+
 def place(seed: bytes, placements) -> bytes:
     """Apply input-to-state replacements [(offset, value), ...] to a seed (extending if needed)."""
     b = bytearray(seed)
