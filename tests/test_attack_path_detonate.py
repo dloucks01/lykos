@@ -98,3 +98,32 @@ def test_attack_path_constructs_injection_objective(store, case, pool, gcc, tmp_
                for ev in (ap_find[0].evidence or []))
     assert [p for p in PocDAO(store.conn).list_by_target(t.id)
             if p.provenance == "constructed" and p.level == "L1"]
+
+
+def test_attack_path_detonates_data_only_dop(store, case, pool, gcc, tmp_path, x86_64_only):
+    """A write + a post-auth sink compose to a DOP path (write->auth data-only); the attack_path
+    stage demonstrates it on the binary by flipping a decision variable -- no PC control."""
+    # the flag-flip fixture: a global `authed` flipped by an overflow -> privileged SECRET path.
+    src = ("#include <stdio.h>\n#include <unistd.h>\n"
+           "static char name[16]; static int authed=0;\n"
+           "int main(void){setvbuf(stdout,0,2,0); int n=read(0,name,64); if(n<=0) return 0;\n"
+           " if(authed){write(1,\"SECRET{dop}\\n\",11);} else {write(1,\"denied\\n\",7);} return 0;}\n")
+    c = tmp_path / "d.c"; c.write_text(src)
+    exe = tmp_path / "d"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(exe)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build dop fixture")
+    t = ingest(store, case.id, exe, filename="d")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, {"cwe": "CWE-787", "title": "oob write into .bss", "detector": "oob_index",
+                              "severity": "high", "state": "corroborated", "confidence": 0.9,
+                              "dedup_key": "w:dop"})
+    fd.upsert(t.id, case.id, {"cwe": "CWE-78", "title": "admin_exec command", "detector": "source_sink",
+                              "severity": "high", "state": "corroborated", "confidence": 0.9,
+                              "dedup_key": "c:dop"})
+    enqueue_attack_path(q, t, force=True); assert pool.wait_idle(90)
+    ap = [f for f in fd.list_by_target(t.id) if f.detector == "attack_path"]
+    assert ap and ap[0].state == "poc-backed"
+    assert any("data-only" in (e.get("detail") or "") for e in (ap[0].evidence or []))

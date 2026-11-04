@@ -75,6 +75,8 @@ STAGES: tuple[StageSpec, ...] = (
               "..analyze.lifecycle_stage", "enqueue_lifecycle_scan", no_params=True),
     StageSpec("intwidth_scan", "Integer signedness/width misuse", "target",
               "..analyze.intwidth_stage", "enqueue_intwidth_scan", no_params=True),
+    StageSpec("dop_scan", "Data-only (DOP) hijack surface: security-decision variables", "target",
+              "..analyze.dop_scan_stage", "enqueue_dop_scan", no_params=True),
     StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
               "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
               on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "

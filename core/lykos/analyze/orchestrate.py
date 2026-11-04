@@ -2346,6 +2346,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "param_sink", status, stop, want=15.0)
                 _staged(bud, store, t, "lifecycle_scan", status, stop, want=15.0)
                 _staged(bud, store, t, "intwidth_scan", status, stop, want=15.0)
+                # Data-only (DOP) hijack surface: security-decision variables a write could flip to
+                # take a privileged path with no control-flow hijack. Cheap/offline source scan.
+                _staged(bud, store, t, "dop_scan", status, stop, want=15.0)
                 # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
                 # 10-20 min and would starve the core sequence under a bounded budget (observed:
                 # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it

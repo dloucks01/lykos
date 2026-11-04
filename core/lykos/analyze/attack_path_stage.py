@@ -86,6 +86,13 @@ def _detonate_path(ctx, target, path) -> dict:
     payload, dos->the crash). Never raises."""
     if not path.reached:
         return {"status": None, "detail": "no objective reached from the attacker's entry"}
+    # DATA-ONLY (DOP): if the path reaches its objective THROUGH a data-only write->auth edge, try to
+    # demonstrate it directly on a binary target -- flip a security-decision variable so the program
+    # takes the privileged path, discovered hands-off (no marker/distance). CFI-immune, leak-free.
+    if any(s.technique and "data-only" in (s.label or "") for s in path.steps):
+        d = _detonate_data_only(ctx, target)
+        if d["status"]:
+            return d
     obj = path.objective
     if obj == attack_path.RCE:
         return _detonate_memory_rce(ctx, target, path)
@@ -136,6 +143,32 @@ def _reflect_dos(ctx, target) -> dict:
     except Exception:                                        # noqa: BLE001
         pass
     return {"status": None, "detail": "dos: no reproduced crash (static ceiling)"}
+
+
+def _detonate_data_only(ctx, target) -> dict:
+    """Demonstrate a data-only (DOP) privilege flip on a binary target: discover_data_only finds the
+    security variable's distance and the privileged signal hands-off and detonates it. Native only;
+    best-effort. 'detonated' when a flip takes the guarded path, else None (honest ceiling)."""
+    try:
+        from .dynamic import sandbox
+        if sandbox.host_arch() != "x86-64" or (target.arch or "") not in ("x86-64", "x86_64", "amd64"):
+            return {"status": None, "detail": "data-only detonation is x86-64 native only"}
+        from . import dop
+        wd = ctx.scratch() / "dop"
+        wd.mkdir(parents=True, exist_ok=True)
+        exe = wd / "target"
+        ctx.content.stage_target(target, exe.parent, exe.name)
+        import os as _os
+        _os.chmod(exe, 0o755)
+        plan, tok = dop.discover_data_only(str(exe), max_distance=256)
+        if plan is not None and tok is not None:
+            return {"status": "detonated",
+                    "detail": f"data-only (DOP): flipping a decision variable at +{plan.distance} takes "
+                              f"the privileged path (signal {tok[:24]!r}) -- no control-flow hijack"}
+    except Exception:                                        # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).debug("data-only detonation skipped", exc_info=True)
+    return {"status": None, "detail": "data-only path present but no flip took a privileged branch here"}
 
 
 def _detonate_memory_rce(ctx, target, path) -> dict:
