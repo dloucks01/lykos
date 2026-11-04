@@ -5,7 +5,7 @@ from ..db.dao import FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
 from .source_lookup import source_project_for
 from . import race_scan
-RACE_STAGE = "race_scan"; TOOL = "lykos.race_scan"; TOOL_VERSION = "1"
+RACE_STAGE = "race_scan"; TOOL = "lykos.race_scan"; TOOL_VERSION = "2"   # v2: true 1-based file lines + provenance-gated precision
 _EXCL = ("third-party", "third_party", "external", "/test/", "/tests/", "/_")
 
 
@@ -47,6 +47,7 @@ def race_scan_stage(ctx) -> dict:
             except OSError:
                 continue
             rel = os.path.relpath(p, str(root))
+            # race_scan reports 1-based FILE lines (not offsets within the function body)
             for b in race_scan.find_double_fetch(src):
                 fd.upsert(target.id, target.case_id, {
                     "cwe": "CWE-367", "severity": "medium", "state": "candidate",
