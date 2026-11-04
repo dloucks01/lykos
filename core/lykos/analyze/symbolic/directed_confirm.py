@@ -134,7 +134,7 @@ def _asan_replay(binary, data: bytes, lib_dirs=None, *, timeout: float = 30.0) -
 
 def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFuzzerTestOneInput",
                      input_size: int = 256, lib_dirs=None, targets=None, target_syms=None,
-                     load_libs=None, timeout: int = 120, ctx=None) -> dict:
+                     load_libs=None, seeds=None, timeout: int = 120, ctx=None) -> dict:
     """Confirm a memory-safety bug via concolic input synthesis + ASan replay. See module docstring.
 
     `explore_binary` is the NON-ASan harness angr explores; `replay_binary` the ASan harness used to
@@ -152,6 +152,12 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
         return out
     spec = {"binary": str(explore_binary), "input_mode": "harness", "harness_fn": harness_fn,
             "input_size": int(input_size), "max_seconds": int(timeout), "num_find": 16}
+    if seeds:
+        # concolic/hybrid seeding: preconstrain states from structure-VALID inputs so angr starts
+        # PAST the outer parse gates and only has to solve the vulnerable region -- the fix for a
+        # deep parser where a blank-buffer explore hits the cutoff with no inputs generated.
+        import base64 as _b64
+        spec["seeds"] = [_b64.b64encode(s).decode() for s in seeds if s]
     if targets:
         spec["targets"] = list(targets)
     if target_syms:
