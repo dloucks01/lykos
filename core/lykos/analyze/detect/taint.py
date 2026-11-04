@@ -805,8 +805,32 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
     return flagged, ret_bool, contribs
 
 
+def _stopper(should_stop, every: float = 1.0):
+    """A cheap poll of `should_stop` (a stage's cancel check, which reads the database): at most
+    once per `every` seconds. Returns a no-arg callable -> bool."""
+    if should_stop is None:
+        return lambda: False
+    import time as _t
+    last = [0.0]
+    hit = [False]
+
+    def poll() -> bool:
+        if hit[0]:
+            return True
+        now = _t.monotonic()
+        if now - last[0] >= every:
+            last[0] = now
+            try:
+                hit[0] = bool(should_stop())
+            except Exception:                                # noqa: BLE001 -- never sink the analysis
+                hit[0] = False
+        return hit[0]
+    return poll
+
+
 def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,
-                    max_funcs=None, skipped_out=None, heap_regions=None, ranked_out=None):
+                    max_funcs=None, skipped_out=None, heap_regions=None, ranked_out=None,
+                    should_stop=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -829,7 +853,13 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     (`rank_functions`) instead of returning nothing; `ranked_out`, when given, is filled with that
     selection's report (total / analyzed / skipped / unreachable / skipped_reachable / exact /
     note) so the caller can state exactly how much was not looked at. Untouched at or below it.
+
+    `should_stop` (the stage's cancel/deadline check) is polled about once a second; when it fires
+    the fixpoint stops and the sites flagged SO FAR are returned, with `ranked_out["cut_short"]`
+    set. Without it a cancelled detect stage kept its worker for ~2 more minutes on a static
+    binary (measured, jhead-3.04), starving every stage after it.
     """
+    stop = _stopper(should_stop)
     heap_regions = heap_regions or {}
     ak = _arch_key(arch)
     if not ak or not _has_abi(ARCH_ABI[ak]):
@@ -863,6 +893,8 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     inq = set(func_addrs)
     cap = len(func_addrs) * 8 + 200
     while wl and cap > 0:
+        if stop():
+            break
         cap -= 1
         f = wl.popleft()
         inq.discard(f)
@@ -883,6 +915,8 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     flagged = set()
     big: list = []
     for f in func_addrs:
+        if stop():
+            break
         acc = [] if mem_out is not None else None
         ff, _, _ = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
                         entry_params[f], ret_tainted, mem_out=acc, oversized=big,
@@ -892,6 +926,10 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
             mem_out.append({**x, "function_addr": f})
     if big and skipped_out is not None:
         skipped_out.extend(big)
+    if stop() and ranked_out is not None:
+        ranked_out["cut_short"] = True
+        ranked_out["note"] = ((ranked_out.get("note") or "") +
+                              " -- cut short by the stage's budget/cancel; partial result").strip(" -")
     return flagged
 
 

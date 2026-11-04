@@ -821,7 +821,8 @@ def detect_stage(ctx) -> dict:
         tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,
                                               max_funcs=taint_cap, skipped_out=oversized,
-                                              heap_regions=heap_regions, ranked_out=rk)
+                                              heap_regions=heap_regions, ranked_out=rk,
+                                              should_stop=ctx.should_cancel)
         if rk:
             ctx.emit("detect.taint_ranked", payload={**rk, "cap": taint_cap})
             if rk.get("skipped_reachable", 0) > 0:
@@ -848,7 +849,8 @@ def detect_stage(ctx) -> dict:
                 _merged[a] = _merged.get(a, set()) | set(idx)
             _with_buf = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=_merged, max_funcs=taint_cap,
-                                              heap_regions=heap_regions)
+                                              heap_regions=heap_regions,
+                                              should_stop=ctx.should_cancel)
             buffer_only = set(_with_buf) - set(tainted_sites)
             ctx.emit("taint.buffer_seed", payload={
                 "seeded_parsers": len(_buf_seeds), "new_sites": len(buffer_only),

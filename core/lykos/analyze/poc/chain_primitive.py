@@ -182,6 +182,15 @@ def _recipe(vclass: str, win, target_bytes: bytes, glibc=None) -> dict:
     return plan
 
 
+def _budget_cut(ctx, where: str) -> dict:
+    """The stage's budget slice was spent (cancel requested). Stop between phases instead of running
+    the next one to completion: an abandoned stage kept its worker thread ~2 min past its slice
+    (measured, jhead-3.04), starving every stage after it."""
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": False,
+                                    "note": f"budget slice spent {where}; later phases not run"})
+    return {"metrics": {"chained": False, "budget_cut": where}}
+
+
 def chain_primitive_stage(ctx) -> dict:
     from ...db.dao import CallEdgeDAO, StringDAO, TargetDAO
     from ..dynamic import sandbox
@@ -244,6 +253,8 @@ def chain_primitive_stage(ctx) -> dict:
     except Exception:                                      # noqa: BLE001 -- best-effort; fall through
         observe.absorbed(_log, "stack-oob construct skipped")
 
+    if ctx.should_cancel():                                # budget slice spent: stop between phases
+        return _budget_cut(ctx, "before leak->groom->control")
     # doc 60 frontier: LEAK -> GROOM -> CONTROL for a heap OOB-write on a PIE target. Composes the
     # adjacent-overflow groom with the PIE two-stage leak oracle to overwrite an adjacent victim's
     # function pointer with the runtime win (defeating ASLR via the disclosed pointer). Fires when
@@ -255,6 +266,8 @@ def chain_primitive_stage(ctx) -> dict:
             ctx.progress(pct=100, msg="leak->groom->control: L3 confirmed (ASLR defeated)")
             return lg
 
+    if ctx.should_cancel():                                # budget slice spent: stop between phases
+        return _budget_cut(ctx, "before the write-what-where route")
     # Without a reachable win, a HIJACK has nothing to point at -- but an arbitrary WRITE does not
     # need one. A write-what-where plus the arbitrary read that comes with it leaks the libc base
     # out of a GOT slot and forges a FILE, so exit() calls system("/bin/sh"): no win function, no
@@ -299,6 +312,8 @@ def chain_primitive_stage(ctx) -> dict:
         ctx.progress(pct=100, msg=f"L2 recipe for {vclass} (live hijack not demonstrable: {why})")
         return {"metrics": {"chained": False, "vclass": vclass}}
 
+    if ctx.should_cancel():                                # budget slice spent: stop between phases
+        return _budget_cut(ctx, "before the win-function ladder")
     win_name, win_addr = win
     workdir = Path(tempfile.mkdtemp(prefix="lykos-chain-"))
     sandbox.protect_dir(getattr(ctx.content, "root", None))

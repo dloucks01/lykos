@@ -95,3 +95,14 @@ def test_angr_driver_resolves_stripped_autonames(tmp_path, gcc):
                  hex(link_main), "main"):
         assert angr_driver._fn_addr(proj, name) == want, name
     assert angr_driver._fn_addr(proj, "no_such_function") is None
+
+
+def test_taint_fixpoint_honours_a_stop_request():
+    """A cancelled detect stage kept its worker ~2 min (jhead-3.04). analyze_program polls the
+    stage's cancel check and returns its partial result, marked cut short."""
+    from lykos.analyze.detect import taint
+    calls = []
+    rk: dict = {}
+    out = taint.analyze_program({0x1000: object()}, [], "x86-64", ranked_out=rk,
+                                should_stop=lambda: calls.append(1) or True)
+    assert out == set() and calls and rk.get("cut_short") is True
