@@ -1659,7 +1659,7 @@ _SKIP_DIRS = (".git", "_lykos_build", "node_modules", ".deps", ".libs",
               "_lykos_cmake_sh_asan", "_qlbuild", "_lykos_cmake", "CMakeFiles")
 
 
-def include_dirs(root, cap: int = 64) -> list:
+def include_dirs(root, cap: int = 256) -> list:
     """Every directory that holds a header, shallowest first.
 
     `-I <root>` alone is not enough for any project that keeps its public header beside its
