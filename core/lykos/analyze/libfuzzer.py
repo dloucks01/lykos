@@ -3096,7 +3096,7 @@ _KEEP_GOING_REPLAYS = 64
 
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
                   corpus: list | None = None, lib_dirs: list | None = None,
-                  keep_going: bool = False) -> dict:
+                  keep_going: bool = False, fork: int = 1) -> dict:
     """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
     Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed."""
     workdir = Path(workdir)
@@ -3127,7 +3127,7 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         # Past the first crash. A plain run STOPS at it: md4c's md_html harness found a heap
         # overflow after 9,705 executions and the rest of its slice went to another entry point,
         # while fork mode on the same harness reaches a second, different defect within seconds.
-        argv += ["-fork=1", "-ignore_crashes=1", "-ignore_timeouts=1", "-ignore_ooms=1"]
+        argv += [f"-fork={max(1, fork)}", "-ignore_crashes=1", "-ignore_timeouts=1", "-ignore_ooms=1"]
     crashes = []
     before = set(art.iterdir())
     try:
