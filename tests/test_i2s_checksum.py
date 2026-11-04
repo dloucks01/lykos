@@ -94,3 +94,47 @@ def test_localized_seeds_from_observations():
     assert any(s[20:22] == b"GO" for s in seeds)
     # the combined seed applies both
     assert any(s[8:12] == b"PASS" and s[20:22] == b"GO" for s in seeds)
+
+
+def _tok_runner(exe):
+    import re
+    def run(d):
+        o = subprocess.run([str(exe)], input=d, capture_output=True, timeout=8).stdout
+        return set(re.findall(rb"[\x20-\x7e]{3,}", o))
+    return run
+
+
+def test_corpus_booster_repairs_real_gate(gate_bin):
+    seed = b"LYK!\x00hello-body"
+    out = i2s.repaired_corpus_seeds(str(gate_bin), [seed], run=_tok_runner(gate_bin), deadline_s=20)
+    assert out and b"PARSED-OK" in subprocess.run([str(gate_bin)], input=out[0],
+                                                  capture_output=True).stdout
+
+
+# A target that RENDERS its computed values instead of gating on them: every input prints new tokens,
+# so a naive "new output token" accept takes the first candidate. Generalization must reject it.
+_ECHO = r"""
+#include <stdio.h>
+#include <unistd.h>
+int main(void){ unsigned char b[256]; int n=read(0,b,sizeof b); if(n<2) return 0;
+  unsigned s=0; for(int i=1;i<n;i++) s=(s+b[i])&0xFF;
+  printf("got %02x want %02x\n", b[0], s); return 0; }
+"""
+
+
+def test_corpus_booster_rejects_value_rendering_target(tmp_path, gcc):
+    c = tmp_path / "e.c"; c.write_text(_ECHO)
+    exe = tmp_path / "e"
+    if subprocess.run([gcc, "-O0", "-w", str(c), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build echo fixture")
+    out = i2s.repaired_corpus_seeds(str(exe), [b"\x00abcdef"], run=_tok_runner(exe), max_off=8,
+                                    deadline_s=20)
+    assert out == []
+
+
+def test_learn_layout_honours_deadline():
+    import time
+    calls = []
+    lay = i2s.learn_layout(b"x" * 40, lambda d: calls.append(1) or False,
+                           deadline=time.monotonic() - 1)
+    assert lay is None and calls == [1]       # only the initial "already accepted?" probe ran

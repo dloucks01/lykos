@@ -71,11 +71,17 @@ class ChecksumLayout:
 
 
 def learn_layout(data: bytes, accept: Callable[[bytes], bool], *, widths=(1, 2, 4),
-                 max_off: int = 64) -> Optional[ChecksumLayout]:
+                 max_off: int = 64, deadline: Optional[float] = None,
+                 verify: Optional[Callable[["ChecksumLayout"], bool]] = None) -> Optional[ChecksumLayout]:
     """Find an integrity-field layout that, when recomputed, makes `accept(repaired)` true. Tries
     each (offset, width, endianness, algorithm) with the body = the rest of the input; the common
     'field is a checksum/length of everything after it' and 'of everything except it' shapes. Returns
-    the first layout that flips reject -> accept, or None. Bounded: a few hundred cheap candidates."""
+    the first layout that flips reject -> accept, or None. Bounded by `max_off` and, when given, a
+    `deadline` (time.monotonic() value) -- each candidate may be a target execution, so the search
+    is capped in wall-clock time, not just in count. `verify(layout)`, when given, must also hold for
+    a layout to be returned; a candidate that is accepted but fails verification is skipped and the
+    search continues (an `accept` driven by output can be fooled by an echoing target)."""
+    import time as _time
     n = len(data)
     if accept(data):
         return None                                       # already accepted -> nothing to repair
@@ -86,9 +92,11 @@ def learn_layout(data: bytes, accept: Callable[[bytes], bool], *, widths=(1, 2, 
             for big in (False, True):
                 for algo in _ALGOS:
                     for body_lo, body_hi in ((off + width, None), (0, None)):
+                        if deadline is not None and _time.monotonic() > deadline:
+                            return None
                         lay = ChecksumLayout(off, width, big, algo, body_lo, body_hi)
                         try:
-                            if accept(lay.apply(data)):
+                            if accept(lay.apply(data)) and (verify is None or verify(lay)):
                                 return lay
                         except Exception:                 # noqa: BLE001
                             continue
@@ -190,29 +198,67 @@ def place(seed: bytes, placements) -> bytes:
     return bytes(b)
 
 
-def repaired_corpus_seeds(exe: str, seeds, *, run, max_seeds: int = 8, max_off: int = 64):
+def _body_variant(seed: bytes, lay: "ChecksumLayout") -> Optional[bytes]:
+    """The seed with one BODY byte changed (never the integrity field), so the field is now stale."""
+    hi = len(seed) if lay.body_hi is None else lay.body_hi
+    for i in range(hi - 1, lay.body_lo - 1, -1):
+        if not (lay.off <= i < lay.off + lay.width):
+            b = bytearray(seed)
+            b[i] ^= 0x01
+            return bytes(b)
+    return None
+
+
+def repaired_corpus_seeds(exe: str, seeds, *, run, max_seeds: int = 8, max_off: int = 64,
+                          deadline_s: Optional[float] = None):
     """Fuzz-campaign booster: for each seed that an integrity gate rejects, learn a checksum/length
-    layout and return the repaired seed so the fuzzer starts EXPLORING behind the gate. The past-gate
-    signal is `run(data) -> reached_blocks` (a set/collection of coverage identifiers); a repair is
-    kept only when it reaches blocks the raw seed did not -- a sound 'got further' signal (new
-    coverage), not a guess. Best-effort and bounded; returns a list of repaired seed bytes. Never
-    raises. `run` is supplied by the harness (it already measures coverage per execution)."""
+    layout and return the repaired seed so the fuzzer starts EXPLORING behind the gate. `run(data)`
+    returns a set of behaviour identifiers (coverage blocks, or output tokens).
+
+    A layout is kept only when it GENERALIZES, which is what separates a real integrity field from an
+    output that merely reflects the input: (1) the repaired seed shows behaviour the raw seed does
+    not; (2) a DIFFERENT body, repaired with the same layout, shows that same new behaviour; and (3)
+    that different body with its field left STALE does not; and (4) a different WRONG value in the
+    field reproduces the seed's original reject exactly. An echoing or value-printing target
+    ('got 0x12 want 0x34') fails (2)-(4); rewriting the magic instead of the checksum fails (4). Bounded by `deadline_s` over all seeds. Never raises."""
+    import time as _time
+    deadline = (_time.monotonic() + deadline_s) if deadline_s else None
     out = []
     try:
         for seed in list(seeds)[:max_seeds]:
+            if deadline is not None and _time.monotonic() > deadline:
+                break
             seed = bytes(seed)
             base = set(run(seed) or ())
             if not base:
                 continue
 
             def accept(d: bytes, _base=base) -> bool:
-                return bool(set(run(d) or ()) - _base)   # reached a block the raw seed did not
+                return bool(set(run(d) or ()) - _base)   # reached behaviour the raw seed did not
 
-            lay = learn_layout(seed, accept, max_off=max_off)
+            def verify(lay, _seed=seed, _base=base) -> bool:
+                var = _body_variant(_seed, lay)
+                if var is None:
+                    return False
+                new = set(run(lay.apply(_seed)) or ()) - _base
+                new &= set(run(lay.apply(var)) or ())       # (2) generalizes to another body
+                new -= set(run(var) or ())                  # (3) the stale-field variant misses it
+                if not new:
+                    return False
+                # (4) the field IS the gate: a different WRONG value in it reproduces the seed's own
+                # reject exactly. Rejects layouts that rewrite gate-earlier bytes (corrupting the
+                # magic trades BADSUM for BADMAGIC -- new, but backwards) and value-rendering output.
+                rep = bytearray(lay.apply(_seed))
+                for i in range(lay.off, lay.off + lay.width):
+                    rep[i] ^= 0x5A
+                return set(run(bytes(rep)) or ()) == _base
+
+            lay = learn_layout(seed, accept, max_off=max_off, deadline=deadline, verify=verify)
             if lay is not None:
                 rep = lay.apply(seed)
                 if rep != seed:
                     out.append(rep)
     except Exception:                                        # noqa: BLE001
         return out
+    return out
     return out

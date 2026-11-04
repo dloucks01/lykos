@@ -2547,7 +2547,8 @@ def fuzz_stage(ctx) -> dict:
     # no mutation reaching the code behind the gate is ever accepted. Learn the field layout from a
     # seed and add the REPAIRED seed to the corpus FRONT, so the fuzzer explores behind the integrity
     # gate. Best-effort, bounded, stdin-only; the 'got further' signal is a repaired seed producing a
-    # printable output token the raw seed did not (a real advance past the reject, not a guess).
+    # output token the raw seed did not AND the learned layout generalizes to a second body (see
+    # i2s.repaired_corpus_seeds); capped at 10s so the probe never eats the campaign.
     try:
         if corpus and not substrate.is_managed(target.file_type) and (not channels or channels[0] == "stdin"):
             import re as _re2
@@ -2557,14 +2558,15 @@ def fuzz_stage(ctx) -> dict:
             if not _ie.exists():
                 ctx.content.stage_target(target, _ie.parent, _ie.name)
 
-            def _out_tokens(d, _exe=str(_ie), _argv=base_argv, _to=min(8.0, max(2.0, exec_timeout))):
+            def _out_tokens(d, _exe=str(_ie), _argv=base_argv, _to=min(2.0, max(0.5, exec_timeout))):
                 try:
                     r = _sp.run([_exe] + list(_argv), input=d, capture_output=True, timeout=_to)
                     return set(_re2.findall(rb"[\x20-\x7e]{3,}", (r.stdout or b"") + (r.stderr or b"")))
                 except Exception:                            # noqa: BLE001
                     return set()
 
-            _rep = _i2s.repaired_corpus_seeds(str(_ie), corpus[:6], run=_out_tokens, max_seeds=4)
+            _rep = _i2s.repaired_corpus_seeds(str(_ie), corpus[:6], run=_out_tokens, max_seeds=4,
+                                                deadline_s=10.0)
             if _rep:
                 corpus = _rep + list(corpus)
                 ctx.emit("fuzz.i2s", payload={
