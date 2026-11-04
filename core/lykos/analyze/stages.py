@@ -83,6 +83,9 @@ STAGES: tuple[StageSpec, ...] = (
               "target", "..analyze.guard_gap_stage", "enqueue_guard_gap", no_params=True),
     StageSpec("alloc_overflow", "Integer overflow in allocation size (wire product/sum, no guard)",
               "target", "..analyze.alloc_overflow_stage", "enqueue_alloc_overflow", no_params=True),
+    StageSpec("sibling_guard", "Missing sibling validation (a guard most dispatch-family siblings "
+              "make, one omits)", "target", "..analyze.sibling_guard_stage",
+              "enqueue_sibling_guard", no_params=True),
     StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
               "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
               on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "

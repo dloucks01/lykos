@@ -2358,6 +2358,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # Allocation-size integer overflow: a wire-derived product/sum used as an alloc/copy
                 # size with no overflow guard (CWE-190 -> CWE-787). Precise sibling of guard_gap.
                 _staged(bud, store, t, "alloc_overflow", status, stop, want=15.0)
+                # Missing-sibling-validation (generalized variant analysis): a bounds/validation
+                # guard most handlers in a dispatch family make but one omits (found CVE-2026-26955).
+                _staged(bud, store, t, "sibling_guard", status, stop, want=15.0)
                 # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
                 # 10-20 min and would starve the core sequence under a bounded budget (observed:
                 # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it
