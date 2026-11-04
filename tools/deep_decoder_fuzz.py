@@ -74,7 +74,8 @@ def main():
         hid = spec.get("id", "?")
         wd = outdir / ("run_" + hid[-40:].replace("/", "_"))
         wd.mkdir(parents=True, exist_ok=True)
-        r = LF.run_libfuzzer(out, wd, seconds=secs, corpus=seeds or None,
+        binary = b.get("binary") or out        # build returns the runnable path; `out` isn't created
+        r = LF.run_libfuzzer(binary, wd, seconds=secs, corpus=seeds or None,
                              lib_dirs=b.get("lib_dirs"), keep_going=True, fork=fork)
         return spec, r
 
