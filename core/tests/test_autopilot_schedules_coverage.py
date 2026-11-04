@@ -27,7 +27,7 @@ def test_coverage_sweep_runs_after_grounding():
 
 def test_core_source_stages_all_scheduled():
     seq = set(_staged_sequence())
-    for stage in ("detect_cwe", "wire_flow", "param_sink", "lifecycle_scan", "intwidth_scan", "dop_scan", "grounding", "coverage_sweep", "confirm", "drivable_confirm", "weaponize_plan", "triage", "attack_path"):
+    for stage in ("detect_cwe", "wire_flow", "param_sink", "lifecycle_scan", "intwidth_scan", "dop_scan", "race_scan", "grounding", "coverage_sweep", "confirm", "drivable_confirm", "weaponize_plan", "triage", "attack_path"):
         assert stage in seq, f"{stage} fell out of the autopilot schedule"
 
 
