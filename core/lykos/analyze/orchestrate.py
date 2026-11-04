@@ -2351,6 +2351,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "dop_scan", status, stop, want=15.0)
                 # Double-fetch (TOCTOU) + uninitialized-pointer deref -- new discovery classes.
                 _staged(bud, store, t, "race_scan", status, stop, want=15.0)
+                # Guard-gap: attacker-controlled stream length used as a seek/copy bound with no
+                # Stream_CheckAndLogRequiredLength / Stream_SafeSeek guard -- the dominant real-bug
+                # shape in FreeRDP (rediscovered CVE-2026-25941). Variant-analysis cross-checked.
+                _staged(bud, store, t, "guard_gap", status, stop, want=15.0)
                 # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
                 # 10-20 min and would starve the core sequence under a bounded budget (observed:
                 # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it

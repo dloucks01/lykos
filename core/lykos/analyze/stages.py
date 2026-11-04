@@ -79,6 +79,8 @@ STAGES: tuple[StageSpec, ...] = (
               "..analyze.dop_scan_stage", "enqueue_dop_scan", no_params=True),
     StageSpec("race_scan", "Double-fetch (TOCTOU) + uninitialized-pointer deref", "target",
               "..analyze.race_scan_stage", "enqueue_race_scan", no_params=True),
+    StageSpec("guard_gap", "Missing stream-length guard (attacker length -> seek/copy, OOB r/w)",
+              "target", "..analyze.guard_gap_stage", "enqueue_guard_gap", no_params=True),
     StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
               "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
               on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "
