@@ -1655,10 +1655,11 @@ def _sources(root: Path, exclude_main: bool):
     return out
 
 
-_SKIP_DIRS = (".git", "_lykos_build", "node_modules", ".deps", ".libs")
+_SKIP_DIRS = (".git", "_lykos_build", "node_modules", ".deps", ".libs",
+              "_lykos_cmake_sh_asan", "_qlbuild", "_lykos_cmake", "CMakeFiles")
 
 
-def include_dirs(root, cap: int = 32) -> list:
+def include_dirs(root, cap: int = 64) -> list:
     """Every directory that holds a header, shallowest first.
 
     `-I <root>` alone is not enough for any project that keeps its public header beside its
@@ -1673,8 +1674,26 @@ def include_dirs(root, cap: int = 32) -> list:
         parts = h.relative_to(root).parts
         if any(seg in _SKIP_DIRS for seg in parts):
             continue
-        dirs.add(h.parent)
-    return sorted(dirs, key=lambda d: (len(d.relative_to(root).parts), str(d)))[:cap]
+        # Add the leaf dir AND every ancestor up to root: a header is included both by its bare name
+        # (`tiffio.h` -> needs its own dir) and by a PATH-PREFIXED angle include (`<freerdp/dvc.h>`
+        # -> needs the dir ABOVE the `freerdp/` prefix, i.e. `<tree>/include`). FreeRDP keeps public
+        # headers only under `include/freerdp/..`, so without the ancestor `include/` the codec and
+        # channel fuzz harnesses failed to compile ("'freerdp/dvc.h' file not found") and nothing
+        # could detonate. Shallowest-first + the cap keep exactly these prefix roots.
+        d = h.parent
+        while True:
+            dirs.add(d)
+            if d == root:
+                break
+            d = d.parent
+    # Prioritise angle-include PREFIX ROOTS (dirs literally named `include`, e.g. `include/` and
+    # `winpr/include/`) -- an `<pkg/hdr.h>` include resolves only against them, and on a big tree
+    # (FreeRDP has hundreds of header dirs) a plain shallowest-first cap drops `winpr/include` and
+    # the codec harness fails on `winpr/winpr.h`. Then shallowest, then path.
+    def _key(d):
+        rel = d.relative_to(root).parts
+        return (0 if (d.name == "include" or rel[-1:] == ("include",)) else 1, len(rel), str(d))
+    return sorted(dirs, key=_key)[:cap]
 
 
 # ---------------------------------------------------------------------------------------------
