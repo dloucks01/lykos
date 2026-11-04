@@ -117,3 +117,34 @@ def test_stitch_plan_composes_write_and_target():
     assert any("privileged branch" in s for s in p["steps"])
     pb = dop.stitch_plan("oob write", {"var": "r->len", "kind": "bounds"})
     assert "out of bounds" in " ".join(pb["steps"])
+
+
+# Forgery cases for the hands-off oracle: targets with NO decision variable whose output still
+# changes with the input. Neither may "discover" a data-only path.
+_ECHO = r"""
+#include <stdio.h>
+#include <unistd.h>
+int main(void){ char b[128]={0}; int n=read(0,b,127); if(n<=0) return 0;
+  printf("hello %s!\n", b); return 0; }
+"""
+_LEN = r"""
+#include <stdio.h>
+#include <unistd.h>
+int main(void){ char b[256]; int n=read(0,b,256); printf("read %d bytes\n", n); return 0; }
+"""
+_HEX = r"""
+#include <stdio.h>
+#include <unistd.h>
+int main(void){ unsigned char b[256]; int n=read(0,b,256); if(n<=0) return 0;
+  printf("last byte %02x\n", b[n-1]); return 0; }
+"""
+
+
+@pytest.mark.parametrize("src", [_ECHO, _LEN, _HEX], ids=["echo", "length", "byte-render"])
+def test_hands_off_discovery_rejects_input_dependent_output(src, tmp_path, gcc):
+    c = tmp_path / "f.c"; c.write_text(src)
+    exe = tmp_path / "f"
+    if subprocess.run([gcc, "-O0", "-w", str(c), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build forgery fixture")
+    plan, tok = dop.discover_data_only(str(exe), max_distance=24, timeout=2.0)
+    assert (plan, tok) == (None, None), f"false data-only discovery: {tok!r}"

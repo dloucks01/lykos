@@ -153,14 +153,15 @@ def _detonate_data_only(ctx, target) -> dict:
         from .dynamic import sandbox
         if sandbox.host_arch() != "x86-64" or (target.arch or "") not in ("x86-64", "x86_64", "amd64"):
             return {"status": None, "detail": "data-only detonation is x86-64 native only"}
-        from . import dop
+        from .poc import dop
         wd = ctx.scratch() / "dop"
         wd.mkdir(parents=True, exist_ok=True)
         exe = wd / "target"
         ctx.content.stage_target(target, exe.parent, exe.name)
         import os as _os
         _os.chmod(exe, 0o755)
-        plan, tok = dop.discover_data_only(str(exe), max_distance=256)
+        plan, tok = dop.discover_data_only(str(exe), max_distance=256, timeout=2.0,
+                                           deadline_s=45.0)
         if plan is not None and tok is not None:
             return {"status": "detonated",
                     "detail": f"data-only (DOP): flipping a decision variable at +{plan.distance} takes "

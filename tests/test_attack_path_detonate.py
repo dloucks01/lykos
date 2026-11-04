@@ -127,3 +127,6 @@ def test_attack_path_detonates_data_only_dop(store, case, pool, gcc, tmp_path, x
     ap = [f for f in fd.list_by_target(t.id) if f.detector == "attack_path"]
     assert ap and ap[0].state == "poc-backed"
     assert any("data-only" in (e.get("detail") or "") for e in (ap[0].evidence or []))
+    # the DOP detonator itself must have fired (not merely the path label saying "data-only")
+    assert any("flipping a decision variable" in (e.get("detail") or "")
+               for e in (ap[0].evidence or [])), ap[0].evidence
