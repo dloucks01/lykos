@@ -26,8 +26,15 @@ expl = LF.build_libfuzzer(root, wd/"codec_expl.bin", spec=spec, timeout=1200, ca
 print(f"[dc]   explore ok={expl.get('ok')} ({int(time.time()-t)}s) {('' if expl.get('ok') else str(expl.get('log'))[-200:])}", flush=True)
 if not (asan.get("ok") and expl.get("ok")): print("[dc] build failed -> cannot run directed confirm"); sys.exit(2)
 print(f"[dc] directed concolic_confirm steered at {syms} (timeout {secs}s) ...", flush=True)
+# structure-valid seeds: argv[5] (or LYKOS_DC_SEEDS) = a directory of seed files. The driver pins
+# each seed's gate-byte PREFIX and leaves the rest of the buffer symbolic.
+seed_dir = sys.argv[5] if len(sys.argv) > 5 else os.environ.get("LYKOS_DC_SEEDS", "")
+seeds = []
+if seed_dir and Path(seed_dir).is_dir():
+    seeds = [p.read_bytes() for p in sorted(Path(seed_dir).iterdir()) if p.is_file()][:8]
+print(f"[dc] {len(seeds)} seed(s)", flush=True)
 r = DC.concolic_confirm(expl["binary"], asan["binary"], target_syms=syms,
-                        lib_dirs=asan.get("lib_dirs"), timeout=secs)
+                        lib_dirs=asan.get("lib_dirs"), seeds=seeds or None, timeout=secs)
 print(f"[dc] RESULT confirmed={r.get('confirmed')} class={r.get('class')} rung={r.get('rung')} reason={r.get('reason')}", flush=True)
 if r.get("confirmed"):
     open(wd/"poc_input.bin","wb").write(r.get("input") or b"")

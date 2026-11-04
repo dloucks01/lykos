@@ -153,9 +153,11 @@ def concolic_confirm(explore_binary, replay_binary, *, harness_fn: str = "LLVMFu
     spec = {"binary": str(explore_binary), "input_mode": "harness", "harness_fn": harness_fn,
             "input_size": int(input_size), "max_seconds": int(timeout), "num_find": 16}
     if seeds:
-        # concolic/hybrid seeding: preconstrain states from structure-VALID inputs so angr starts
-        # PAST the outer parse gates and only has to solve the vulnerable region -- the fix for a
-        # deep parser where a blank-buffer explore hits the cutoff with no inputs generated.
+        # concolic/hybrid seeding: the driver pins only a PREFIX of each structure-valid seed (its
+        # header/gate bytes -- 16 bytes and half the seed) and leaves the rest of the buffer
+        # symbolic, so those states begin with the outer parse gates already satisfied and the
+        # solver works on the remainder (see angr_driver.seed_prefix_plan). The fully-symbolic
+        # state is kept too. Seeding changes reach only; every input is still ASan-replay gated.
         import base64 as _b64
         spec["seeds"] = [_b64.b64encode(s).decode() for s in seeds if s]
     if targets:
@@ -299,7 +301,7 @@ def _rung_concolic(h, *, timeout, ctx):
         harness_fn=h.get("harness_fn", "LLVMFuzzerTestOneInput"),
         input_size=min(int(h.get("input_size", 256)), _CONCOLIC_MAX_INPUT), lib_dirs=h.get("lib_dirs"),
         targets=h.get("targets"), target_syms=h.get("target_syms"),
-        load_libs=h.get("load_libs"), timeout=timeout, ctx=ctx)
+        load_libs=h.get("load_libs"), seeds=h.get("seeds"), timeout=timeout, ctx=ctx)
 
 
 def smartfuzz_confirm(fuzz_binary, *, lib_dirs=None, seeds=None, input_size=4096, timeout=90,
