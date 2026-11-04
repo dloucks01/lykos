@@ -1590,8 +1590,11 @@ def _distinct_crashes(store, target_id):
 
 def _crash_representatives(store, target_id):
     """Every distinct crash bucket's representative(s), primaries first (uncapped)."""
+    # A QASan-demonstrated error (isolation "qasan") does NOT crash natively, and this prove loop
+    # (root_cause/build_poc/primitive) replays natively -- it would only report "did not reproduce".
+    # The qasan lane files its own confirmed finding; it is kept out of the native loop.
     crashes = [d for d in DynResultDAO(store.conn).list_by_target(target_id)
-               if d.crashed and d.input_sha]
+               if d.crashed and d.input_sha and (d.isolation or "") != "qasan"]
     # Recover the fault PC of any crashes that would otherwise collapse into one
     # `(signal, None)` bucket, so two genuinely distinct in-code defects both reach the prove
     # loop. Hijacks stay None and keep collapsing (see `_recover_missing_fault_pcs`).

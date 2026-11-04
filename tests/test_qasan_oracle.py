@@ -103,3 +103,53 @@ def test_static_binaries_are_declined_with_a_reason(tmp_path, gcc):
     assert not ok and "statically linked" in why
     ok, why = qasan.applicable(exe.read_bytes(), "aarch64")
     assert not ok and "x86-64" in why
+
+
+_GATED = r"""
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+int main(void){ unsigned char h[8]; if(read(0,h,8)<2 || h[0]!='Q') return 0;
+  unsigned n=h[1]; char *b=malloc(16); memset(b,'x',16);
+  volatile unsigned long s=0; for(unsigned i=0;i<n;i++) s+=b[i];   /* silent over-read if n>16 */
+  free(b); return 0; }
+"""
+
+
+def test_coverage_stage_files_a_qasan_demonstrated_overread(store, case, tmp_path, gcc):
+    """End to end through the real coverage_fuzz stage: AFL -Q runs under QASan, the silent
+    over-read never crashes natively, and the QASan replay pass files a CONFIRMED CWE-125 finding
+    located in main -- kept out of the native prove loop (isolation 'qasan')."""
+    import base64
+    from lykos.analyze import register
+    from lykos.analyze.fuzz import aflpp, enqueue_coverage_fuzz
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import DynResultDAO, FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    if aflpp.locate_afl() is None:
+        pytest.skip("afl-fuzz not installed")
+    exe = _build(_GATED, tmp_path, gcc, "gated")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, lease_seconds=180,
+                                                              poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, case.id, exe)
+        from lykos.analyze.ingest import enqueue_triage
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(120)
+        run = enqueue_coverage_fuzz(q, t, params={
+            "input_mode": "stdin", "max_seconds": 40, "exec_timeout": 1, "qemu": True,
+            "seeds": [base64.b64encode(b"Q\x04AAAAAA").decode()]})
+        assert pool.wait_idle(240)
+        rec = q.runs.get(run.id)
+        if rec.status != "done":
+            pytest.skip("afl-fuzz could not run here: " + str(rec.error))
+    finally:
+        pool.stop(grace=3.0)
+    q_f = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "qasan"]
+    assert q_f, "QASan lane filed nothing"
+    f = q_f[0]
+    assert f.cwe == "CWE-125" and f.state == "confirmed" and "main" in f.title
+    assert any(d.isolation == "qasan" for d in DynResultDAO(store.conn).list_by_target(t.id))

@@ -435,10 +435,28 @@ def coverage_stage(ctx) -> dict:
     if not _dep_ok:
         ctx.emit("coverage.deps", payload={"resolved": False, "note": _dep_why})
         ctx.progress(msg="missing shared libraries — the handshake will fail until they are supplied")
+    # QASan lane (binary-only memory oracle): on an x86-64 dynamically linked, non-sanitizer
+    # target, run the campaign under QEMU-ASan so heap errors that do not crash natively stop the
+    # target. Measured on the shipped gif2rgb: 2 min under QASan surfaced the DumpScreen2RGB
+    # colormap over-read (CVE-2016-3977 group) that native fuzzing can never see.
+    _qasan_on = False
+    if afl_path and use_qemu and p.get("qasan", True) and _plain is None:
+        try:
+            from ..dynamic import qasan as _qasan
+            _ok, _why = _qasan.applicable(exe.read_bytes(), target.arch)
+            if _ok:
+                _lib = _qasan._locate()[1] / "libqasan.so"
+                _dst = Path(afl_path) / "libqasan.so"
+                if not _dst.exists():
+                    _dst.symlink_to(_lib)
+                _qasan_on = True
+            ctx.emit("coverage.qasan", payload={"enabled": _qasan_on, "note": _why or None})
+        except Exception:                                    # noqa: BLE001 -- the lane is additive
+            observe.absorbed(_log, "qasan lane unavailable")
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
                               mode=mode, qemu=use_qemu, argv_template=argv_template,
                               input_file=input_file, qemu_ld_prefix=_ld_prefix,
-                              converge=bool(p.get("converge")))
+                              converge=bool(p.get("converge")), qasan=_qasan_on)
     # How contained the campaign was. A degraded (unsandboxed) run is reported at warn level --
     # coverage fuzzing still happened, but the operator must be able to see it ran unconfined.
     _iso = getattr(proc, "isolation", None)
@@ -549,6 +567,7 @@ def coverage_stage(ctx) -> dict:
                          base_argv=replay_argv, blocks=cover_blocks,
                          endianness=target.endianness, bits=target.bits)[1]
 
+    _qasan_cands: list = []
     for data in raw:
         if ctx.should_cancel():
             break
@@ -556,6 +575,7 @@ def coverage_stage(ctx) -> dict:
         alog.record_result(data, res, phase="afl-crash",
                            note=None if res.crashed else "AFL saved it as a crash; did not reproduce here")
         if not res.crashed:
+            _qasan_cands.append(data)                 # maybe a QASan-only memory error
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
         defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
@@ -603,6 +623,13 @@ def coverage_stage(ctx) -> dict:
             fault_pc=res.fault_pc, discriminator=defect_key, hijack=hj))
         confirmed += 1
 
+    if _qasan_on:
+        try:
+            _qasan_cands += [f.read_bytes() for f, _m in aflpp.saved_entries(out_dir, "hangs")][:40]
+            confirmed += qasan_pass(ctx, target, exe, _qasan_cands, mode=mode, argv=replay_argv,
+                                    suffix=suffix, exec_timeout=exec_timeout, origin="coverage_fuzz")
+        except Exception:                                    # noqa: BLE001 -- additive lane
+            observe.absorbed(_log, "qasan replay pass failed")
     # Uninitialized-read pass (CWE-457): detonate the corpus against the MSan build if one exists.
     try:
         _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
@@ -637,6 +664,80 @@ def coverage_stage(ctx) -> dict:
     # Persist as the run's output artifact so /runs/<id>/output carries the coverage achieved.
     sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))
     return {"output_shas": [sha], "output_kind": "fuzz-summary"}
+
+
+_QASAN_TITLES = {"heap-buffer-overflow": "Heap buffer {acc}", "heap-use-after-free": "Use after free",
+                 "double-free": "Double free", "invalid-free": "Invalid free",
+                 "stack-buffer-overflow": "Stack buffer overflow",
+                 "global-buffer-overflow": "Global buffer overflow"}
+
+
+def qasan_pass(ctx, target, exe, inputs, *, mode, argv, suffix, exec_timeout, origin,
+               max_runs: int = 40, deadline_s: float = 120.0) -> int:
+    """Replay candidate inputs under QASan and file every DISTINCT memory error it demonstrates.
+
+    `inputs` are what a native replay could not show: AFL crashes that did not reproduce natively and
+    AFL hangs (QASan's report path can spin, so AFL files many detections as hangs). Each accepted
+    report is execution-demonstrated by a shadow-memory oracle with forgery checks (dynamic.qasan),
+    so the finding is `confirmed`; it is not poc-backed (no reproducer bundle is built here).
+    Distinct = (class, access, in-target site). Bounded by max_runs / deadline_s. Returns #filed."""
+    import time as _t
+    from ...db.dao import FunctionDAO
+    from ..dynamic import qasan
+    fd, dd = FindingDAO(ctx.conn), DynResultDAO(ctx.conn)
+    blob = Path(exe).read_bytes()
+    funcs = sorted(((int(f.addr, 16) if str(f.addr).startswith("0x") else int(f.addr)), f)
+                   for f in FunctionDAO(ctx.conn).list_by_target(target.id) if f.addr)
+    t_end = _t.monotonic() + deadline_s
+    seen, filed, runs = set(), 0, 0
+    for data in inputs:
+        if runs >= max_runs or _t.monotonic() > t_end or ctx.should_cancel():
+            break
+        runs += 1
+        rep = qasan.run(exe, data, argv=list(argv or ()), mode=mode,
+                        timeout=max(6.0, 3 * exec_timeout), input_suffix=suffix or "")
+        if rep is None:
+            continue
+        key = (rep.kind, rep.access, rep.site_off)
+        if key in seen:
+            continue
+        seen.add(key)
+        va = qasan.site_va(rep, blob)
+        fn = None
+        if va is not None:
+            for a, f in funcs:
+                if a <= va < a + max(int(f.size or 0), 1):
+                    fn = f
+                    break
+        acc = (rep.access or "").lower()
+        title = _QASAN_TITLES.get(rep.kind, f"Memory error ({rep.kind})").format(
+            acc="over-read" if acc == "read" else "over-write" if acc == "write" else "overflow")
+        # name: the recovered function, else the symbol QASan printed for the in-target frame
+        sym = next((n for n, mod, off in rep.frames if n and off == rep.site_off), None)
+        name = (fn.name if fn and fn.name else None) or sym
+        where = f" in {name}" if name else ""
+        input_sha = ctx.put_artifact("afl-crash-input", data=data)
+        dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
+                  input_mode=mode, argv=list(argv or []), signal=None, signal_name="QASAN",
+                  crashed=True, isolation="qasan", duration_ms=None,
+                  note=rep.summary(), fault_pc=va,
+                  defect_key=f"qasan:{rep.kind}:{rep.access}:{rep.site_off}")
+        fd.upsert(target.id, target.case_id, {
+            "cwe": rep.cwe, "title": f"{title}{where} (QASan-demonstrated)",
+            "severity": "high" if rep.access == "WRITE" or rep.kind != "heap-buffer-overflow" else "medium",
+            "state": "confirmed", "confidence": 0.9, "detector": "qasan",
+            "dedup_key": f"{rep.cwe}:qasan:{rep.kind}:{rep.access}:{rep.site_off}",
+            "function_addr": fn.addr if fn else None,
+            "site_addr": hex(va) if va is not None else None,
+            "evidence": [{"channel": "qasan", "detail": f"{rep.summary()} -- found by {origin}; the "
+                                                         f"native binary does not crash on it"},
+                         {"channel": "qasan-input", "detail": f"input {input_sha[:12]} via {mode}"},
+                         {"channel": "qasan-report", "detail": rep.raw[:1500]}]})
+        filed += 1
+    ctx.emit("coverage.qasan_replay", payload={"candidates": len(inputs), "runs": runs,
+                                               "filed": filed,
+                                               "kinds": sorted({k[0] for k in seen})})
+    return filed
 
 
 def _brief(att: dict) -> dict:
