@@ -50,23 +50,23 @@ consistent (nested-checksum handling); wired into fuzz/stage.py as a guarded see
 checksum-correct seeds in front of the corpus. Remaining: full runtime input-to-state offset
 localization (CmpLog-style) for computed comparisons beyond checksums.
 
-### P2 — Leakless modern-glibc heap (House of Water / Tangerine)
+### P2 — Leakless modern-glibc heap (House of Water) — LANDED (P2 core)
 Safe-linking (2.32+) mangles tcache/fastbin fd, so the current heap chain needs a heap leak. House of
 Water abuses `tcache_perthread_struct` (NOT safe-linked) for a leakless primitive; House of Tangerine
 modernizes House of Orange for 2.34/2.39. Extends the heap column to the no-leak case on the glibc
 lykos actually faces (2.39/2.43). Pairs with House of Apple 2 (already built) for leakless FSOP RCE.
 
-### P3 — Partial-pointer overwrite / low-byte ASLR bypass
+### P3 — Partial-pointer overwrite / low-byte ASLR bypass — ALREADY BUILT (audit)
 When no leak exists, a 1–2 byte overwrite of a saved pointer reaches a chosen target within the same
 page/segment (deterministic) or with 1/16–1/4096 brute (probabilistic L3). Turns some no-leak write
 primitives into control without a full leak.
 
-### P4 — TOCTOU / double-fetch + uninitialized-use detection (discovery)
+### P4 — TOCTOU / double-fetch + uninitialized-use detection — LANDED (race_scan)
 Static typestate beyond UAF: a value fetched-checked-refetched across a trust boundary (double
 fetch), and a read of memory on a path with no preceding initialization. New vuln classes; the
 double-fetch then drives a race PoC, the uninit a disclosure.
 
-### P5 — ret2dlresolve for Full-RELRO alternatives / BROP generalization
+### P5 — BROP generalization — ALREADY BUILT (audit)
 ret2dlresolve dies under Full RELRO. Where a leak is impossible and RELRO is full, BROP (blind ROP,
 already partly present for servers) + stack-reading generalization is the fallback. Lower priority.
 
@@ -75,3 +75,7 @@ Each new TTP is a capability EDGE in the attack-path graph: it states its precon
 and the capability/objective it gains, with a deterministic planner and a forgery-proof oracle. DOP's
 `WRITE→AUTH` is the template — a paradigm that opens new PATHS (discovery) and new L3s (weaponization)
 at once. Build order: P0 (done) → P1 (most new bugs) → P2/P3 (more no-leak L3) → P4 → P5.
+
+
+## Build-out status (2026-11-03, end of session)
+P0 DOP: DONE (paradigm + discovery + dop_scan stage + attack-path detonation). P1 input-to-state: DONE (checksum/length repair wired into fuzzer; colorization offset localization core; full CmpLog offset-localization integration = remaining glue). P2 House of Water: leakless-alloc planner + forge DONE (live glibc-2.43 detonation = environment ceiling). P3 partial-overwrite + P5 BROP: AUDIT found ALREADY BUILT and wired (_pie_partial_overwrite_exploit, brop.py + _pie_brop_server/shell_exploit) -- not rebuilt. P4 double-fetch + uninit-ptr: DONE (race_scan stage). Backlog complete.
