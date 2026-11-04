@@ -47,7 +47,12 @@ _ERR = re.compile(rb"ERROR: QEMU-AddressSanitizer: ([\w-]+) on (?:unknown )?addr
                   rb"(?: at pc (0x[0-9a-f]+)| \(pc (0x[0-9a-f]+))")
 _ACCESS = re.compile(rb"(READ|WRITE) of size (\d+) at")
 _REGION = re.compile(rb"is located (\d+) bytes to the (left|right) of (\d+)-byte region")
-_FRAME = re.compile(rb"#(\d+) 0x[0-9a-f]+ (?:in (\S+) )?\(([^()+]+)\+(0x[0-9a-f]+)\)")
+#: a stack frame: `#N 0xPC [in FN] [FILE:LINE] [(MODULE+0xOFF)]`. QASan symbolises a STATIC
+#: function from .symtab as `in DumpScreen2RGB gif2rgb.c:?` with NO module suffix -- those frames
+#: are placed in the target by PC range (see parse), or the innermost frames would be lost and the
+#: caller's return address taken as the site (measured: gif2rgb reported main+0x8f70).
+_FRAME = re.compile(rb"#(\d+) (0x[0-9a-f]+)(?: in (\S+))?(?: [^\s()]+:[^\s()]+)?"
+                    rb"(?: \(([^()+]+)\+(0x[0-9a-f]+)\))?")
 _ANSI = re.compile(rb"\x1b\[[0-9;]*m")
 
 #: QASan bug class -> CWE. Reads and writes split heap-buffer-overflow (the class names the same
@@ -157,38 +162,74 @@ def applicable(exe_bytes: bytes, arch: Optional[str]) -> tuple:
     return True, ""
 
 
-def parse(stderr: bytes, *, module: str) -> Optional[QasanReport]:
-    """Parse the FIRST QASan report in `stderr`. `module` is the staged target's file name; frames
-    in it give the in-target site. Returns None when there is no report or none of its frames is in
-    the target (the nonce check)."""
+def _image_span(exe_bytes: bytes) -> int:
+    """Bytes from the lowest PT_LOAD page to the end of the highest (the mapped image's extent)."""
+    import struct
+    if len(exe_bytes) < 64 or exe_bytes[:4] != b"\x7fELF" or exe_bytes[4] != 2:
+        return 0
+    (phoff,) = struct.unpack_from("<Q", exe_bytes, 32)
+    (phentsize,) = struct.unpack_from("<H", exe_bytes, 54)
+    (phnum,) = struct.unpack_from("<H", exe_bytes, 56)
+    lo, hi = None, 0
+    for i in range(min(phnum, 256)):
+        b = phoff + i * phentsize
+        if b + 48 > len(exe_bytes):
+            break
+        if struct.unpack_from("<I", exe_bytes, b)[0] != 1:
+            continue
+        va = struct.unpack_from("<Q", exe_bytes, b + 16)[0]
+        memsz = struct.unpack_from("<Q", exe_bytes, b + 40)[0]
+        lo = va if lo is None else min(lo, va)
+        hi = max(hi, va + memsz)
+    return (hi - (lo & ~0xFFF)) if lo is not None else 0
+
+
+def parse(stderr: bytes, *, module: str, image_span: int = 0) -> Optional[QasanReport]:
+    """Parse the FIRST QASan report in `stderr`. `module` is the staged target's file name; a frame
+    naming it fixes the target's load base (pc - offset), and with `image_span` (the image's mapped
+    extent) a frame QASan printed WITHOUT a module suffix (a static function symbolised from
+    .symtab) is placed in the target by its PC. Returns None when there is no report or no frame
+    names the nonce'd target."""
     text = _ANSI.sub(b"", stderr or b"")
     m = _ERR.search(text)
     if not m:
         return None
     body = text[m.start():]
-    # cut at a second report, if any: we classify the first error only
-    nxt = _ERR.search(body, 1)
+    nxt = _ERR.search(body, 1)                               # classify the first error only
     first = body[:nxt.start()] if nxt else body
     acc = _ACCESS.search(first)
     reg = _REGION.search(first)
     alloc_at = first.find(b"allocated by")
-    frames, alloc_off, site_off = [], None, None
     mod = module.encode()
+    raw_frames = []                                          # (in_alloc, pc, fn, path, off)
+    base = None
     for fm in _FRAME.finditer(first):
-        path = fm.group(3)
-        off = int(fm.group(4), 16)
-        fn = fm.group(2).decode("latin-1") if fm.group(2) else None
-        base = os.path.basename(path).decode("latin-1", "replace")
-        in_target = os.path.basename(path) == mod
-        if alloc_at != -1 and fm.start() > alloc_at:
-            if in_target and alloc_off is None:
+        pc = int(fm.group(2), 16)
+        fn = fm.group(3).decode("latin-1") if fm.group(3) else None
+        path = fm.group(4)
+        off = int(fm.group(5), 16) if fm.group(5) else None
+        in_alloc = alloc_at != -1 and fm.start() > alloc_at
+        raw_frames.append((in_alloc, pc, fn, path, off))
+        if path is not None and os.path.basename(path) == mod and off is not None and base is None:
+            base = pc - off
+    if base is None:
+        return None                                          # no frame names the nonce'd target
+    frames, alloc_off, site_off = [], None, None
+    for in_alloc, pc, fn, path, off in raw_frames:
+        if path is not None:
+            in_target = os.path.basename(path) == mod
+            name = os.path.basename(path).decode("latin-1", "replace")
+        else:
+            in_target = bool(image_span) and base <= pc < base + image_span
+            off = (pc - base) if in_target else None
+            name = "target" if in_target else "?"
+        if in_alloc:
+            if in_target and alloc_off is None and fn not in ("malloc", "calloc", "realloc"):
                 alloc_off = off
             continue
-        frames.append((fn, base, off))
+        frames.append((fn, name if not in_target else "target", off))
         if in_target and site_off is None:
             site_off = off
-    if site_off is None and alloc_off is None:
-        return None                                          # no frame names the nonce'd target
     region = None
     if reg:
         region = (f"{int(reg.group(1))} bytes to the {reg.group(2).decode()} of "
@@ -245,7 +286,11 @@ def run(exe, data: bytes, *, argv=(), mode: str = "stdin", timeout: float = 10.0
             except OSError:
                 return None
             ended = _wait(p, stdin_data, err_path, timeout)
-        rep = parse(err_path.read_bytes(), module=nonce)
+        try:
+            span = _image_span(Path(exe).read_bytes()[:1 << 20])
+        except OSError:
+            span = 0
+        rep = parse(err_path.read_bytes(), module=nonce, image_span=span)
         if rep is None:
             return None
         if ended.startswith("exit:"):

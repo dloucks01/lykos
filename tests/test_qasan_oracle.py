@@ -153,3 +153,24 @@ def test_coverage_stage_files_a_qasan_demonstrated_overread(store, case, tmp_pat
     f = q_f[0]
     assert f.cwe == "CWE-125" and f.state == "confirmed" and "main" in f.title
     assert any(d.isolation == "qasan" for d in DynResultDAO(store.conn).list_by_target(t.id))
+
+
+def test_static_function_frames_without_module_suffix_are_the_site():
+    """QASan prints a static function symbolised from .symtab as `in DumpScreen2RGB gif2rgb.c:?`
+    with NO (module+off) suffix. Those innermost frames ARE the site; taking the first suffixed
+    frame instead reported main's return address (real gif2rgb report, 2026-11-04)."""
+    rep = (b"==1==ERROR: QEMU-AddressSanitizer: heap-buffer-overflow on address 0x7ffff6185bdc at pc "
+           b"0x7ffff617739b bp 0x1 sp 0x2\nREAD of size 1 at 0x7ffff6185bdc thread T2\n"
+           b"    #0 0x00007ffff617739b in DumpScreen2RGB gif2rgb.c:?\n"
+           b"    #1 0x00007ffff6177d56 in GIF2RGB gif2rgb.c:?\n"
+           b"    #2 0x00007ffff6177f70 in main (/tmp/x/t_abc+0x8f70)\n"
+           b"    #3 0x00007ffff6f22601 in __libc_start_call_main ./csu/x.h:83\n\n"
+           b"0x7ffff6185bdc is located 6 bytes to the right of 6-byte region [0x1,0x7)\n"
+           b"allocated by thread T2 here:\n"
+           b"    #0 0x00007ffff7fa85eb in __libqasan_malloc /v/libqasan/malloc.c:191\n"
+           b"    #3 0x00007ffff617475d in GifMakeMapObject (/tmp/x/t_abc+0x575d)\n")
+    r = qasan.parse(rep, module="t_abc", image_span=0xe190)
+    assert r.site_off == 0x839b and r.frames[0][0] == "DumpScreen2RGB"
+    assert r.alloc_off == 0x575d
+    # libc at +0xdb3601 from the image base is outside the image span -> not a target frame
+    assert r.frames[3][2] is None
