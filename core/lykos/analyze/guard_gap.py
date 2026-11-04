@@ -16,8 +16,10 @@ Two ideas make this precise:
    favour precision over recall.
 
 2. VARIANT CROSS-CHECK. When a sibling handler in the same family guards the very field this one
-   reads but does not (the classic copy-paste-variant bug), that is forgery-proof evidence the
-   omission is a defect, not an intentional unbounded read. Such a finding is marked high-confidence.
+   reads but does not (the classic copy-paste-variant bug), that CORROBORATES that the omission is
+   a defect rather than an intentional unbounded read. It is a static same-family heuristic -- not a
+   confirmation and not forgery-proof (only an executed oracle is) -- so such a finding is raised to
+   high severity but stays a candidate.
 
 Pure string/AST analysis (the body brace-matcher is shared with dispatcher_harness). No execution.
 The stage wrapper lives in guard_gap_stage.py.
@@ -149,8 +151,15 @@ def _family(fn: str) -> str:
 
 
 def variant_confirmed(text: str, gap: dict, guards: set) -> bool:
-    """True when a sibling function in the same family GUARDS the same field this gap reads unguarded
-    -- forgery-proof evidence the omission is a defect (the copy-paste-variant bug)."""
+    """Back-compat alias: True when variant_sibling() finds a guarding sibling. Despite the legacy
+    name this is static CORROBORATION, never a confirmation."""
+    return variant_sibling(text, gap, guards) is not None
+
+
+def variant_sibling(text: str, gap: dict, guards: set):
+    """The name of a sibling function in the same family that GUARDS the same field this gap reads
+    unguarded (the copy-paste-variant shape), else None. A static heuristic: it corroborates that
+    the omission is a defect; it does not confirm one."""
     fam = _family(gap["fn"])
     base = gap["base"]
     guard_re = re.compile(_PRIM + "|" + "|".join(re.escape(g) for g in guards)) if guards else _PRIM_RE
@@ -159,5 +168,5 @@ def variant_confirmed(text: str, gap: dict, guards: set) -> bool:
             continue
         gtext = _guard_text(body, guard_re)
         if re.search(r'\b' + re.escape(base) + r'\b', gtext):
-            return True
-    return False
+            return name
+    return None

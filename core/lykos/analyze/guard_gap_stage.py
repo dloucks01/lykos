@@ -1,8 +1,8 @@
 """`guard_gap` stage -- files the attacker-controlled-length-without-a-bounds-guard findings
 (guard_gap.find_guard_gaps) over the case source. These are the genuine missing-`CheckAndLogRequired
 Length` over-read/over-write bugs that the volume length detectors bury under false positives; a
-variant-confirmed one (a sibling handler guards the same field) is high severity. Cheap, offline,
-non-fuzzing. See guard_gap.py for the mechanism.
+variant-corroborated one (a sibling handler guards the same field -- a static heuristic, still a
+candidate) is high severity. Cheap, offline, non-fuzzing. See guard_gap.py for the mechanism.
 """
 from __future__ import annotations
 import io, os, tarfile
@@ -64,7 +64,7 @@ def guard_gap_stage(ctx) -> dict:
             continue
         rel = os.path.relpath(p, str(root))
         for g in guard_gap.find_guard_gaps(text, guards):
-            vc = guard_gap.variant_confirmed(text, g, guards)
+            vc = guard_gap.variant_sibling(text, g, guards)   # static corroboration, not a confirm
             vc_n += 1 if vc else 0
             sev = "high" if vc else "medium"
             detail = (f"{rel}:{g['line']}: '{g['var']}' is read off the wire in {g['fn']}() and "
@@ -72,17 +72,18 @@ def guard_gap_stage(ctx) -> dict:
                       f"project guard wrapper) on it -- attacker-controlled {g['kind']} past the "
                       f"stream buffer.")
             if vc:
-                detail += (" VARIANT-CONFIRMED: a sibling handler in the same family guards this "
-                           "very field, so the omission is a defect, not an intentional read.")
+                detail += (f" Variant-corroborated (sibling {vc}() guards the same field "
+                           f"'{g['base']}'): the omission is likely a copy-paste defect rather than "
+                           f"an intentional read. Static heuristic only -- no execution evidence.")
             fd.upsert(target.id, target.case_id, {
                 "cwe": g["cwe"], "severity": sev, "state": "candidate",
                 "detector": "guard_gap", "stage": GUARD_GAP_STAGE,
                 "title": f"Missing stream-length guard: '{g['base']}' bounds a {g['kind']} in "
-                         f"{g['fn']}()" + (" (variant-confirmed)" if vc else ""),
+                         f"{g['fn']}()" + (" (variant-corroborated)" if vc else ""),
                 "dedup_key": f"guardgap:{rel}:{g['fn']}:{g['base']}:{g['kind']}",
                 "evidence": [{"channel": "guard-gap", "detail": detail}]})
             n += 1
-    return {"metrics": {"guard_gap_findings": n, "guard_gap_variant_confirmed": vc_n,
+    return {"metrics": {"guard_gap_findings": n, "guard_gap_variant_corroborated": vc_n,
                         "guard_wrappers": len(guards)}}
 
 

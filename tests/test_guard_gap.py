@@ -1,6 +1,7 @@
 """Guard-gap detector (CWE-125/787): an attacker-controlled stream length used as a size/seek bound
 with no bounds guard. Precision-first -- the whole point is to NOT fire where the code guards."""
-from lykos.analyze.guard_gap import (discover_guards, find_guard_gaps, variant_confirmed, _base)
+from lykos.analyze.guard_gap import (discover_guards, find_guard_gaps, variant_confirmed,
+                                     variant_sibling, _base)
 
 
 def _guards(src):
@@ -97,6 +98,16 @@ def test_variant_confirmed_cross_check():
     gaps = find_guard_gaps(src, guards)
     gap2 = next(g for g in gaps if g["fn"] == "recv_2_pdu")
     assert variant_confirmed(src, gap2, guards)
+    assert variant_sibling(src, gap2, guards) == "recv_1_pdu"     # names the corroborating sibling
+
+
+def test_variant_evidence_never_claims_confirmation(tmp_path):
+    # a static same-family heuristic must not be worded as a confirmation / forgery-proof result
+    import inspect
+    from lykos.analyze import guard_gap_stage
+    src = inspect.getsource(guard_gap_stage.guard_gap_stage)
+    assert "CONFIRMED" not in src and "forgery" not in src.lower()
+    assert "variant-corroborated" in src.lower()
 
 
 def test_base_identifier():
