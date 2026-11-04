@@ -28,23 +28,27 @@ have**, and **discovery that reaches code current detectors/fuzzers can't**.
 
 ## Novel-TTP backlog (prioritised)
 
-### P0 — Data-Oriented Programming (DOP) — LANDED (66c3303)
+### P0 — Data-Oriented Programming (DOP) — LANDED (66c3303, 2d5ed56; discovery half done)
 Reach impact by corrupting DATA, not control flow (Hu S&P'16; FlowStitch USENIX'15). Overwrite a
 security-decision variable so the program's own code takes the privileged path — CFI-immune, leak-
 free, and applicable when a write can't reach a code pointer. Built `poc/dop.py` (plan_flag_flip +
 forgery-proof differential oracle + distance sweep), the attack-path `WRITE→AUTH` DOP edge (a write
 unlocks post-auth sinks data-only), proven e2e on a flag-flip fixture. **Next:** auto-discover the
 security-decision variable (a global flag gating a privileged sink) + its marker on a real target
-(the discovery half); extend to bounds/length and path/command-buffer DOP targets; general DOP
+(the discovery half) — DONE: dop.discover_data_only (hands-off binary: finds the privileged
+signal by diffing vs a benign run + sweeps the distance) and dop.find_dop_targets (source-side
+security-decision-variable detector). Remaining: extend to bounds/length and path/command-buffer DOP targets; general DOP
 gadget/data-flow stitching (FlowStitch) for Turing-complete data-only chains.
 
-### P1 — Input-to-State (REDQUEEN, NDSS'19) — coverage breakthrough
+### P1 — Input-to-State (REDQUEEN, NDSS'19) — coverage breakthrough — LANDED (24c3365)
 Observe where input bytes appear (nearly) unmodified in comparison operands at run time; patch the
 input to satisfy magic bytes / nested checksums automatically — a lightweight alternative to taint
 or symbolic that scales to big binaries. This is how we reach bugs behind format gates and checksums
-that the reach-gated fuzzer and concolic solver stall on. Build: an I2S colorization pass feeding the
-directed fuzzer's mutator (deterministic, per-target). Finds NEW bugs; the weaponizers then take them
-to L3.
+that the reach-gated fuzzer and concolic solver stall on. DONE: fuzz/i2s.py learns a checksum/length field layout (offset/width/endian/algo/range over
+sum8-32/xor/len/crc32/adler32) against a POSITIVE accept signal and repairs it so mutated bodies stay
+consistent (nested-checksum handling); wired into fuzz/stage.py as a guarded seed-booster that puts
+checksum-correct seeds in front of the corpus. Remaining: full runtime input-to-state offset
+localization (CmpLog-style) for computed comparisons beyond checksums.
 
 ### P2 — Leakless modern-glibc heap (House of Water / Tangerine)
 Safe-linking (2.32+) mangles tcache/fastbin fd, so the current heap chain needs a heap leak. House of
