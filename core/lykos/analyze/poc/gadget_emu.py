@@ -295,6 +295,7 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             if address == stop_at:
                 reached[0] = True
                 uc_.emu_stop()
+        mu = None
         try:
             mu = uc.Uc(_uc_arch, _uc_mode)
             mu.mem_map(_CODE_BASE, 0x1000)
@@ -308,11 +309,14 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             mu.emu_start(_CODE_BASE, _CODE_BASE + len(window), count=max_insns + 4)
         except uc.UcError:
             pass
-        if not reached[0]:                                        # body faulted before the return
-            return None
-        vals = {w: mu.reg_read(_reg[w]) for w in read_regs}
-        vals["__spadj__"] = mu.reg_read(_reg[cfg.sp]) - _SP0       # sp delta at the terminator
-        return vals
+        try:
+            if not reached[0]:                                    # body faulted before the return
+                return None
+            vals = {w: mu.reg_read(_reg[w]) for w in read_regs}
+            vals["__spadj__"] = mu.reg_read(_reg[cfg.sp]) - _SP0   # sp delta at the terminator
+            return vals
+        finally:
+            _close_uc(mu)
 
     def _classify_seed(val, own, seeding):
         _rs, reg_by_val, _ss, stack_by_val, _sb = seeding
@@ -383,6 +387,24 @@ def find_reg_control_gadgets(data: bytes, arch: str, *, want=("a1", "a2"), segme
             if scanned >= scan_cap:
                 return results
     return results
+
+
+def _close_uc(mu) -> None:
+    """Free an emulator's native state NOW. A Uc with a hook is in a reference cycle, so it is only
+    reclaimed by the cyclic GC -- which is triggered by Python object counts, not native memory. One
+    scan builds tens of thousands of emulators (~3 MB native each), so without this a static binary's
+    gadget scan grew to 69 GB and was OOM-killed. unicorn 2.x exposes the close as a weakref.finalize;
+    fall back to dropping the callbacks when it is absent."""
+    if mu is None:
+        return
+    fin = getattr(mu, "_Uc__finalizer", None)
+    try:
+        if callable(fin):
+            fin()
+        else:
+            getattr(mu, "_callbacks", {}).clear()
+    except Exception:                                        # noqa: BLE001 -- best-effort release
+        pass
 
 
 def _disasm_stream(md, seg: bytes):
