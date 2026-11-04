@@ -2542,6 +2542,38 @@ def fuzz_stage(ctx) -> dict:
             "sample": [t.decode("latin-1", "replace")[:32] for t in _rt_tokens[:8]],
             "why": "values the target COMPARED its input against at runtime, which a static "
                    "string scan cannot see when the value is computed"})
+    # INPUT-TO-STATE checksum/length repair (REDQUEEN): a parser that rejects any input whose
+    # embedded checksum/length field does not match the body stalls the fuzzer at the front door --
+    # no mutation reaching the code behind the gate is ever accepted. Learn the field layout from a
+    # seed and add the REPAIRED seed to the corpus FRONT, so the fuzzer explores behind the integrity
+    # gate. Best-effort, bounded, stdin-only; the 'got further' signal is a repaired seed producing a
+    # printable output token the raw seed did not (a real advance past the reject, not a guess).
+    try:
+        if corpus and not substrate.is_managed(target.file_type) and (not channels or channels[0] == "stdin"):
+            import re as _re2
+            import subprocess as _sp
+            from . import i2s as _i2s
+            _ie = ctx.scratch() / "i2s_target.bin"
+            if not _ie.exists():
+                ctx.content.stage_target(target, _ie.parent, _ie.name)
+
+            def _out_tokens(d, _exe=str(_ie), _argv=base_argv, _to=min(8.0, max(2.0, exec_timeout))):
+                try:
+                    r = _sp.run([_exe] + list(_argv), input=d, capture_output=True, timeout=_to)
+                    return set(_re2.findall(rb"[\x20-\x7e]{3,}", (r.stdout or b"") + (r.stderr or b"")))
+                except Exception:                            # noqa: BLE001
+                    return set()
+
+            _rep = _i2s.repaired_corpus_seeds(str(_ie), corpus[:6], run=_out_tokens, max_seeds=4)
+            if _rep:
+                corpus = _rep + list(corpus)
+                ctx.emit("fuzz.i2s", payload={
+                    "repaired_seeds": len(_rep),
+                    "why": "an embedded checksum/length field was repaired so the fuzzer explores "
+                           "behind the integrity gate instead of being rejected at it"})
+    except Exception:                                        # noqa: BLE001 -- advisory, never sink the campaign
+        pass
+
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
     fmt = p.get("format_name") or ("custom" if p.get("format") else None)
     if mutator is None and not p.get("format") and any(
