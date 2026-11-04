@@ -912,7 +912,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
 
 def _analyze_in(cli: Path, binary: Path, T: Path, *, ctx, timeout: int) -> dict:
     """The body of `analyze`, writing its rizin output files under `T`."""
-    # Recover `main` on an aarch64 binary where the disassembler would miss it: main is passed to
+    # Recover `main` on a stripped aarch64/x86-64 binary where the disassembler would miss it: main is passed to
     # __libc_start_main only as a data pointer (never called), so a static/stripped aarch64 target
     # gets no function/name there. Decode _start (doc 04) and seed rizin with it so main is
     # analyzed + named for the function list, decompilation, xrefs and detectors alike.

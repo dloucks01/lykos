@@ -592,8 +592,45 @@ def to_format_details(info: ElfInfo) -> dict[str, Any]:
                     "sections": len(info.sections)}}
 
 
+def _main_from_start_x86_64(data: bytes) -> Optional[int]:
+    """x86-64 glibc `_start` passes main in rdi to __libc_start_main: `mov rdi, imm32` (48 c7 c7) on a
+    non-PIE build, `lea rdi, [rip+disp32]` (48 8d 3d) on a PIE. Decode the first instructions at
+    e_entry for that load, stopping at the first call. Returns main's link-time VA or None."""
+    (e_entry,) = struct.unpack_from("<Q", data, 24)
+    (e_phoff,) = struct.unpack_from("<Q", data, 32)
+    (e_phentsize,) = struct.unpack_from("<H", data, 54)
+    (e_phnum,) = struct.unpack_from("<H", data, 56)
+    off = None
+    for i in range(min(e_phnum, 256)):
+        base = e_phoff + i * e_phentsize
+        if base + 56 > len(data):
+            break
+        (p_type,) = struct.unpack_from("<I", data, base)
+        if p_type != 1:
+            continue
+        p_offset, p_vaddr = struct.unpack_from("<QQ", data, base + 8)
+        (p_filesz,) = struct.unpack_from("<Q", data, base + 32)
+        if p_vaddr <= e_entry < p_vaddr + p_filesz:
+            off = p_offset + (e_entry - p_vaddr)
+            break
+    if off is None:
+        return None
+    code = bytes(data[off:off + 64])
+    found = None
+    for i in range(len(code) - 6):
+        if code[i] == 0xFF and code[i + 1] in (0x15, 0x25) or code[i] == 0xE8:
+            break                                              # the call/jmp to __libc_start_main
+        if code[i:i + 3] == b"\x48\xc7\xc7":                    # mov rdi, imm32 (sign-extended)
+            (imm,) = struct.unpack_from("<i", code, i + 3)
+            found = imm & 0xFFFFFFFFFFFFFFFF
+        elif code[i:i + 3] == b"\x48\x8d\x3d":                  # lea rdi, [rip+disp32]
+            (disp,) = struct.unpack_from("<i", code, i + 3)
+            found = e_entry + i + 7 + disp
+    return found if found else None
+
+
 def main_from_start(data: bytes) -> Optional[int]:
-    """Recover the virtual address of `main` on a (possibly stripped) aarch64 glibc binary.
+    """Recover the virtual address of `main` on a (possibly stripped) aarch64 or x86-64 glibc binary.
 
     `main` is passed to __libc_start_main only as the first argument in x0 -- it is never the
     target of a call -- so a disassembler's call-graph analysis often neither creates nor names a
@@ -608,6 +645,8 @@ def main_from_start(data: bytes) -> Optional[int]:
         if data[4] != 2 or data[5] != 1:                       # ELF64, little-endian only
             return None
         (e_machine,) = struct.unpack_from("<H", data, 18)
+        if e_machine == 0x3E:                                  # EM_X86_64
+            return _main_from_start_x86_64(data)
         if e_machine != 0xB7:                                  # EM_AARCH64
             return None
         (e_entry,) = struct.unpack_from("<Q", data, 24)

@@ -28,7 +28,8 @@ def _stored_grounding(fdict) -> "tuple | None":
     read from its `grounding-map` evidence (which carries grounded/reachable/verdict with the full
     run context). Returns None when absent (then the caller recomputes). Maps the stored flags into
     the verdict vocabulary `finding_triage.triage_finding` expects: a disproved finding keeps its
-    FP verdict; a real one becomes exploitable- vs off-surface-candidate by its `reachable` flag."""
+    FP verdict; a real one becomes exploitable- vs off-surface-candidate by its `reachable` flag, or
+    'undecided' when reachability was never decided (never collapsed into off-surface)."""
     import json
     for e in (fdict.get("evidence") or []):
         if not isinstance(e, dict) or e.get("channel") != "grounding-map":
@@ -42,7 +43,13 @@ def _stored_grounding(fdict) -> "tuple | None":
         grounded = bool(gm.get("grounded", True))
         if not grounded:
             return (False, gm.get("verdict") or "disproved")
-        return (True, "exploitable-candidate" if gm.get("reachable") else "off-surface-candidate")
+        reach = gm.get("reachable")
+        if reach is None:
+            # undecided (no function resolved / no call graph) is NOT off-surface: filing it there
+            # was a silent dismissal of most binary-only findings. finding_triage routes it to
+            # "decide reachability first" instead.
+            return (True, "undecided")
+        return (True, "exploitable-candidate" if reach else "off-surface-candidate")
     return None
 
 

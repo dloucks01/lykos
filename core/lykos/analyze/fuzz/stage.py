@@ -2552,15 +2552,17 @@ def fuzz_stage(ctx) -> dict:
     try:
         if corpus and not substrate.is_managed(target.file_type) and (not channels or channels[0] == "stdin"):
             import re as _re2
-            import subprocess as _sp
             from . import i2s as _i2s
             _ie = ctx.scratch() / "i2s_target.bin"
             if not _ie.exists():
                 ctx.content.stage_target(target, _ie.parent, _ie.name)
+                os.chmod(_ie, 0o755)
 
             def _out_tokens(d, _exe=str(_ie), _argv=base_argv, _to=min(2.0, max(0.5, exec_timeout))):
+                # through the sandbox like every other target execution (bwrap, no network, mem cap)
                 try:
-                    r = _sp.run([_exe] + list(_argv), input=d, capture_output=True, timeout=_to)
+                    r = sandbox.run(_exe, argv=[str(x) for x in _argv], stdin=d, timeout=_to,
+                                    arch=target.arch, endianness=target.endianness, bits=target.bits)
                     return set(_re2.findall(rb"[\x20-\x7e]{3,}", (r.stdout or b"") + (r.stderr or b"")))
                 except Exception:                            # noqa: BLE001
                     return set()

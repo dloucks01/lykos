@@ -11,7 +11,9 @@ spec.json:
   input_size   symbolic input length in bytes
   targets      ["0x..."] sink addresses to reach (find=); may be empty for coverage mode
   avoid        ["0x..."] addresses to avoid (optional)
-  seeds        [base64,...] concrete inputs to preconstrain (concolic / hybrid seeding)
+  seeds        [base64,...] concrete inputs; each seeds states whose first bytes (a PREFIX: the
+               header/gate bytes) are pinned to the seed and whose remainder stays symbolic --
+               see seed_prefix_plan (concolic / hybrid seeding)
   max_seconds  wall-clock budget
   max_states   cap on simultaneously-active states (state-explosion guard)
   num_find     stop after this many target-reaching states
@@ -45,6 +47,30 @@ def _int(a):
         return None
 
 
+_AUTONAME = __import__("re").compile(r"^(?:fcn|sub|fun|loc)[._]([0-9a-fA-F]{4,16})$", __import__("re").I)
+
+
+def _fn_addr(proj, fn: str):
+    """Resolve a function given as a symbol, an address, or a disassembler AUTO-NAME (rizin
+    `fcn.0040abcd`, IDA `sub_40abcd`, Ghidra `FUN_0040abcd`) to an address in angr's load. Numeric
+    and auto-named addresses are LINK-TIME (what rizin/Ghidra report), so they are rebased by the
+    main object's load delta -- angr maps a PIE at 0x400000 while rizin reports it at 0. Returns an
+    int or None."""
+    a = _int(fn)
+    if a is None:
+        m = _AUTONAME.match(fn or "")
+        if m:
+            a = int(m.group(1), 16)
+    if a is not None:
+        mo = proj.loader.main_object
+        delta = (getattr(mo, "mapped_base", 0) or 0) - (getattr(mo, "linked_base", 0) or 0)
+        if not (mo.min_addr <= a < mo.max_addr) and mo.min_addr <= a + delta < mo.max_addr:
+            a += delta
+        return a
+    sym = proj.loader.find_symbol(fn)
+    return sym.rebased_addr if sym is not None else None
+
+
 def _write(path, obj):
     with open(path, "w") as fh:
         json.dump(obj, fh)
@@ -72,6 +98,33 @@ def _place(base, carrier):
     if _PLACEHOLDER in out:
         return [carrier if a == _PLACEHOLDER else a for a in out]
     return out + [carrier]
+
+
+#: cap on SEEDED initial states (the fully-symbolic state is added on top of these)
+_MAX_SEEDED_STATES = 8
+#: the longest prefix a seed pins -- a parser's magic/length/type gates sit in the first bytes
+_SEED_GATE_PREFIX = 16
+
+
+def seed_prefix_plan(seeds, size, cap=_MAX_SEEDED_STATES):
+    """[(seed_index, prefix_bytes)] -- which seeded states to build.
+
+    A seed is NOT pinned in full: hard-constraining every byte (`byte == v`) makes the state fully
+    concrete over the seed length, i.e. angr just replays the seed and has nothing left to solve.
+    Instead each seed pins only a PREFIX -- the header/gate bytes that get angr past the outer parse
+    checks -- and leaves the rest symbolic for the solver: one state at min(len, 16) bytes and one at
+    min(len, len//2) bytes (deduplicated, empty prefixes dropped), both clipped to the symbolic
+    `size`. At most `cap` seeded states in total, in seed order."""
+    plan = []
+    for i, s in enumerate(seeds or []):
+        n = min(len(s or b""), int(size))
+        for k in sorted({min(n, _SEED_GATE_PREFIX), min(n, len(s or b"") // 2)}, reverse=True):
+            if k <= 0:
+                continue
+            if len(plan) >= cap:
+                return plan
+            plan.append((i, bytes(s[:k])))
+    return plan
 
 
 def build_args(base, mode, symbolic):
@@ -111,15 +164,12 @@ def _run_uc(angr, proj, spec, result, out_path):
     import signal as _sig
     import time as _t
     fn = str(spec.get("uc_fn") or "")
-    addr = _int(fn)
+    addr = _fn_addr(proj, fn)
     if addr is None:
-        sym = proj.loader.find_symbol(fn)
-        if sym is None:
-            result.update(ok=True, uc={"function": fn, "reached": False,
-                          "note": "function symbol not found"})
-            _write(out_path, result)
-            return 0
-        addr = sym.rebased_addr
+        result.update(ok=True, uc={"function": fn, "reached": False,
+                      "note": "function symbol not found"})
+        _write(out_path, result)
+        return 0
     O = angr.options
     fill = {O.SYMBOL_FILL_UNCONSTRAINED_MEMORY, O.SYMBOL_FILL_UNCONSTRAINED_REGISTERS, O.LAZY_SOLVES}
     try:
@@ -263,11 +313,11 @@ def main(spec_path, out_path):
         steered = []
         for _name in (spec.get("target_syms") or []):
             try:
-                _s = proj.loader.find_symbol(_name)
+                _a = _fn_addr(proj, str(_name))           # symbol, address or fcn./FUN_ auto-name
             except Exception:                              # noqa: BLE001 -- a loader quirk, just skip
-                _s = None
-            if _s is not None:
-                targets.append(_s.rebased_addr)
+                _a = None
+            if _a is not None:
+                targets.append(_a)
                 steered.append(_name)
         targets = sorted(set(targets))
         result["steered_syms"] = steered
@@ -334,6 +384,8 @@ def main(spec_path, out_path):
             else:                                            # stdin
                 st = _stdin_state()
             if preconstrain is not None:
+                # `preconstrain` is a seed PREFIX (seed_prefix_plan): only those bytes are pinned,
+                # the rest of the buffer stays symbolic for the solver.
                 try:
                     for i, byte in enumerate(preconstrain[:size]):
                         st.solver.add(symbytes.get_byte(i) == byte)
@@ -341,8 +393,9 @@ def main(spec_path, out_path):
                     pass
             return st
 
-        # concolic/hybrid: one preconstrained state per seed, plus a fully-symbolic state
-        states = [make_state(s) for s in seeds[:8]]
+        # concolic/hybrid: up to _MAX_SEEDED_STATES prefix-pinned seeded states (gate bytes from a
+        # seed, remainder symbolic), plus the fully-symbolic state
+        states = [make_state(pfx) for _i, pfx in seed_prefix_plan(seeds, size)]
         states.append(make_state())
         simgr = proj.factory.simulation_manager(states, save_unconstrained=True)
 
