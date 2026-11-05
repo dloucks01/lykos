@@ -324,6 +324,47 @@ def _traversal_opens(target: Target, data: bytes) -> list:
     return hits
 
 
+def _qasan_verdict(target: Target, hyp: Hypothesis, data: bytes):
+    """QASan replays of the plain build, for a memory hypothesis that does not crash natively.
+    Confirms only when EVERY replay reports an error whose in-target site (for an alloc-size
+    overflow: whose allocation site) lies inside the hypothesis's own function -- the same
+    attribution bar the native-crash path uses. None when QASan does not apply or never fired
+    (the caller keeps its own verdict)."""
+    if target.mode not in ("file", "stdin") or hyp.func_addr is None or not hyp.func_size:
+        return None
+    try:
+        from ..analyze.dynamic import qasan
+        blob = Path(target.exe).read_bytes()
+        arch = target.arch or ("x86-64" if blob[18:20] == b"\x3e\x00" else None)
+        if not qasan.applicable(blob, arch)[0]:
+            return None
+        lo, hi = hyp.func_addr, hyp.func_addr + hyp.func_size
+        agree, last = 0, None
+        for _ in range(REPLAYS):
+            rep = qasan.run(target.exe, data, argv=list(target.argv), mode=target.mode,
+                            timeout=10.0)
+            if rep is None:
+                break
+            if hyp.kind == "int-overflow-alloc":
+                site = (rep.alloc_off + (qasan.site_va(rep, blob) - rep.site_off)
+                        if rep.alloc_off is not None and rep.site_off is not None else None)
+                ok = rep.kind == "heap-buffer-overflow" and site is not None and lo <= site < hi
+            else:
+                site = qasan.site_va(rep, blob)
+                ok = site is not None and lo <= site < hi
+            last = (f"{rep.summary()} -> site {site:#x}" if site is not None else rep.summary())
+            if not ok:
+                return Verdict(False, "qasan", f"{last}, outside {hyp.func or 'the site function'}",
+                               None, agree)
+            agree += 1
+        if agree == REPLAYS:
+            return Verdict(True, "qasan", f"{last} inside {hyp.func or 'the site function'} on "
+                           f"{REPLAYS}/{REPLAYS} QASan replays (no native crash)", hyp.line, agree)
+        return None if agree == 0 else Verdict(False, "qasan", last or "", None, agree)
+    except Exception:                                    # noqa: BLE001 -- an extra oracle, never fatal
+        return None
+
+
 def validate(target: Target, hyp: Hypothesis, data: bytes):
     """-> (Verdict, incidental) where incidental is (kind, file, line, func) for a sanitizer
     report that fired somewhere other than this site, else None."""
@@ -514,6 +555,12 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
     runs = _native_runs(target, data, REPLAYS)
     sigs = [r.signal for r in runs]
     if not all(r.crashed and r.signal in FATAL for r in runs):
+        # A binary with no sanitizer build: a heap over-read / small over-write / UAF does not
+        # crash natively, so a correctly SOLVED input looked like a failure. QASan (QEMU-ASan,
+        # forgery-checked) is the binary oracle for exactly that.
+        qv = _qasan_verdict(target, hyp, data)
+        if qv is not None:
+            return qv, None
         return Verdict(False, "native-crash",
                        f"did not crash on every replay ({', '.join(str(s) for s in sigs)})"), None
     pcs = {r.fault_pc for r in runs}
