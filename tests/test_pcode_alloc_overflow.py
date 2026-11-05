@@ -12,6 +12,14 @@ differs only in the property the detector must read:
   u32 * u32 (wraps)                      vs  `x > UINT32_MAX / y`, __builtin_mul_overflow
   int * 16 in 32 bits from atoi(argv)    vs  int * sizeof(...) (sign-extended to 64 first)
 
+and, for FIELD-carried taint (decoded in one function, stored in a struct / global, multiplied in
+another -- the range of the stored value travels with it):
+
+  hdr->count (u32 from read()) * 24      vs  hdr->w * hdr->h holding u16 values in int fields
+  g_cfg.nrec (u32 from read()) * 24      vs  `if (hdr->count > UINT32_MAX / 24) return` first
+  a stack struct filled by the same      vs  a field only ever set from a constant
+    parser, consumed by address
+
 Two layers: synthetic P-Code (pins the width rule, no toolchain), and real compiled fixtures lifted
 through the project's own path (ingest -> disassemble -> FunctionDAO.ir) at -O0 and -O2, on x86-64
 and -- when a cross compiler is installed -- aarch64.
@@ -275,10 +283,60 @@ NI void *tn_int_sizeof(const char *s) {
 NI void *tn_untainted(int k) { return malloc(k * 64); }
 NI void *tn_const(void) { return malloc(4096); }
 
+/* ---- field-carried: decoded in one function, multiplied in ANOTHER (noipa: keep the load in
+ *      the consumer -- gcc -O2 would otherwise pass the field by value into a .isra clone) ---- */
+#define NX __attribute__((noinline, noipa))
+struct fhdr { uint32_t magic; uint32_t count; int w, h; };
+/* scalar stores: gcc -O2 would pack w and h into one SIMD store, whose value the lifter cannot
+ * model -- the field is then (safely) not judged at all, and the range rule goes unexercised */
+__attribute__((noinline, noipa, optimize("no-tree-vectorize")))
+int parse_header(int fd, struct fhdr *hd) {
+    uint8_t b[12];
+    if (read(fd, b, sizeof b) != (ssize_t)sizeof b) return -1;
+    hd->magic = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+    hd->count = (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
+    hd->w = b[8] | b[9] << 8;                /* u16 values held in int fields (giflib's shape) */
+    hd->h = b[10] | b[11] << 8;
+    return 0;
+}
+NX void *tp_field_count(const struct fhdr *hd) { return malloc(hd->count * 24u); }
+NX void *tp_field_stack(const struct fhdr *hd) { return malloc(hd->count * 40u); }
+NX void *tn_field_u16(const struct fhdr *hd) { return malloc(hd->w * hd->h); }
+NX void *tn_field_guarded(const struct fhdr *hd) {
+    if (hd->count > UINT32_MAX / 24) return 0;
+    return malloc(hd->count * 24u);
+}
+struct gcfg { uint32_t ver; uint32_t nrec; } g_cfg;
+NX int load_config(int fd) {
+    uint32_t v[2];
+    if (read(fd, v, sizeof v) != (ssize_t)sizeof v) return -1;
+    g_cfg.ver = v[0];
+    g_cfg.nrec = v[1];
+    return 0;
+}
+NX void *tp_field_global(void) { return malloc(g_cfg.nrec * 24u); }
+struct opts { uint32_t flags; uint32_t nslots; };
+NX void opts_init(struct opts *o) { o->flags = 1; o->nslots = 4096; }
+NX void *tn_field_const(const struct opts *o) { return malloc(o->nslots * 24u); }
+struct one { uint32_t n; };
+NX int one_read(int fd, struct one *p) { return read(fd, &p->n, 4) == 4 ? 0 : -1; }
+NX void one_runtime(struct one *p) { p->n = (uint32_t)getpid(); }  /* not input, not constant */
+NX void *tn_field_mixed(const struct one *p) { return malloc(p->n * 24u); }
+NX int one_ok(const struct one *p) { return p->n <= UINT32_MAX / 24; }  /* a validator */
+NX void *tn_field_validated(const struct one *p) { return malloc(p->n * 24u); }
+NX int one_parse_checked(int fd, struct one *p) {
+    uint32_t v;
+    if (read(fd, &v, 4) != 4) return -1;
+    p->n = v;
+    if (p->n > UINT32_MAX / 24) return -1;       /* checked right after it is stored */
+    return 0;
+}
+NX void *tn_field_checked_at_store(const struct one *p) { return malloc(p->n * 24u); }
+
 int main(int argc, char **argv) {
     FILE *f = fopen(argc > 1 ? argv[1] : "/dev/null", "rb");
     int fd = f ? fileno(f) : 0;
-    void *keep[32]; int i = 0;
+    void *keep[48]; int i = 0;
     keep[i++] = tp_count32(fd); keep[i++] = tp_add(fd); keep[i++] = tp_u64(fd);
     keep[i++] = tp_interproc(fd); keep[i++] = tp_fread_struct(f);
     keep[i++] = tp_atoi(argc > 2 ? argv[2] : "1");
@@ -290,6 +348,20 @@ int main(int argc, char **argv) {
     keep[i++] = tn_strlen(argc > 2 ? argv[2] : "x");
     keep[i++] = tn_int_sizeof(argc > 3 ? argv[3] : "1");
     keep[i++] = tn_untainted(3); keep[i++] = tn_const();
+    struct fhdr *hd = malloc(sizeof *hd), sh;
+    if (hd && parse_header(fd, hd) == 0) {
+        keep[i++] = tp_field_count(hd); keep[i++] = tn_field_u16(hd);
+        keep[i++] = tn_field_guarded(hd);
+    }
+    if (parse_header(fd, &sh) == 0) keep[i++] = tp_field_stack(&sh);
+    if (load_config(fd) == 0) keep[i++] = tp_field_global();
+    struct opts *op = malloc(sizeof *op);
+    if (op) { opts_init(op); keep[i++] = tn_field_const(op); }
+    struct one *m = malloc(sizeof *m), *v = malloc(sizeof *v), *c = malloc(sizeof *c);
+    if (m && one_read(fd, m) == 0) { one_runtime(m); keep[i++] = tn_field_mixed(m); }
+    if (v && one_read(fd, v) == 0 && one_ok(v)) keep[i++] = tn_field_validated(v);
+    if (c && one_parse_checked(fd, c) == 0) keep[i++] = tn_field_checked_at_store(c);
+    keep[i++] = hd; keep[i++] = op; keep[i++] = m; keep[i++] = v; keep[i++] = c;
     for (int j = 0; j < i; j++) free(keep[j]);
     return 0;
 }
@@ -297,10 +369,15 @@ int main(int argc, char **argv) {
 
 # function holding the allocation -> the arithmetic width the wrap happens at
 _TP = {"tp_count32": 32, "tp_add": 32, "tp_u64": 64, "alloc_items": 32, "tp_fread_struct": 32,
-       "tp_atoi": 32, "tp_sscanf": 32, "tp_validated": 32}
+       "tp_atoi": 32, "tp_sscanf": 32, "tp_validated": 32,
+       "tp_field_count": 32, "tp_field_stack": 32, "tp_field_global": 32}
 _TN = ["tn_u16", "tn_zext64", "tn_const_bound", "tn_div", "tn_builtin", "tn_builtin64",
        "tn_result_check", "tn_clamp", "tn_mask", "tn_shift_check", "tn_calloc", "tn_strlen",
-       "tn_int_sizeof", "tn_untainted", "tn_const"]
+       "tn_int_sizeof", "tn_untainted", "tn_const",
+       "tn_field_u16", "tn_field_guarded", "tn_field_const", "tn_field_mixed",
+       "tn_field_validated", "tn_field_checked_at_store"]
+#: the field-carried true positives: their tainted operand arrives through a struct / global field
+_TP_FIELD = ("tp_field_count", "tp_field_stack", "tp_field_global")
 
 _BUILDS = [("x86-64", "gcc", "-O0"), ("x86-64", "gcc", "-O2"),
            ("aarch64", "aarch64-linux-gnu-gcc", "-O0"), ("aarch64", "aarch64-linux-gnu-gcc", "-O2")]
@@ -445,6 +522,54 @@ def test_write_with_the_unwrapped_length_raises_confidence(lifted):
     (c,) = by_fn["tp_count32"]
     # the row loop is bounded by the un-wrapped count n, not by the wrapped size
     assert c["written_after"] and "loop" in c["written_after"]["detail"], c
+
+
+def _size_facts(lifted, key, fn):
+    """(taint origin, attacker range) of the size argument of `fn`'s allocation, read from the
+    analysed program -- to show a true negative is cleared for the right reason."""
+    if key not in lifted:
+        pytest.skip(f"no {key[0]} {key[1]} build")
+    L = lifted[key]
+    P = pg._build_program(L["irs"], L["edges"], L["arch"], L["bits"], L["names"], None,
+                          lambda: False, {})
+    (faddr,) = [a for a, n in L["names"].items() if n == fn]
+    F = P.funcs[faddr]
+    (rec,) = [r for r in F.calls.values() if P._alloc_args(r)]
+    size = rec["args"][P._alloc_args(rec)[0]]
+    return P.taint(size), P.rng(size, (faddr, rec["block"], ()), attacker=True)
+
+
+@pytest.mark.parametrize("key", _KEYS, ids=_IDS)
+def test_field_taint_names_the_object_it_was_stored_to(lifted, key):
+    """hdr->count / g_cfg.nrec decoded from read() in one function and multiplied in another: the
+    operand's origin says which object carried it, and its range is the stored u32's."""
+    _recs, by_fn, st = _run(lifted, key)
+    where = {"tp_field_count": "heap@", "tp_field_stack": "stack of main",
+             "tp_field_global": "global "}
+    for fn in _TP_FIELD:
+        (r,) = [r for r in by_fn[fn] if not r["guard_status"].startswith("guarded")]
+        (o,) = [o for o in r["operands"] if o["tainted"]]
+        assert "read@" in o["origin"] and f"(stored to {where[fn]}" in o["origin"], o
+        assert o["range"] == [0, 0xFFFFFFFF], o
+    assert st["via_field"] == len(_TP_FIELD), st
+
+
+@pytest.mark.parametrize("key", _KEYS, ids=_IDS)
+def test_field_true_negatives_are_cleared_for_the_right_reason(lifted, key):
+    # the u16 values stored into int fields carry their range: tainted, but w*h <= 0xfffe0001
+    t, r = _size_facts(lifted, key, "tn_field_u16")
+    assert t and "(stored to heap@" in t and r[1] <= 0xFFFF * 0xFFFF, (t, r)
+    # the consumer's own check `count > UINT32_MAX / 24` bounds the tainted field
+    t, r = _size_facts(lifted, key, "tn_field_guarded")
+    assert t and r[1] <= (0xFFFFFFFF // 24) * 24, (t, r)
+    # a validator called before the consumer, and a check right after the store, cap it too
+    for fn in ("tn_field_validated", "tn_field_checked_at_store"):
+        t, r = _size_facts(lifted, key, fn)
+        assert not t or r[1] <= (0xFFFFFFFF // 24) * 24, (fn, t, r)
+    # a field only ever set from a constant, or also from a non-input value, is not attacker data
+    for fn in ("tn_field_const", "tn_field_mixed"):
+        t, _r = _size_facts(lifted, key, fn)
+        assert not t, (fn, t)
 
 
 def test_detect_stage_files_one_pcode_alloc_overflow_per_site(store, case, tmp_path, gcc):

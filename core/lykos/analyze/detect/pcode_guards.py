@@ -40,6 +40,43 @@ How it works (a pure function over the stored per-function IR, no stage wiring):
     on every path to the site (dominating branches, the edge into a phi, a select's condition).
   * The top-down walk of the allocation size finds the arithmetic node whose mathematical range
     exceeds the width it is consumed at, and checks the guard kinds above.
+
+FIELD FACTS -- a value decoded in one function, stored into a struct or a global, and read in
+another (`hdr->count = rd32(p)` in the parser, `malloc(hdr->count * 24)` in the consumer):
+
+  * Identity. Every write the evaluation sees (STORE, an input fill, a memcpy) is filed under the
+    abstract LOCATION it writes: an access path (root, offsets) whose root is a global's absolute
+    address, an allocation SITE (the call that returned the object -- an allocator, a recognised
+    size-preserving wrapper, or an internal function whose every non-NULL return is one such
+    object), a function's stack frame, or "what parameter i of f points at"; every offset but
+    the last is a pointer loaded from that offset (`*(*(p+8)+4)`), so pointer chains through
+    structs and globals are followed. A parameter-rooted location is LIFTED through each call
+    site to where that caller's argument points (up to 5 levels, 64 locations), keeping the call
+    chain, so a setter's store and the consumer's load meet at the concrete object. Limits:
+    allocation sites are context-insensitive (every object from one site is one object); array
+    elements (`a[i].f`, a non-constant index) have no identity and are not judged; a pointer
+    merged from two objects at a join has none either; writes a library routine makes
+    internally, and SIMD-packed stores whose value the lifter cannot model, are invisible.
+  * Range. A load reads the RANGE of the value stored there -- computed where it is stored, under
+    that store's dominating checks, narrowed to the argument's range at the call chain when the
+    stored value is the setter's parameter, clipped to the store width -- not the full width of
+    the field: giflib's `int SWidth` holds a u16 from DGifGetWord, so `SWidth * 3` cannot wrap.
+    A struct copy carries the source field's facts. Taint and constants are evaluated AT the call
+    chain (a setter called with input on one object and with a constant on another taints one).
+  * The write rule (per object): a load counts as attacker data only when EVERY write that may
+    define its bytes is attacker data or a compile-time constant (an init `= 0`, `= 4096`: its
+    range is known, so it cannot hide a larger trusted value). One untainted write of unknown
+    value, a load spanning several writes, or a self-referential re-store (`h->n -= k`, a clamp
+    written back) and the field is not judged at all -- this is what keeps a naive full-width
+    field taint from reporting giflib's u16 fields.
+  * Guards elsewhere. Checks on the field are applied where they could run first: branches that
+    dominate the load (in its function and, three caller levels up, before the call), anything
+    in a function called at those dominating points (a validator), and any check on the stored
+    value in the function that stores it (`h->n = v; if (h->n > MAX) return -1;`). A check in
+    another function is assumed to hold on the outcome that carries on past an early exit (both
+    outcomes when that is unclear): a constant upper bound caps the range; a bound that cannot
+    be applied exactly (a run-time value, an expression over the field) clears the field. Zero /
+    sign checks and loop counters compared with the field bound nothing.
 """
 from __future__ import annotations
 
@@ -127,6 +164,12 @@ _MAX_PASSES = 4
 _MAX_DEPTH = 48               # expression depth; deeper values become opaque
 _MAX_DOMS = 96                # dominating blocks examined per context
 _ROUNDS = 4                   # inter-procedural rounds
+# field facts (a value stored to memory in one function, loaded in another)
+_FIELD_DEPTH = 4              # offsets in an access path (pointers loaded on the way + the field)
+_LIFT_DEPTH = 5               # caller levels a parameter-rooted location is lifted through
+_LIFT_BUDGET = 64             # locations one write / load may denote
+_FIELD_WRITES = 48            # writes examined per object field; more -> the field is not judged
+_COPY_DEPTH = 2               # struct-copy (memcpy) hops followed to the source field
 
 _X86_FAMILIES = [
     ("RAX", "EAX", "AX", "AL", "AH"), ("RBX", "EBX", "BX", "BL", "BH"),
@@ -159,6 +202,25 @@ _SP_FAMILY = {"x86-64": "RSP", "x86": "ESP", "aarch64": "SP", "arm": "SP", "mips
 
 def _mask(size: int) -> int:
     return (1 << (8 * size)) - 1
+
+
+_CYCLE = ("cycle",)            # _ptr_path: a node on the current resolution stack (a loop)
+
+
+def _shift(p, off):
+    """Access path `p` moved by `off` bytes within its final object."""
+    return (p[0], p[1][:-1] + (p[1][-1] + off,))
+
+
+def _compose(q, p):
+    """A parameter-rooted path `p` seen from a caller whose argument points at `q`."""
+    offs = q[1][:-1] + (q[1][-1] + p[1][0],) + p[1][1:]
+    return (q[0], offs) if len(offs) <= _FIELD_DEPTH else None
+
+
+def _upper(rel, K):
+    """The upper bound `x rel K` puts on x, or None."""
+    return K - 1 if rel == "lt" else K if rel in ("le", "eq") else None
 
 
 # ------------------------------------------------------------------------------- node store
@@ -646,6 +708,10 @@ class _Func:
         self.rets: dict = {}            # (block, site) -> return node
         self.outs: dict = {}            # (param idx, off, size) -> {value nodes}
         self.regions: dict = {}         # (lo, hi) stack ranges filled with input -> origin spec
+        self.stores: dict = {}          # (block, addr node, size, value node) -> None (ordered set)
+        self.fills: dict = {}           # (block, ptr node, length, spec) -> None
+        self._vconds = None             # comparisons computed as values (field guards)
+        self._outc: dict = {}           # block -> branch outcomes that carry on (field guards)
         self.skipped = None
         self._reach: dict = {}
         self._atoms: dict = {}
@@ -786,6 +852,21 @@ class _Program:
         self.gregions: dict = {}        # (lo, hi) absolute address range of a filled global
         self.call_rec: dict = {}        # call site -> record
         self._visiting: set = set()
+        self._blk = None                # the block being evaluated (write records)
+        # field facts: structural indexes, built once after evaluation (they do not depend on taint)
+        self._paths: dict = {}          # pointer node -> access path (root, offsets) | None
+        self._pstack: dict = {}         # nodes whose path is being computed -> stack depth
+        self._ptmp: dict = {}           # provisional paths inside an open loop
+        self._plow = 1 << 30
+        self._rpaths: dict = {}         # internal call site -> the path its return points at
+        self._lvls: dict = {}           # location -> ([(location in a caller, call chain)], cut)
+        self._callers_idx = None        # function -> internal call records that call it
+        self._fidx = None               # (root, deref prefix) -> offset bucket -> writes
+        self._wild: dict = {}           # writes whose locations ran past the lift budget
+        self._cidx = None               # location -> comparisons on a load of it
+        self._ldat: dict = {}           # load node -> {(function, block, insn)} it is read in
+        self._fwhere: dict = {}         # (path, size) -> the object a field fact came from
+        self.fstats: dict = defaultdict(int)
         self.reset_memos()
 
     def reset_memos(self):
@@ -794,6 +875,8 @@ class _Program:
         self._memo_rng: dict = {}
         self._memo_rt: dict = {}
         self._memo_rr: dict = {}
+        self._memo_field: dict = {}     # load node -> (origin, range) from the field facts | None
+        self._raw_ld: set = set()       # load nodes tainted as raw input bytes (not via a field)
 
     def _fam_of_group(self, grp):
         for r in sorted(grp, key=lambda r: (-len(r), r)):
@@ -869,6 +952,8 @@ class _Program:
             changed = False
             F.rets.clear()
             F.outs.clear()
+            F.stores.clear()
+            F.fills.clear()
             for a in F.order:
                 ins = [(p, OUT[p]) for p in F.preds.get(a, ()) if p in OUT]
                 if a == F.entry:
@@ -1041,12 +1126,14 @@ class _Program:
             return v
         v = N.mk(("ld", size, addr, epoch), N.depth[addr] + 1, where)
         heap[hk] = v
+        self._ldat.setdefault(v, set()).add((F.addr, self._blk, where))
         return v
 
     def _store(self, F, st, addr, size, val):
         N = self.N
         stk, heap = st[1], st[2]
         ka = N.key[addr]
+        F.stores[(self._blk, addr, size, val)] = None       # for the field facts
         if ka[0] == "sp" and ka[3] == F.addr:
             off = ka[2]
             for o2 in [o for o, (s2, _v) in stk.items() if o < off + size and off < o + s2]:
@@ -1100,6 +1187,7 @@ class _Program:
         blk = F.by[a]
         instrs = blk.get("instructions") or []
         F.cond.pop(a, None)
+        self._blk = a
         nins = len(instrs)
         for ii, ins in enumerate(instrs):
             iaddr = ins.get("addr")
@@ -1276,7 +1364,7 @@ class _Program:
                 # first one that is not an address
                 if not self._addressish(F, p):
                     break
-                self._fill(F, st, p, 8, spec)
+                self._fill(F, st, p, 8, spec, flen=4)
                 handled.add(i)
         cp = _COPIES.get(nm)
         if cp is not None and len(args) > max(cp[0], cp[1]):
@@ -1297,7 +1385,12 @@ class _Program:
                 continue                    # the callee only reads through this pointer
             lo = kp[2]
             for o in [o for o in stk if lo <= o < lo + 64]:
-                stk[o] = (stk[o][0], N.top(stk[o][0], ("clob", iaddr, o)))
+                # a neighbour of the passed object (not its first word) keeps, in the top's tag,
+                # the value it held: still unknown for taint and range, but the field facts may
+                # take a pointer's object identity from it (`&ext` passed beside `gif` would
+                # otherwise erase which object `gif` points at)
+                old = stk[o][1] if o >= lo + self.word else None
+                stk[o] = (stk[o][0], N.top(stk[o][0], ("clobs", iaddr, o, old)))
         for (pi, off, sz) in summary:
             if pi < len(args):
                 p = args[pi]
@@ -1368,11 +1461,15 @@ class _Program:
             v *= c
         return v
 
-    def _fill(self, F, st, ptr, length, spec):
+    def _fill(self, F, st, ptr, length, spec, flen=None):
         """Bytes at `ptr` now hold input (`spec` = an origin, or ('if-ptr', src, origin) for a
         copy whose source may or may not be input -- resolved lazily, so evaluation does not
-        depend on taint facts)."""
+        depend on taint facts). `flen`: the byte count the field facts file it under, when the
+        evaluation's own length is only an over-estimate (a scanf conversion)."""
         N = self.N
+        fl = length if flen is None else flen
+        if isinstance(fl, int) and 0 < fl <= 0x100000:
+            F.fills[(self._blk, ptr, fl, spec)] = None     # for the field facts (known length only)
         k = N.key[ptr]
         if k[0] == "sp" and k[3] == F.addr:
             lo = k[2]
@@ -1429,6 +1526,11 @@ class _Program:
             out = self._out_taint(k, seen)
         elif kind == "ld":
             out = self._load_taint(k[2], seen)
+            if out:
+                self._raw_ld.add(n)
+            else:
+                ff = self._field(n, seen)
+                out = ff[0] if ff else None
         elif kind == "op":
             for x in k[3:]:
                 if isinstance(x, int) and N.key[x][0] != "c":
@@ -1537,8 +1639,11 @@ class _Program:
                 idx = self._param_index(k[3])
                 if idx is not None:
                     out = self.p_ptr.get((k[2], idx))
-            elif kind in ("ld", "srcld", "out"):
-                # a pointer read out of attacker-controlled memory points where the attacker says
+            elif kind == "ld":
+                # a pointer read out of attacker-controlled memory points where the attacker says;
+                # an attacker-set integer FIELD is not such a pointer, so the field facts stay out
+                out = self._load_taint(k[2], seen)
+            elif kind in ("srcld", "out"):
                 out = self.taint(n, seen)
             elif kind == "ret":
                 callee = k[3]
@@ -1602,6 +1707,677 @@ class _Program:
             if o:
                 return o
         return None
+
+    # ------------------------------------------------------------------------ field facts
+    # A value decoded in one function, stored into a struct or a global, and read in another.
+    # Every write the evaluation saw (STORE, input fill, memcpy) is filed under the ABSTRACT
+    # LOCATION it writes; a load reads the writes filed under its own location. See the module
+    # docstring ("field facts") for the identity scheme, the range rule and the guard rule.
+    def _ptr_path(self, n):
+        """Where pointer value `n` points: (root, offsets) or None. Roots: ("g",) a global
+        (offsets[0] is the absolute address), ("h", site) the object an allocation call at `site`
+        returned, ("p", f, i) whatever f's parameter i points at, ("s", f) f's stack frame
+        (offsets[0] is the frame offset). Every offset but the last is a pointer LOADED from that
+        offset of the object before it: *(*(p + 8) + 4) is (("p", f, 0), (8, 4))."""
+        r = self._paths.get(n, 0)
+        if r != 0:
+            return r
+        d = self._pstack.get(n)
+        if d is not None:                          # a loop: optimistic, settled by the phi
+            self._plow = min(self._plow, d)
+            return _CYCLE
+        if n in self._ptmp:
+            return self._ptmp[n]
+        depth = len(self._pstack)
+        self._pstack[n] = depth
+        saved, self._plow = self._plow, 1 << 30
+        try:
+            r = self._ptr_path_(n)
+        finally:
+            del self._pstack[n]
+        low, self._plow = self._plow, min(saved, self._plow)
+        if r is _CYCLE and low >= depth:
+            r = None                               # nothing but the loop itself: unknown
+        if low >= depth:
+            self._paths[n] = r                     # final: no open loop below this node
+        else:
+            self._ptmp[n] = r                      # provisional on an enclosing loop's phi
+        if depth == 0:
+            self._ptmp.clear()
+        return r
+
+    def _ptr_path_(self, n):
+        N = self.N
+        base, off = self._split(n)
+        kb = N.key[base]
+        kind = kb[0]
+        if kind == "c":
+            return (("g",), (kb[2],)) if kb[2] >= 0x1000 else None
+        if kind == "arg":
+            idx = self._param_index(kb[3])
+            return (("p", kb[2], idx), (off,)) if idx is not None else None
+        if kind == "sp":
+            return (("s", kb[3]), (kb[2] + off,))
+        if kind == "top":
+            tag = kb[2]
+            if isinstance(tag, tuple) and tag and tag[0] == "clobs" and tag[3] is not None:
+                q = self._ptr_path(tag[3])
+                if q is _CYCLE:
+                    return _CYCLE if off == 0 else None
+                return _shift(q, off) if q is not None else None
+            return None
+        if kind == "out":
+            # the pointer a callee stored through its parameter: a load of that field after
+            # the call ("out", size, site, param, offset)
+            rec = self.call_rec.get(kb[2])
+            if rec is None or kb[1] != self.word or kb[3] >= len(rec["args"]):
+                return None
+            q = self._ptr_path(rec["args"][kb[3]])
+            if q in (None, _CYCLE) or len(q[1]) >= _FIELD_DEPTH:
+                return None
+            return (q[0], _shift(q, kb[4])[1] + (off,))
+        if kind == "ret":
+            rec = self.call_rec.get(kb[2])
+            if rec is None or kb[1] != self.word:
+                return None
+            if self._alloc_args(rec) is not None:
+                return (("h", kb[2]), (off,))
+            if rec["internal"] and rec["dst"] in self.funcs:
+                rp = self._ret_path(rec)
+                return _shift(rp, off) if rp else None
+            return None
+        if kind == "ld":
+            q = self._ptr_path(kb[2])
+            if q in (None, _CYCLE) or len(q[1]) >= _FIELD_DEPTH or kb[1] != self.word:
+                return None
+            return (q[0], q[1] + (off,))
+        if kind in ("phi", "sel"):
+            if base != n:
+                q = self._ptr_path(base)
+                return _shift(q, off) if q not in (None, _CYCLE) else None
+            ins = list(N.phi_in.get(base, {}).values()) if kind == "phi" else [kb[3], kb[4]]
+            got, cyc = None, False
+            for x in ins:
+                if x == base or N.cval(x) == 0:
+                    continue                       # a NULL arm does not change the object
+                p = self._ptr_path(x)
+                if p is _CYCLE:
+                    cyc = True
+                    continue                       # the value carried round a loop unchanged
+                if p is None or (got is not None and p != got):
+                    return None                    # two objects, or a loop-carried pointer
+                got = p
+            return got if got is not None or not cyc else _CYCLE
+        return None
+
+    def _ret_path(self, rec):
+        """The object an internal call returns: one path for every non-NULL return (a
+        constructor's allocation, a global, or -- mapped through this call -- a parameter)."""
+        site = rec["site"]
+        r = self._rpaths.get(site, 0)
+        if r != 0:
+            return r
+        self._rpaths[site] = None
+        F = self.funcs.get(rec["dst"])
+        got = None
+        for v in (F.rets.values() if F is not None else ()):
+            if self.N.cval(v) == 0:
+                continue
+            p = self._ptr_path(v)
+            p = None if p is _CYCLE else p
+            if p is not None and p[0][0] == "p" and p[0][1] == rec["dst"]:
+                i = p[0][2]
+                q = self._ptr_path(rec["args"][i]) if i < len(rec["args"]) else None
+                p = _compose(q, p) if q not in (None, _CYCLE) else None
+            if p is None or (got is not None and p != got):
+                got = None
+                break
+            got = p
+        self._rpaths[site] = got
+        return got
+
+    def _callers(self):
+        if self._callers_idx is None:
+            idx = defaultdict(list)
+            for rec in self.call_rec.values():
+                if rec["internal"] and rec["dst"] in self.funcs:
+                    idx[rec["dst"]].append(rec)
+            self._callers_idx = idx
+        return self._callers_idx
+
+    def _levels(self, loc):
+        """`loc` and every location it denotes in the callers of its function (a parameter-rooted
+        location is lifted through each call site to where that caller's argument points), each
+        with the call chain that maps it: ([(location, chain)], cut by the budget)."""
+        r = self._lvls.get(loc)
+        if r is not None:
+            return r
+        out, cut, todo = [(loc, ())], False, [(loc, ())]
+        callers = self._callers()
+        while todo and not cut:
+            cur, ch = todo.pop()
+            root = cur[0]
+            if root[0] != "p" or len(ch) >= _LIFT_DEPTH:
+                continue
+            sites = {x["site"] for x in ch}
+            for rec in callers.get(root[1], ()):
+                args = rec["args"]
+                if rec["site"] in sites or root[2] >= len(args):
+                    continue
+                q = self._ptr_path(args[root[2]])
+                nl = _compose(q, cur) if q not in (None, _CYCLE) else None
+                if nl is None:
+                    continue
+                out.append((nl, ch + (rec,)))
+                if len(out) > _LIFT_BUDGET:
+                    cut = True
+                    break
+                todo.append((nl, ch + (rec,)))
+        r = (out, cut)
+        self._lvls[loc] = r
+        return r
+
+    def _field_index(self):
+        """Every write of the program filed under every location it may write."""
+        if self._fidx is not None:
+            return self._fidx
+        idx: dict = defaultdict(lambda: defaultdict(list))
+        wild: dict = defaultdict(list)
+        for f, F in self.funcs.items():
+            writes = [(addr, size, ("v", f, blk, val)) for (blk, addr, size, val) in F.stores]
+            for (blk, ptr, ln, spec) in F.fills:
+                if isinstance(spec, tuple) and spec and spec[0] == "if-ptr":
+                    writes.append((ptr, ln, ("c", f, blk, spec[1], spec[2])))
+                else:
+                    writes.append((ptr, ln, ("f", f, blk, spec)))
+            for addr, size, ent in writes:
+                p = self._ptr_path(addr)
+                if p is None:
+                    continue
+                lv, cut = self._levels(p)
+                if cut:
+                    wild[(p[1][-1], size)].append(ent)
+                for loc, ch in lv:
+                    lo = loc[1][-1]
+                    e = (lo, lo + size, ent, ch)
+                    b = idx[(loc[0], loc[1][:-1])]
+                    if size > 256:
+                        b["big"].append(e)
+                    else:
+                        for k in range(lo >> 4, ((lo + size - 1) >> 4) + 1):
+                            b[k].append(e)
+        self._fidx, self._wild = idx, wild
+        return idx
+
+    def _writes_at(self, key, d, size):
+        """The writes filed under object `key` that overlap bytes [d, d + size)."""
+        b = self._field_index().get(key)
+        if not b:
+            return []
+        got, out = set(), []
+        for k in [*range(d >> 4, ((d + size - 1) >> 4) + 1), "big"]:
+            for e in b.get(k, ()):
+                if id(e) in got or e[1] <= d or e[0] >= d + size:
+                    continue
+                got.add(id(e))
+                out.append(e)
+        return out
+
+    def _field(self, n, seen=None):
+        """(origin, range) for load node `n` read from the field facts, or None."""
+        r = self._memo_field.get(n, 0)
+        if r != 0:
+            return r
+        self._memo_field[n] = None                 # recursion guard
+        seen = set() if seen is None else seen
+        k = self.N.key[n]
+        p = self._ptr_path(k[2])
+        r = None
+        if p is not None:
+            q = self._field_query(p, k[1], seen)
+            if q:
+                r = self._field_guarded(n, q)
+        self._memo_field[n] = r
+        return r
+
+    def _field_query(self, p, size, seen, depth=0):
+        """The attacker data a `size`-byte load at location `p` reads: (origin, range, the
+        tainted value writes, the levels of p) or None. Judged per OBJECT (each level of p): an
+        object counts when every write that may define those bytes is attacker data or a
+        compile-time constant; the load's facts are the union over the objects that count."""
+        key = ("fq", p, size)
+        if key in seen:
+            return None
+        seen.add(key)
+        self._field_index()
+        lv, _cut = self._levels(p)
+        for ent in self._wild.get((p[1][-1], size), ()):
+            if self._write_value(ent, (), 0, size, seen, depth) is None:
+                return None          # a write we could not place may be an untainted one
+        origin, lo, hi, vals, where = None, None, None, [], []
+        for loc, _ch in lv:
+            r = self._level_fact((loc[0], loc[1][:-1]), loc[1][-1], size, seen, depth)
+            if not r:
+                continue
+            origin = origin or r[0]
+            lo = r[1][0] if lo is None else min(lo, r[1][0])
+            hi = r[1][1] if hi is None else max(hi, r[1][1])
+            vals.extend(r[2])
+            where.append(loc)
+        if origin is None:
+            return None
+        # name the object: a concrete one (heap / global / stack) over a parameter's pointee
+        self._fwhere[(p, size)] = min(where, key=lambda x: x[0][0] == "p")
+        return (origin, (lo, hi), vals, lv)
+
+    def _level_fact(self, key, d, size, seen, depth):
+        ws = self._writes_at(key, d, size)
+        if not ws:
+            return None
+        if len(ws) > _FIELD_WRITES:
+            return None
+        origin, lo, hi, vals = None, None, None, []
+        for (s_lo, s_hi, ent, ch) in ws:
+            if not (s_lo <= d and d + size <= s_hi):
+                return None          # the load spans several writes: its value is none of them
+            r = self._write_value(ent, ch, d - s_lo, size, seen, depth)
+            if r is None:
+                return None          # a write that is neither attacker data nor a constant
+            o, rr = r
+            origin = origin or o
+            lo = rr[0] if lo is None else min(lo, rr[0])
+            hi = rr[1] if hi is None else max(hi, rr[1])
+            if o and ent[0] == "v":
+                vals.append((ent, ch))
+        if origin is None:
+            return None              # constants only: nothing the attacker drives
+        return (origin, (lo, hi), vals)
+
+    def _write_value(self, ent, ch, rel, size, seen, depth):
+        """What bytes [rel, rel + size) of one write hold: (origin | None for a constant, range),
+        or None when it is neither attacker data nor a constant."""
+        N = self.N
+        full = (0, _mask(size))
+        kind = ent[0]
+        if kind == "v":
+            _k, f, blk, val = ent
+            vs = N.size(val)
+            c = self._chain_const(val, ch)
+            if c is not None:
+                v = (c >> (8 * rel)) & _mask(size)
+                return (None, (v, v))
+            o = self._chain_taint(val, ch, seen)
+            if not o:
+                return None
+            # the stored value's range where it is stored (its dominating checks), narrowed by
+            # the range the argument has at this call chain when the value is a parameter
+            r = self.rng(val, (f, blk, ()), True)
+            rc = self._chain_range(val, ch)
+            if rc is not None and r[0] >= 0 and max(r[0], rc[0]) <= min(r[1], rc[1]):
+                r = (max(r[0], rc[0]), min(r[1], rc[1]))
+            if r[0] < 0 or r[1] > _mask(vs):
+                r = (0, _mask(vs))                 # clipped to the store width
+            if rel:
+                r = (r[0] >> (8 * rel), r[1] >> (8 * rel))
+            return (o, r if r[1] <= full[1] else full)
+        if kind == "f":
+            o = self._spec(ent[3], seen)
+            return (o, full) if o else None
+        if kind == "c":
+            _k, f, blk, src, origin = ent
+            # a struct copy: the field of the copy holds what the source field holds
+            if depth < _COPY_DEPTH:
+                q = self._ptr_path(src)
+                if q is not None:
+                    r = self._field_query(_shift(q, rel), size, seen, depth + 1)
+                    if r:
+                        return (f"{origin} <- {r[0]}", r[1])
+            o = self.ptr_taint(src, seen)
+            return (f"{origin} <- {o}", full) if o else None
+        return None
+
+    def _chain_taint(self, v, ch, seen, depth=0):
+        """Taint of a stored value AT the call chain the write was lifted through: the storing
+        function's parameters are the arguments of that chain's call sites, so a setter called
+        with a constant on one object and with input on another taints only the second."""
+        if not ch:
+            return self.taint(v, seen)
+        N = self.N
+        k = N.key[v]
+        kind = k[0]
+        if kind == "arg":
+            rec = ch[0]
+            idx = self._param_index(k[3]) if k[2] == rec["dst"] else None
+            if idx is not None and idx < len(rec["args"]):
+                return self._chain_taint(rec["args"][idx], ch[1:], seen, depth + 1)
+            return self.taint(v, seen)
+        if depth > 20:
+            return self.taint(v, seen)
+        if kind in ("op", "sel"):
+            xs = (k[3], k[4]) if kind == "sel" else [x for x in k[3:] if isinstance(x, int)]
+            for x in xs:
+                if N.key[x][0] != "c":
+                    o = self._chain_taint(x, ch, seen, depth + 1)
+                    if o:
+                        return o
+            return None
+        if kind == "phi":
+            mark = ("ct", v, len(ch))
+            if mark in seen:
+                return None
+            seen.add(mark)
+            for x in N.phi_in.get(v, {}).values():
+                if x != v:
+                    o = self._chain_taint(x, ch, seen, depth + 1)
+                    if o:
+                        return o
+            return None
+        return self.taint(v, seen)
+
+    def _chain_const(self, v, ch, depth=0):
+        """The stored value as a constant at this call chain, else None."""
+        N = self.N
+        c = N.cval(v)
+        if c is not None or not ch or depth > 8:
+            return c
+        k = N.key[v]
+        if k[0] == "arg":
+            rec = ch[0]
+            idx = self._param_index(k[3]) if k[2] == rec["dst"] else None
+            if idx is None or idx >= len(rec["args"]):
+                return None
+            r = self._chain_const(rec["args"][idx], ch[1:], depth + 1)
+            return None if r is None else r & _mask(k[1])
+        if k[0] == "op" and k[2] in ("INT_ZEXT", "INT_SEXT", "SUBPIECE", "INT_AND", "INT_OR",
+                                      "INT_ADD", "INT_MULT", "INT_LEFT", "INT_RIGHT"):
+            a = self._chain_const(k[3], ch, depth + 1)
+            b = self._chain_const(k[4], ch, depth + 1) if len(k) > 4 else None
+            if a is None or (len(k) > 4 and b is None):
+                return None
+            if k[2] == "SUBPIECE":
+                return (a >> (8 * b)) & _mask(k[1])
+            return _fold(k[2], a, b, N.size(k[3]), N.size(k[4]) if len(k) > 4 else 0, k[1])
+        return None
+
+    def _chain_range(self, v, ch):
+        """When the stored value IS a parameter, its range at the chain's call site."""
+        if not ch:
+            return None
+        N = self.N
+        k = N.key[_strip(N, v)]
+        rec = ch[0]
+        if k[0] != "arg" or k[2] != rec["dst"]:
+            return None
+        idx = self._param_index(k[3])
+        if idx is None or idx >= len(rec["args"]):
+            return None
+        a = rec["args"][idx]
+        r = self.rng(a, (rec["func"], rec["block"], ()), True)
+        rr = self._chain_range(a, ch[1:])
+        if rr is not None and r[0] >= 0 and max(r[0], rr[0]) <= min(r[1], rr[1]):
+            r = (max(r[0], rr[0]), min(r[1], rr[1]))
+        return r if r[0] >= 0 else None
+
+    # field guards ------------------------------------------------------------------------
+    def _value_conds(self, F):
+        """Comparisons F computes as VALUES (returned, passed, stored, or a cmov/csel select's
+        condition) -- a validator's `return n <= MAX` has no branch of its own."""
+        if F._vconds is not None:
+            return F._vconds
+        N = self.N
+        roots = list(F.rets.values()) + [a for r in F.calls.values() for a in r["args"]] + \
+            [k[3] for k in F.stores]
+        out, seen, todo = set(), set(), list(roots)
+        while todo and len(seen) < 6000:
+            x = todo.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            k = N.key[x]
+            if k[0] == "sel":
+                out.add(k[2])
+                todo.extend((k[3], k[4]))
+            elif k[0] == "op":
+                if k[2] in _CMP and k[1] == 1:
+                    out.add(x)
+                todo.extend(v for v in k[3:] if isinstance(v, int))
+            elif k[0] == "phi" and k[2] == F.addr:
+                todo.extend(N.phi_in.get(x, {}).values())   # a value merged from its paths
+        F._vconds = out
+        return out
+
+    def _outcomes(self, F, blk):
+        """The outcomes of block blk's branch that can lead on into the function's work. When one
+        successor is an early exit (a handful of blocks of its own, while the other carries on
+        through many) only the other outcome is a guard; otherwise both are possible."""
+        memo = F._outc
+        r = memo.get(blk)
+        if r is not None:
+            return r
+        r = (True, False)
+        c = F.cond.get(blk)
+        succ = F.succ.get(blk, [])
+        if c is not None and len(set(succ)) == 2 and c[1] in succ:
+            taken = c[1]
+            fall = [x for x in succ if x != taken][0]
+            rt = self._reach_from(F, taken, blk)
+            rf = self._reach_from(F, fall, blk)
+            ut, uf = rt - rf, rf - rt
+            if len(ut) <= 4 and len(uf) >= 8:
+                r = (False,)                       # the taken side bails out
+            elif len(uf) <= 4 and len(ut) >= 8:
+                r = (True,)
+        memo[blk] = r
+        return r
+
+    @staticmethod
+    def _reach_from(F, start, avoid, cap=600):
+        seen, todo = set(), [start]
+        while todo and len(seen) < cap:
+            x = todo.pop()
+            if x in seen or x == avoid:
+                continue
+            seen.add(x)
+            todo.extend(F.succ.get(x, ()))
+        return seen
+
+    def _cmp_index(self):
+        """Every load a comparison reads (a branch condition, or a comparison used as a value),
+        filed under each location it may read: loc -> [(function, condition, load, block)]."""
+        if self._cidx is not None:
+            return self._cidx
+        N = self.N
+        idx: dict = defaultdict(list)
+        for f, F in self.funcs.items():
+            conds = [(blk, cond) for blk, (cond, _t) in F.cond.items()] + \
+                [(None, c) for c in self._value_conds(F)]
+            for blk, cond in conds:
+                for s in _subnodes(N, (cond,), 200):
+                    ks = N.key[s]
+                    if ks[0] != "ld":
+                        continue
+                    p = self._ptr_path(ks[2])
+                    if p is None:
+                        continue
+                    for loc, _ch in self._levels(p)[0]:
+                        idx[loc].append((f, cond, s, blk))
+        self._cidx = idx
+        return idx
+
+    def _field_guarded(self, n, q):
+        """Apply every comparison the program makes on this field's value -- a load of the field
+        anywhere, or the value where it is stored (and up the setter's call chain). Whether a
+        check in ANOTHER function precedes the allocation is unknown, so a check is assumed to
+        hold on the outcome(s) that carry on (see _outcomes): a constant upper bound caps the
+        range, and a bound the analysis cannot apply exactly (a run-time value, an expression
+        over the field) clears the field. Zero / sign checks (`x == 0`, `x <= 0`, `x < 0`) bound
+        nothing and are ignored, as are loop counters compared with the field."""
+        origin, (lo, hi), vals, lv = q
+        N = self.N
+        size = N.size(n)
+        groups: dict = {}
+
+        def add(func, cond, blk, exact, leaves=()):
+            g = groups.setdefault((func, cond), (set(), set(), blk))
+            g[0].update(exact)
+            g[1].update(leaves)
+
+        # (A) checks on a load of the field that run BEFORE this load: exact dominating
+        # branches here and in the callers before their call; anything inside the callees that
+        # those dominating call sites invoke (a validator)
+        locs = {loc for loc, _ch in lv}
+        exact_atoms, before = self._checks_before(n)
+        for atom in exact_atoms:
+            ms = {x for x in _subnodes(N, (atom[0], atom[2]), 120)
+                  if N.key[x][0] == "ld" and self.field_locs(x) & locs}
+            if ms:
+                e = self._check_effect(atom, ms, set())
+                if e == "opaque":
+                    self.fstats["cleared_by_check"] += 1
+                    return None
+                if e is not None:
+                    lo, hi = _apply_signed(lo, hi, "le", e[1], size) if e[2] else \
+                        _apply_unsigned(lo, hi, "le", e[1])
+                    if lo > hi:
+                        return None
+        cidx = self._cmp_index()
+        for loc in locs:
+            for (f, cond, m, blk) in cidx.get(loc, ()):
+                if before is None or f in before:
+                    add(f, cond, blk, (m,))
+        # (B) checks on the stored value where it is stored (they run before any later load)
+        for (ent, ch) in vals:
+            func, v, chain = ent[1], ent[3], ch
+            for _ in range(_LIFT_DEPTH + 1):
+                s = _strip(N, v)
+                exact = {v, s}
+                leaves = {t for t in _subnodes(N, (v,), 60)
+                          if N.key[t][0] in ("srcld", "ld", "arg", "ret", "out", "phi")} - exact
+                mine = exact | leaves
+                F = self.funcs.get(func)
+                if F is not None:
+                    conds = [(blk, cond) for blk, (cond, _t) in F.cond.items()] + \
+                        [(None, c) for c in self._value_conds(F)]
+                    for blk, cond in conds:
+                        if _subnodes(N, (cond,), 200) & mine:
+                            add(func, cond, blk, exact, leaves)
+                ks = N.key[s]
+                if not chain or ks[0] != "arg" or ks[2] != chain[0]["dst"]:
+                    break
+                idx = self._param_index(ks[3])
+                if idx is None or idx >= len(chain[0]["args"]):
+                    break
+                v, func, chain = chain[0]["args"][idx], chain[0]["func"], chain[1:]
+        for (f, cond), (exact, leaves, blk) in groups.items():
+            F = self.funcs.get(f)
+            outs = self._outcomes(F, blk) if (F is not None and blk is not None) else (True, False)
+            for pos in outs:
+                for atom in self.atoms(cond, pos):
+                    e = self._check_effect(atom, exact, leaves - exact)
+                    if e is None:
+                        continue
+                    if e == "opaque":
+                        self.fstats["cleared_by_check"] += 1
+                        return None
+                    _c, U, sg = e
+                    lo, hi = _apply_signed(lo, hi, "le", U, size) if sg else \
+                        _apply_unsigned(lo, hi, "le", U)
+                    if lo > hi:
+                        return None
+        self.fstats["facts"] += 1
+        k = N.key[n]
+        at = self._fwhere.get((self._ptr_path(k[2]), k[1])) or lv[0][0]
+        return (f"{origin} (stored to {self._loc_text(at)})", (lo, hi))
+
+    def _checks_before(self, n):
+        """For load node n: (atoms that hold where it is read -- its function's dominating
+        branches and, up to three caller levels, the callers' branches dominating the call --,
+        the set of functions invoked at call sites dominating those points, transitively; None
+        when that set ran past its budget, meaning: any function)."""
+        atoms, roots = [], set()
+        todo = [(f, b, _hexint(w), 0) for (f, b, w) in self._ldat.get(n, ())]
+        seen = set()
+        callers = self._callers()
+        while todo:
+            f, b, ref, d = todo.pop()
+            if (f, b, ref) in seen or len(seen) > 64:
+                continue
+            seen.add((f, b, ref))
+            F = self.funcs.get(f)
+            if F is None or b is None:
+                continue
+            atoms.extend(self.ctx_atoms((f, b, ())))
+            doms = set(F.dom_chain(b))
+            for rec in F.calls.values():
+                if not (rec["internal"] and rec["dst"] in self.funcs):
+                    continue
+                # a dominating block's calls, or this block's calls made before the point
+                if rec["block"] in doms or (rec["block"] == b and (
+                        ref is None or (_hexint(rec["site"]) or 0) < ref)):
+                    roots.add(rec["dst"])
+            if d < 3:
+                for rec in callers.get(f, ()):
+                    todo.append((rec["func"], rec["block"], _hexint(rec["site"]), d + 1))
+        before, todo = set(), list(roots)
+        while todo:
+            g = todo.pop()
+            if g in before:
+                continue
+            before.add(g)
+            if len(before) > 400:
+                return atoms, None
+            todo.extend(self.cg.get(g, ()))
+        return atoms, before
+
+    def _check_effect(self, atom, exact, leaves):
+        """What one outcome of a comparison implies for the field: None, ("cap", U, signed), or
+        "opaque" (a bound that cannot be applied exactly)."""
+        N = self.N
+        lhs, rel, rhs, signed = atom
+        sl, sr = _subnodes(N, (lhs,), 120), _subnodes(N, (rhs,), 120)
+        mine = exact | leaves
+        if not ((sl | sr) & mine):
+            return None
+        cl, cr = N.cval(lhs), N.cval(rhs)
+        if cl is not None or cr is not None:
+            for (tgt, rl, K, sg) in self._peel(lhs, rel, rhs, signed):
+                if tgt in mine:
+                    U = _upper(rl, K)
+                    if U is None or U <= 0:
+                        return None                # a lower bound, or a zero / sign check
+                    return ("cap", U, sg) if tgt in exact else "opaque"
+            e_rel, K, ks = (rel, cr, N.size(rhs)) if cr is not None else (_FLIP[rel], cl,
+                                                                           N.size(lhs))
+            U = _upper(e_rel, _signed(K, ks) if signed else K)
+            return "opaque" if U is not None and U > 0 else None
+        fl, fr = bool(sl & mine), bool(sr & mine)
+        if fl and fr:
+            return "opaque"
+        rl = rel if fl else _FLIP[rel]
+        if rl not in ("lt", "le", "eq"):
+            return None                            # the field is bounded BELOW by it
+        if any(self._is_induction(s) for s in (sr if fl else sl)):
+            return None                            # a loop counter compared with the field
+        return "opaque"
+
+    def _loc_text(self, loc):
+        root, offs = loc
+        tail = "".join(f"->{o:#x}" if i else f"+{o:#x}" for i, o in enumerate(offs))
+        if root[0] == "g":
+            return f"global {offs[0]:#x}" + "".join(f"->{o:#x}" for o in offs[1:])
+        if root[0] == "h":
+            return f"heap@{root[1]}{tail}"
+        if root[0] == "s":
+            return f"stack of {self.names.get(root[1], root[1])}{tail}"
+        return f"*param{root[2]} of {self.names.get(root[1], root[1])}{tail}"
+
+    def field_locs(self, n):
+        """Every location load node `n` may read (empty for a non-load or an unplaced one)."""
+        k = self.N.key[n]
+        if k[0] != "ld":
+            return frozenset()
+        p = self._ptr_path(k[2])
+        return frozenset(loc for loc, _ch in self._levels(p)[0]) if p is not None else frozenset()
 
     # ------------------------------------------------------------------------------ ranges
     def full(self, n):
@@ -1670,6 +2446,12 @@ class _Program:
             return full
         if kind == "srcld":
             return full
+        if kind == "ld" and tainted and n not in self._raw_ld:
+            ff = self._field(n)
+            if ff is not None:
+                lo, hi = ff[1]
+                if hi <= full[1] and lo >= -(full[1] >> 1) - 1:
+                    return (lo, hi)
         return full
 
     def _edge_ctx(self, f, p, b):
@@ -2309,6 +3091,7 @@ class _Detector:
         P, N = self.P, self.N
         R = alloc["ret"]
         leaves = {_strip(N, v) for v in (w["x"], w["y"]) if N.cval(v) is None}
+        leaves |= self._same_field_loads(F, leaves)
         size_node = alloc["args"][alloc["size_arg"]]
         for rec in F.calls.values():
             spec = _WRITERS.get(rec["name"])
@@ -2333,6 +3116,27 @@ class _Detector:
                                 "detail": f"{rec['name']}() writes into it in a loop bounded by "
                                           f"{_pretty(P, lhs)} {rel} {_pretty(P, rhs)}"}
         return None
+
+    def _same_field_loads(self, F, leaves):
+        """Loads in F of the same field as a load among `leaves` -- `n = hdr->count` re-read
+        after a call is a different load node but the same operand."""
+        P, N = self.P, self.N
+        locs = set()
+        for x in leaves:
+            locs |= P.field_locs(x)
+        if not locs:
+            return set()
+        out = set()
+        for rec in F.calls.values():
+            for a in rec["args"]:
+                for s in _subnodes(N, (a,), 80):
+                    if N.key[s][0] == "ld" and P.field_locs(s) & locs:
+                        out.add(s)
+        for _blk, (cond, _t) in F.cond.items():
+            for s in _subnodes(N, (cond,), 120):
+                if N.key[s][0] == "ld" and P.field_locs(s) & locs:
+                    out.add(s)
+        return out
 
     def _derives(self, p, R, depth=0):
         N = self.N
@@ -2370,14 +3174,55 @@ def alloc_overflow_sites(func_irs, call_edges, arch, *, bits=64, names=None, ent
     reason, written_after, confidence.
     """
     stop = should_stop or (lambda: False)
-    P = _Program(func_irs, call_edges, arch, bits, names, entry_seeds)
     stats = {"functions": len(func_irs or {}), "skipped_over_budget": 0, "alloc_sites": 0,
-             "reported": 0, "suppressed": defaultdict(int), "cut_short": False}
-    if not P.ak or not (P.callargfams or P.stack_args):
-        stats["note"] = f"no calling convention for arch {arch!r}"
+             "tainted_sizes": 0, "reported": 0, "via_field": 0, "suppressed": defaultdict(int),
+             "cut_short": False}
+    P = _build_program(func_irs, call_edges, arch, bits, names, entry_seeds, stop, stats)
+    if P is None:
         if stats_out is not None:
             stats_out.update(stats)
         return []
+    D = _Detector(P)
+    out = []
+    for faddr, F in P.funcs.items():
+        if stop():
+            stats["cut_short"] = True
+            break
+        for rec in F.calls.values():
+            sizes = P._alloc_args(rec)
+            if sizes is None:
+                continue
+            stats["alloc_sites"] += 1
+            if any(P.taint(rec["args"][si]) for si in sizes if si < len(rec["args"])):
+                stats["tainted_sizes"] += 1
+            r = _site_record(P, D, F, rec, sizes)
+            if r is None:
+                stats["suppressed"]["no-tainted-wrap"] += 1
+                continue
+            if r["guard_status"].startswith("guarded"):
+                stats["suppressed"][r["guard_status"]] += 1
+                if include_suppressed:
+                    out.append(r)
+                continue
+            stats["reported"] += 1
+            if any("(stored to " in str(o.get("origin") or "") for o in r["operands"]):
+                stats["via_field"] += 1
+            out.append(r)
+    stats["suppressed"] = dict(stats["suppressed"])
+    stats["field"] = dict(P.fstats)
+    if stats_out is not None:
+        stats_out.update(stats)
+    out.sort(key=lambda r: (str(r["function_addr"]), _hexint(r["site_addr"]) or 0))
+    return out
+
+
+def _build_program(func_irs, call_edges, arch, bits, names, entry_seeds, stop, stats):
+    """Evaluate every function and run the inter-procedural parameter fixpoint; the analysed
+    _Program, or None (with stats["note"]) when the arch has no calling convention."""
+    P = _Program(func_irs, call_edges, arch, bits, names, entry_seeds)
+    if not P.ak or not (P.callargfams or P.stack_args):
+        stats["note"] = f"no calling convention for arch {arch!r}"
+        return None
     for f in P.bottom_up():
         if stop():
             stats["cut_short"] = True
@@ -2417,33 +3262,7 @@ def alloc_overflow_sites(func_irs, call_edges, arch, *, bits=64, names=None, ent
         if not changed:
             break
     P.reset_memos()
-    D = _Detector(P)
-    out = []
-    for faddr, F in P.funcs.items():
-        if stop():
-            stats["cut_short"] = True
-            break
-        for rec in F.calls.values():
-            sizes = P._alloc_args(rec)
-            if sizes is None:
-                continue
-            stats["alloc_sites"] += 1
-            r = _site_record(P, D, F, rec, sizes)
-            if r is None:
-                stats["suppressed"]["no-tainted-wrap"] += 1
-                continue
-            if r["guard_status"].startswith("guarded"):
-                stats["suppressed"][r["guard_status"]] += 1
-                if include_suppressed:
-                    out.append(r)
-                continue
-            stats["reported"] += 1
-            out.append(r)
-    stats["suppressed"] = dict(stats["suppressed"])
-    if stats_out is not None:
-        stats_out.update(stats)
-    out.sort(key=lambda r: (str(r["function_addr"]), _hexint(r["site_addr"]) or 0))
-    return out
+    return P
 
 
 def _site_record(P, D, F, rec, sizes):
