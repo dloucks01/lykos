@@ -164,6 +164,16 @@
   .asm .ins.focus { background: #13233C; box-shadow: inset 3px 0 0 var(--blue); }
   .xref { font: 12px var(--mono); border: none; background: transparent; color: var(--blue); cursor: pointer; padding: 2px 0; text-align: left; }
   .xref:disabled { color: var(--tx3); cursor: default; }
+  /* narrow windows: the nav becomes one scrollable row across the top */
+  @media (max-width: 860px) {
+    .body { flex-direction: column; flex-wrap: nowrap; }
+    .nav { max-width: none; flex: none; flex-direction: row; align-items: center; overflow-x: auto;
+           border-right: none; border-bottom: 1px solid var(--line); padding: 6px 10px; gap: 4px; }
+    .nav .sep { width: 1px; height: 22px; margin: 0 6px; flex: none; }
+    .nav > span.dim { display: none; }
+    .nav button { flex: none; min-height: 36px; padding: 6px 12px; }
+    .main { padding: 16px 14px; }
+  }
   @media (max-width: 700px) { .x-out { padding-left: 0; } .ln .st { min-width: 0; }
     .trow { grid-template-columns: 1fr 1fr; } .flist { max-width: none; } }
 </style>

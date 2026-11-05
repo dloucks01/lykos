@@ -75,7 +75,7 @@ a.pf-mini { text-decoration: none; }
                 border: none; background: transparent; color: var(--tx); font: inherit; font-size: 13.5px; text-align: left; cursor: pointer; }
 .pf-lead-cwe { flex: none; width: 72px; font-size: 11.5px; }
 .pf-lead-t { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
-.pf-lead-side { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; padding: 4px 0; }
+.pf-lead-side { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; padding: 4px 0; margin-left: auto; }
 .pf-lead-side .pf-rel:has(.pf-rel-list) { flex: 1 1 100%; padding-left: 16px; }
 
 /* per-target chain strip */
