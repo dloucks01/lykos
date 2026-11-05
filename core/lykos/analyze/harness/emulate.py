@@ -30,6 +30,7 @@ _SENTINEL = 0x0000BB0000000000       # the fake return address; reaching it = a 
 _HEAP_ADDR = 0x0000CC0000000000      # bump-allocator region for the malloc/calloc/realloc stubs
 _HEAP_SZ = 0x1000000                 # 16 MiB heap
 _TLS_ADDR = 0x0000DD0000000000       # a fake TLS block so `fs:[0x28]` (the stack canary) is valid
+_TLS_BELOW = 0x10000                 # mapped below fs: a static glibc's TLS variables (fs:-N)
 _MAX_INSNS = 2_000_000               # per-segment instruction runaway guard
 #: libc stubs that only READ their arguments -- a fault inside one is an over-READ (CWE-125), not a
 #: write. Everything else (memset/strcpy dest, unknown) is treated as a write, as before.
@@ -706,7 +707,9 @@ def _setup(elf_bytes: bytes, res: HarnessResult):
         uc.mem_map(_INPUT_ADDR, _INPUT_SZ, UC_PROT_ALL)
         uc.mem_map(_SENTINEL & ~(_PAGE - 1), _PAGE, UC_PROT_ALL)
         uc.mem_map(_HEAP_ADDR, _HEAP_SZ, UC_PROT_ALL)    # for the malloc/calloc/realloc stubs
-        uc.mem_map(_TLS_ADDR, _PAGE, UC_PROT_ALL)        # fake TLS so the stack canary read works
+        # fake TLS: fs:[0x28] (the stack canary) above, and glibc's STATIC TLS block below
+        # (errno, tcache, locale pointers live at negative fs offsets in a static binary)
+        uc.mem_map(_TLS_ADDR - _TLS_BELOW, _TLS_BELOW + _PAGE, UC_PROT_ALL)
     except Exception as e:                               # noqa: BLE001
         res.note = f"map failed: {e}"
         return None

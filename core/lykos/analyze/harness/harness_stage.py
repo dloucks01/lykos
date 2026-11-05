@@ -126,6 +126,60 @@ def _drive_shape(rf) -> str:
     return "ptr" if rf.ptr_len == 1 else "ptr_len"
 
 
+class _LibSet(set):
+    """Library function starts, plus their [start, end) ranges for `contains_pc`."""
+
+    def __init__(self, it=()):
+        super().__init__(it)
+        self.ranges: list = []
+        self.bound = None        # stripped static: libscope's layout boundary (library above it)
+
+    def contains_pc(self, pc) -> bool:
+        import bisect
+        if pc is None:
+            return False
+        if self.bound is not None and pc >= self.bound:
+            return True          # a library body the reach rule kept (e.g. unnamed malloc)
+        if not self.ranges:
+            return False
+        i = bisect.bisect_right(self.ranges, (pc, float("inf"))) - 1
+        return i >= 0 and self.ranges[i][0] <= pc < self.ranges[i][1]
+
+
+def _uninit_libc_artifact(r, lib) -> bool:
+    """A NULL-page fault at a PC inside a static binary's (unstubbed) libc, with no heap verdict.
+
+    The harness calls one program function directly: the static startup never ran, so libc's
+    stdio/locale/TLS state is zero, and a libc body the function calls reads NULL+offset on ANY
+    input (measured on stripped jhead-3.04: 4 of 4 such faults, at 0x0/0xb8/0x178/0x308, all on
+    the seed). The fault is the harness's missing initialisation, not the input's. A redzone-heap
+    fault inside glibc's own memcpy (heap_kind set) is a different thing and is kept."""
+    return (lib.contains_pc(r.fault_pc) and not getattr(r, "heap_kind", "")
+            and r.fault_addr is not None and 0 <= r.fault_addr < 0x1000)
+
+
+def _library_addrs(ctx, target) -> "_LibSet":
+    """Int addresses (decompiler coordinates) of a static binary's linked-in library bodies."""
+    from ...db.dao import CallEdgeDAO
+    from ..detect import libscope
+    from .rank import _to_int
+    try:
+        fns = FunctionDAO(ctx.conn).list_by_target(target.id)
+        blob = ctx.content.path(target.sha256).read_bytes()
+        sc = libscope.library_scope(blob, fns, edges=CallEdgeDAO(ctx.conn).list_by_target(target.id))
+        ex = sc.get("excluded") or {}
+        out = _LibSet(a for a in (_to_int(x) for x in ex) if a is not None)
+        for f in fns:
+            a = _to_int(f.addr)
+            if f.addr in ex and a is not None and f.size:
+                out.ranges.append((a, a + int(f.size)))
+        out.ranges.sort()
+        out.bound = sc.get("layout_bound")
+        return out
+    except Exception:                                    # noqa: BLE001 -- scoping is an aid
+        return _LibSet()
+
+
 def _decompiler_base(conn, target, data: bytes) -> Optional[int]:
     """Where the decompiler placed the image: 0 for a fixed-address executable; for a PIE, derived
     from the entry function (Ghidra rebases a PIE to 0x100000, the native backend keeps 0). None
@@ -337,7 +391,11 @@ def harness_stage(ctx) -> dict:
     # fuzzed buffer at their pointer argument. A ranked function that touches a sink / reads input is
     # driven even when its param TYPES were not recovered (the old `ptr_len >= 1` gate dropped the
     # real vulnerable function on -O0 / stripped builds; see _drivable / _drive_shape).
-    cands = [r for r in ranked if _drivable(r)][:int(p.get("max_functions", 6))]
+    # A STATIC binary carries its libc: never drive those bodies (libscope -- symbol files, FLIRT,
+    # names, layout + reach). Measured on stripped jhead-3.04: all 4 of the harness's findings were
+    # glibc internals called with a fuzzed buffer for an argument -- not the program's bugs.
+    lib = _library_addrs(ctx, target)
+    cands = [r for r in ranked if _drivable(r) and r.addr not in lib][:int(p.get("max_functions", 6))]
     if not cands:
         note = ("no drivable parser among the top ranked targets -- the promising ones "
                 "take input via fd/FILE, which this harness model does not drive yet")
@@ -390,9 +448,11 @@ def harness_stage(ctx) -> dict:
             if _ai is not None and _nm in _MODELLED:
                 stub_names.setdefault(_ai, _nm)
     findings = 0
+    artifacts = 0            # faults in uninitialised static libc (see _uninit_libc_artifact)
     prog_leads = []          # function-level crashes to replay against the whole program (-> L3)
+    _cancelled = getattr(ctx, "should_cancel", None) or (lambda: False)
     for rf in cands:
-        if ctx.should_cancel():
+        if _cancelled():
             break
         shape = _drive_shape(rf)
         label = rf.name or hex(rf.addr)
@@ -413,6 +473,9 @@ def harness_stage(ctx) -> dict:
         for c in fr.crashes:
             r = c["result"]
             inp = c["input"]
+            if _uninit_libc_artifact(r, lib):
+                artifacts += 1
+                continue
             sha = ctx.put_artifact("harness-crash-input", data=inp)
             cwe, kind = _fault_cwe(r)
             fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
@@ -463,6 +526,9 @@ def harness_stage(ctx) -> dict:
                     r = c["result"]
                     if (r.fault_pc, r.access) in single_sites:
                         continue                             # the single-call pass already filed it
+                    if _uninit_libc_artifact(r, lib):
+                        artifacts += 1
+                        continue
                     inp = c["input"]
                     msgs = [m for m in inp.split(b"\n") if m]
                     sha = ctx.put_artifact("harness-seq-input", data=inp)
@@ -525,7 +591,8 @@ def harness_stage(ctx) -> dict:
                          "against the whole program")
         prog_crashes = _replay_against_program(ctx, target, p, prog_leads)
     ctx.emit("harness.done", payload={"supported": True, "functions": len(cands),
-             "findings": findings, "program_crashes": prog_crashes})
+             "findings": findings, "program_crashes": prog_crashes,
+             "libc_init_artifacts": artifacts})
     esc = (f"; {prog_crashes} reproduced at PROGRAM level (escalatable to L3)" if prog_crashes
            else (f"; {len(prog_leads)} seeded for concolic/directed_fuzz reachability"
                  if prog_leads else ""))

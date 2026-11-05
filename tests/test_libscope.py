@@ -184,6 +184,8 @@ def test_layout_reach_scopes_a_stripped_static_image_without_hiding_program_code
     edges = [e(0x1000, 0x1100), e(0x1100, 0x1200), e(0x1000, 0x6100), e(0x1200, 0x6200),
              e(0x1000, 0x5000), e(0x5000, 0x6000), e(0x6100, 0x6300)]
     got = _layout_reach(funcs, excluded, edges)
+    from lykos.analyze.detect.libscope import _BOUND_KEY
+    assert got.pop(_BOUND_KEY) == 0x5000                         # the lowest library body above main
     assert set(got) == {hex(0x6000), hex(0x6300)}, got
     assert all(v == "layout-reach" for v in got.values())
     # too little library evidence above main: the boundary is not trusted

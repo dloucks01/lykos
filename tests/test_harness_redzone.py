@@ -147,3 +147,26 @@ def test_heap_model_unit():
     assert h.free(0) is None
     c = h.alloc(4)
     assert c > b                                              # freed memory is never reused
+
+
+def test_uninitialised_static_libc_fault_is_an_artifact_not_a_finding():
+    """A NULL-page fault at a PC inside a static binary's libc (no heap verdict) is the harness's
+    missing libc initialisation; a redzone-heap fault inside glibc's own memcpy is a real one."""
+    from types import SimpleNamespace as N
+
+    from lykos.analyze.harness.harness_stage import _LibSet, _uninit_libc_artifact
+    lib = _LibSet({0x42CD40})
+    lib.ranges = [(0x42CD40, 0x42CE84)]                    # malloc
+    lib.bound = 0x40FCF0                                    # stripped: everything above is library
+    tls_null = N(fault_pc=0x42CD7D, fault_addr=0x178, heap_kind="", access="read")
+    assert _uninit_libc_artifact(tls_null, lib)
+    above = N(fault_pc=0x47E19D, fault_addr=0x308, heap_kind="", access="read")
+    assert _uninit_libc_artifact(above, lib)                # above the layout boundary
+    heap = N(fault_pc=0x432D90, fault_addr=0xCC0000000040, heap_kind="heap-buffer-overflow",
+             access="write")
+    assert not _uninit_libc_artifact(heap, lib)             # memcpy overflowing a redzone chunk
+    prog = N(fault_pc=0x408B10, fault_addr=0x0, heap_kind="", access="read")
+    assert not _uninit_libc_artifact(prog, lib)             # the program's own NULL deref
+    wild = N(fault_pc=0x42CD7D, fault_addr=0x4141414141, heap_kind="", access="read")
+    assert not _uninit_libc_artifact(wild, lib)             # input-driven wild pointer in libc
+    assert not _uninit_libc_artifact(tls_null, _LibSet())   # dynamic binary: nothing scoped

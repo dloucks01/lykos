@@ -184,8 +184,13 @@ def _layout_reach(functions, excluded: dict, edges) -> dict:
             reach.add(v)
             if v < bound:                                # traverse only the program's own region
                 stack.append(v)
-    return {by_int[a].addr: "layout-reach" for a in by_int
-            if a >= bound and a not in reach and a not in lib}
+    out = {by_int[a].addr: "layout-reach" for a in by_int
+           if a >= bound and a not in reach and a not in lib}
+    out[_BOUND_KEY] = bound
+    return out
+
+
+_BOUND_KEY = "__layout_bound__"
 
 
 def library_scope(blob, functions, *, flirt_named=None, edges=None) -> dict:
@@ -263,8 +268,11 @@ def library_scope(blob, functions, *, flirt_named=None, edges=None) -> dict:
             excluded[f.addr] = "flirt"
         elif is_library_name(name):
             excluded[f.addr] = "name"
+    layout_bound = None
     if edges is not None and not addrs and excluded:
-        for a, b in _layout_reach(functions, excluded, edges).items():
+        lr = _layout_reach(functions, excluded, edges)
+        layout_bound = lr.pop(_BOUND_KEY, None)
+        for a, b in lr.items():
             excluded.setdefault(a, b)
     kept = sum(1 for f in functions if f.addr not in excluded)
     # Never blind the stage: if scoping would leave nothing, the attribution is wrong.
@@ -275,5 +283,6 @@ def library_scope(blob, functions, *, flirt_named=None, edges=None) -> dict:
         basis[b] = basis.get(b, 0) + 1
     names = {f.addr: f.name for f in functions}
     out.update(excluded=excluded, basis=basis, kept=kept,
-               sample=sorted(str(names.get(a) or a) for a in excluded)[:12])
+               sample=sorted(str(names.get(a) or a) for a in excluded)[:12],
+               layout_bound=layout_bound)
     return out
