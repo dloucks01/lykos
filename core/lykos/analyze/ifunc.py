@@ -1,6 +1,6 @@
-"""IFUNC resolution for x86-64 ELF images: what the loader (or a static binary's startup) does
-with R_X86_64_IRELATIVE relocations, done once, offline, so an emulator or a symbolic executor
-sees the GOT the real process would see.
+"""IFUNC resolution for x86-64 and aarch64 ELF images: what the loader (or a static binary's
+startup) does with IRELATIVE relocations, done once, offline, so an emulator or a symbolic
+executor sees the GOT the real process would see.
 
 In a statically linked glibc binary every string/memory routine (memcpy, strlen, strchr, ...)
 is an IFUNC: callers jump through a `.plt` slot whose GOT entry the startup fills by CALLING a
@@ -22,7 +22,8 @@ import struct
 from collections import OrderedDict
 from typing import Optional
 
-_R_IRELATIVE = 37
+_R_IRELATIVE = {"x86-64": 37, "aarch64": 1032}
+_EM = {62: "x86-64", 183: "aarch64"}
 _SHT_SYMTAB, _SHT_RELA = 2, 4
 _STT_GNU_IFUNC = 10
 _PAGE = 0x1000
@@ -35,9 +36,16 @@ _MAX_INSNS = 200_000                  # a glibc resolver is a few dozen instruct
 _CACHE: "OrderedDict" = OrderedDict()
 
 
+def _machine(data: bytes):
+    """'x86-64' / 'aarch64' for a little-endian ELF64 image, else None."""
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return None
+    return _EM.get(struct.unpack_from("<H", data, 18)[0])
+
+
 def _is_x86_64_elf(data: bytes) -> bool:
-    return (len(data) >= 64 and data[:4] == b"\x7fELF" and data[4] == 2 and data[5] == 1
-            and struct.unpack_from("<H", data, 18)[0] == 62)
+    """A supported image (the name predates aarch64 support)."""
+    return _machine(data) is not None
 
 
 def _sections(data: bytes) -> list:
@@ -75,14 +83,16 @@ def irelative_relocs(data: bytes) -> list:
     """[(slot_va, resolver_va)] for every R_X86_64_IRELATIVE relocation, from the RELA sections
     (a static binary has no PT_DYNAMIC: its `.rela.plt` is found through the section headers),
     falling back to the dynamic tables when the section headers are gone."""
-    if not _is_x86_64_elf(data):
+    machine = _machine(data)
+    if machine is None:
         return []
+    irel = _R_IRELATIVE[machine]
     found: dict = {}
 
     def scan(off: int, size: int) -> None:
         for k in range(0, max(0, min(size, len(data) - off)) - 23, 24):
             r_off, r_info, r_add = struct.unpack_from("<QQq", data, off + k)
-            if r_info & 0xFFFFFFFF == _R_IRELATIVE and r_add > 0:
+            if r_info & 0xFFFFFFFF == irel and r_add > 0:
                 found.setdefault(r_off, r_add)
 
     secs = _sections(data)
@@ -160,53 +170,68 @@ def _resolve(data: bytes) -> dict:
     relocs = irelative_relocs(data)
     if not relocs:
         return {}
+    machine = _machine(data)
     try:
-        from unicorn import UC_ARCH_X86, UC_MODE_64, UC_PROT_ALL, Uc, UcError
-        from unicorn.x86_const import (
-            UC_X86_REG_FS_BASE,
-            UC_X86_REG_RAX,
-            UC_X86_REG_RDI,
-            UC_X86_REG_RSI,
-            UC_X86_REG_RSP,
-        )
+        from unicorn import UC_PROT_ALL, Uc, UcError
+        if machine == "x86-64":
+            from unicorn import UC_ARCH_X86, UC_MODE_64
+            from unicorn import x86_const as c
+            uc_args = (UC_ARCH_X86, UC_MODE_64)
+            SP, RET, ARGS = c.UC_X86_REG_RSP, c.UC_X86_REG_RAX, (c.UC_X86_REG_RDI, c.UC_X86_REG_RSI)
+            TLS_REG, LR = c.UC_X86_REG_FS_BASE, None
+        else:
+            from unicorn import UC_ARCH_ARM64, UC_MODE_ARM
+            from unicorn import arm64_const as c
+            uc_args = (UC_ARCH_ARM64, UC_MODE_ARM)
+            SP, RET, ARGS = c.UC_ARM64_REG_SP, c.UC_ARM64_REG_X0, (c.UC_ARM64_REG_X0,
+                                                                c.UC_ARM64_REG_X1)
+            TLS_REG, LR = c.UC_ARM64_REG_TPIDR_EL0, c.UC_ARM64_REG_X30
     except Exception:                                      # noqa: BLE001 -- no unicorn: nothing resolved
         return {}
     e_type = struct.unpack_from("<H", data, 0x10)[0]
     base = _PIE_BASE if e_type == 3 else 0
     loads = _loads(data)
     exec_spans = [(v, v + ms) for v, _o, _fs, ms, fl in loads if fl & 1]
-    uc = Uc(UC_ARCH_X86, UC_MODE_64)
+    uc = Uc(*uc_args)
     try:
+        if machine == "aarch64":
+            try:
+                uc.reg_write(c.UC_ARM64_REG_CPACR_EL1, 0x300000)
+            except Exception:                              # noqa: BLE001
+                pass
         mapped: list = []
         for v, off, fs, ms, _fl in loads:
             lo = (base + v) & ~(_PAGE - 1)
             hi = (base + v + max(ms, fs) + _PAGE - 1) & ~(_PAGE - 1)
-            for a, b in mapped:                             # never double-map a shared page
-                if lo < b and hi > a:
-                    lo = max(lo, b) if lo >= a else lo
-                    hi = min(hi, a) if hi <= b else hi
+            for a_, b_ in mapped:                           # never double-map a shared page
+                if lo < b_ and hi > a_:
+                    lo = max(lo, b_) if lo >= a_ else lo
+                    hi = min(hi, a_) if hi <= b_ else hi
             if hi > lo:
                 uc.mem_map(lo, hi - lo, UC_PROT_ALL)
                 mapped.append((lo, hi))
             if fs:
                 uc.mem_write(base + v, data[off:off + fs])
         uc.mem_map(_STACK_TOP - _STACK_SZ, _STACK_SZ, UC_PROT_ALL)
-        uc.mem_map(_TLS, _PAGE, UC_PROT_ALL)
+        uc.mem_map(_TLS - _PAGE, 2 * _PAGE, UC_PROT_ALL)
         uc.mem_map(_SENTINEL, _PAGE, UC_PROT_ALL)
-        uc.reg_write(UC_X86_REG_FS_BASE, _TLS)
+        uc.reg_write(TLS_REG, _TLS)
         out: dict = {}
         for slot, res in relocs:
             sp = _STACK_TOP - 0x1000
-            uc.mem_write(sp, struct.pack("<Q", _SENTINEL))
-            uc.reg_write(UC_X86_REG_RSP, sp)
-            uc.reg_write(UC_X86_REG_RAX, 0)
-            uc.reg_write(UC_X86_REG_RDI, 0)                # hwcap / cpu_features arguments: none
-            uc.reg_write(UC_X86_REG_RSI, 0)
+            if LR is None:
+                uc.mem_write(sp, struct.pack("<Q", _SENTINEL))
+            else:
+                uc.reg_write(LR, _SENTINEL)
+            uc.reg_write(SP, sp)
+            uc.reg_write(RET, 0)
+            for r in ARGS:                                  # hwcap / cpu-feature arguments: none
+                uc.reg_write(r, 0)
             try:
                 uc.emu_start(base + res, _SENTINEL, count=_MAX_INSNS)
             except UcError:
                 continue
-            impl = (uc.reg_read(UC_X86_REG_RAX) - base) & 0xFFFFFFFFFFFFFFFF
+            impl = (uc.reg_read(RET) - base) & 0xFFFFFFFFFFFFFFFF
             if any(lo <= impl < hi for lo, hi in exec_spans):
                 out[slot] = impl
         return out

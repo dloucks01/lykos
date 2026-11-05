@@ -30,7 +30,7 @@ _SENTINEL = 0x0000BB0000000000       # the fake return address; reaching it = a 
 _HEAP_ADDR = 0x0000CC0000000000      # bump-allocator region for the malloc/calloc/realloc stubs
 _HEAP_SZ = 0x1000000                 # 16 MiB heap
 _TLS_ADDR = 0x0000DD0000000000       # a fake TLS block so `fs:[0x28]` (the stack canary) is valid
-_TLS_BELOW = 0x10000                 # mapped below fs: a static glibc's TLS variables (fs:-N)
+_TLS_BELOW = 0x10000                 # mapped each side of the thread pointer (static TLS)
 _MAX_INSNS = 2_000_000               # per-segment instruction runaway guard
 #: libc stubs that only READ their arguments -- a fault inside one is an over-READ (CWE-125), not a
 #: write. Everything else (memset/strcpy dest, unknown) is treated as a write, as before.
@@ -129,8 +129,10 @@ def _build_plan(data: bytes) -> dict:
     import struct
     if data[:4] != b"\x7fELF" or len(data) < 64:
         raise ValueError("not an ELF")
-    if data[4] != 2:
-        raise ValueError("harness executor is x86-64 only for now")
+    machine = _machine(data)
+    if machine is None:
+        raise ValueError("the harness drives little-endian x86-64 and aarch64 ELF64 images")
+    _R_64, _R_GLOB_DAT, _R_JUMP_SLOT, _R_RELATIVE = _RELOCS[machine]
     en = "<" if data[5] == 1 else ">"
     e_type = struct.unpack_from(en + "H", data, 0x10)[0]
     base = _PIE_BASE if e_type == 3 else 0
@@ -288,10 +290,11 @@ def _build_plan(data: bytes) -> dict:
         size = (16 * len(stubs) + _PAGE - 1) & ~(_PAGE - 1)
         regions.append((_STUB_ADDR, size))
         writes.append((_STUB_ADDR, b"\xc3" * size))     # `ret`: never runs (the hook stops first)
-    plt = {base + a: n for a, n in _plt_map(data).items()}
+    plt = {base + a: n for a, n in _plt_map(data, machine).items()}
     plt.update(static_names)
     plt.update({a: n for n, a in stubs.items()})
-    return {"e_type": e_type, "base": base, "span": (lo_img, hi_img), "regions": regions,
+    return {"machine": machine, "e_type": e_type, "base": base, "span": (lo_img, hi_img),
+            "regions": regions,
             "writes": writes + extra, "relocations": applied, "stubs": len(stubs), "plt": plt}
 
 
@@ -350,7 +353,7 @@ def _sections(data: bytes) -> dict:
     return out
 
 
-def _plt_map(data: bytes) -> dict:
+def _plt_map(data: bytes, machine: str = "x86-64") -> dict:
     """{stub_addr: symbol_name} for every JUMP_SLOT in the PLT -- the externals a function calls.
 
     Maps the i-th .rela.plt JUMP_SLOT's symbol to BOTH the classic `.plt[i+1]` stub and the
@@ -385,6 +388,10 @@ def _plt_map(data: bytes) -> dict:
     for i, nm in enumerate(names):
         if not nm:
             continue
+        if machine == "aarch64":
+            if plt and plt["addr"]:
+                out[plt["addr"] + 32 + i * 16] = nm      # PLT0 is 32 bytes, entries 16
+            continue
         if plt and plt["addr"]:
             out[plt["addr"] + (i + 1) * 16] = nm         # classic: .plt[0] is the resolver
         if pltsec and pltsec["addr"]:
@@ -395,6 +402,121 @@ def _plt_map(data: bytes) -> dict:
 _NULL_PAGE = 0x1000
 # Above this no real allocator can succeed either, so a NULL for it is genuine, not an artifact.
 _IMPOSSIBLE_ALLOC = 1 << 40
+
+
+_EM = {62: "x86-64", 183: "aarch64"}
+#: (R_64/ABS64, GLOB_DAT, JUMP_SLOT, RELATIVE) per machine
+_RELOCS = {"x86-64": (1, 6, 7, 8), "aarch64": (257, 1025, 1026, 1027)}
+
+
+def _machine(data: bytes) -> Optional[str]:
+    """'x86-64' / 'aarch64' for a little-endian ELF64 image the harness drives, else None."""
+    import struct
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return None
+    return _EM.get(struct.unpack_from("<H", data, 18)[0])
+
+
+class _Arch:
+    """What differs between the ISAs the harness drives: registers, how a call reaches the
+    sentinel and how an emulated libc routine returns, where the call site is, syscalls, TLS."""
+
+    def __init__(self, machine: str):
+        self.machine = machine
+        if machine == "x86-64":
+            from unicorn import UC_ARCH_X86, UC_MODE_64
+            from unicorn import x86_const as c
+            self.uc_args = (UC_ARCH_X86, UC_MODE_64)
+            self.args = (c.UC_X86_REG_RDI, c.UC_X86_REG_RSI, c.UC_X86_REG_RDX, c.UC_X86_REG_RCX)
+            self.ret, self.sp, self.pc, self.lr = (c.UC_X86_REG_RAX, c.UC_X86_REG_RSP,
+                                                   c.UC_X86_REG_RIP, None)
+            self.sys_nr = c.UC_X86_REG_RAX
+            # write, read, exit/exit_group, getpid/gettid, mmap, brk
+            self.nr = {"write": 1, "read": 0, "exit": (60, 231), "pid": (39, 186), "mmap": 9,
+                       "brk": 12}
+            self._c = c
+        elif machine == "aarch64":
+            from unicorn import UC_ARCH_ARM64, UC_MODE_ARM
+            from unicorn import arm64_const as c
+            self.uc_args = (UC_ARCH_ARM64, UC_MODE_ARM)
+            self.args = (c.UC_ARM64_REG_X0, c.UC_ARM64_REG_X1, c.UC_ARM64_REG_X2,
+                         c.UC_ARM64_REG_X3)
+            self.ret, self.sp, self.pc, self.lr = (c.UC_ARM64_REG_X0, c.UC_ARM64_REG_SP,
+                                                   c.UC_ARM64_REG_PC, c.UC_ARM64_REG_X30)
+            self.sys_nr = c.UC_ARM64_REG_X8
+            self.nr = {"write": 64, "read": 63, "exit": (93, 94), "pid": (172, 178), "mmap": 222,
+                       "brk": 214}
+            self._c = c
+        else:
+            raise ValueError(f"no harness model for {machine}")
+
+    def new_uc(self):
+        from unicorn import Uc
+        uc = Uc(*self.uc_args)
+        if self.machine == "aarch64":
+            try:                                         # FP/SIMD on (memcpy & co. use q-regs)
+                uc.reg_write(self._c.UC_ARM64_REG_CPACR_EL1, 0x300000)
+            except Exception:                            # noqa: BLE001 -- already on in this build
+                pass
+        return uc
+
+    def set_tls(self, uc) -> None:
+        if self.machine == "x86-64":
+            # A real function reads its stack canary from `fs:[0x28]`: point FS at a fake TLS
+            # block with a fixed canary there, so the read succeeds and setup/return values match
+            # (no spurious __stack_chk_fail).
+            uc.reg_write(self._c.UC_X86_REG_FS_BASE, _TLS_ADDR)
+            uc.mem_write(_TLS_ADDR + 0x28, b"\x11\x22\x33\x44\x55\x66\x77\x00")
+        else:
+            # aarch64 keeps its canary in a global (__stack_chk_guard); TPIDR_EL0 is the thread
+            # pointer static TLS hangs off
+            uc.reg_write(self._c.UC_ARM64_REG_TPIDR_EL0, _TLS_ADDR)
+
+    def enter(self, uc) -> None:
+        """Fresh stack whose return lands on the sentinel."""
+        if self.lr is None:
+            sp = ((_STACK_TOP - 0x1000) & ~0xF) - 8
+            uc.mem_write(sp, _SENTINEL.to_bytes(8, "little"))  # `ret` lands here
+        else:
+            sp = (_STACK_TOP - 0x1000) & ~0xF
+            uc.reg_write(self.lr, _SENTINEL)
+        uc.reg_write(self.sp, sp)
+
+    def stub_return(self, uc) -> Optional[int]:
+        """Where an emulated external returns to (popping it on x86), or None for a bad stack."""
+        from unicorn import UcError
+        if self.lr is not None:
+            return uc.reg_read(self.lr)
+        rsp = uc.reg_read(self.sp)
+        try:
+            ret = int.from_bytes(uc.mem_read(rsp, 8), "little")
+        except UcError:
+            return None
+        uc.reg_write(self.sp, rsp + 8)
+        return ret
+
+    def call_site(self, uc, retaddr: int) -> Optional[int]:
+        """The call instruction that reached the stub, when it is a direct one (x86 `call rel32`,
+        aarch64 `bl` / `blr`): the caller's site, so two faulting calls to the same libc routine
+        stay distinct."""
+        from unicorn import UcError
+        try:
+            if self.lr is None:
+                return retaddr - 5 if retaddr >= 5 and uc.mem_read(retaddr - 5, 1)[0] == 0xE8 else None
+            w = int.from_bytes(uc.mem_read(retaddr - 4, 4), "little")
+            return retaddr - 4 if ((w & 0xFC000000) == 0x94000000
+                                   or (w & 0xFFFFFC1F) == 0xD63F0000) else None
+        except UcError:
+            return None
+
+    def hook_syscalls(self, uc, handler) -> None:
+        """`handler(uc)` on every syscall instruction (x86 `syscall`, aarch64 `svc #0`)."""
+        from unicorn import UC_HOOK_INSN, UC_HOOK_INTR
+        if self.machine == "x86-64":
+            uc.hook_add(UC_HOOK_INSN, lambda u, _d: handler(u), None, 1, 0,
+                        self._c.UC_X86_INS_SYSCALL)
+        else:
+            uc.hook_add(UC_HOOK_INTR, lambda u, intno, _d: handler(u) if intno == 2 else None)
 
 
 class _StubFault(Exception):
@@ -695,34 +817,33 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
 
 
 def _setup(elf_bytes: bytes, res: HarnessResult):
-    """Create the emulator, map the ELF (a PIE at _PIE_BASE, relocated) + stack/input/heap/
-    sentinel/TLS, set the fake stack canary. Returns (uc, plan, heap) on success or None (with
-    res.note set) on a mapping failure."""
-    from unicorn import UC_ARCH_X86, UC_MODE_64, UC_PROT_ALL, Uc
-    from unicorn.x86_const import UC_X86_REG_FS_BASE
-    uc = Uc(UC_ARCH_X86, UC_MODE_64)
+    """Create the emulator for the image's ISA, map the ELF (a PIE at _PIE_BASE, relocated) +
+    stack/input/heap/sentinel/TLS. Returns (uc, plan, heap, arch) or None (res.note set)."""
+    from unicorn import UC_PROT_ALL
+    machine = _machine(elf_bytes)
+    if machine is None:
+        res.note = "not a little-endian x86-64 / aarch64 ELF64 image"
+        return None
+    arch = _Arch(machine)
+    uc = arch.new_uc()
     try:
         plan = _map_segments(uc, elf_bytes)
         uc.mem_map(_STACK_TOP - _STACK_SZ, _STACK_SZ, UC_PROT_ALL)
         uc.mem_map(_INPUT_ADDR, _INPUT_SZ, UC_PROT_ALL)
         uc.mem_map(_SENTINEL & ~(_PAGE - 1), _PAGE, UC_PROT_ALL)
         uc.mem_map(_HEAP_ADDR, _HEAP_SZ, UC_PROT_ALL)    # for the malloc/calloc/realloc stubs
-        # fake TLS: fs:[0x28] (the stack canary) above, and glibc's STATIC TLS block below
-        # (errno, tcache, locale pointers live at negative fs offsets in a static binary)
-        uc.mem_map(_TLS_ADDR - _TLS_BELOW, _TLS_BELOW + _PAGE, UC_PROT_ALL)
+        # fake TLS: x86's canary at fs:[0x28] and a static glibc's TLS variables below the thread
+        # pointer (x86 variant II) or above it (aarch64 variant I)
+        uc.mem_map(_TLS_ADDR - _TLS_BELOW, 2 * _TLS_BELOW, UC_PROT_ALL)
     except Exception as e:                               # noqa: BLE001
         res.note = f"map failed: {e}"
         return None
-    # A real function reads its stack canary from `fs:[0x28]`. Point FS at a fake TLS block with a
-    # fixed canary there, so the read succeeds and the setup/return values match (no spurious
-    # __stack_chk_fail). Without this every canary-protected function faults at 0x28 on entry.
-    uc.reg_write(UC_X86_REG_FS_BASE, _TLS_ADDR)
-    uc.mem_write(_TLS_ADDR + 0x28, b"\x11\x22\x33\x44\x55\x66\x77\x00")
-    return uc, plan, _Heap()
+    arch.set_tls(uc)
+    return uc, plan, _Heap(), arch
 
 
 def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap, *,
-                    arg_shape: str, max_insns: int) -> HarnessResult:
+                    arg_shape: str, max_insns: int, arch: Optional["_Arch"] = None) -> HarnessResult:
     """Call `func_addr` once per message, IN ORDER, reusing ONE emulator state so globals (.bss/
     .data) and the heap persist between calls -- this is what lets a sequence reach a state a
     single call cannot (T6). Each call gets a fresh stack + input buffer; coverage accumulates
@@ -732,25 +853,16 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
 
     from unicorn import (
         UC_HOOK_BLOCK,
-        UC_HOOK_INSN,
         UC_HOOK_MEM_FETCH_UNMAPPED,
         UC_HOOK_MEM_READ,
-        UC_HOOK_MEM_WRITE,
         UC_HOOK_MEM_READ_UNMAPPED,
+        UC_HOOK_MEM_WRITE,
         UC_HOOK_MEM_WRITE_UNMAPPED,
         UC_MEM_WRITE,
         UcError,
     )
-    from unicorn.x86_const import (
-        UC_X86_INS_SYSCALL,
-        UC_X86_REG_RAX,
-        UC_X86_REG_RCX,
-        UC_X86_REG_RDI,
-        UC_X86_REG_RDX,
-        UC_X86_REG_RIP,
-        UC_X86_REG_RSI,
-        UC_X86_REG_RSP,
-    )
+    arch = arch or _Arch("x86-64")
+    PC, RET = arch.pc, arch.ret
     pending = {"name": None}
     deadline = {"t": 0.0}
 
@@ -767,7 +879,7 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
     def _on_unmapped(uc_, access, addr, size, value, _ud):
         res.crashed = True
         res.fault_addr = addr
-        res.fault_pc = uc_.reg_read(UC_X86_REG_RIP)
+        res.fault_pc = uc_.reg_read(PC)
         res.access = {19: "read", 20: "write", 21: "fetch"}.get(access, str(access))
         return False
 
@@ -780,53 +892,55 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
         if v is not None:
             res.crashed = True
             res.fault_addr = addr
-            res.fault_pc = uc_.reg_read(UC_X86_REG_RIP)
+            res.fault_pc = uc_.reg_read(PC)
             res.access = acc
             res.heap_kind, res.heap_detail = v
             uc_.emu_stop()
 
-    def _on_syscall(uc_, _ud):
+    nrs = arch.nr
+
+    def _on_syscall(uc_):
         # libc code that runs natively (a static binary) issues real syscalls. Unhooked, unicorn
-        # treats `syscall` as a no-op that leaves rax = the syscall number: brk "returned" 12 and
-        # glibc's malloc then used address 12 as its heap. Model the harmless ones; fail the rest
-        # honestly and mark the result a harness artifact (a later NULL fault is not the input's).
-        nr = uc_.reg_read(UC_X86_REG_RAX)
-        a2 = uc_.reg_read(UC_X86_REG_RDX)
-        if nr == 1:                                       # write: all of it
+        # treats x86 `syscall` as a no-op that leaves rax = the syscall number: brk "returned" 12
+        # and glibc's malloc then used address 12 as its heap. Model the harmless ones; fail the
+        # rest honestly and mark the result a harness artifact (a later NULL fault is not the
+        # input's).
+        nr = uc_.reg_read(arch.sys_nr)
+        a2 = uc_.reg_read(arch.args[2])
+        if nr == nrs["write"]:                            # write: all of it
             ret = a2
-        elif nr == 0:                                     # read: EOF
+        elif nr == nrs["read"]:                           # read: EOF
             ret = 0
-        elif nr in (60, 231):                             # exit / exit_group: a clean end
+        elif nr in nrs["exit"]:                           # exit / exit_group: a clean end
             res.returned = True
             res.note = (res.note + "; " if res.note else "") + "exit()"
             uc_.emu_stop()
             return
-        elif nr == 39 or nr == 186:                       # getpid / gettid
+        elif nr in nrs["pid"]:                            # getpid / gettid
             ret = 4242
         else:                                             # brk/mmap/open/...: not available
-            ret = -38 if nr not in (9, 12) else (-12 if nr == 9 else 0)
+            ret = -12 if nr == nrs["mmap"] else (0 if nr == nrs["brk"] else -38)
             res.artifact_null = True
             if f"syscall:{nr}" not in res.note:
                 res.note = (res.note + "; " if res.note else "") + f"syscall:{nr} failed"
-        uc_.reg_write(UC_X86_REG_RAX, ret & 0xFFFFFFFFFFFFFFFF)
+        uc_.reg_write(RET, ret & 0xFFFFFFFFFFFFFFFF)
 
-    uc.hook_add(UC_HOOK_INSN, _on_syscall, None, 1, 0, UC_X86_INS_SYSCALL)
+    arch.hook_syscalls(uc, _on_syscall)
     uc.hook_add(UC_HOOK_BLOCK, _on_block)
     uc.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, _on_heap,
                 begin=_HEAP_ADDR, end=_HEAP_ADDR + _HEAP_SZ - 1)
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
                 | UC_HOOK_MEM_FETCH_UNMAPPED, _on_unmapped)
+    regs = (*arch.args, RET, PC)
 
     for idx, msg in enumerate(messages):
         buf = bytes(msg)[:_INPUT_SZ]
         uc.mem_write(_INPUT_ADDR, b"\x00" * min(_INPUT_SZ, len(buf) + 8))  # clear stale tail
         uc.mem_write(_INPUT_ADDR, buf)
-        sp = ((_STACK_TOP - 0x1000) & ~0xF) - 8
-        uc.mem_write(sp, _SENTINEL.to_bytes(8, "little"))  # sentinel return: `ret` lands here
-        uc.reg_write(UC_X86_REG_RSP, sp)
-        uc.reg_write(UC_X86_REG_RDI, _INPUT_ADDR)
+        arch.enter(uc)
+        uc.reg_write(arch.args[0], _INPUT_ADDR)
         if arg_shape == "ptr_len":
-            uc.reg_write(UC_X86_REG_RSI, len(buf))
+            uc.reg_write(arch.args[1], len(buf))
         res.returned = False
         res.note = ""                                     # per-call; a prior clean call left it empty
         deadline["t"] = _time.time() + 10.0               # wall-clock runaway guard, per call
@@ -839,38 +953,26 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
             except UcError:
                 if not res.crashed and pending["name"] is None:
                     res.note = res.note or "emulation error (unsupported instruction)"
-                    res.fault_pc = uc.reg_read(UC_X86_REG_RIP)
+                    res.fault_pc = uc.reg_read(PC)
                 break
             if res.crashed:
                 break
             if pending["name"] is None:
                 # no pending external -> reached the sentinel (clean return) or a budget stop
-                if uc.reg_read(UC_X86_REG_RIP) in (_SENTINEL, 0) and not res.note:
+                if uc.reg_read(PC) in (_SENTINEL, 0) and not res.note:
                     res.returned = True
                 break
             calls += 1
             if calls > _MAX_CALLS:
                 res.note = "too many external calls"
                 break
-            # simulate the `call`'s callee: pop the return address, emulate the libc func, resume.
-            rsp = uc.reg_read(UC_X86_REG_RSP)
-            try:
-                retaddr = int.from_bytes(uc.mem_read(rsp, 8), "little")
-            except UcError:
+            # simulate the call's callee: take the return address, emulate the libc func, resume.
+            retaddr = arch.stub_return(uc)
+            if retaddr is None:
                 res.note = "bad stack at external call"
                 break
-            uc.reg_write(UC_X86_REG_RSP, rsp + 8)
-            # the CALL instruction that reached this stub, when it is a plain `call rel32` (E8):
-            # the caller's site, so two faulting calls to the same libc routine stay distinct
-            site = None
-            try:
-                if retaddr >= 5 and uc.mem_read(retaddr - 5, 1)[0] == 0xE8:
-                    site = retaddr - 5
-            except UcError:
-                site = None
-            _emulate_libc(uc, pending["name"], res, heap,
-                          (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX,
-                           UC_X86_REG_RAX, UC_X86_REG_RIP), call_site=site)
+            _emulate_libc(uc, pending["name"], res, heap, regs,
+                          call_site=arch.call_site(uc, retaddr))
             if res.crashed:
                 break
             cur = retaddr
@@ -956,7 +1058,7 @@ def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
     setup = _setup(elf_bytes, res)
     if setup is None:
         return res
-    uc, plan, heap = setup
+    uc, plan, heap, arch = setup
     shift = _shift_for(plan, load_base)
     plt = plan["plt"]
     if stub_names:
@@ -966,5 +1068,5 @@ def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
         if extra:
             plt = {**extra, **plt}
     _drive_messages(uc, func_addr + shift, list(messages), res, plt, heap,
-                    arg_shape=arg_shape, max_insns=max_insns)
+                    arg_shape=arg_shape, max_insns=max_insns, arch=arch)
     return _to_decompiler(res, plan, shift)

@@ -30,6 +30,7 @@ _ACCESS_CWE = {"read": ("CWE-125", "out-of-bounds read"),
                "write": ("CWE-787", "out-of-bounds write"),
                "fetch": ("CWE-119", "control-flow corruption")}
 _X86_64 = {"x86-64", "x86_64", "amd64"}
+_SUPPORTED_ARCH = _X86_64 | {"aarch64", "arm64"}
 
 
 _HEAP_CWE = {"heap-use-after-free": ("CWE-416", "heap use-after-free"),
@@ -370,10 +371,11 @@ def harness_stage(ctx) -> dict:
         raise ValueError("harness requires a target_id")
     p = ctx.params or {}
     # Gating -- decline cleanly (never raise) with a reason the operator can act on.
-    if (target.arch or "") not in _X86_64:
-        note = f"the harness executor is x86-64 only; this target is {target.arch}"
+    if (target.arch or "") not in _SUPPORTED_ARCH or (target.endianness or "little") != "little":
+        note = (f"the harness executor drives x86-64 and aarch64 (little-endian); this target is "
+                f"{target.arch} {target.endianness or ''}".strip())
         ctx.emit("harness.done", payload={"supported": False, "note": note})
-        ctx.progress(pct=100, msg="harness: x86-64 only")
+        ctx.progress(pct=100, msg="harness: x86-64 / aarch64 only")
         return {"supported": False, "findings": 0, "note": note}
     if not available():
         note = "unicorn is not available"
