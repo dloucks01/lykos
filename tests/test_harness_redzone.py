@@ -170,3 +170,24 @@ def test_uninitialised_static_libc_fault_is_an_artifact_not_a_finding():
     wild = N(fault_pc=0x42CD7D, fault_addr=0x4141414141, heap_kind="", access="read")
     assert not _uninit_libc_artifact(wild, lib)             # input-driven wild pointer in libc
     assert not _uninit_libc_artifact(tls_null, _LibSet())   # dynamic binary: nothing scoped
+
+
+def test_caller_contract_faults_are_replay_only():
+    """What a fabricated argument breaks is the caller's contract; what the input breaks is a bug."""
+    from types import SimpleNamespace as N
+
+    from lykos.analyze.harness.emulate import (_HEAP_ADDR, _INPUT_ADDR, _INPUT_SZ, _STACK_SZ,
+                                               _STACK_TOP)
+    from lykos.analyze.harness.harness_stage import _contract_fault
+    img = (0x401000, 0x40F000)
+    f = lambda a, acc="read", hk="", note="": N(fault_addr=a, access=acc, heap_kind=hk,  # noqa: E731
+                                                note=note)
+    assert _contract_fault(f(0x8), img)                               # NULL field of the "struct"
+    assert _contract_fault(f(0xFFFFFFFF00000000), img)                # a pointer from the buffer
+    assert _contract_fault(f(_INPUT_ADDR + _INPUT_SZ), img)           # scanned off the input
+    assert not _contract_fault(f(_HEAP_ADDR + 0x40, "write", "heap-buffer-overflow"), img)
+    assert not _contract_fault(f(0x410200), img)                      # past a global: kept
+    assert not _contract_fault(f(_STACK_TOP - 0x100, "write"), img)   # the stack: kept
+    assert _contract_fault(f(_STACK_TOP - _STACK_SZ - 0x10, "write"), img)  # off the stack bottom
+    assert not _contract_fault(f(0x4141414141414141, "fetch"), img)   # control flow: kept
+    assert not _contract_fault(f(0x0, "write", note="stack canary (__stack_chk_fail)"), img)

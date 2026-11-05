@@ -23,7 +23,7 @@ _log = __import__("logging").getLogger(__name__)
 _PAGE = 0x1000
 # A high, out-of-the-way layout so it never collides with a (no-PIE) image mapped at 0x400000.
 _STACK_TOP = 0x7F0000000000
-_STACK_SZ = 0x200000                 # 2 MiB stack
+_STACK_SZ = 0x800000                 # 8 MiB stack: Linux's default RLIMIT_STACK
 _INPUT_ADDR = 0x0000AA0000000000     # where the fuzzed buffer is placed
 _INPUT_SZ = 0x100000                 # 1 MiB input window (mapped; input written at the base)
 _SENTINEL = 0x0000BB0000000000       # the fake return address; reaching it = a clean return
