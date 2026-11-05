@@ -60,7 +60,21 @@ def this_run_rows(db, prior_ids, launched_at):
     return runs, done, findings, pocs
 
 
+def _configure_log() -> None:
+    """Timestamped, module-tagged logging like every other tool (LYKOS_LOG sets the level)."""
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                                      "core"))
+    try:
+        from lykos import observe
+        observe.configure()
+    except Exception:                                    # noqa: BLE001 -- the launcher still works
+        pass
+
+
 def main():
+    _configure_log()
     ap = argparse.ArgumentParser()
     ap.add_argument("target")
     ap.add_argument("case_store")

@@ -17,7 +17,10 @@ def _root(ctx,target):
             with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),mode="r:gz") as tf:
                 for m in tf.getmembers():
                     if m.isfile() and not m.name.startswith("/") and ".." not in m.name: tf.extract(m,r)
-        except Exception: return None
+        except Exception:                            # noqa: BLE001 -- no source tree: decline
+            import logging
+            logging.getLogger(__name__).warning("source archive could not be unpacked", exc_info=True)
+            return None
     return r
 def lifecycle_stage(ctx)->dict:
     target=TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None

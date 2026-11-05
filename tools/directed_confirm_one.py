@@ -7,6 +7,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core"))
 from lykos.analyze import libfuzzer as LF
 from lykos.analyze.symbolic import directed_confirm as DC
+from lykos import observe
+
+observe.configure()                         # timestamped, module-tagged log (LYKOS_LOG sets level)
 
 root = Path(sys.argv[1]).resolve()
 syms = sys.argv[2].split(",") if len(sys.argv) > 2 else ["clear_decompress_residual_data", "clear_resize_buffer"]

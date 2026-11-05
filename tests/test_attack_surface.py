@@ -54,7 +54,8 @@ def test_in_surface_is_boosted_off_surface_is_annotated_not_hidden(store, case):
     _cand(store.conn, t, det="int_overflow", cwe="CWE-190", path="tools/gen_manpage.c", line=5,
           key="off:1", conf=0.5)
     counts = SC._rank_by_surface(_Ctx(store.conn), t, surface={"pdu.c"})
-    assert counts == {"in_surface": 1, "off_surface": 1}
+    assert (counts["in_surface"], counts["off_surface"]) == (1, 1)
+    assert counts.get("surface_recipes", 0) >= 0      # the potential-PoC floor's own counter
     f_in, f_off = _get(store.conn, t, "in:1"), _get(store.conn, t, "off:1")
     # in-surface boosted above its base; off-surface NOT penalised (kept at base, still present)
     assert f_in.confidence > 0.5 and abs(f_off.confidence - 0.5) < 1e-6

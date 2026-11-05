@@ -30,6 +30,9 @@ from pathlib import Path
 # make `lykos` importable no matter the cwd (a script run by absolute path does not get core/ on path)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core"))
 from lykos.analyze import libfuzzer as LF   # noqa: E402
+from lykos import observe                   # noqa: E402
+
+observe.configure()                         # timestamped, module-tagged log (LYKOS_LOG sets level)
 
 
 def _mem_total_mb():
