@@ -90,10 +90,14 @@ export function NowRunning({ recs }) {
     </div>`;
 }
 
-export function Console({ recs, caseId }) {
+export function Console({ recs, caseId, targets = [], stage: stageProp, setStage: setStageProp }) {
+  const tname = useMemo(() => Object.fromEntries(targets.map((t) => [t.id, t.filename || t.id])), [targets]);
+  const multi = targets.length > 1;
   const [filter, setFilter] = useState("all");
   const [follow, setFollow] = useState(true);
-  const [stage, setStage] = useState("");
+  const [stageLocal, setStageLocal] = useState("");
+  const stage = stageProp !== undefined ? stageProp : stageLocal;
+  const setStage = setStageProp || setStageLocal;
   const body = useRef(null);
   const set = FILTERS.find((f) => f[0] === filter)[2];
   const stages = useMemo(() => [...new Set(recs.filter((r) => r.k === "stage").map((r) => r.stage))], [recs]);
@@ -116,7 +120,7 @@ export function Console({ recs, caseId }) {
         ${FILTERS.map(([k, label]) => html`<button class=${"tab" + (filter === k ? " on" : "")} onClick=${() => setFilter(k)}>${label}</button>`)}
         <select value=${stage} onChange=${(e) => setStage(e.target.value)} style="padding:4px 8px;font-size:12px">
           <option value="">all stages</option>
-          ${stages.map((s) => html`<option value=${s}>${s}</option>`)}
+          ${(stage && !stages.includes(stage) ? [stage, ...stages] : stages).map((s) => html`<option value=${s}>${s}</option>`)}
         </select>
         <div style="flex:1 1 auto"></div>
         <span class="mono dim" style="font-size:11px">${recs.length.toLocaleString()} records · routine executions sampled, crashes in full</span>
@@ -130,10 +134,12 @@ export function Console({ recs, caseId }) {
           const [text, extra] = lineOf(r);
           return html`<div>
             <div class="ln"><span class="t">${clock(r.t)}</span><span class=${"k k-" + r.k}>${KIND[r.k] || r.k}</span>
-              <span class="st">${r.stage}</span><span class=${r.k === "crash" ? "k-crash" : r.k === "stage" ? "k-stage" : ""}>${text}</span></div>
+              <span class="st">${r.stage}${multi && r.target ? html`<br /><span class="dim" style="font-size:10.5px">${(tname[r.target] || r.target).slice(0, 18)}</span>` : null}</span><span class=${r.k === "crash" ? "k-crash" : r.k === "stage" ? "k-stage" : ""}>${text}</span></div>
             ${extra.map((x) => html`<div class="ln x-out">${x}</div>`)}
           </div>`;
-        }) : html`<div class="dim">Nothing yet. Start an analysis — every stage, execution and tool it runs appears here.</div>`}
+        }) : html`<div class="dim">${stage
+          ? `No console output from ${stage} yet — it has not run in this case, or it was declined before starting.`
+          : "Nothing yet. Start an analysis — every stage, execution and tool it runs appears here."}</div>`}
       </div>
     </section>`;
 }
@@ -188,4 +194,34 @@ export function FuzzWindows({ recs }) {
         </article>`;
       })}</div>` : html`<div class="panel empty">No fuzzing campaign has run in this case yet.</div>`}
     </section>`;
+}
+
+// The autopilot's plan as one strip: a cell per stage, coloured by its state; hover for the
+// stage's own words, click to show only that stage in the console.
+const PLAN_STYLE = {
+  done: "background:#3A4F6E", running: "background:var(--blue);box-shadow:0 0 0 3px rgba(110,168,254,.25)",
+  pending: "background:#232A35", declined: "background:transparent;border:1px solid #2E3541",
+  skipped: "background:transparent;border:1px dashed #3A4352", error: "background:var(--amber)",
+  timeout: "background:var(--amber)", cancelled: "background:#4A3F2A",
+};
+export function PlanStrip({ plan, stage, setStage }) {
+  if (!plan || !plan.length) return null;
+  const count = {};
+  for (const p of plan) count[p.state] = (count[p.state] || 0) + 1;
+  const order = ["running", "done", "pending", "declined", "skipped", "error", "timeout", "cancelled"];
+  return html`<section class="panel pad" style="display:flex;flex-direction:column;gap:9px">
+    <div class="row-c" style="flex-wrap:wrap;gap:12px">
+      <h2>Plan</h2>
+      ${order.filter((k) => count[k]).map((k) => html`<span class="dim" style="font-size:12px">
+        <span style=${"display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px;" + (PLAN_STYLE[k] || "")}></span>${count[k]} ${k === "declined" ? "not applicable" : k}</span>`)}
+      ${stage ? html`<button class="btn sm" style="margin-left:auto" onClick=${() => setStage("")}>Show all stages</button>` : null}
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:3px">
+      ${plan.map((p) => html`<button aria-label=${`${p.label || p.stage}: ${p.state}`}
+        title=${`${p.label || p.stage} — ${p.state}${p.detail ? ": " + p.detail : ""}`}
+        onClick=${() => setStage(stage === p.stage ? "" : p.stage)}
+        style=${"width:15px;height:15px;border-radius:3px;border:none;padding:0;cursor:pointer;"
+          + (PLAN_STYLE[p.state] || PLAN_STYLE.pending) + (stage === p.stage ? ";outline:2px solid var(--tx);outline-offset:1px" : "")}></button>`)}
+    </div>
+  </section>`;
 }

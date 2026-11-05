@@ -1,9 +1,10 @@
 // Engagement screen: every target of the case and what is PROVEN on each, plus adding a target
 // and starting an analysis (with the CLI's invocation options: argv template, input channel).
-import { useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
-import { bestLevel, laneOf, pocsOf, rankFindings } from "./data.js";
+import { bestLevel, getJSON, laneOf, pocsOf, rankFindings } from "./data.js";
+import { Lazy, useModule } from "./lazy.js";
 
 const LEVEL_TEXT = { L3: "working exploit", L2: "control primitive", L1: "crash" };
 
@@ -51,12 +52,19 @@ function StartPanel({ caseId, targets, onStarted }) {
   const [budget, setBudget] = useState(600);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [more, setMore] = useState(false);
+  const [opts, setOpts] = useState({});
+  const mod = useModule("./results.js");
   const start = async () => {
     setBusy(true); setErr(null);
-    const overrides = {};
+    const st = mod && mod.buildRunSettings ? mod.buildRunSettings(opts) : { overrides: {}, skipStages: [] };
+    const overrides = { ...st.overrides };
     if (argv.trim()) overrides.argv = argv.trim();
     if (mode !== "auto") overrides.input_mode = mode;
-    try { await api.startBackground(caseId, targets.map((t) => t.id), budget, overrides); onStarted && onStarted(); }
+    try {
+      await api.startBackground(caseId, targets.map((t) => t.id), budget, overrides, !!opts.converge, st.skipStages);
+      onStarted && onStarted();
+    }
     catch (e) { setErr(String(e.message || e)); }
     setBusy(false);
   };
@@ -74,8 +82,51 @@ function StartPanel({ caseId, targets, onStarted }) {
           <option value="300">5 min</option><option value="600">10 min</option>
           <option value="1800">30 min</option><option value="7200">2 h</option></select></label>
     </div>
+    ${more ? html`<${Lazy} path="./results.js" name="RunOptions" props=${{ value: opts, onChange: setOpts, caseId }}
+      fallback=${html`<span class="dim">More options are not available.</span>`} />` : null}
     <div class="row-c"><button class="btn primary" disabled=${busy || !targets.length} onClick=${start}>Start analysis</button>
+      <button class="btn sm" onClick=${() => setMore(!more)} aria-expanded=${more}>${more ? "Fewer options ▴" : "More options ▾"}</button>
       ${err ? html`<span style="color:var(--amber-tx);font-size:12px">${err}</span>` : null}</div>
+  </section>`;
+}
+
+function ExportPanel({ caseId }) {
+  const fmts = [["html", "HTML report"], ["pdf", "PDF report"], ["sarif", "SARIF"], ["json", "JSON"]];
+  return html`<section class="panel pad" style="display:flex;flex-direction:column;gap:10px">
+    <h2>Report & export</h2>
+    <span class="muted" style="font-size:13px">The engagement report, generated offline from this case.</span>
+    <div class="row-c" style="flex-wrap:wrap">
+      ${fmts.map(([f, l]) => html`<a class="btn sm" href=${`/cases/${caseId}/report?format=${f}`} target="_blank" rel="noopener">${l}</a>`)}
+      <a class="btn sm" href=${`/cases/${caseId}/export`} download>Case archive</a>
+    </div>
+  </section>`;
+}
+
+function DeleteTarget({ t, onDeleted }) {
+  const [arm, setArm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (!arm) return html`<button class="btn sm" title="remove this target and its results from the case"
+    onClick=${() => { setArm(true); setTimeout(() => setArm(false), 5000); }}>Remove</button>`;
+  return html`<button class="btn sm" style="border-color:#7A3B2E;color:#FFB4A6" disabled=${busy}
+    onClick=${async () => { setBusy(true); try { await api.deleteTarget(t.id); } finally { setBusy(false); onDeleted && onDeleted(); } }}>
+    Confirm remove</button>`;
+}
+
+function SystemMap({ caseId, targets }) {
+  const [m, setM] = useState(null);
+  useEffect(() => {
+    if (!caseId || targets.length < 2) { setM(null); return; }
+    getJSON(`/cases/${caseId}/systemmap`).then(setM).catch(() => setM(null));
+  }, [caseId, targets.length]);
+  if (!m || !(m.edges || []).length) return null;
+  const name = Object.fromEntries((m.nodes || []).map((n) => [n.id, n.filename || n.id]));
+  return html`<section class="panel" style="overflow:hidden">
+    <div class="pad" style="padding-bottom:6px"><h2>How the targets connect</h2>
+      <span class="dim" style="font-size:12px">${m.edges.length} link(s) between ${m.nodes.length} targets — loads, execs, IPC, shared files</span></div>
+    ${m.edges.map((e) => html`<div class="ev">
+      <span class="mono" style="flex:1 1 40%;min-width:0">${name[e.src] || name[e.source] || e.src || e.source}</span>
+      <span class="chip">${e.kind || e.type || e.label || "→"}</span>
+      <span class="mono" style="flex:1 1 40%;min-width:0">${name[e.dst] || name[e.target] || e.dst || e.target}</span></div>`)}
   </section>`;
 }
 
@@ -128,7 +179,10 @@ export function EngagementScreen({ cases, caseId, setCaseId, data, go, reloadCas
         <span class="row-c" style="justify-content:flex-end;flex-wrap:wrap">
           <button class="btn sm" onClick=${() => go("proof", { targetId: t.id })}>Proof</button>
           <button class="btn sm" onClick=${() => go("code", { targetId: t.id })}>Code</button>
+          <${DeleteTarget} t=${t} onDeleted=${data.reload} />
         </span>
       </div>`)}
-    </section>` : null}`;
+    </section>` : null}
+    <${SystemMap} caseId=${caseId} targets=${data.targets} />
+    ${caseId ? html`<${ExportPanel} caseId=${caseId} />` : null}`;
 }

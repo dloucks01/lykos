@@ -143,6 +143,22 @@ class JobQueue:
             "ORDER BY created_at ASC LIMIT 1", (cache_key, case_id)).fetchone()
         return AnalysisRunDAO._row(r) if r else None
 
+    def _console_cache_hit(self, case_id, stage, target_id, run_id, cached_id) -> None:
+        """Say on the live run console that a stage was satisfied from cache: it never runs, so
+        it would otherwise leave no line at all and a filtered console reads as 'nothing ran'."""
+        try:
+            from pathlib import Path as _P
+
+            from . import runlog
+            row = self.conn.execute("PRAGMA database_list").fetchone()
+            if not row or not row[2]:
+                return
+            runlog.RunLog(_P(row[2]).parent, case_id, run_id=run_id, stage=stage,
+                          target_id=target_id).stage_event(
+                "end", outcome=f"reused a cached result (run {str(cached_id)[:12]})", secs=0)
+        except Exception:                                    # noqa: BLE001 -- console only
+            pass
+
     def _materialize_cache_hit(self, case_id: str, stage: str, target_id: Optional[str],
                                params: Optional[dict], tool: Optional[str],
                                tool_version: Optional[str], ck: str, cached: AnalysisRun,
@@ -158,6 +174,7 @@ class JobQueue:
         self.conn.execute(
             "UPDATE analysis_run SET status='done', started_at=?, ended_at=? WHERE id=?",
             (now, now, run.id))
+        self._console_cache_hit(case_id, stage, target_id, run.id, cached.id)
         ra = RunArtifactDAO(self.conn)
         for link in ra.list_by_run(cached.id):
             ra.link(run.id, link.artifact_sha256, link.role)

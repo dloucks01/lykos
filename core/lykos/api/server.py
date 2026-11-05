@@ -365,6 +365,7 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -418,8 +419,10 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._static_asset("classic.html")
             if path == "/rebuild.html":        # doc 59 ground-up GUI rebuild (dev entry; old app stays)
                 return self._static_asset("rebuild.html")
-            if path == "/next.html":           # the redesigned workbench (app3/), built screen by screen
+            if path == "/next.html":           # the redesigned workbench, also the default at /
                 return self._static_asset("next.html")
+            if path == "/workbench-v1.html":   # the previous default workbench (index.html + app/)
+                return self._static_asset("index.html")
             m = _STATIC_ASSET.match(path)
             if m:
                 return self._static_asset(m.group(1))

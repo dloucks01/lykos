@@ -7,8 +7,9 @@ import { useEffect, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 import { CodeScreen } from "./code.js";
-import { Console, FuzzWindows, NowRunning } from "./console.js";
+import { Console, FuzzWindows, NowRunning, PlanStrip } from "./console.js";
 import { useCaseData } from "./data.js";
+import { Lazy, useModule } from "./lazy.js";
 import { EngagementScreen } from "./engagement.js";
 import { FindingDetail, ProofScreen } from "./proof.js";
 
@@ -68,6 +69,13 @@ function fmtDur(s) {
 
 function RunControls({ caseId, targets, ap, onChanged }) {
   const [budget, setBudget] = useState(600);
+  const [opts, setOpts] = useState({});
+  const [showOpts, setShowOpts] = useState(false);
+  const settingsMod = useModule("./results.js");
+  const startArgs = () => {
+    const st = settingsMod && settingsMod.buildRunSettings ? settingsMod.buildRunSettings(opts) : { overrides: {}, skipStages: [] };
+    return [st.overrides, !!opts.converge, st.skipStages];
+  };
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const running = ap && (ap.running || ap.state === "running");
@@ -77,8 +85,8 @@ function RunControls({ caseId, targets, ap, onChanged }) {
     try { await fn(); onChanged && onChanged(); } catch (e) { setErr(String(e.message || e)); }
     setBusy(false);
   };
-  return html`
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+  return html`<div>
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;justify-content:flex-end">
       ${running ? html`
         <span class="chip on"><span class="dot live"></span>${paused ? "Paused" : "Running"}
           ${(() => {
@@ -98,15 +106,21 @@ function RunControls({ caseId, targets, ap, onChanged }) {
             <option value="300">5 min</option><option value="600">10 min</option>
             <option value="1800">30 min</option><option value="7200">2 h</option>
           </select></label>
+        <button class="btn sm" onClick=${() => setShowOpts(!showOpts)} aria-expanded=${showOpts}>Options${showOpts ? " ▴" : " ▾"}</button>
         <button class="btn primary sm" disabled=${busy || !targets.length}
-          onClick=${() => act(() => api.startBackground(caseId, targets.map((t) => t.id), budget))}>
+          onClick=${() => act(() => api.startBackground(caseId, targets.map((t) => t.id), budget, ...startArgs()))}>
           Start analysis</button>`}
       ${err ? html`<span style="color:var(--amber-tx);font-size:12px">${err}</span>` : null}
-    </div>`;
+    </div>
+    ${showOpts && !running ? html`<div class="panel pad" style="margin-top:10px">
+      <${Lazy} path="./results.js" name="RunOptions" props=${{ value: opts, onChange: setOpts, caseId }}
+        fallback=${html`<span class="dim">Run options are not available.</span>`} /></div>` : null}
+  </div>`;
 }
 
 function RunScreen({ caseId, targets, ap, refreshAp }) {
   const recs = useCaseConsole(caseId);
+  const [stage, setStage] = useState("");
   return html`
     <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px">
       <div style="display:flex;flex-direction:column;gap:2px">
@@ -117,11 +131,14 @@ function RunScreen({ caseId, targets, ap, refreshAp }) {
       <${RunControls} caseId=${caseId} targets=${targets} ap=${ap} onChanged=${refreshAp} />
     </div>
     <${NowRunning} recs=${recs} />
-    <${Console} recs=${recs} caseId=${caseId} targets=${targets} />
-    <${FuzzWindows} recs=${recs} />`;
+    <${PlanStrip} plan=${ap && ap.plan} stage=${stage} setStage=${setStage} />
+    <${Console} recs=${recs} caseId=${caseId} targets=${targets} stage=${stage} setStage=${setStage} />
+    <${FuzzWindows} recs=${recs} />
+    <${Lazy} path="./results.js" name="RunResults"
+      props=${{ caseId, running: !!(ap && (ap.running || ap.state === "running")) }} fallback=${html``} />`;
 }
 
-const NAV = [["engagement", "Engagement"], ["run", "Run"], ["proof", "Proof"], ["code", "Code"]];
+const NAV = [["engagement", "Engagement"], ["run", "Run"], ["proof", "Proof"], ["code", "Code"], ["system", "System"]];
 
 function readHash() {
   const h = new URLSearchParams(location.hash.slice(1));
@@ -157,9 +174,12 @@ function App() {
     setCases(cs);
     return cs;
   }).catch(() => []);
-  useEffect(() => { reloadCases().then((cs) => { if (!caseId && cs.length) setCaseId(cs[cs.length - 1].id); }); }, []);
+  // first load with no case in the URL: pick the newest case, KEEP the requested view
+  useEffect(() => { reloadCases().then((cs) => { if (!caseId && cs.length) setR((o) => ({ ...o, caseId: cs[cs.length - 1].id })); }); }, []);
   const refreshAp = () => api.backgroundStatus(caseId).then(setAp).catch(() => {});
   const cur = cases.find((c) => c.id === caseId);
+  const [version, setVersion] = useState(null);
+  useEffect(() => { api.version().then((v) => setVersion(v ? (v.display || [v.version, v.short].filter(Boolean).join(" · ")) : null)).catch(() => {}); }, []);
   const proven = data.findings.filter((f) => f.state === "poc-backed").length;
   const navOn = r.view === "finding" ? "proof" : r.view;
 
@@ -173,6 +193,7 @@ function App() {
       back=${() => go("proof")} toCode=${(t, addr) => go("code", { targetId: t, addr })} />`;
   else if (r.view === "code") body = html`<${CodeScreen} data=${data} targetId=${r.targetId} focusAddr=${r.addr}
       focusTarget=${(t) => go("code", { targetId: t })} openFinding=${(id) => go("finding", { findingId: id })} />`;
+  else if (r.view === "system") body = html`<${Lazy} path="./system.js" name="SystemScreen" />`;
   else body = html`<${EngagementScreen} cases=${cases} caseId=${caseId} setCaseId=${setCaseId} data=${data}
       go=${go} reloadCases=${reloadCases} running=${running} />`;
 
@@ -187,7 +208,8 @@ function App() {
         ${cur ? html`<span class="chip">Case · ${cur.name || cur.id}</span>` : null}
         ${running ? html`<button class="chip on" style="cursor:pointer" onClick=${() => go("run")}><span class="dot live"></span>analysis running</button>` : null}
         <div style="flex:1 1 auto"></div>
-        <a class="chip" href="/">Current workbench</a>
+        ${version ? html`<span class="chip mono" title="lykos build">${version}</span>` : null}
+        <a class="chip" href="/workbench-v1.html" title="the previous workbench">Previous workbench</a>
       </header>
       <div class="body">
         <nav class="nav" aria-label="Workbench">

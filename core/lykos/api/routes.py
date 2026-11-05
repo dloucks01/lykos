@@ -80,8 +80,11 @@ _ASSET_TYPES = {
 
 
 def _read_ui() -> bytes:
-    """Load the UI page — works from a filesystem checkout AND from a zipapp (.pyz)."""
-    return _read_static("index.html")
+    """Load the UI page — works from a filesystem checkout AND from a zipapp (.pyz).
+
+    The default is the redesigned workbench (next.html + app3/). The previous workbench stays
+    reachable at /workbench-v1.html (index.html + app/) and the single-file one at /classic.html."""
+    return _read_static("next.html")
 
 
 def _read_static(relpath: str) -> bytes:

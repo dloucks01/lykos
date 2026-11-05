@@ -193,10 +193,12 @@ def test_rerun_cache_hit(api, sample_elf):
 def test_ui_served_over_tcp(api_http):
     st, body = _tcp(api_http, "GET", "/")
     assert st == 200
-    # The workbench shell: a title, the mount point, and the ES-module entry point. The app
-    # itself lives in ./app/*.js loaded via the import map, not inline in this page.
+    # The default is the redesigned workbench: a title, the mount point and the ES-module entry
+    # point (./app3/*.js via the import map). The previous workbench stays reachable.
     assert b"<title>" in body and b"lykos" in body.lower()
-    assert b'id="root"' in body and b"app/app.js" in body
+    assert b'id="app"' in body and b"app3/main.js" in body
+    st, body = _tcp(api_http, "GET", "/workbench-v1.html")
+    assert st == 200 and b'id="root"' in body and b"app/app.js" in body
 
 
 def test_ui_assets_served_over_tcp(api_http):
