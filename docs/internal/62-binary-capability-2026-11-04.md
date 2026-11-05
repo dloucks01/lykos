@@ -159,3 +159,21 @@ real parsers solver reach + hypothesis RANKING are the bottleneck.
 3. pcode_guards: heap/global field taint (its measured reach gap) and the guard_gap / intwidth
    analogues.
 4. Item 5 (unicorn driver-synth) for functions no whole-program path reaches.
+
+## 6. Third pass (2026-11-04): working the ranked next steps
+
+- **hypo_hunt focus + seeding** (66e1050): proposals restricted to the <=12 functions other evidence
+  names (jhead 3,230 -> 43, landing on the CVE functions; giflib -> DumpScreen2RGB first), and the
+  input prefix pinned to the format specimen the parser accepts. **Solved counts did not move.**
+  Measured root cause = symbolic exploration collapses before reaching any site:
+  * static jhead-3.04: 113,738 states die jumping to 0x0 (IFUNC/IRELATIVE slots left unresolved
+    in angr's load of a static glibc binary); drained at 96 s after 2,128 steps;
+  * dynamic gif2rgb: drained in 3 s / 992 steps at the input-file open in angr's libc model.
+  Next for this item: make the angr environment model the targets' startup and file I/O faithfully
+  (the reach blocker), then re-measure. Not done in this pass.
+- **Stripped static binaries** (9932475): analyze/syswrap.py names libc by behaviour (syscall
+  numbers incl. glibc>=2.41 cancellable wrappers; system via "exit 0"/"/bin/sh"). jhead-3.04
+  stripped: system/execve/read/write/open recovered, sink/source names exact vs the symbolized build.
+- **pcode_guards field taint with ranges** (e596e38): real set 0 -> 0 reports on 11,905 functions,
+  tainted allocation sizes 12 -> 26 (all correctly bounded), Tier-0 still exactly 2/2.
+- Item 5 (unicorn driver-synth) still open.
