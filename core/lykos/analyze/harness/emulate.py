@@ -1067,6 +1067,14 @@ def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
         extra = {a + shift: n for a, n in stub_names.items() if n in _MODELLED}
         if extra:
             plt = {**extra, **plt}
-    _drive_messages(uc, func_addr + shift, list(messages), res, plt, heap,
-                    arg_shape=arg_shape, max_insns=max_insns, arch=arch)
+    try:
+        _drive_messages(uc, func_addr + shift, list(messages), res, plt, heap,
+                        arg_shape=arg_shape, max_insns=max_insns, arch=arch)
+    finally:
+        # A hooked Uc sits in a reference cycle and is only reclaimed by the cyclic GC, which
+        # counts Python objects, not native memory: one campaign builds thousands of emulators
+        # (~20 MB mapped each), and the first autopilot run with the harness scheduled was
+        # OOM-killed on static jhead-3.04. Free it now (gadget_emu._close_uc, same leak).
+        from ..poc.gadget_emu import _close_uc
+        _close_uc(uc)
     return _to_decompiler(res, plan, shift)

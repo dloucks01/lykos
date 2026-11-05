@@ -108,3 +108,26 @@ def test_no_ifunc_image_is_a_no_op():
     assert ifunc.irelative_relocs(b"not an elf") == []
     assert ifunc.resolve(b"\x7fELF") == {}
     assert ifunc.summary(b"") is None
+
+
+def test_a_harness_campaign_does_not_leak_emulators(static_bin):
+    """Each execution builds a hooked Uc; without an explicit close they live until the cyclic GC
+    runs (it counts Python objects, not native memory). Measured on static jhead-3.04: 3,000 execs
+    = 2,055 MB without the close, 62 MB with it -- the autopilot run was OOM-killed. Run in a fresh
+    interpreter so the peak RSS is this campaign's alone."""
+    import sys
+    exe, _stripped, syms = static_bin
+    code = (
+        "import resource,sys\n"
+        "from lykos.analyze.harness.fuzz import fuzz_function\n"
+        f"blob=open({str(exe)!r},'rb').read()\n"
+        f"fuzz_function(blob,{syms['scopy']},budget_execs=2000,budget_seconds=60)\n"
+        "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss//1024)\n")
+    import os
+
+    import lykos
+    env = {**os.environ, "PYTHONPATH": str(Path(lykos.__file__).resolve().parents[1])}
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=240,
+                       env=env)
+    assert r.returncode == 0, r.stderr[-400:]
+    assert int(r.stdout.strip().splitlines()[-1]) < 500, r.stdout
