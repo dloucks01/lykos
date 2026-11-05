@@ -23,7 +23,8 @@ _STATIC_DETECTORS = ("dangerous_api", "stack_frame", "hardcoded_secrets", "weak_
                      "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
                      "int_overflow_check", "int_overflow_alloc", "scanf_bounded_overflow",
                      "heap_fptr_call", "lang_sinks", "unchecked_privdrop", "world_writable_perms",
-                     "privilege_drop_order", "format_string", "array_index")
+                     "privilege_drop_order", "format_string", "array_index",
+                     "pcode_alloc_overflow")
 TOOL = "detect"
 # -2: CWE-121 gated on the copy destination resolving to the stack frame. -3: re-detection is
 # idempotent. -4: the gate is arg0-only (scanf/sscanf no longer suppressed), works on x86-64/arm/
@@ -32,7 +33,7 @@ TOOL = "detect"
 # is re-analyzed instead of reprojecting stale findings. -5: static CWE-129 (array_index), scanf
 # widths matched per destination, privilege-drop order per path with raises excluded, and the
 # logic/auth detectors' stale sites reset on re-detection.
-TOOL_VERSION = "detect-5"
+TOOL_VERSION = "detect-6"
 
 
 # Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
@@ -118,6 +119,53 @@ def _reg_name(tok):
     """`reg:EAX:4` -> `EAX`, else None."""
     parts = (tok or "").split(":")
     return parts[1] if len(parts) >= 2 and parts[0] == "reg" else None
+
+
+def _pcode_alloc_candidates(ctx, target, func_irs, dctx, entry_seeds):
+    """detect/pcode_guards.alloc_overflow_sites as candidates, one per allocation SITE (dedup key
+    carries the site). `corroborated` when a write with the un-wrapped length follows the
+    allocation (the corruption itself), else `candidate`; never above -- a static result is
+    confirmed only by execution (hypo_hunt / QASan). Returns None when the detector cannot run
+    (no calling convention for the arch, or it failed) so the caller keeps the legacy shape."""
+    try:
+        from . import pcode_guards
+        stats: dict = {}
+        names = {f.addr: f.name for f in (dctx.functions or []) if getattr(f, "addr", None)}
+        recs = pcode_guards.alloc_overflow_sites(
+            func_irs, dctx.call_edges, target.arch, bits=target.bits or 64, names=names,
+            entry_seeds=entry_seeds, stats_out=stats, should_stop=ctx.should_cancel)
+    except Exception as e:                               # noqa: BLE001 -- keep the legacy detector
+        ctx.emit("detect.detector_error", level="warn",
+                 payload={"detector": "pcode_alloc_overflow", "error": str(e)[:160]})
+        return None
+    ctx.emit("detect.pcode_alloc_overflow", payload={
+        "alloc_sites": stats.get("alloc_sites"), "reported": len(recs),
+        "suppressed": dict(stats.get("suppressed") or {}), "cut_short": stats.get("cut_short"),
+        "note": stats.get("note")})
+    if stats.get("note") and not recs and not stats.get("alloc_sites"):
+        return None                                      # did not apply to this arch
+    out = []
+    for r in recs:
+        ops = ", ".join(f"{o.get('expr')}:{o.get('bits')}b{'*' if o.get('tainted') else ''}"
+                        for o in (r.get("operands") or []))
+        written = bool(r.get("written_after"))
+        out.append({
+            "cwe": "CWE-190", "severity": "high" if written else "medium",
+            "state": "corroborated" if written else "candidate",
+            "confidence": float(r.get("confidence") or (0.75 if written else 0.55)),
+            "detector": "pcode_alloc_overflow",
+            "title": (f"Integer overflow in the size passed to {r.get('allocator') or 'an allocator'}"
+                      f" in {r.get('function') or r.get('function_addr')} "
+                      f"({r.get('width_bits')}-bit {r.get('op')}, -> {r.get('consequence')})"),
+            "function_addr": r.get("function_addr"), "site_addr": r.get("site_addr"),
+            "dedup_key": f"CWE-190:pcode_alloc_overflow:{r.get('site_addr')}",
+            "site_detail": r.get("reason"),
+            "evidence": [{"channel": "pcode-alloc-overflow",
+                          "detail": (f"{r.get('reason')} [operands {ops}; max "
+                                     f"{r.get('max_value')}; guard {r.get('guard_status')}"
+                                     + ("; the un-wrapped length is later written into the "
+                                        "buffer" if written else "") + "]")}]})
+    return out
 
 
 def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8,
@@ -1020,6 +1068,12 @@ def detect_stage(ctx) -> dict:
     cands += _intover_candidates(func_irs, dctx.functions, only=touched,
                                  ptr_bytes=(target.bits or 64) // 8,
                                  alloc_sites=_alloc_sites, argregs=_argregs)
+    # Precise allocation-size overflow (P-Code, doc 62 item 4): taint + true operand widths
+    # (ZEXT/SEXT/SUBPIECE) + guard reasoning, ONE candidate per allocation site. When it runs it
+    # supersedes the untainted int_overflow_alloc roll-up above (no taint, width or guard model).
+    _pg = _pcode_alloc_candidates(ctx, target, func_irs, dctx, entry_seeds)
+    if _pg is not None:
+        cands = [c for c in cands if c.get("detector") != "int_overflow_alloc"] + _pg
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"
