@@ -125,15 +125,20 @@ def _pcode_alloc_candidates(ctx, target, func_irs, dctx, entry_seeds):
     """detect/pcode_guards.alloc_overflow_sites as candidates, one per allocation SITE (dedup key
     carries the site). `corroborated` when a write with the un-wrapped length follows the
     allocation (the corruption itself), else `candidate`; never above -- a static result is
-    confirmed only by execution (hypo_hunt / QASan). Returns None when the detector cannot run
-    (no calling convention for the arch, or it failed) so the caller keeps the legacy shape."""
+    confirmed only by execution (hypo_hunt / QASan). Returns (candidates, sites it DECIDED --
+    reported or guarded), or None when the detector cannot run (no calling convention for the
+    arch, or it failed) so the caller keeps the legacy shape."""
     try:
         from . import pcode_guards
         stats: dict = {}
         names = {f.addr: f.name for f in (dctx.functions or []) if getattr(f, "addr", None)}
-        recs = pcode_guards.alloc_overflow_sites(
+        allrecs = pcode_guards.alloc_overflow_sites(
             func_irs, dctx.call_edges, target.arch, bits=target.bits or 64, names=names,
-            entry_seeds=entry_seeds, stats_out=stats, should_stop=ctx.should_cancel)
+            entry_seeds=entry_seeds, stats_out=stats, should_stop=ctx.should_cancel,
+            include_suppressed=True)
+        recs = [r for r in allrecs if not str(r.get("guard_status") or "").startswith("guarded")]
+        covered = {r.get("site_addr") for r in allrecs
+                   if r in recs or str(r.get("guard_status") or "").startswith("guarded")}
     except Exception as e:                               # noqa: BLE001 -- keep the legacy detector
         ctx.emit("detect.detector_error", level="warn",
                  payload={"detector": "pcode_alloc_overflow", "error": str(e)[:160]})
@@ -165,7 +170,7 @@ def _pcode_alloc_candidates(ctx, target, func_irs, dctx, entry_seeds):
                                      f"{r.get('max_value')}; guard {r.get('guard_status')}"
                                      + ("; the un-wrapped length is later written into the "
                                         "buffer" if written else "") + "]")}]})
-    return out
+    return out, covered
 
 
 def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8,
@@ -1073,7 +1078,12 @@ def detect_stage(ctx) -> dict:
     # supersedes the untainted int_overflow_alloc roll-up above (no taint, width or guard model).
     _pg = _pcode_alloc_candidates(ctx, target, func_irs, dctx, entry_seeds)
     if _pg is not None:
-        cands = [c for c in cands if c.get("detector") != "int_overflow_alloc"] + _pg
+        _pc, _covered = _pg
+        # the legacy shape is dropped only where the precise detector DECIDED the site (reported
+        # it, or found a guard); a site it could not judge keeps the legacy candidate (measured:
+        # dropping it wholesale lost malloc(argc * K), whose argc taint the new pass does not seed)
+        cands = [c for c in cands if not (c.get("detector") == "int_overflow_alloc"
+                                          and c.get("site_addr") in _covered)] + _pc
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"
