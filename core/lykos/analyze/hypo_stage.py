@@ -106,8 +106,24 @@ def hypo_stage(ctx) -> dict:
         if len(lines) % 10 == 0:
             ctx.progress(msg=msg[:90])
 
+    focus, basis = ([], {})
+    if p.get("focus", True):
+        focus, basis = _focus_functions(ctx.conn, target, int(p.get("max_focus", _MAX_FOCUS)))
+    extra = {"focus_funcs": focus} if focus else {}
+    seed_fmt = None
+    if p.get("seed", True) and mode in ("file", "stdin"):
+        seed_fmt, seed = _pick_seed(ctx, target, exe, mode, argv)
+        if seed:
+            import base64 as _b64
+            extra["seed_b64"] = _b64.b64encode(seed).decode()
+            ctx.emit("hypo.seed", payload={"format": seed_fmt, "bytes": len(seed),
+                     "note": "the solver starts past this format's front gates (seed prefix pinned)"})
+    ctx.emit("hypo.focus", payload={
+        "functions": len(focus), "basis": basis,
+        "note": (f"proposing only inside {len(focus)} function(s) other evidence names"
+                 if focus else "no per-site evidence on this target yet -- proposing everywhere")})
     res = loop.hunt_target(t, budget, input_size=int(p.get("input_size", 300)),
-                           mem_mb=int(p.get("mem_mb", 8192)), log=_log)
+                           mem_mb=int(p.get("mem_mb", 8192)), log=_log, extra=extra)
     hyps = res.get("hypotheses") or []
     filed = _file_confirmed(ctx, target, hyps, mode, argv)
     kinds: dict = {}
@@ -123,6 +139,117 @@ def hypo_stage(ctx) -> dict:
     ctx.emit("hypo.done", payload=payload)
     ctx.progress(pct=100, msg=payload["note"][:90])
     return {"metrics": {"proposed": len(hyps), "confirmed": filed}}
+
+
+#: functions the loop is focused on at most (each one costs solver time)
+_MAX_FOCUS = 12
+
+#: per-SITE evidence detectors -> weight. Roll-ups / advisories (dangerous_api) are excluded: they
+#: name an API, not a defect site. Demonstrated evidence (qasan, a crash) outranks static.
+_FOCUS_WEIGHT = {"qasan": 10.0, "fuzz": 8.0, "directed_fuzz": 8.0, "coverage_fuzz": 8.0,
+                 "root_cause": 8.0, "pcode_alloc_overflow": 6.0, "oob_index": 5.0,
+                 "array_index": 5.0, "tainted_deref": 4.0, "stack_frame": 4.0,
+                 "int_overflow_check": 2.0, "heap_fptr_call": 2.0}
+_FOCUS_CWES = {"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125", "CWE-126",
+               "CWE-127", "CWE-129", "CWE-131", "CWE-190", "CWE-191", "CWE-369", "CWE-415",
+               "CWE-416", "CWE-476", "CWE-787", "CWE-805", "CWE-822", "CWE-823", "CWE-824"}
+
+
+def _focus_functions(conn, target, cap: int):
+    """The functions other evidence names as defect SITES, best first: ([link VA], basis).
+
+    Read per SITE (finding_site): a roll-up finding names many functions, but its own
+    function_addr is only the first. Each (finding, function) pair contributes the detector's
+    weight once, x2 when that site is corroborated or better, x1.5 when grounding found the
+    finding attacker-reachable, plus a small capped bonus for further sites in the same function;
+    sites the bounds analysis judged guarded contribute nothing."""
+    import json as _json
+    import math
+
+    def _addr(v):
+        try:
+            return int(v, 16) if isinstance(v, str) and v.startswith("0x") else int(v)
+        except (TypeError, ValueError):
+            return None
+    findings = {f.id: f for f in FindingDAO(conn).list_by_target(target.id)
+                if _FOCUS_WEIGHT.get(f.detector or "") and (f.cwe or "") in _FOCUS_CWES}
+    if not findings:
+        return [], {}
+    reach: dict = {}
+    for fid, f in findings.items():
+        for e in (f.evidence or []):
+            if isinstance(e, dict) and e.get("channel") == "grounding-map":
+                try:
+                    reach[fid] = _json.loads(e.get("detail") or "{}").get("reachable") is True
+                except Exception:                        # noqa: BLE001
+                    pass
+                break
+    per: dict = {}                                       # (fid, func) -> [site states]
+    marks = ",".join("?" * len(findings))
+    rows = conn.execute(f"SELECT finding_id, function_addr, state, verdict FROM finding_site "
+                        f"WHERE finding_id IN ({marks})", list(findings)).fetchall()
+    for r in rows:
+        if (r["verdict"] or "").lower() == "guarded":
+            continue
+        a = _addr(r["function_addr"])
+        if a is not None:
+            per.setdefault((r["finding_id"], a), []).append(r["state"] or "")
+    for fid, f in findings.items():                      # a finding with no site rows: its own addr
+        a = _addr(f.function_addr)
+        if a is not None and not any(k[0] == fid for k in per):
+            per[(fid, a)] = [f.state or ""]
+    score: dict = {}
+    basis: dict = {}
+    for (fid, a), states in per.items():
+        f = findings[fid]
+        w = _FOCUS_WEIGHT[f.detector]
+        if any(st in ("corroborated", "confirmed", "poc-backed") for st in states + [f.state or ""]):
+            w *= 2.0
+        if reach.get(fid):
+            w *= 1.5
+        w += min(2.0, 0.5 * math.log2(len(states))) if len(states) > 1 else 0.0
+        score[a] = score.get(a, 0.0) + w
+        basis[f.detector] = basis.get(f.detector, 0) + 1
+    ranked = sorted(score, key=lambda a: -score[a])[:max(0, cap)]
+    return ranked, basis
+
+
+def _pick_seed(ctx, target, exe, mode, argv):
+    """(format, specimen) the target's parser gets furthest with, or (None, None). Candidates are
+    the formats its strings/imports name (fuzz.structure.detect_formats, top 3); the winner is the
+    specimen whose run differs from a same-length garbage input's (exit status or output) -- the
+    parser accepted its front gates. jhead names tiff first (EXIF is TIFF-structured) but only
+    accepts JPEG files: a fixed first pick would pin the wrong magic."""
+    try:
+        from ..db.dao import StringDAO
+        from .dynamic import sandbox
+        from .fuzz import structure
+        strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
+                   if getattr(x, "value", None)]
+        imps = [e.dst_name for e in CallEdgeDAO(ctx.conn).list_by_target(target.id) if e.dst_name]
+        fmts = structure.detect_formats(strings, imps)[:3]
+    except Exception:                                    # noqa: BLE001
+        return None, None
+    best = (None, None, -1)
+    for fm in fmts:
+        sd = structure.seed_for_name(fm)
+        if not sd:
+            continue
+        try:
+            r = sandbox.run_batch(str(exe), [sd, b"A" * len(sd)], mode=mode,
+                                  base_argv=[a for a in argv if mode == "file" or a != "@@"],
+                                  timeout=5.0, arch=target.arch, endianness=target.endianness,
+                                  bits=target.bits)
+        except Exception:                                # noqa: BLE001
+            r = None
+        if not r or len(r) != 2:
+            continue
+        good, junk = r
+        score = int(good.exit_code != junk.exit_code) + int(
+            (good.stdout or b"") + (good.stderr or b"") != (junk.stdout or b"") + (junk.stderr or b""))
+        if not good.crashed and score > best[2]:
+            best = (fm, sd, score)
+    return (best[0], best[1]) if best[2] > 0 else (None, None)
 
 
 def _file_confirmed(ctx, target, hyps, mode, argv) -> int:

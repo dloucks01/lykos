@@ -34,6 +34,8 @@ validator is the precision filter, and failures come back as exclusions).
 
 spec.json: binary, argv (list, "@@" = input carrier), input_mode (file|stdin|arg), input_size,
            max_seconds, max_states, width, exclude {hyp_id: [b64,...]}, only [hyp_id,...],
+           focus_funcs [link VA,...] (propose only inside these functions),
+           seed_b64 / seed_pin (pin the input's first seed_pin bytes to a format specimen),
            max_rss_mb (default 8192: past it the driver writes partial results and exits 3),
            solver_timeout_ms (default 10000), solver_max_mb (z3 heap cap, default max_rss_mb)
 out.json : ok, angr_version, stats, hypotheses:[{id, kind, cwe, site, func, func_addr, callee,
@@ -1112,12 +1114,21 @@ class Driver:
         own = self._own_functions() if self.spec.get("cb_scope") else None
         if own is not None:
             self.stats["own_functions"] = len(own)
+        # FOCUS: propose only inside the functions other evidence names (link-time VAs from the
+        # core: static detector / QASan / directed-fuzz sites). On a real parser an unfocused
+        # proposer emits thousands of generic stores and solves none of them in budget.
+        focus = {int(a) for a in (self.spec.get("focus_funcs") or [])}
+        fdelta = self.main_obj.mapped_base - self.main_obj.linked_base
+        if focus:
+            self.stats["focus_funcs"] = len(focus)
         for f in list(kb.functions.values()):
             if f.is_plt or f.is_simprocedure or f.name in BORING_FUNCS or f.is_syscall:
                 continue
             if not self.main_obj.contains_addr(f.addr):
                 continue
             if own is not None and f.addr not in own:
+                continue
+            if focus and (f.addr - fdelta) not in focus:
                 continue
             for cs in f.get_call_sites():
                 tgt = f.get_call_target(cs)
@@ -1513,6 +1524,17 @@ class Driver:
         st = self.p.factory.full_init_state(args=args, add_options=opts,
                                             remove_options={angr.options.LAZY_SOLVES}, **kw)
         self._configure_state(st, n)
+        # SEEDED reach: pin the first `seed_pin` bytes of the input to a format specimen, so the
+        # parser's front gates (magic, header lengths, segment markers) hold by construction and the
+        # solver spends its budget past them. The rest stays symbolic. Without it a real parser's
+        # sites are out of reach from the entry in budget (measured: 0-2 of 43-3,230 solved).
+        seed = base64.b64decode(self.spec["seed_b64"]) if self.spec.get("seed_b64") else b""
+        if seed:
+            pin = int(self.spec.get("seed_pin") or max(16, len(seed) // 2))
+            pin = min(pin, len(seed), n)
+            for i in range(pin):
+                st.solver.add(self.inp.get_byte(i) == seed[i])
+            self.stats["seed_pinned"] = pin
         return st
 
     def _func_state(self, func_addr):
