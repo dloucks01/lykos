@@ -132,7 +132,9 @@ def test_a_harness_campaign_does_not_leak_emulators(static_bin):
         f"blob=open({str(exe)!r},'rb').read()\n"
         f"fuzz_function(blob,{syms['scopy']},budget_execs=2000,budget_seconds=60)\n"
         "print(lykos.__file__)\n"
-        "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss//1024)\n")
+        # VmHWM, the peak RSS of THIS image: ru_maxrss survives execve, so a child spawned from a
+        # large pytest worker reported the worker's ~2.7 GB in the full suite, not its own peak
+        "print(next(int(l.split()[1]) for l in open('/proc/self/status') if l.startswith('VmHWM'))//1024)\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=240,
                        env=env, cwd=str(exe.parent))

@@ -37,6 +37,27 @@ _HELPER = Path(__file__).with_name("heaptrace.py")
 _WORD = 8
 
 
+
+def _static_site(ctx, target, pc, load_base, pie):
+    """The watchpoint's runtime PC in the coordinates every other finding uses (the decompiler's).
+    A PIE runs at an ASLR base: filing the raw PC (0x55555555cdd9) matched no function, so the
+    finding's reachability stayed 'unknown' and the code view could not open it."""
+    try:
+        if pc is None:
+            return None
+        a = int(str(pc), 16)
+        if not pie or not load_base:
+            return hex(a)
+        link = a - int(str(load_base), 16)
+        from ...db.dao import FunctionDAO
+        from .. import elf
+        from ..debug.rootcause import image_base
+        blob = ctx.content.path(target.sha256).read_bytes()
+        base = image_base(FunctionDAO(ctx.conn).list_by_target(target.id), elf.parse(blob).entry) or 0
+        return hex(link + base)
+    except Exception:                                    # noqa: BLE001 -- keep the raw pc
+        return str(pc) if pc is not None else None
+
 def _array_candidates(objects: dict) -> list[dict]:
     """Fixed-size global arrays worth guarding: a word-multiple OBJECT of at least two elements
     (a pointer/handle table). Scalars (size 8) and oversized blobs are skipped."""
@@ -316,8 +337,10 @@ def oob_index_stage(ctx) -> dict:
                         observe.absorbed(_log, "skipping this item")
                         continue
                     if rep.get("oob_index"):
-                        ev = next((e for e in rep.get("events", [])
-                                   if e.get("error") == "oob-index"), {})
+                        ev = dict(next((e for e in rep.get("events", [])
+                                        if e.get("error") == "oob-index"), {}))
+                        ev["site"] = _static_site(ctx, target, ev.get("pc"), rep.get("load_base"),
+                                                  pie)
                         found = (arr, opt, boundary, seq, ev)
                         break
 
@@ -358,7 +381,8 @@ def oob_index_stage(ctx) -> dict:
             "cwe": "CWE-129", "title": "Improper validation of array index", "severity": "high",
             "detector": "oob_index", "state": "corroborated", "confidence": 0.85,
             "dedup_key": f"CWE-129:oobindex:{arr['name']}",
-            "function_addr": None, "site_addr": ev.get("pc"), "site_detail": arr["name"],
+            "function_addr": None, "site_addr": ev.get("site") or ev.get("pc"),
+            "site_detail": arr["name"],
             "evidence": [{"channel": "oob-index", "detail": detail}]})
         ctx.emit("oob_index.done", payload={
             "applicable": True, "oob_index": True, "array": arr["name"], "option": opt,

@@ -167,6 +167,10 @@ STAGES: tuple[StageSpec, ...] = (
     # --- Prove: root-cause and the exploit ladder ---------------------------------------------
     # root_cause/build_poc/poc_primitive require params["input_sha"] (the crashing input), so they
     # are NOT no_params -- listing them would drop that input and every one would fail.
+    # every unresolved finding: replay the kept inputs to decide reach, fire the site-reaching ones
+    # under the memory oracles, and give each finding a measured verdict (or a crash to prove)
+    StageSpec("finding_resolve", "Resolve every finding (reached? fires? verdict)", "target",
+              "..analyze.resolve_stage", "enqueue_finding_resolve"),
     StageSpec("root_cause", "Root-cause", "target", "..analyze.debug", "enqueue_root_cause"),
     StageSpec("build_poc", "Build PoC", "target", "..analyze.poc", "enqueue_build_poc"),
     StageSpec("poc_primitive", "PoC primitive", "target", "..analyze.poc", "enqueue_primitive"),

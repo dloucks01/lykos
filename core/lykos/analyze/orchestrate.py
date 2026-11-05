@@ -2850,6 +2850,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # search phase held back exists for exactly this: a campaign that finds a crash in
                 # its final seconds must still have time to root-cause and prove it.
                 bud.phase("prove")
+                # Every unresolved finding gets a verdict from the inputs this run kept: reached?
+                # fires under the memory oracles at its own site? A finding that fires becomes a
+                # crash row the prove loop below takes; the rest carry what was measured.
+                _staged(bud, store, t, "finding_resolve", status, stop, want=90.0)
+                crashes = _distinct_crashes(store, tid)
                 # The prove loop's ceiling, made VISIBLE when it bites: a crash bucket that is never
                 # proved because of the cap must not read as "there was no such crash".
                 _reps = _crash_representatives(store, tid)

@@ -2055,6 +2055,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         (execs < 200 and rate < 20 and not did_work)
         or (execs >= 200 and not entered)
         or (coverage_dead and not did_work))
+    try:                                                  # for the finding resolver
+        from . import corpus_keep
+        corpus_keep.keep(ctx, target, corpus, source=event_prefix, mode=mode, argv=list(base_argv or ()))
+    except Exception:                                     # noqa: BLE001 -- a convenience
+        pass
     stats = {"execs": execs, "crashes": crashes, "flaky": flaky,
              # Timed-out executions, and the re-verified hang filed from them (if any) -- so a
              # campaign whose timeouts were never checked does not read as "no hang".

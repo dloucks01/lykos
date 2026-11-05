@@ -82,7 +82,7 @@ const DYNAMIC_BACKENDS = new Set([
 //
 // the finalizers -- they resolve, plan and chain what the WHOLE pass found, so they only mean
 // anything at the end of a server-side run:
-// not-in-tab: drivable_confirm, triage, weaponize_plan, attack_path
+// not-in-tab: drivable_confirm, triage, weaponize_plan, attack_path, finding_resolve
 //
 // the propose -> solve -> validate loop: a long, memory-capped angr run (systemd-run MemoryMax)
 // the server schedules before the fuzz campaigns; the browser cannot hold that slice:

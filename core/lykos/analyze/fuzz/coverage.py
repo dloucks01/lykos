@@ -635,6 +635,13 @@ def coverage_stage(ctx) -> dict:
         _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
     except Exception:
         observe.absorbed(_log, "continuing")
+    # keep the queue AFL built (the inputs that reached new code) for the finding resolver
+    try:
+        from . import corpus_keep
+        corpus_keep.keep(ctx, target, (pth.read_bytes() for pth, _m in aflpp.saved_entries(out_dir, "queue")),
+                         source="coverage_fuzz", mode=mode, argv=list(replay_argv or ()))
+    except Exception:                                        # noqa: BLE001 -- a convenience
+        observe.absorbed(_log, "could not keep the AFL corpus")
     _asserts: list = []
     _att = _log_afl_campaign(ctx, alog, out_dir, stats, exe=exe, mode=mode, target=target,
                              replay_argv=replay_argv, exec_timeout=exec_timeout,
