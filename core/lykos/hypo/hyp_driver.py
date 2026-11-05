@@ -2611,7 +2611,7 @@ class Driver:
                     _fr = self.stats.setdefault("errored_from", {})
                     if len(_fr) < 24 or _fk in _fr:
                         _fr[_fk] = _fr.get(_fk, 0) + 1
-                except Exception:
+                except Exception:  # noqa: BLE001 -- a state with no history: diagnostics only
                     pass
                 tr = self.stats.setdefault("errored_trace", {})
                 if key not in tr:       # first traceback per kind: the evidence to fix a model

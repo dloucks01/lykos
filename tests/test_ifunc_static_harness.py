@@ -117,17 +117,26 @@ def test_a_harness_campaign_does_not_leak_emulators(static_bin):
     interpreter so the peak RSS is this campaign's alone."""
     import sys
     exe, _stripped, syms = static_bin
-    code = (
-        "import resource,sys\n"
-        "from lykos.analyze.harness.fuzz import fuzz_function\n"
-        f"blob=open({str(exe)!r},'rb').read()\n"
-        f"fuzz_function(blob,{syms['scopy']},budget_execs=2000,budget_seconds=60)\n"
-        "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss//1024)\n")
     import os
 
     import lykos
-    env = {**os.environ, "PYTHONPATH": str(Path(lykos.__file__).resolve().parents[1])}
+    root = str(Path(lykos.__file__).resolve().parents[1])
+    # sys.path pinned in the child and a clean cwd: with `-c` the CWD comes first on sys.path,
+    # and other tests in the suite leave extracted (older) lykos copies around -- the child must
+    # measure THIS tree's harness, which it checks by printing where lykos came from.
+    code = (
+        "import resource,sys\n"
+        f"sys.path.insert(0,{root!r})\n"
+        "import lykos\n"
+        "from lykos.analyze.harness.fuzz import fuzz_function\n"
+        f"blob=open({str(exe)!r},'rb').read()\n"
+        f"fuzz_function(blob,{syms['scopy']},budget_execs=2000,budget_seconds=60)\n"
+        "print(lykos.__file__)\n"
+        "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss//1024)\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=240,
-                       env=env)
+                       env=env, cwd=str(exe.parent))
     assert r.returncode == 0, r.stderr[-400:]
+    out = r.stdout.strip().splitlines()
+    assert out[-2].startswith(root), out
     assert int(r.stdout.strip().splitlines()[-1]) < 500, r.stdout
