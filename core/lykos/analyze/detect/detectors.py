@@ -119,6 +119,9 @@ def dangerous_api(ctx: DetectContext):
         n = normalize(e.dst_name)
         if n not in DANGEROUS:
             continue
+        if n in _SCANF_VARIANTS and _scanf_unbounded_at(
+                ctx, ctx.func_irs.get(e.src_addr), e.site_addr) is False:
+            continue                                  # this call's format is fully bounded (%d, %16s)
         cwe, sev, desc = DANGEROUS[n]
         cand = _cand(
             cwe, f"{desc}", sev, "dangerous_api",
@@ -684,6 +687,9 @@ def stack_buffer_overflow(ctx: DetectContext):
         if n in _UNBOUNDED_COPY:
             if n in ("scanf", "sscanf") and not scanf_maybe_unbounded:
                 continue                          # only width-bounded %Ns present -> not a bug
+            if n in _SCANF_VARIANTS and _scanf_unbounded_at(
+                    ctx, ctx.func_irs.get(e.src_addr), e.site_addr) is False:
+                continue                          # THIS call's format has no unbounded %s/%[
             sinks_by_func[e.src_addr].append((n, e.site_addr))
     out = []
     for addr, frame in ctx.frames.items():
@@ -1184,6 +1190,34 @@ def _format_at(ctx, texts, reg: str):
         if v is not None:
             return v, None
     return None, _str_flag_for_reg(texts, reg)
+
+
+def _scanf_unbounded_at(ctx, ir, site):
+    """For a scanf-family call at `site`: True when ITS format (read at the call site) has an
+    unbounded %s / %[ conversion, False when the format is recovered and has none, None when the
+    format cannot be recovered (keep the finding -- never guess it away).
+
+    The binary-wide heuristic ("some string in the image has an unbounded %s") flagged EVERY
+    sscanf in a program that has one: gif2rgb's option parser calls sscanf(arg, "%d", &n) at
+    0x975f and was filed as both 'sscanf with unbounded %s' and a CWE-121 stack smash."""
+    if not ir or site is None:
+        return None
+    flat = [(i.get("addr"), (i.get("text") or "")) for b in _blocks_of(ir)
+            for i in (b.get("instructions") or [])]
+    sv = _naddr(site)
+    for idx, (a, t) in enumerate(flat):
+        if _naddr(a) != sv:
+            continue
+        variant = _norm_call(t)
+        if variant not in _SCANF_VARIANTS:
+            return None
+        fmt, sym = _format_at(ctx, [x for _, x in flat[:idx]], _SCANF_VARIANTS[variant][0])
+        convs = (_scanf_conversions(fmt) if fmt is not None
+                 else (_resolve_scanf_format(sym, ctx.strings) if sym else None))
+        if convs is None:
+            return None
+        return any(w is None and not alloc and conv in ("s", "[") for _k, w, conv, alloc in convs)
+    return None
 
 
 def _r2_flagify(v: str) -> str:

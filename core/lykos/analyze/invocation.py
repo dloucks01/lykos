@@ -958,6 +958,12 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     strings = [s for s in (strings or []) if s]
     if usage_hint:
         strings = list(strings) + [usage_hint]
+    if help_text:
+        # A usage line the program PRINTS is as authoritative as one in its strings -- more so: a
+        # program that builds it at runtime from an option spec (giflib's GAPrintHowTo) has no
+        # usage string at all, and the help output was ignored by the usage parser.
+        strings = list(strings) + [ln.strip() for ln in help_text.splitlines()
+                                   if "usage" in ln.lower() and len(ln) < 600]
     use, usage = from_usage(strings, prog=prog)
     opt = from_optstring(strings)
     cmp_ = from_argv_compares(strings)
