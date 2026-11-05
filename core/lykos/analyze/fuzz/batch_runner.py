@@ -20,7 +20,8 @@ Run as: python3 batch_runner.py <mode> <per_timeout> <exe> [base argv...]
 stdin:  u32 count, u32 n_blocks, then n_blocks * u64 block addresses (image-relative),
         then per input: u32 length + bytes
 stdout: per input: i32 rc, u32 stdout_len, u32 stderr_len, u8 flags, u32 n_new,
-        u64 fault_pc (image-relative, 0 if unknown), then stdout, stderr, and
+        u64 fault_pc (image-relative, 0 if unknown), u64 fault_addr (siginfo si_addr of a fatal
+        signal, absolute, 0 if unknown), then stdout, stderr, and
         n_new * u64 newly reached block addresses
 """
 import ctypes
@@ -37,6 +38,8 @@ _log = logging.getLogger(__name__)
 
 PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_POKETEXT = 0, 1, 4
 PTRACE_CONT, PTRACE_KILL, PTRACE_GETREGS = 7, 8, 12
+PTRACE_GETSIGINFO = 0x4202
+_UNKNOWN_ADDR = 0xFFFFFFFFFFFFFFFF          # fault_addr on the wire when the kernel did not say
 _INT3 = 0xCC
 # Signals whose default action is a core-dumping fault -- the only ones that mean "crash". A
 # non-fault signal the program does not catch (SIGALRM, SIGTERM, SIGPIPE, SIGCHLD, SIGWINCH...)
@@ -235,7 +238,7 @@ def _arm(libc, pid, mem, base, blocks, plan):
 
 
 def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitizer=False):
-    """Run one input under ptrace. Returns (rc, out, err, flags, reached, fault_pc)."""
+    """Run one input under ptrace. Returns (rc, out, err, flags, reached, fault_pc, fault_addr)."""
     r_out, w_out = os.pipe()
     r_err, w_err = os.pipe()
     r_in, w_in = os.pipe()
@@ -346,6 +349,7 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
     reached, regs = [], _Regs()
     deadline = _now() + timeout
     rc, flags, deliver, fault_pc, delivered = 0, 0, 0, 0, 0
+    fault_addr = 0
 
     def _kill_reap():
         try:
@@ -424,6 +428,17 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
             # program is the same finding, however many distinct defects produced them.
             if libc.ptrace(PTRACE_GETREGS, pid, 0, ctypes.byref(regs)) == 0:
                 fault_pc = regs.rip - base
+            # ...and the faulting DATA address (siginfo.si_addr), which tells a NULL dereference
+            # (near 0) from a wild / attacker-corrupted pointer (0x4141...). Absolute, not
+            # image-relative: it is an address the program tried to touch, not one of its own.
+            # si_code SI_KERNEL (0x80) is a general-protection fault -- on x86-64 a NON-CANONICAL
+            # pointer such as 0x4141414141414141 -- and the kernel then reports si_addr = 0, which
+            # would read as a NULL dereference. That address is UNKNOWN: sent as all-ones.
+            _si = ctypes.create_string_buffer(128)
+            if libc.ptrace(PTRACE_GETSIGINFO, pid, 0, _si) == 0:
+                _code = struct.unpack_from("<i", _si.raw, 8)[0]
+                fault_addr = (_UNKNOWN_ADDR if _code == 0x80
+                              else struct.unpack_from("<Q", _si.raw, 16)[0])
             rc = -sig                                   # fatal: report it, and do not deliver,
             os.kill(pid, signal.SIGKILL)                # so no core dump handler runs
             try:
@@ -453,7 +468,7 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
             os.close(fd)
         except OSError:
             pass
-    return rc, out, err, flags, reached, fault_pc
+    return rc, out, err, flags, reached, fault_pc, fault_addr
 
 
 def _now():
@@ -569,9 +584,9 @@ def main():
         else:
             argv = [exe] + base_argv + [carrier]
             stdin = b""
-        reached, fault_pc = [], 0
+        reached, fault_pc, fault_addr = [], 0, 0
         if trace:
-            rc, so, se, flags, reached, fault_pc = _trace_one(libc, argv, stdin, per_timeout,
+            rc, so, se, flags, reached, fault_pc, fault_addr = _trace_one(libc, argv, stdin, per_timeout,
                                                               blocks, exe, plan, sanitizer)
             if reached and shared_arm:
                 # ONE-SHOT ACROSS THE BATCH, not just within one execution: a block an earlier
@@ -600,7 +615,8 @@ def main():
                 rc, so, flags = 0, b"", 2
                 se = ("lykos-batch: cannot execute %s: %s" % (argv[0], e)).encode(
                     "utf-8", "replace")[:4096]
-        out.write(struct.pack("<iIIBIQ", rc, len(so), len(se), flags, len(reached), fault_pc))
+        out.write(struct.pack("<iIIBIQQ", rc, len(so), len(se), flags, len(reached), fault_pc,
+                              fault_addr))
         out.write(so); out.write(se)
         if reached:
             out.write(struct.pack("<%dQ" % len(reached), *reached))

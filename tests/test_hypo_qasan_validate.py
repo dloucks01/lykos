@@ -101,3 +101,55 @@ def test_hypo_hunt_stage_confirms_a_silent_heap_read_on_a_plain_binary(store, ca
     for f in hy:
         print("HYPO-FINDING", f.cwe, f.title, [e.get("detail") for e in f.evidence
                                                if e.get("channel") == "validated"])
+
+
+_ND = r"""
+#include <stdio.h>
+__attribute__((noinline)) int deref(int *p) { return *p; }
+int main(void){ int c = getchar(); if (c == EOF) return 0;
+  return deref(c == 'N' ? (int *)0 : (int *)0x4141414141414141UL); }
+"""
+
+
+def test_null_deref_needs_a_near_null_fault_address(tmp_path, gcc):
+    """Native attribution: a NULL deref faults AT its site AND on a near-0 data address. A
+    corrupted pointer faults at the same instruction on 0x4141... -- not CWE-476 (Tier-0
+    --binary-only s01/s06/r01 were false confirmations of exactly this)."""
+    c = tmp_path / "nd.c"; c.write_text(_ND)
+    exe = tmp_path / "nd"
+    if subprocess.run([gcc, "-O0", "-w", "-no-pie", str(c), "-o", str(exe)],
+                      capture_output=True).returncode:
+        pytest.skip("cannot build fixture")
+    a, n = _sym(exe, "deref")
+    from lykos.analyze.dynamic import sandbox
+    r = sandbox.run_batch(str(exe), [b"N"], mode="stdin", timeout=5, arch="x86-64", fault_pc=True)
+    site = r[0].fault_pc if r else None
+    if site is None:
+        pytest.skip("no traced fault PC on this host")
+    h = Hypothesis(id=f"null-deref@{site:#x}", kind="null-deref", cwe="CWE-476", site=site,
+                   func="deref", func_addr=a, func_size=n)
+    t = Target(exe=exe, argv=[], mode="stdin", arch="x86-64")
+    v, _ = validate(t, h, b"N")
+    assert v.confirmed and v.method == "native-crash", v.detail
+    v2, _ = validate(t, h, b"W")
+    assert not v2.confirmed and "not a NULL dereference" in v2.detail
+
+
+def test_frame_relative_accesses_are_never_null_derefs(tmp_path, gcc):
+    """A fault on an rbp/rsp-relative access (or an implicit stack op like `leave`) proves the
+    frame was corrupted by an overflow; it is never CWE-476 (Tier-0 s01/r01)."""
+    from lykos.hypo.validate import _frame_relative
+    c = tmp_path / "f.c"
+    c.write_text("int g(int *p){ volatile int x = 3; return *p + x; }\nint main(void){return 0;}\n")
+    exe = tmp_path / "f"
+    if subprocess.run([gcc, "-O0", "-no-pie", str(c), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build fixture")
+    dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn", str(exe)], capture_output=True,
+                         text=True).stdout
+    g = dis.split("<g>:", 1)[1].split("\n\n", 1)[0]
+    rows = [ln.split(":", 1) for ln in g.splitlines() if ":" in ln]
+    def at(pred):
+        return next(int(a.strip(), 16) for a, ins in rows if pred(ins))
+    assert _frame_relative(exe, at(lambda i: "(%rbp)" in i))            # frame local
+    assert _frame_relative(exe, at(lambda i: i.strip().startswith(("leave", "pop"))))
+    assert not _frame_relative(exe, at(lambda i: "(%rax)" in i or "(%rdx)" in i))  # real pointer

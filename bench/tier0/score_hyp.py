@@ -101,6 +101,12 @@ def score_case(cid, bindir, budget, keep=None):
                 bug = next((b for b in case["bugs"] if b["oracle"] == "exec"), None)
             else:
                 bug = bug_lines.get(v.line)
+                if bug is None and h.kind == "control-flow-hijack":
+                    # a hijacked return IS the demonstrated consequence of a stack overflow in the
+                    # SAME function (the hijack's site line is the ret, not the overflowing copy);
+                    # a hijack anywhere else is still a false confirmation.
+                    bug = next((b for b in case["bugs"] if b.get("kind") == "stack-write"
+                                and b.get("function") == h.func), None)
             if bug is not None:
                 found.setdefault(bug["id"], row)
             else:

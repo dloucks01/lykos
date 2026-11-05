@@ -196,6 +196,9 @@ class RunResult:
     # Image-relative address of the faulting instruction, when the target was traced. Two
     # crashes at different addresses are different defects, however alike their signals look.
     fault_pc: Optional[int] = None
+    # The data address a fatal signal faulted on (siginfo si_addr), when traced: a NULL deref
+    # faults near 0, a corrupted pointer at an attacker-shaped address.
+    fault_addr: Optional[int] = None
     # Which of the requested coverage blocks this run reached, or None when coverage was not
     # asked for. This used to travel in `note`, parsed back out of a comma-joined string --
     # which worked only because nothing else ever put anything in `note`. The channel runner
@@ -358,11 +361,11 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
     results, off = [], 0
     for _ in payloads:
-        if off + 25 > len(out):
+        if off + 33 > len(out):
             return None                               # truncated reply: fall back rather than
-        code, nso, nse, flags, nnew, fault_pc = struct.unpack(   # invent one
-            "<iIIBIQ", out[off:off + 25])
-        off += 25
+        code, nso, nse, flags, nnew, fault_pc, fault_addr = struct.unpack(   # invent one
+            "<iIIBIQQ", out[off:off + 33])
+        off += 33
         so, se = out[off:off + nso], out[off + nso:off + nso + nse]
         off += nso + nse
         reached = ()
@@ -396,6 +399,8 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
                                  timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
                                  duration_ms=per_ms, fault_pc=(fault_pc or None),
+                                 fault_addr=(fault_addr if crashed and fault_pc
+                                             and fault_addr != 0xFFFFFFFFFFFFFFFF else None),
                                  # both channels, like run(): `blocks_hit` is the explicit
                                  # one, `note` stays for a reader that has not been moved over
                                  blocks_hit=tuple(reached) if blocks else None,

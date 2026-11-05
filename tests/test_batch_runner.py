@@ -162,7 +162,7 @@ def test_a_refaulting_handler_is_killed_at_the_deadline_not_spun_forever(gcc, tm
         pytest.skip("no function entries recovered")
     libc = _libc_for_trace()
     start = time.time()
-    rc, out, err, flags, reached, fault_pc = batch_runner._trace_one(
+    rc, out, err, flags, reached, fault_pc, _fault_addr = batch_runner._trace_one(
         libc, [str(exe)], b"", 2.0, blocks, str(exe), {})
     elapsed = time.time() - start
     # the regression: without the fix this never returns
