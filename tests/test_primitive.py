@@ -768,3 +768,27 @@ def test_a_lever_byte_between_the_sampled_offsets_is_still_found():
     finally:
         ps._ADDR_PROBE_FULL = old
     assert not (v0 or {}).get("controlled"), v0
+
+
+def test_file_mode_detonation_can_open_its_input(gcc, tmp_path):
+    """`_detonate_capturing` writes a file-mode input to scratch under /tmp, which the sandbox
+    masks with an empty tmpfs. Without binding it back the target only ever said it could not
+    open its input -- seen on the live run console (gif2rgb: every OOB probe 'Failed to open
+    given file'), so those experiments tested nothing."""
+    from types import SimpleNamespace
+
+    from lykos.analyze.poc import primitive_stage as ps
+    src = tmp_path / "o.c"
+    src.write_text('#include <stdio.h>\nint main(int c,char**v){FILE*f=fopen(v[1],"rb");'
+                   'if(!f){puts("CANNOT-OPEN");return 2;}int n=fgetc(f);printf("OPENED %d\\n",n);'
+                   'return 0;}\n')
+    (tmp_path / "bin").mkdir()
+    exe = tmp_path / "bin" / "o"                       # NOT the scratch dir's parent: the sandbox
+    if subprocess.run([gcc, "-O0", "-w", str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")                    # binds the exe's own dir back in
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    ctx = SimpleNamespace(scratch=lambda: scratch)
+    target = SimpleNamespace(arch=None, endianness=None, bits=None)
+    _rep, out = ps._detonate_capturing(ctx, target, str(exe), "file", ["@@"], b"A", 5)
+    assert b"OPENED 65" in out, out

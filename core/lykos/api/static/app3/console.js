@@ -19,6 +19,14 @@ function clock(t) {
   return d.toTimeString().slice(0, 8) + "." + String(Math.floor((t % 1) * 10));
 }
 function n(v) { return v == null ? "—" : (typeof v === "number" ? v.toLocaleString() : String(v)); }
+// Program output as a console line: printable text as-is (whitespace folded), mostly-binary
+// output (an image decoder writing pixels to stdout) as a short marker, never a wall of glyphs.
+function outText(label, s) {
+  if (!s) return null;
+  const bad = (s.match(/[\uFFFD\u0000-\u0008\u000E-\u001F]/g) || []).length;
+  if (bad > s.length * 0.15) return `${label}: [binary output, ${s.length} chars shown of the tail]`;
+  return `${label}: ` + s.replace(/\s+/g, " ").slice(0, 220);
+}
 function exitText(r) {
   if (r.sig) return r.sig;
   if (r.timeout) return "timeout";
@@ -39,9 +47,7 @@ function lineOf(r) {
       const bits = [r.cmd, r.bytes != null ? `${r.bytes} B` : null, r.mode && r.mode !== "stdin" ? r.mode : null,
                     exitText(r), r.pc ? `pc ${r.pc}` : null, r.addr ? `addr ${r.addr}` : null,
                     r.ms != null ? `${r.ms} ms` : null, r.iso || null].filter(Boolean);
-      const extra = [];
-      if (r.out) extra.push("stdout: " + r.out.replace(/\s+/g, " ").slice(0, 220));
-      if (r.err) extra.push("stderr: " + r.err.replace(/\s+/g, " ").slice(0, 220));
+      const extra = [outText("stdout", r.out), outText("stderr", r.err)].filter(Boolean);
       return [bits.join("   "), extra];
     }
     case "runs": {

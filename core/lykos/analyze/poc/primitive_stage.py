@@ -289,9 +289,13 @@ def _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout, *, asl
     else:
         return None, b""
     try:
+        # a file-mode input lives in scratch under /tmp, which the sandbox masks with an empty
+        # tmpfs: bind it back or the target only ever says it cannot open its input (the run
+        # console showed every one of these detonations failing that way on gif2rgb)
         res = sandbox.run(exe, argv=argv, stdin=stdin_bytes, timeout=timeout,
                           arch=target.arch, endianness=target.endianness, bits=target.bits,
-                          env_overrides=env, aslr=aslr)
+                          env_overrides=env, aslr=aslr,
+                          ro_binds=((str(work),) if mode == "file" else ()))
     except Exception:                                    # noqa: BLE001 -- advisory step
         return None, b""
     return (parse_asan_report((res.stderr or b"").decode("utf-8", "replace")),
