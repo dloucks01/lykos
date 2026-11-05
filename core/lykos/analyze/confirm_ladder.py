@@ -142,6 +142,13 @@ _MIT_GLOSS = {
 }
 
 
+def _enabled(v) -> bool:
+    """A mitigation value that means ON (True / "on" / "yes" / "full" / "enabled")."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("on", "yes", "true", "full", "enabled")
+    return v is True
+
+
 def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dict]:
     """{class_primitive, mitigations_in_way, demonstrated_level?, ceiling?, ceiling_reason?,
     targets_live?} for a finding, or None. Faithful: primitive = class definition, mitigations =
@@ -150,11 +157,14 @@ def finding_exploitability(f: dict, mitigations: Optional[dict]) -> Optional[dic
     prim = CLASS_PRIMITIVE.get(f.get("cwe"))
     m = mitigations or {}
     mi: list[str] = []
+    # Triage stores mitigations as strings ("on"/"off"/"partial"): a truthiness test read "off" as
+    # ENABLED, so a canary-less, partial-RELRO binary was told a canary and a read-only GOT stood
+    # in the way -- the GUI's exploitability block contradicted the target's own mitigation grid.
     for k in ("nx", "pie", "canary"):
-        if m.get(k):
+        if _enabled(m.get(k)):
             mi.append(_MIT_GLOSS[k])
     relro = m.get("relro")
-    if relro in ("full", True) or m.get("bind_now"):
+    if relro in ("full", True) or _enabled(m.get("bind_now")):
         mi.append("full RELRO/BIND_NOW — the GOT is read-only at runtime")
     elif relro == "partial":
         mi.append("partial RELRO — the GOT is still writable at runtime")

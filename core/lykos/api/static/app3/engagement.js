@@ -49,7 +49,7 @@ function AddTarget({ caseId, onAdded }) {
     <h2>Add a target</h2>
     <span class="muted" style="font-size:13px">Drop a binary or firmware image here, or${" "}
       <label style="color:var(--blue);cursor:pointer">browse files<input type="file" multiple hidden
-        onChange=${(e) => upload(e.target.files)} /></label>, or pick a
+        onChange=${(e) => upload(e.target.files)} /></label>, or pick a${" "}
       <label style="color:var(--blue);cursor:pointer">source folder<input type="file" webkitdirectory="" multiple hidden
         onChange=${(e) => upload(e.target.files)} /></label>.</span>
     ${busy ? html`<span class="dim" style="font-size:12px">${busy}</span>` : null}

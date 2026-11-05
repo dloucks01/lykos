@@ -170,3 +170,18 @@ def test_serializer_attaches_per_finding_detail():
     assert d["reachability"]["attack_surface"] == "on"
     assert d["verification"]["verdict"] == "prove-out-shortlist"
     assert d["verification"]["shortlist"] is True
+
+
+def test_mitigations_stored_as_off_are_not_in_the_way():
+    """Triage stores mitigations as strings; "off" is not an enabled mitigation. gif2rgb (no
+    canary, partial RELRO, no BIND_NOW) was told a canary and a read-only GOT stood in the way."""
+    from lykos.analyze.confirm_ladder import finding_exploitability
+    f = {"cwe": "CWE-125", "evidence": []}
+    m = {"nx": "on", "pie": "on", "relro": "partial", "bind_now": "off", "canary": "off"}
+    mi = " | ".join(finding_exploitability(f, m)["mitigations_in_way"])
+    assert "NX" in mi and "PIE" in mi
+    assert "canary" not in mi
+    assert "partial RELRO" in mi and "read-only" not in mi
+    full = finding_exploitability(f, {"relro": "full", "bind_now": "on", "canary": "on"})
+    assert any("read-only" in x for x in full["mitigations_in_way"])
+    assert any("canary" in x for x in full["mitigations_in_way"])
