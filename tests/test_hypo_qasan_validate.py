@@ -58,3 +58,46 @@ def test_silent_overread_validates_via_qasan_in_its_own_function_only(pie, tmp_p
     # an in-bounds input confirms nothing
     v3, _ = validate(t, _hyp(exe, "parse"), b"Q\x08AAAAAA")
     assert not v3.confirmed
+
+
+def test_hypo_hunt_stage_confirms_a_silent_heap_read_on_a_plain_binary(store, case, tmp_path, gcc):
+    """The autopilot stage, end to end, on Tier-0 o04_heap_read built PLAIN (no ASan, no -g): the
+    glyph index reads past malloc(n_glyphs) -- silent natively. The loop must propose it, solve an
+    input, and validate it by QASan inside `measure`."""
+    from pathlib import Path
+    from lykos.analyze import register
+    from lykos.analyze.hypo_stage import enqueue_hypo_hunt
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.hypo import engine
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    if engine.angr_python() is None:
+        pytest.skip("angr not available")
+    src = Path(__file__).resolve().parents[1] / "bench" / "tier0" / "o04_heap_read" / "prog.c"
+    exe = tmp_path / "o04"
+    if subprocess.run([gcc, "-O0", "-w", "-fno-stack-protector", "-no-pie", str(src), "-o",
+                       str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build o04")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, lease_seconds=600,
+                                                              poll_interval=0.05))
+    pool.start()
+    try:
+        t = ingest(store, case.id, exe)
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(120)
+        run = enqueue_hypo_hunt(q, t, params={"input_mode": "file", "argv": ["@@"],
+                                              "budget": 150, "mem_mb": 8192})
+        assert pool.wait_idle(600)
+        rec = q.runs.get(run.id)
+        assert rec.status == "done", rec.error
+    finally:
+        pool.stop(grace=3.0)
+    hy = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "hypo"]
+    done = store.conn.execute("SELECT payload_json FROM event WHERE type='hypo.done'").fetchall()
+    assert hy, f"no hypothesis validated: {[r[0] for r in done]}"
+    assert any("measure" in f.title and f.state == "confirmed" for f in hy), [f.title for f in hy]
+    for f in hy:
+        print("HYPO-FINDING", f.cwe, f.title, [e.get("detail") for e in f.evidence
+                                               if e.get("channel") == "validated"])

@@ -2588,6 +2588,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # cheaply (no build) for a binary-only target or a source tree with no in-tree
                 # harness -- so scheduling it unconditionally costs those nothing.
                 _staged(bud, store, t, "source_confirm", status, stop, want=240.0)
+                # NON-FUZZING FIRST on a BINARY: the hypothesis loop proposes violation sites in the
+                # binary's own code, solves each to an input with angr and confirms only what a
+                # site-attributed oracle (native crash or QASan in the site's function, 3/3) shows.
+                # Before the fuzz campaigns so they do not spend its slice. Declines on non-ELF /
+                # shared objects / >32 MB; a source project's binaries are hunted the same way.
+                if not _is_server:
+                    _staged(bud, store, t, "hypo_hunt", status, stop, want=150.0)
                 # UNDER-CONSTRAINED symbolic execution of the UNDRIVEN functions -- discovery for code
                 # no harness reaches (the ladder above and the campaigns below only exercise what a
                 # harness drives). It files CANDIDATE control-hijack leads with an under-constrained

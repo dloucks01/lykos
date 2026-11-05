@@ -132,6 +132,9 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("libfuzzer", "libFuzzer harness", "target", "..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
     StageSpec("source_confirm", "Directed source confirmation", "target",
               "..analyze.source_confirm_stage", "enqueue_source_confirm"),
+    # the binary counterpart: propose -> solve (angr) -> validate (native crash / QASan at the site)
+    StageSpec("hypo_hunt", "Hypothesis loop (propose -> solve -> validate)", "target",
+              "..analyze.hypo_stage", "enqueue_hypo_hunt"),
     StageSpec("uc_symbolic", "Under-constrained symbolic exec (undriven code)", "target",
               "..analyze.symbolic.uc_stage", "enqueue_uc_symbolic"),
     StageSpec("synth_confirm", "Synthesized-driver confirmation", "target",
