@@ -1484,6 +1484,12 @@ def primitive_stage(ctx) -> dict:
 #: one ptrace-captured detonation (milliseconds native), so the budget is generous for the
 #: minimized crash inputs this runs on and bounded for anything larger.
 _ADDR_PROBE_OFFSETS = 48
+#: When the evenly spaced sample finds no lever, the offsets it skipped are tried too, up to this
+#: input length and wall time. A lever byte sitting between two samples was invisible: giflib-5.1.4
+#: (150-byte crash, step 3) read "a FIXED address" while an 84-byte input of the SAME bucket (step
+#: 1, every byte tried) showed address control -- the verdict depended on the input's length.
+_ADDR_PROBE_FULL = 1024
+_ADDR_PROBE_FULL_S = 30.0
 _ADDR_PROBE_VALUES = (0x00, 0x40, 0x80, 0xff)
 
 
@@ -1588,6 +1594,23 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
             d = abs(int(cap["fault_addr"]) - base_addr)
             if d > best[0]:
                 best = (d, off, bytes(var))
+    if best[1] is None and step > 1 and len(orig) <= _ADDR_PROBE_FULL:
+        import time as _t
+        _stop = _t.monotonic() + _ADDR_PROBE_FULL_S
+        for off in range(len(orig)):
+            if off % step == 0:
+                continue                                   # already sampled above
+            if _t.monotonic() > _stop:
+                break
+            v = 0xFF if orig[off] != 0xFF else 0x00
+            var = bytearray(orig); var[off] = v
+            cap = cap_fn(bytes(var))
+            if cap.get("ok") and cap.get("fault_addr") is not None:
+                d = abs(int(cap["fault_addr"]) - base_addr)
+                if d:
+                    obs.append((f"byte@{off}=0x{v:02x}", cap))
+                    best = (d, off, bytes(var))
+                    break                                  # the lever; its scale is measured below
     # The campaign's OTHER crashes, each one a free observation of the same question.
     for sha, data in siblings or ():
         cap = cap_fn(data)

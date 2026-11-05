@@ -737,3 +737,34 @@ def test_a_read_off_the_buffer_end_onto_guard_pages_is_not_address_control():
     moved = [(lbl, cap(c["fault_addr"] + 0x18)) for lbl, c in obs]
     m = P.address_primitive(moved, disasm="movzx edx,BYTE PTR [rbx]")
     assert m["controlled"] and m["max_level"] == 2
+
+
+
+def test_a_lever_byte_between_the_sampled_offsets_is_still_found():
+    """`_address_verdict` with a 150-byte crashing input whose fault address depends ONLY on byte 4:
+    the evenly spaced sample steps by 3 (0, 3, 6, ...) and skips it. That read 'the faulting
+    address is FIXED' -- a DoS -- purely because of the input's length (giflib-5.1.4: L2 in one run,
+    L1 in the next, same defect). The skipped offsets are now tried when the sample finds none."""
+    from types import SimpleNamespace
+
+    from lykos.analyze.poc import primitive_stage as ps
+    orig = b"LZ\x00\x00\x40" + b"\x00" * 145
+    assert len(orig) // ps._ADDR_PROBE_OFFSETS == 3
+
+    def capture_for(_mode):
+        def cap(data):                                     # movzx edx, byte ptr [rdx]
+            return {"ok": True, "fault_addr": 0x7F0000000000 + data[4] * 0x100000,
+                    "pc": 0x401000, "pc_bytes": "0fb612", "signal_name": "SIGSEGV"}
+        return cap
+    ctx = SimpleNamespace(emit=lambda *a, **k: None)
+    verdict, _demo, _cap, _mode = ps._address_verdict(ctx, capture_for, ["stdin"], orig, "x86-64")
+    assert verdict and verdict.get("controlled"), verdict
+    assert verdict.get("offset") == 4, verdict
+    # the guard: the sample alone (fallback off) misses the lever
+    old = ps._ADDR_PROBE_FULL
+    try:
+        ps._ADDR_PROBE_FULL = 0
+        v0, *_ = ps._address_verdict(ctx, capture_for, ["stdin"], orig, "x86-64")
+    finally:
+        ps._ADDR_PROBE_FULL = old
+    assert not (v0 or {}).get("controlled"), v0

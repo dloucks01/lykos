@@ -15,6 +15,7 @@ makes it cancellable.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import re
 import threading
@@ -1588,6 +1589,52 @@ def _distinct_crashes(store, target_id):
     return _crash_representatives(store, target_id)[:_MAX_DISTINCT_CRASHES]
 
 
+def _bucket_key(d) -> tuple:
+    """The prove loop's crash bucket (see _crash_representatives for why each part is there)."""
+    if d.defect_key:
+        return (d.signal_name, d.defect_key)
+    if d.fault_pc is not None:
+        return (d.signal_name, d.fault_pc)
+    return (d.signal_name, None, _crash_channel(d))
+
+
+#: Extra inputs from the SAME crash bucket that poc_primitive gets when its first input showed a
+#: FIXED fault address. Which input represents a bucket is an accident of discovery order: on
+#: giflib-5.1.4 one run's representative moved the read address with the input (L2 address
+#: control) and the next run's -- same PC, same defect -- read one fixed address (DoS only).
+_PRIMITIVE_ALTS = 2
+
+
+def _bucket_alternates(store, target_id, rep, k: int = _PRIMITIVE_ALTS) -> list:
+    """Up to `k` other natively crashing inputs in `rep`'s bucket (distinct inputs)."""
+    key, seen, out = _bucket_key(rep), {rep.input_sha}, []
+    for d in DynResultDAO(store.conn).list_by_target(target_id):
+        if (not d.crashed or not d.input_sha or d.input_sha in seen
+                or (d.isolation or "") == "qasan" or _bucket_key(d) != key):
+            continue
+        seen.add(d.input_sha)
+        out.append(d)
+        if len(out) >= k:
+            break
+    return out
+
+
+def _primitive_fixed_address(store, case_id) -> bool:
+    """True when the LAST poc_primitive verdict on this case was 'the faulting address is fixed
+    across input variants' -- the one verdict another input of the same bucket can change."""
+    try:
+        row = store.conn.execute("SELECT payload_json FROM event WHERE type='primitive.done' "
+                                 "AND case_id=? ORDER BY rowid DESC LIMIT 1", (case_id,)).fetchone()
+        if not row:
+            return False
+        pl = json.loads(row[0] or "{}")
+        av = pl.get("address_verdict") or {}
+        return (not pl.get("confirmed") and av.get("controlled") is False
+                and not av.get("nondeterministic") and (av.get("span") == 0))
+    except Exception:                                    # noqa: BLE001 -- an extra attempt only
+        return False
+
+
 def _crash_representatives(store, target_id):
     """Every distinct crash bucket's representative(s), primaries first (uncapped)."""
     # A QASan-demonstrated error (isolation "qasan") does NOT crash natively, and this prove loop
@@ -1628,12 +1675,7 @@ def _crash_representatives(store, target_id):
         # signal on stdin and in an argv filename are two entry routes that need not share a
         # defect, and folding them made the second route's crash unprovable. On a substrate where
         # no PC can be recovered (wine, qemu) the bucket also keeps a second representative.
-        if d.defect_key:
-            key = (d.signal_name, d.defect_key)
-        elif d.fault_pc is not None:
-            key = (d.signal_name, d.fault_pc)
-        else:
-            key = (d.signal_name, None, _crash_channel(d))
+        key = _bucket_key(d)
         if key not in seen:
             seen.add(key)
             out.append(d)
@@ -2831,6 +2873,20 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     _staged(bud, store, t, "root_cause", status, stop, p, want=60.0)
                     _staged(bud, store, t, "build_poc", status, stop, p, want=60.0)
                     _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
+                    # a FIXED fault address on this input: another input of the same bucket may
+                    # move it (the representative is whichever input found the bucket first)
+                    if _max_verified_poc_level(store, tid) < 2 and _primitive_fixed_address(
+                            store, t.case_id):
+                        for alt in _bucket_alternates(store, tid, cr):
+                            if stop.is_set():
+                                break
+                            pa = {"input_sha": alt.input_sha}
+                            if getattr(alt, "input_mode", None) and getattr(alt, "argv", None):
+                                pa.update(argv=list(alt.argv), input_mode=alt.input_mode)
+                            _staged(bud, store, t, "poc_primitive", status, stop, pa, want=60.0)
+                            if (_max_verified_poc_level(store, tid) >= 2
+                                    or not _primitive_fixed_address(store, t.case_id)):
+                                break
                     _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
                 # Prove each recorded HANG (CWE-835). A campaign files a re-verified hang as a
                 # corroborated finding with no dyn_result row, so the crash loop above never sees
