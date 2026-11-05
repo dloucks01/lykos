@@ -11,9 +11,12 @@ def _cwe(text):
 def test_ubsan_array_index_is_a_bounds_bug_not_generic_ub():
     # An out-of-bounds array write used to classify as CWE-758/medium, which buries a real
     # memory-safety defect. UBSan does not say whether the access was a read or a write, so the
-    # bounds PARENT class is the honest answer -- not CWE-125/CWE-787.
+    # answer must not guess CWE-125/CWE-787. CWE-129 (improper validation of an array index) is
+    # direction-neutral and is the class lykos files out-of-bounds indexes under everywhere else
+    # (the static CWE-129 detector, oob_index) -- rootcause maps it there deliberately.
     cwe, bug = _cwe("t.c:4:67: runtime error: index 64 out of bounds for type 'char [64]'")
-    assert cwe == "CWE-119" and bug == "array-index-out-of-bounds"
+    assert cwe in ("CWE-129", "CWE-119") and bug == "array-index-out-of-bounds"
+    assert cwe not in ("CWE-758", "CWE-125", "CWE-787")
 
 
 def test_ubsan_signed_integer_overflow():
