@@ -132,6 +132,10 @@ function RunScreen({ caseId, targets, ap, refreshAp, go }) {
     <${PlanStrip} plan=${ap && ap.plan} stage=${stage} setStage=${setStage} />
     <${Console} recs=${recs} caseId=${caseId} targets=${targets} stage=${stage} setStage=${setStage} />
     <${FuzzWindows} recs=${recs} />
+    <details class="panel" style="padding:0">
+      <summary class="pad" style="cursor:pointer;font-weight:600">Drive a target by hand <span class="dim" style="font-weight:400;font-size:12px">— interactive sandboxed console</span></summary>
+      <div style="padding:0 0 2px"><${Lazy} path="./interact.js" name="InteractiveConsole" props=${{ targets }} /></div>
+    </details>
     <${Lazy} path="./results.js" name="RunResults" fallback=${html``}
       props=${{ caseId, ap, targets, running: !!(ap && (ap.running || ap.state === "running")),
                 onOpenStage: (st) => { setStage(st); window.scrollTo({ top: 0, behavior: "smooth" }); },

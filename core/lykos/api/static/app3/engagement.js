@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
+import { folderArchive, isFolderPick } from "../app/archive.js";
 import { bestLevel, getJSON, laneOf, pocsOf, rankFindings, startSettings } from "./data.js";
 import { Lazy, useModule } from "./lazy.js";
 
@@ -25,8 +26,16 @@ function AddTarget({ caseId, onAdded }) {
   const [over, setOver] = useState(false);
   const [busy, setBusy] = useState(null);
   const [err, setErr] = useState(null);
-  const upload = async (files) => {
+  const upload = async (fileList) => {
     setErr(null);
+    let files = [...fileList];
+    // a FOLDER pick (a source tree) is packed into one archive client-side and ingested as a
+    // source project, as the previous workbench did
+    if (isFolderPick(fileList)) {
+      setBusy(`packing ${files.length} files into a source archive…`);
+      try { files = [await folderArchive(fileList)]; }
+      catch (e) { setBusy(null); setErr(`could not pack the folder: ${e.message || e}`); return; }
+    }
     for (const f of files) {
       setBusy(`uploading ${f.name}…`);
       try { await api.uploadTarget(caseId, f); } catch (e) { setErr(`${f.name}: ${e.message || e}`); }
@@ -36,11 +45,13 @@ function AddTarget({ caseId, onAdded }) {
   };
   return html`<section class=${"drop" + (over ? " over" : "")}
       onDragOver=${(e) => { e.preventDefault(); setOver(true); }} onDragLeave=${() => setOver(false)}
-      onDrop=${(e) => { e.preventDefault(); setOver(false); upload([...e.dataTransfer.files]); }}>
+      onDrop=${(e) => { e.preventDefault(); setOver(false); upload(e.dataTransfer.files); }}>
     <h2>Add a target</h2>
     <span class="muted" style="font-size:13px">Drop a binary or firmware image here, or${" "}
-      <label style="color:var(--blue);cursor:pointer">browse<input type="file" multiple hidden
-        onChange=${(e) => upload([...e.target.files])} /></label>.</span>
+      <label style="color:var(--blue);cursor:pointer">browse files<input type="file" multiple hidden
+        onChange=${(e) => upload(e.target.files)} /></label>, or pick a
+      <label style="color:var(--blue);cursor:pointer">source folder<input type="file" webkitdirectory="" multiple hidden
+        onChange=${(e) => upload(e.target.files)} /></label>.</span>
     ${busy ? html`<span class="dim" style="font-size:12px">${busy}</span>` : null}
     ${err ? html`<span style="color:var(--amber-tx);font-size:12px">${err}</span>` : null}
   </section>`;
