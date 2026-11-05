@@ -200,7 +200,7 @@ export const api = {
   // The tool's own validation gates (`lykos archgate` / `realgate` / `eval`), one at a time in the
   // background; poll selftest() for progress and the verdict. selftestHistory() = `lykos dashboard`.
   selftest: () => _req("GET", "/selftest"),
-  startSelftest: (kind, options = {}) => _req("POST", "/selftest", { kind, options }),
+  startSelftest: (kind, options = {}) => _req("POST", "/selftest", { body: { kind, options } }),
   selftestHistory: () => _req("GET", "/selftest/history"),
 };
 

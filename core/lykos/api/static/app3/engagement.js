@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
-import { bestLevel, getJSON, laneOf, pocsOf, rankFindings } from "./data.js";
+import { bestLevel, getJSON, laneOf, pocsOf, rankFindings, startSettings } from "./data.js";
 import { Lazy, useModule } from "./lazy.js";
 
 const LEVEL_TEXT = { L3: "working exploit", L2: "control primitive", L1: "crash" };
@@ -55,14 +55,15 @@ function StartPanel({ caseId, targets, onStarted }) {
   const [more, setMore] = useState(false);
   const [opts, setOpts] = useState({});
   const mod = useModule("./results.js");
+  useEffect(() => { if (mod && mod.loadRunOptions) setOpts(mod.loadRunOptions()); }, [mod]);
   const start = async () => {
     setBusy(true); setErr(null);
-    const st = mod && mod.buildRunSettings ? mod.buildRunSettings(opts) : { overrides: {}, skipStages: [] };
-    const overrides = { ...st.overrides };
-    if (argv.trim()) overrides.argv = argv.trim();
-    if (mode !== "auto") overrides.input_mode = mode;
     try {
-      await api.startBackground(caseId, targets.map((t) => t.id), budget, overrides, !!opts.converge, st.skipStages);
+      const [ov, converge, skip] = await startSettings(mod, opts, caseId);
+      const overrides = { ...ov };
+      if (argv.trim()) overrides.argv = argv.trim();
+      if (mode !== "auto") overrides.input_mode = mode;
+      await api.startBackground(caseId, targets.map((t) => t.id), budget, overrides, converge, skip);
       onStarted && onStarted();
     }
     catch (e) { setErr(String(e.message || e)); }
@@ -82,7 +83,7 @@ function StartPanel({ caseId, targets, onStarted }) {
           <option value="300">5 min</option><option value="600">10 min</option>
           <option value="1800">30 min</option><option value="7200">2 h</option></select></label>
     </div>
-    ${more ? html`<${Lazy} path="./results.js" name="RunOptions" props=${{ value: opts, onChange: setOpts, caseId }}
+    ${more ? html`<${Lazy} path="./results.js" name="RunOptions" props=${{ value: opts, onChange: setOpts, caseId, hideInvocation: true }}
       fallback=${html`<span class="dim">More options are not available.</span>`} />` : null}
     <div class="row-c"><button class="btn primary" disabled=${busy || !targets.length} onClick=${start}>Start analysis</button>
       <button class="btn sm" onClick=${() => setMore(!more)} aria-expanded=${more}>${more ? "Fewer options ▴" : "More options ▾"}</button>

@@ -95,3 +95,16 @@ export function functionAt(functions, addr) {
   }
   return best;
 }
+
+// The start arguments for api.startBackground after the budget: [overrides, converge, skipStages],
+// from the run-options module (results.js) when it loaded. Seeds default to ALL of the case's
+// seeds, as the previous workbench did -- the server uses none when seed_shas is absent.
+export async function startSettings(mod, opts, caseId) {
+  if (!mod || !mod.buildRunSettings) return [{}, !!(opts && opts.converge), []];
+  let seeds = null;
+  try { const r = await api.seeds(caseId); seeds = Array.isArray(r) ? r : (r && (r.seeds || Object.values(r).find(Array.isArray))) || []; }
+  catch (_e) { seeds = null; }
+  if (mod.saveRunOptions) mod.saveRunOptions(opts);
+  const st = mod.buildRunSettings(opts, seeds);
+  return [st.overrides || {}, !!(opts && opts.converge), st.skipStages || []];
+}

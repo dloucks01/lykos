@@ -1,0 +1,66 @@
+/* System screen (app3/system.js). Uses the tokens in next.html; adds only what this screen needs. */
+:root { --sy-bad: #FFB4A6; --sy-bad-edge: #7A3B2E; --sy-bad-soft: #2A1714; }
+
+.sy-grid { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.sy-col { flex: 1 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.sy-h { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.sy-sub { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--tx2); margin-bottom: 6px; }
+.sy-note { font-size: 12.5px; margin: 6px 0 0; }
+.sy-warn { font-size: 12.5px; color: var(--amber-tx); background: var(--amber-soft); border: 1px solid #5C4618;
+           border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+.sy-amber { color: var(--amber-tx); border-color: #5C4618; }
+.sy-amber-tx { color: var(--amber-tx); }
+
+/* build */
+.sy-display { font-size: 13px; margin-top: 8px; color: var(--tx); word-break: break-word; }
+.sy-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 10px 0 0; font-size: 12.5px; }
+.sy-dl dt { color: var(--tx3); } .sy-dl dd { margin: 0; color: var(--tx2); word-break: break-all; }
+
+/* doctor */
+.sy-doctor { overflow: hidden; }
+.sy-verdict { margin: 0 16px; padding: 10px 12px; border-radius: 8px; font-size: 13px; border: 1px solid var(--border);
+              background: var(--raised); }
+.sy-verdict.t-ok { border-color: var(--blue-edge); background: var(--blue-soft); color: var(--blue-tx); }
+.sy-verdict.t-info { color: var(--tx); }
+.sy-verdict.t-warn { border-color: #5C4618; background: var(--amber-soft); color: #F3D9A8; }
+.sy-verdict.t-bad { border-color: var(--sy-bad-edge); background: var(--sy-bad-soft); color: var(--sy-bad); }
+.sy-doctor .kpi { padding: 10px 12px; } .sy-doctor .kpi b { font-size: 20px; }
+.sy-tc { font-size: 11.5px; padding-top: 6px; padding-bottom: 0; word-break: break-word; }
+.sy-gaps { display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--line); margin-top: 10px; }
+.sy-gap { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; }
+.sy-cmd { display: flex; align-items: center; gap: 8px; margin-top: 6px; min-width: 0; }
+.sy-cmd code { flex: 1 1 auto; min-width: 0; font-size: 11.5px; background: var(--term); border: 1px solid var(--border);
+               border-radius: 6px; padding: 5px 8px; color: #CBD2DC; overflow-x: auto; white-space: pre; user-select: all; }
+.sy-cmd .btn.sm { flex: none; }
+.sy-tier { border-top: 1px solid var(--line); }
+.sy-tier-h { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 10px 16px 4px; font-size: 13px; }
+.sy-tier-h .dim { font-size: 12px; }
+.sy-tool { display: flex; gap: 10px; padding: 7px 16px; align-items: flex-start; }
+.sy-tool + .sy-tool { border-top: 1px solid #191E26; }
+.sy-mark { flex: none; width: 16px; text-align: center; font-weight: 700; color: var(--blue); }
+.sy-tool.miss .sy-mark { color: var(--amber); } .sy-tool.part .sy-mark { color: var(--amber-tx); }
+.sy-tool-b { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
+.sy-tool-t { font-size: 13px; font-weight: 600; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sy-tool-t .chip { font-weight: 500; font-size: 11px; padding: 1px 8px; }
+.sy-unl, .sy-without { font-size: 12.5px; color: var(--tx2); }
+.sy-found { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* self-test */
+.sy-gates { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 12px; }
+.sy-gate { font: inherit; text-align: left; display: flex; flex-direction: column; gap: 3px; padding: 10px 12px;
+           border-radius: 10px; border: 1px solid var(--border); background: var(--raised); color: var(--tx); cursor: pointer; }
+.sy-gate:hover { border-color: var(--border-2); }
+.sy-gate:disabled { opacity: .5; cursor: default; }
+.sy-gate b { font-size: 13px; } .sy-gate span { font-size: 12px; } .sy-gate .mono { font-size: 11px; }
+.sy-run { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+          display: flex; flex-direction: column; gap: 8px; background: var(--bar); }
+.sy-verdict-chip { font-size: 11.5px; font-weight: 700; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--border-2); }
+.sy-verdict-chip.t-ok { color: var(--blue-tx); border-color: var(--blue-edge); background: var(--blue-soft); }
+.sy-verdict-chip.t-info { color: var(--tx2); }
+.sy-verdict-chip.t-bad { color: var(--sy-bad); border-color: var(--sy-bad-edge); background: var(--sy-bad-soft); }
+.sy-reason { font-size: 13px; } .sy-reason.t-bad { color: var(--sy-bad); } .sy-reason.t-ok { color: var(--blue-tx); }
+.sy-pre { margin: 6px 0 0; font: 11.5px/1.55 var(--mono); background: var(--term); color: #CBD2DC; border: 1px solid var(--border);
+          border-radius: 8px; padding: 8px 10px; max-height: 340px; overflow: auto; white-space: pre; }
+.sy-reg { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--amber-tx); }
+
+@media (max-width: 700px) { .sy-dl { grid-template-columns: 1fr; } .sy-dl dd { margin-bottom: 4px; } }

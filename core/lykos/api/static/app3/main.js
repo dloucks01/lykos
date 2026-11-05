@@ -8,7 +8,7 @@ import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 import { CodeScreen } from "./code.js";
 import { Console, FuzzWindows, NowRunning, PlanStrip } from "./console.js";
-import { useCaseData } from "./data.js";
+import { startSettings, useCaseData } from "./data.js";
 import { Lazy, useModule } from "./lazy.js";
 import { EngagementScreen } from "./engagement.js";
 import { FindingDetail, ProofScreen } from "./proof.js";
@@ -72,10 +72,7 @@ function RunControls({ caseId, targets, ap, onChanged }) {
   const [opts, setOpts] = useState({});
   const [showOpts, setShowOpts] = useState(false);
   const settingsMod = useModule("./results.js");
-  const startArgs = () => {
-    const st = settingsMod && settingsMod.buildRunSettings ? settingsMod.buildRunSettings(opts) : { overrides: {}, skipStages: [] };
-    return [st.overrides, !!opts.converge, st.skipStages];
-  };
+  useEffect(() => { if (settingsMod && settingsMod.loadRunOptions) setOpts(settingsMod.loadRunOptions()); }, [settingsMod]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const running = ap && (ap.running || ap.state === "running");
@@ -108,7 +105,8 @@ function RunControls({ caseId, targets, ap, onChanged }) {
           </select></label>
         <button class="btn sm" onClick=${() => setShowOpts(!showOpts)} aria-expanded=${showOpts}>Options${showOpts ? " ▴" : " ▾"}</button>
         <button class="btn primary sm" disabled=${busy || !targets.length}
-          onClick=${() => act(() => api.startBackground(caseId, targets.map((t) => t.id), budget, ...startArgs()))}>
+          onClick=${() => act(async () => api.startBackground(caseId, targets.map((t) => t.id), budget,
+            ...(await startSettings(settingsMod, opts, caseId))))}>
           Start analysis</button>`}
       ${err ? html`<span style="color:var(--amber-tx);font-size:12px">${err}</span>` : null}
     </div>
@@ -118,7 +116,7 @@ function RunControls({ caseId, targets, ap, onChanged }) {
   </div>`;
 }
 
-function RunScreen({ caseId, targets, ap, refreshAp }) {
+function RunScreen({ caseId, targets, ap, refreshAp, go }) {
   const recs = useCaseConsole(caseId);
   const [stage, setStage] = useState("");
   return html`
@@ -134,8 +132,11 @@ function RunScreen({ caseId, targets, ap, refreshAp }) {
     <${PlanStrip} plan=${ap && ap.plan} stage=${stage} setStage=${setStage} />
     <${Console} recs=${recs} caseId=${caseId} targets=${targets} stage=${stage} setStage=${setStage} />
     <${FuzzWindows} recs=${recs} />
-    <${Lazy} path="./results.js" name="RunResults"
-      props=${{ caseId, running: !!(ap && (ap.running || ap.state === "running")) }} fallback=${html``} />`;
+    <${Lazy} path="./results.js" name="RunResults" fallback=${html``}
+      props=${{ caseId, ap, targets, running: !!(ap && (ap.running || ap.state === "running")),
+                onOpenStage: (st) => { setStage(st); window.scrollTo({ top: 0, behavior: "smooth" }); },
+                onOpenFinding: go ? (id) => go("finding", { findingId: id }) : undefined,
+                onFocusTarget: go ? (tid) => go("proof", { targetId: targets.some((t) => t.id === tid) ? tid : null }) : undefined }} />`;
 }
 
 const NAV = [["engagement", "Engagement"], ["run", "Run"], ["proof", "Proof"], ["code", "Code"], ["system", "System"]];
@@ -186,11 +187,12 @@ function App() {
   let body;
   if (!caseId) body = html`<div class="empty">No case yet.
       <${EngagementScreen} cases=${cases} caseId=${null} setCaseId=${setCaseId} data=${data} go=${go} reloadCases=${reloadCases} /></div>`;
-  else if (r.view === "run") body = html`<${RunScreen} caseId=${caseId} targets=${data.targets} ap=${ap} refreshAp=${refreshAp} />`;
+  else if (r.view === "run") body = html`<${RunScreen} caseId=${caseId} targets=${data.targets} ap=${ap} refreshAp=${refreshAp} go=${go} />`;
   else if (r.view === "proof") body = html`<${ProofScreen} data=${data} targetId=${r.targetId}
       open=${(id) => go("finding", { findingId: id })} focusTarget=${(t) => setR((o) => ({ ...o, targetId: t }))} />`;
   else if (r.view === "finding") body = html`<${FindingDetail} data=${data} findingId=${r.findingId}
-      back=${() => go("proof")} toCode=${(t, addr) => go("code", { targetId: t, addr })} />`;
+      back=${() => go("proof")} toCode=${(t, addr) => go("code", { targetId: t, addr })}
+      open=${(id) => go("finding", { findingId: id })} />`;
   else if (r.view === "code") body = html`<${CodeScreen} data=${data} targetId=${r.targetId} focusAddr=${r.addr}
       focusTarget=${(t) => go("code", { targetId: t })} openFinding=${(id) => go("finding", { findingId: id })} />`;
   else if (r.view === "system") body = html`<${Lazy} path="./system.js" name="SystemScreen" />`;

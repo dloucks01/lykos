@@ -51,6 +51,38 @@ def _flag_prefix(argv: list, mode: str, data: bytes) -> list:
     return argv
 
 
+def _delivery_for(store, target, input_sha, rows):
+    """(mode, argv) for an input with no crash row: the PoC bundle's meta.json, else the most
+    common delivery among the target's crashing rows. (None, []) when nothing says."""
+    import json
+    import tarfile
+    try:
+        from ..db.dao import PocDAO
+        for p in PocDAO(store.conn).list_by_target(target.id):
+            if p.input_sha != input_sha or not p.bundle_sha:
+                continue
+            try:
+                with tarfile.open(store.content.path(p.bundle_sha), mode="r:gz") as tf:
+                    for m in tf.getmembers():
+                        if m.isfile() and m.name.split("/")[-1] == "meta.json":
+                            meta = json.loads(tf.extractfile(m).read(1 << 20) or b"{}")
+                            mode = meta.get("input_mode") or meta.get("mode")
+                            if mode:
+                                av = meta.get("argv") or meta.get("base_argv") or []
+                                return mode, [str(a) for a in av] if isinstance(av, list) else []
+            except Exception:                         # noqa: BLE001 -- not a readable bundle
+                continue
+    except Exception:                                 # noqa: BLE001 -- fall through to the rows
+        _log.debug("poc bundle delivery lookup failed", exc_info=True)
+    crashed = [d for d in rows if d.crashed and d.input_mode]
+    if crashed:
+        from collections import Counter
+        mode = Counter(d.input_mode for d in crashed).most_common(1)[0][0]
+        ref = next(d for d in reversed(crashed) if d.input_mode == mode)
+        return mode, list(ref.argv or [])
+    return None, []
+
+
 def replay_verdict(store, target, input_sha: str, *, times: int = 5,
                    timeout: float = 8.0, persist: bool = True) -> Optional[dict]:
     """Replay `input_sha` against `target` `times` times (bounded 1..10) and return the verdict
@@ -66,10 +98,23 @@ def replay_verdict(store, target, input_sha: str, *, times: int = 5,
     except Exception:
         _log.debug("replay input load failed for %s", input_sha, exc_info=True)
         return None
-    dr = next((d for d in DynResultDAO(store.conn).list_by_target(target.id)
-               if d.input_sha == input_sha), None)
-    mode = (dr.input_mode if dr else None) or "stdin"
+    rows = DynResultDAO(store.conn).list_by_target(target.id)
+    dr = next((d for d in rows if d.input_sha == input_sha), None)
+    mode = dr.input_mode if dr else None
     argv = list(dr.argv) if (dr and dr.argv) else []
+    if not mode:
+        # A PoC's (often minimized) input has no crash row of its own. Defaulting to stdin
+        # replayed a file-input target's PoC over stdin: "did not reproduce 0/5" on a proven
+        # gif2rgb finding. Take the delivery the PoC bundle recorded, else the channel the
+        # target's crashes were found on.
+        mode, argv = _delivery_for(store, target, input_sha, rows)
+    mode = mode or "stdin"
+    # The oracle the crash was found under: a heap over-read found with the guard-page allocator
+    # (isolation "...+guardpage") does not fault natively, so a plain replay "did not reproduce"
+    # a proven finding. Replay under the same guard when this input's row, or (for a PoC input
+    # with no row) the target's crashes on this channel, used it.
+    ref_rows = [dr] if dr else [d for d in rows if d.crashed and (d.input_mode or "stdin") == mode]
+    guard = any("guardpage" in (d.isolation or "") for d in ref_rows)
     base_argv = _flag_prefix(argv, mode, data)
 
     d = Path(tempfile.mkdtemp(prefix="lykos-replay-"))
@@ -93,7 +138,7 @@ def replay_verdict(store, target, input_sha: str, *, times: int = 5,
             try:
                 _, res = run_input(exe, mode, workfile, timeout, target.arch, data,
                                    endianness=target.endianness, bits=target.bits,
-                                   base_argv=base_argv)
+                                   base_argv=base_argv, guard_page=guard)
             except Exception:
                 _log.debug("replay run_input failed for %s", input_sha, exc_info=True)
                 continue                          # a delivery that cannot be built is not a crash
