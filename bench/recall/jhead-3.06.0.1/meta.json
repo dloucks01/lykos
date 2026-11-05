@@ -113,5 +113,6 @@
       "reason": "faulty code still present, but since 5186ddc every section is allocated with 20 spare bytes, so the over-reads stay in bounds and are invisible to ASan (Debian still lists 6624/6625 as unfixed/unimportant)."
     }
   ],
-  "binary_path": "examples/vuln-targets/bin/jhead-3.06.0.1_x86-64"
+  "binary_path": "examples/vuln-targets/bin/jhead-3.06.0.1_x86-64",
+  "debug_binary": "examples/vuln-targets/bin/jhead-3.06.0.1_x86-64.dbg"
 }

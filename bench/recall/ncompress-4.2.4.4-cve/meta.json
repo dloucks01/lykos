@@ -45,5 +45,6 @@
       "reason": "MAXCODE(maxbits) at compress42.c:1644 is computed before the maxbits>BITS check; maxbits<=31 and long is 64-bit on LP64, and the check then aborts. Not a crash on x86-64."
     }
   ],
-  "binary_path": "examples/vuln-targets/bin/ncompress_x86-64_cve"
+  "binary_path": "examples/vuln-targets/bin/ncompress_x86-64_cve",
+  "debug_binary": "examples/vuln-targets/bin/ncompress_x86-64_cve.dbg"
 }

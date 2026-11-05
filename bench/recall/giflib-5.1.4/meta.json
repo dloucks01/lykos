@@ -413,5 +413,6 @@
       "reason": "Uninitialized buffer in DumpScreen2RGB. An info/MSan issue, not a crash."
     }
   ],
-  "binary_path": "examples/vuln-targets/bin/gif2rgb_x86-64"
+  "binary_path": "examples/vuln-targets/bin/gif2rgb_x86-64",
+  "debug_binary": "examples/vuln-targets/bin/gif2rgb_x86-64.dbg"
 }
