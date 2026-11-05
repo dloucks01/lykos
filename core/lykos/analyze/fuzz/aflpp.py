@@ -270,7 +270,10 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
     # several times slower than native, and AFL's default calibration timeout marks it "too slow"
     # and can abort the whole run. `<ms>+` keeps going and skips the slow entries instead of
     # failing. Native (instrumented) runs keep AFL's own auto-calibration.
-    tmout = ["-t", "5000+"] if qemu else []
+    # Under QASan a detection often SPINS until the per-exec timeout (its report path does not
+    # exit), so every hit costs a full timeout: measured on gif2rgb, 23 timeouts x 5 s ate 115 s of
+    # a 120 s campaign. 2 s keeps detections cheap; `+` still skips genuinely slow entries.
+    tmout = (["-t", "2000+"] if qasan else ["-t", "5000+"]) if qemu else []
     cmd = [str(afl)] + (["-Q"] if qemu else []) + tmout + ffile + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
     env = dict(os.environ)

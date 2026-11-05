@@ -1320,10 +1320,58 @@ def _file_assertion(ctx, target, fd, *, mode, data, prefix, res, msg, detector) 
 _ENGINE_OF_PREFIX = {"fuzz": "fuzz", "directed": "directed_fuzz", "harness": "boundary_fuzz"}
 
 
+#: kept (coverage-novel) inputs remembered per stage for the QASan sweep
+_QASAN_SINK_CAP = 400
+#: inputs the sweep replays: the most recently kept ones (deepest coverage) first
+_QASAN_SWEEP_RUNS = 24
+
+
+def qasan_sweep(ctx, target, sink, *, exec_timeout: float, origin: str,
+                max_runs: int = _QASAN_SWEEP_RUNS, deadline_s: float = 45.0) -> int:
+    """Replay a campaign's kept inputs under QASan (the binary memory oracle): this engine runs the
+    target natively, so a heap over-read / small over-write / UAF on any of them was invisible. The
+    most recently kept inputs go first -- coverage-novel inputs found late are the deepest. One
+    bounded pass per stage; files through coverage.qasan_pass (confirmed, forgery-checked).
+    Declines (0) when QASan does not apply to this target. Never raises."""
+    if not sink or ctx.should_cancel():
+        ctx.emit(f"{origin}.qasan_sweep", payload={"applied": False, "kept_inputs": len(sink or ()),
+                                                   "note": "no kept inputs to sweep"})
+        return 0
+    try:
+        from ..dynamic import qasan
+        first_exe = sink[0][3]
+        ok, why = qasan.applicable(Path(first_exe).read_bytes(), target.arch)
+        if not ok:
+            ctx.emit(f"{origin}.qasan_sweep", payload={"applied": False, "note": why})
+            return 0
+        from . import aflpp
+        if aflpp.is_sanitizer_build(Path(first_exe).read_bytes()):
+            return 0                                  # ASan already instruments this build
+        from .coverage import qasan_pass
+        groups: dict = {}
+        for data, mode, suffix, exe, argv in reversed(sink):          # newest first
+            groups.setdefault((mode, suffix, exe, argv), []).append(data)
+        filed, per = 0, max(4, max_runs // max(1, len(groups)))
+        for (mode, suffix, exe, argv), inputs in groups.items():
+            seen, uniq = set(), []
+            for d in inputs:
+                if d not in seen:
+                    seen.add(d); uniq.append(d)
+            filed += qasan_pass(ctx, target, exe, uniq[:per], mode=mode, argv=list(argv),
+                                suffix=suffix, exec_timeout=exec_timeout, origin=origin,
+                                max_runs=per, deadline_s=deadline_s / max(1, len(groups)))
+        return filed
+    except Exception as e:                               # noqa: BLE001 -- additive lane
+        observe.absorbed(_log, "qasan sweep skipped")
+        ctx.emit(f"{origin}.qasan_sweep", level="warn",
+                 payload={"applied": False, "error": f"{type(e).__name__}: {e}"[:200]})
+        return 0
+
+
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
                   mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None,
-                  exe_name: str = ""):
+                  exe_name: str = "", kept_sink: Optional[list] = None):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -1750,6 +1798,9 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         corpus[rng.randrange(len(corpus))] = data
                     kept += 1
                     kept_this = True
+                    if kept_sink is not None and len(kept_sink) < _QASAN_SINK_CAP:
+                        # (input, how it was delivered) for the end-of-stage QASan sweep
+                        kept_sink.append((data, mode, _suffix, str(exe), tuple(base_argv or ())))
                     if closer and not novel:
                         directed_kept += 1
             if all_blocks and cover_reported:
@@ -2742,6 +2793,7 @@ def fuzz_stage(ctx) -> dict:
     blocks_known = 0
     stage_deadline = time.time() + max_seconds
     stopped_by: dict = {}
+    _kept_sink: list = []
     for i, ch in enumerate(channels):
         _kw = {"run_fn": _lin_run} if _lin_run is not None else {}
         # A channel that converged or stalled early hands its unused slice to the channels after
@@ -2757,7 +2809,7 @@ def fuzz_stage(ctx) -> dict:
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
                            cover_blocks=blocks, cover_flags=flags, base_argv=base_argv,
-                           exe_name=_exec_name, **_kw)
+                           exe_name=_exec_name, kept_sink=_kept_sink, **_kw)
         for k in totals:
             totals[k] += st.get(k, 0)
         blocks_hit = max(blocks_hit, st.get("blocks_hit", 0))
@@ -2768,6 +2820,8 @@ def fuzz_stage(ctx) -> dict:
             break
     ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals,
                                        "stopped": stopped_by or None})
+    if p.get("qasan", True) and not totals.get("crashes"):
+        qasan_sweep(ctx, target, _kept_sink, exec_timeout=exec_timeout, origin="fuzz")
     # Block coverage: how much of the recovered code the campaign actually reached. A parser
     # that fuzzed for a full budget but hit 3% of blocks never got past its length check.
     pct = round(100.0 * blocks_hit / blocks_known, 1) if blocks_known else None

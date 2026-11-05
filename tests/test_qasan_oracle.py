@@ -174,3 +174,55 @@ def test_static_function_frames_without_module_suffix_are_the_site():
     assert r.alloc_off == 0x575d
     # libc at +0xdb3601 from the image base is outside the image span -> not a target frame
     assert r.frames[3][2] is None
+
+
+_GATED_FUZZ = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+int main(void){ unsigned char h[8]; if(read(0,h,8)<2) return 0;
+  unsigned n=h[1]; char *b=malloc(16); memset(b,'x',16);
+  volatile unsigned long s=0;
+  if(n>16){ puts("long record");                    /* a new behaviour the fuzzer keeps */
+    s += b[16 - (int)n]; }                          /* heap UNDER-read: before the chunk */
+  free(b); return 0; }
+"""
+
+
+def test_sandbox_fuzz_stage_sweeps_its_kept_inputs_under_qasan(store, case, tmp_path, gcc):
+    """The blind `fuzz` stage runs natively (with the guard-page allocator) and keeps behaviour-novel
+    inputs. A heap UNDER-read lands before the chunk -- libdislocator guards only the END of an
+    allocation, so it never faults -- and only the end-of-stage QASan sweep can demonstrate it."""
+    import base64
+    from lykos.analyze import register
+    from lykos.analyze.fuzz import enqueue_fuzz
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    exe = _build(_GATED_FUZZ, tmp_path, gcc, "gfz")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, lease_seconds=180,
+                                                              poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, case.id, exe)
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(120)
+        enqueue_fuzz(q, t, params={"input_mode": "stdin", "max_seconds": 20, "max_execs": 3000,
+                                   "exec_timeout": 1,
+                                   "seeds": [base64.b64encode(b"Q\x04AAAAAA").decode()]})
+        assert pool.wait_idle(240)
+    finally:
+        pool.stop(grace=3.0)
+    q_f = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "qasan"]
+    if not q_f:
+        sweep = store.conn.execute("SELECT payload_json FROM event WHERE type='fuzz.qasan_sweep'"
+                                   ).fetchall()
+        errs = [r[0] for r in sweep if '"error"' in (r[0] or "")]
+        if errs:                               # a broken sweep must fail, not skip
+            pytest.fail(f"qasan sweep errored: {errs}")
+        pytest.skip("the blind campaign kept no input with n>16 in its budget (load)")
+    assert q_f[0].cwe == "CWE-125" and q_f[0].state == "confirmed" and "main" in q_f[0].title
+    assert any("found by fuzz" in (e.get("detail") or "") for e in q_f[0].evidence)
