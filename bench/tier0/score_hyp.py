@@ -13,7 +13,8 @@ Only then is the answer key consulted:
   * found               = a confirmation at a declared bug line (exec oracle: injected exec)
   * false confirmation  = a confirmation anywhere else, or on a negative case
 
-usage: score_hyp.py [--budget S] [--jobs N] [--out DIR] [--json FILE] [--keep DIR] [case-id ...]
+usage: score_hyp.py [--budget S] [--jobs N] [--out DIR] [--json FILE] [--keep DIR] [--binary-only]
+                    [case-id ...]
 """
 import argparse
 import json
@@ -29,6 +30,9 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "core"))   # the product's hypo package: engine + validator
+
+
+BINARY_ONLY = False
 
 
 def score_case(cid, bindir, budget, keep=None):
@@ -75,8 +79,14 @@ def score_case(cid, bindir, budget, keep=None):
                             extra=extra, workdir=Path(work))
     wall = round(time.time() - t0, 1)
     hyps = engine.hypotheses_from(out, prog)
-    target = Target(exe=Path(prog), argv=list(inv["argv"]), mode=inv["input_mode"],
-                    asan_exe=Path(asan), msan_exe=Path(msan) if has_msan else None)
+    if BINARY_ONLY:
+        # binary-only oracle: no sanitizer builds -- the validator must confirm from a native
+        # crash or QASan (QEMU-ASan on the plain prog). DWARF of prog is used only to SCORE.
+        target = Target(exe=Path(prog), argv=list(inv["argv"]), mode=inv["input_mode"],
+                        arch="x86-64")
+    else:
+        target = Target(exe=Path(prog), argv=list(inv["argv"]), mode=inv["input_mode"],
+                        asan_exe=Path(asan), msan_exe=Path(msan) if has_msan else None)
     bug_lines = {b["line"]: b for b in case["bugs"]}
     found, false_conf, rows = {}, [], []
     for h in hyps:
@@ -110,8 +120,13 @@ def main():
     ap.add_argument("--out", help="build dir to (re)use")
     ap.add_argument("--json", help="write full results here")
     ap.add_argument("--keep", help="keep each case's work dir (spec, out.json, driver.log) here")
+    ap.add_argument("--binary-only", action="store_true",
+                    help="validate with NO sanitizer builds (native crash / QASan only) -- the "
+                         "binary-only measurement; prog's DWARF is used only to score")
     ap.add_argument("cases", nargs="*")
     a = ap.parse_args()
+    global BINARY_ONLY
+    BINARY_ONLY = bool(a.binary_only)
     ids = a.cases or sorted(d for d in os.listdir(HERE)
                             if os.path.isfile(os.path.join(HERE, d, "case.json")))
     bindir = a.out or tempfile.mkdtemp(prefix="tier0-bin-")
