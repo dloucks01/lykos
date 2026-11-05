@@ -106,6 +106,39 @@ difference between seeing and not seeing the bug class.
 6. **Static-binary scoping**: on a statically linked binary, scope taint/bounds to non-libc code
    (FLIRT-identified or symbol-named libc bodies excluded) — jhead-3.04 spent 229 s analysing glibc.
 
-## 5. Bench after this session
+## 5. Results (2026-11-04, second session)
 
-(filled in from bench/recall/runs-binary-20261104b)
+**Recall bench, binary surface, blind** (bench/recall/runs-binary-20261104b, rescored with the
+debug-twin matcher): 3/35 defects (5/48 ids). New: giflib's DumpScreen2RGB colormap over-read
+(CVE-2016-3977 / CVE-2020-23922 / CVE-2022-28506) found blind via the QASan lane and proven at L2
+with a verified PoC; both earlier runs missed it. jhead-3.06 L3 and ncompress L2 held.
+
+**Tier-0, binary-only** (`score_hyp.py --binary-only`: no sanitizer builds, the validator must
+confirm from a native crash or QASan): first measurement 14/48 with **30 false confirmations** --
+all from the native-crash rule "fault PC anywhere in the hypothesis's function". After the
+site-precise attribution fix (57a7f5a): **15/48, 0 false**. Same code with the sanitizer oracle:
+32/48, 0 false. The gap is classes a plain binary cannot show without instrumentation (stack
+writes into a callee's frame, uninit, leaks, type confusion) plus solver reach.
+
+| doc 62 §4 item | status | commit |
+|---|---|---|
+| 1 QASan everywhere | AFL lane, sandbox/directed fuzz sweep, hypo validator lane, 2 s AFL timeout. QASan reproducer bundle **not built** (deferred) | 2063a2f e118d32 86b02ed |
+| 2 binary ground truth | debug twins (3 byte-identical; unzip/jhead-3.04 not reproducible), address matcher, `binary-stripped` surface, one crash = one defect | 780aa48 |
+| 3 hypothesis loop stage | `hypo_hunt` in the autopilot search phase before fuzzing; o04 heap read validated by QASan on a plain build | de44d82 57a7f5a |
+| 4 P-Code detectors | alloc-size overflow (`pcode_alloc_overflow`): Tier-0 2/2 real, 0 on 10,705 real functions | d671f65 |
+| 5 unicorn driver-synth | open | |
+| 6 static-binary scoping | jhead-3.04 detect 39 s -> 3 s, 463/464 program sites kept | cda08a8 |
+
+**Also fixed this session:** taint fixpoints were round-robin (one 1,950-block glibc function: 426 s
+in one call, out of the cancel check's reach) -> worklists, verified identical on 2,852/2,852 runs
+(7eb9b62); libtokencap preloaded into bwrap/setarch so their option strings were "runtime tokens"
+(87c86ab); 16 stages registered only on import and undispatchable from the web GUI (562f45a).
+
+**Known open:** `tests/test_ubsan_classify.py::test_ubsan_array_index_is_a_bounds_bug_not_generic_ub`
+fails on HEAD (expects CWE-119, gets CWE-129); `core/tests/test_triage.py` and `tests/test_triage.py`
+collide when both trees are collected together.
+
+**Next:** run the blind recall bench with hypo_hunt + pcode_alloc_overflow + scoping in; the
+`binary-stripped` surface run; item 5; extend pcode_guards to the guard_gap / intwidth analogues;
+heap/global field taint for pcode_guards (its measured reach gap -- decoded struct fields read in
+another function).
