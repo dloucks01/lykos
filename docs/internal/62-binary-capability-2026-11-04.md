@@ -138,7 +138,24 @@ in one call, out of the cancel check's reach) -> worklists, verified identical o
 fails on HEAD (expects CWE-119, gets CWE-129); `core/tests/test_triage.py` and `tests/test_triage.py`
 collide when both trees are collected together.
 
-**Next:** run the blind recall bench with hypo_hunt + pcode_alloc_overflow + scoping in; the
-`binary-stripped` surface run; item 5; extend pcode_guards to the guard_gap / intwidth analogues;
-heap/global field taint for pcode_guards (its measured reach gap -- decoded struct fields read in
-another function).
+**Final blind recall run, everything in** (bench/recall/runs-binary-20261104c, 600 s):
+
+| surface | defects | proven (verified PoC) | notes |
+|---|---|---|---|
+| baseline binary (11-02) | 2/35 | 2 (jhead-3.06 L3, ncompress L2) | |
+| binary (11-04) | **4/35** | **4**: giflib L2, jhead-3.04 L3, jhead-3.06 L3, ncompress L2 | jhead-3.04 executed its target for the first time (taint fix) and its CVE-2022-41751 went L3 |
+| binary-stripped (new) | 3/35 | 3 (all but jhead-3.04) | matched by address through the debug twins |
+
+jhead-3.04 stripped (static + stripped) still reaches nothing. `hypo_hunt` ran on every target but
+**did not pay on real binaries yet**: it proposed 79-3,230 hypotheses (jhead-3.04: 3,085 generic
+"store" sites), solved at most 1 in its 150 s and confirmed 0 -- it works at Tier-0 scale, and on
+real parsers solver reach + hypothesis RANKING are the bottleneck.
+
+**Next (ranked):**
+1. Rank and cap hypo_hunt's proposals toward sites other evidence already points at (detect_cwe /
+   pcode_alloc_overflow sites, QASan sweep hits, directed-fuzz nearest blocks) instead of solving
+   thousands of generic stores; seed angr from fuzz corpora that already reach the site.
+2. Stripped STATIC binaries (jhead-3.04 stripped): FLIRT-relabel quality and reach there.
+3. pcode_guards: heap/global field taint (its measured reach gap) and the guard_gap / intwidth
+   analogues.
+4. Item 5 (unicorn driver-synth) for functions no whole-program path reaches.
