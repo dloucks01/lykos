@@ -1188,7 +1188,12 @@ class EndpointsMixin:
                 if err:
                     return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._TARGET_STAGES[stage])
-                run = fn(q, target) if stage in (_INGEST, "disassemble", "detect_cwe") \
+                # The no-params set is the stage table's own (StageSpec.no_params), the same one the
+                # autopilot uses. A hard-coded trio here made every newer no-params stage
+                # (guard_gap, triage, attack_path, ...) TypeError at dispatch: runnable from the
+                # CLI/autopilot, unreachable from the web GUI.
+                from ..analyze.orchestrate import _NO_PARAMS
+                run = fn(q, target) if (stage in _NO_PARAMS or stage == _INGEST) \
                     else fn(q, target, params=params)
             elif stage in self._TARGET_STAGES:
                 return self._json({"error": f"stage {stage!r} requires a target_id"}, 400)

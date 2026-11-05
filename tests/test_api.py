@@ -387,7 +387,8 @@ def test_target_stage_enqueue_fns_accept_params():
     import inspect
 
     from lykos.api.server import Handler
-    no_params = {"ingest_triage", "disassemble", "detect_cwe"}
+    from lykos.analyze.orchestrate import _NO_PARAMS
+    no_params = set(_NO_PARAMS) | {"ingest_triage"}
     broken = []
     for stage, (mod, fn_name) in Handler._TARGET_STAGES.items():
         if stage in no_params:
