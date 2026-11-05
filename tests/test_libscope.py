@@ -162,3 +162,32 @@ def test_call_into_an_unanalysed_library_body_is_still_a_named_sink():
                            dst_name="system", external=False)
     flagged = taint.analyze_program({main: ir}, [edge], "x86-64", entry_seeds={main: {1}})
     assert "0x1008" in flagged
+
+
+def test_layout_reach_scopes_a_stripped_static_image_without_hiding_program_code():
+    """Stripped static image, no symbol-file marks: the boundary is the lowest identified library
+    body above main; above it, only what main cannot reach through program code is excluded."""
+    from types import SimpleNamespace as N
+
+    from lykos.analyze.detect.libscope import _layout_reach
+    fn = lambda a, n=None: N(addr=hex(a), name=n or f"FUN_{a:08x}")   # noqa: E731
+    funcs = [fn(0x1000, "main"), fn(0x1100), fn(0x1200),            # program region
+             fn(0x5000, "system"), fn(0x5100, "snprintf"), fn(0x5200, "open"),
+             fn(0x5300, "read"), fn(0x5400, "write"),                # identified library bodies
+             fn(0x6000),            # unnamed, called only by library code   -> excluded
+             fn(0x6100),            # unnamed, called directly by main       -> kept (leaf)
+             fn(0x6200),            # called by program code below B         -> kept
+             fn(0x6300),            # called only via 0x6100 (above B)       -> excluded
+             fn(0x0800)]            # unnamed BELOW main: never excluded
+    excluded = {f.addr: "name" for f in funcs if not f.name.startswith(("FUN_", "main"))}
+    e = lambda s, d: N(src_addr=hex(s), dst_addr=hex(d))             # noqa: E731
+    edges = [e(0x1000, 0x1100), e(0x1100, 0x1200), e(0x1000, 0x6100), e(0x1200, 0x6200),
+             e(0x1000, 0x5000), e(0x5000, 0x6000), e(0x6100, 0x6300)]
+    got = _layout_reach(funcs, excluded, edges)
+    assert set(got) == {hex(0x6000), hex(0x6300)}, got
+    assert all(v == "layout-reach" for v in got.values())
+    # too little library evidence above main: the boundary is not trusted
+    few = {hex(0x5000): "name"}
+    assert _layout_reach(funcs, few, edges) == {}
+    # no main: nothing to anchor on
+    assert _layout_reach([f for f in funcs if f.name != "main"], excluded, edges) == {}

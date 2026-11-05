@@ -171,8 +171,56 @@ class Driver:
         self.main_obj = self.p.loader.main_object
         self.x86 = self.p.arch.name in ("AMD64", "X86")
         self._install_models()
+        self._install_ifuncs()
         self.dlocals = self._dwarf_locals()
         self._globals_table()
+
+    def _install_ifuncs(self):
+        """Keep by-name models OFF a static binary's IFUNC resolvers.
+
+        In a static glibc binary the symbol `strlen` IS the IFUNC resolver; the startup calls it
+        once (IRELATIVE) and stores what it returns in the `.plt` GOT slot. `hook_symbol("strlen",
+        LeanStrlen)` therefore hooked the RESOLVER: the startup's call returned strlen(<garbage>)
+        = 0, the slot became 0, and every later strlen call jumped to 0x0 -- measured: 9,698
+        errored states from the strlen stub at 0x4010f0 on static jhead-3.04 (113,738 in a longer
+        run), the hypothesis loop's reach collapse on static binaries.
+
+        The parent resolved each slot offline (spec["ifunc"] = [[slot, impl, name, resolver]],
+        link-time VAs). A hooked resolver is unhooked and its model moved to the implementation
+        the resolver selects, so the startup's IRELATIVE pass writes the real implementation and
+        every call through the slot still reaches the model. A routine angr models but the driver
+        does not hook gets angr's libc SimProcedure on the implementation (no symbolic stepping
+        through SSE2 string code). The slot is also written directly, for a run that does not
+        start at the image's entry."""
+        slots = self.spec.get("ifunc") or []
+        if not slots:
+            return
+        obj = self.main_obj
+        shift = obj.mapped_base - getattr(obj, "linked_base", 0)
+        libc = self.angr.SIM_PROCEDURES.get("libc", {})
+        moved = hooked = written = 0
+        for row in slots:
+            slot, impl, name = row[0], row[1], row[2]
+            resolver = row[3] if len(row) > 3 else None
+            r_impl = impl + shift
+            r_res = resolver + shift if resolver is not None else None
+            if r_res is not None and self.p.is_hooked(r_res):
+                model = self.p.hooked_by(r_res)
+                self.p.unhook(r_res)
+                if not self.p.is_hooked(r_impl) and model is not None:
+                    self.p.hook(r_impl, model)
+                    moved += 1
+            elif name and name in libc and not self.p.is_hooked(r_impl):
+                self.p.hook(r_impl, libc[name]())
+                hooked += 1
+            try:
+                self.p.loader.memory.pack_word(slot + shift, r_impl)
+                written += 1
+            except Exception:  # a slot outside the loaded image: leave it
+                pass
+        self.stats["ifunc_slots"] = written
+        self.stats["ifunc_moved"] = moved
+        self.stats["ifunc_hooked"] = hooked
 
     def _globals_table(self):
         """Data objects with known extent: ELF symbols with a size (best effort; stripped -> sections)."""
@@ -1112,6 +1160,11 @@ class Driver:
         has_check = False                 # TOCTOU: the program performs a filename check somewhere
         open_sites = []                   # (ins, cs, func, callee) of input-openable sinks
         own = self._own_functions() if self.spec.get("cb_scope") else None
+        if self.spec.get("own_funcs"):
+            # the core's library attribution (libscope) for a static binary: link-time VAs
+            _d = self.main_obj.mapped_base - self.main_obj.linked_base
+            spec_own = {int(a) + _d for a in self.spec["own_funcs"]}
+            own = spec_own if own is None else (own & spec_own) or spec_own
         if own is not None:
             self.stats["own_functions"] = len(own)
         # FOCUS: propose only inside the functions other evidence names (link-time VAs from the
@@ -2550,6 +2603,16 @@ class Driver:
                 key = f"{type(e.error).__name__}@{e.state.addr:#x}"
                 errs = self.stats.setdefault("errored", {})
                 errs[key] = errs.get(key, 0) + 1
+                # WHERE the path came from (guest blocks, not the Python stack): the evidence that
+                # names the unmodelled pointer behind a jump to 0 (static libc init skipped, ...)
+                try:
+                    _src = list(e.state.history.bbl_addrs)[-3:]
+                    _fk = f"{key}<-{_src[-1]:#x}" if _src else key
+                    _fr = self.stats.setdefault("errored_from", {})
+                    if len(_fr) < 24 or _fk in _fr:
+                        _fr[_fk] = _fr.get(_fk, 0) + 1
+                except Exception:
+                    pass
                 tr = self.stats.setdefault("errored_trace", {})
                 if key not in tr:       # first traceback per kind: the evidence to fix a model
                     import traceback as _tb

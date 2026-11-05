@@ -26,6 +26,15 @@ missed bug.
   name         No usable file attribution: glibc-internal spellings (`_IO_`, `_dl_`, `_nl_`, `__`),
                the C runtime glue (`_start`, `frame_dummy`, ...), and libc API names DEFINED in the
                binary (a static `memcpy` body is libc's).
+  layout-reach Stripped, no file marks: the linker appends archive members (libc.a) AFTER the
+               program's own objects, so the program's code lies below the lowest identified
+               library body above `main` (the boundary B). A function is excluded on this basis
+               only when it lies at or above B AND `main` cannot reach it through the program's
+               own code (functions below B, never through an identified library body). Either
+               test alone keeps it: a boundary placed too low by a stray hot/startup-section libc
+               body still leaves every program function main calls in scope. Measured on stripped
+               jhead-3.04: 22 -> 634 of 786 excluded, 0 of the 86 program functions (truth: the
+               unstripped twin's symbol-file attribution).
 
 A function attributed to a program source file is never excluded, `main` is never excluded, and
 nothing is ever excluded on a dynamically linked binary.
@@ -140,12 +149,53 @@ def _symbol_marks(blob, info):
     return [a for a, _ in marks], [o for _, o in marks]
 
 
-def library_scope(blob, functions, *, flirt_named=None) -> dict:
+#: identified library bodies above main needed before the layout boundary is trusted
+_LAYOUT_MIN_LIB = 5
+
+
+def _layout_reach(functions, excluded: dict, edges) -> dict:
+    """{addr: "layout-reach"} for the stripped-static case (see the module docstring)."""
+    by_int = {}
+    for f in functions:
+        a = _to_int(getattr(f, "addr", None))
+        if a is not None:
+            by_int[a] = f
+    main = next((a for a, f in by_int.items() if _base_name(getattr(f, "name", "") or "") == "main"),
+                None)
+    if main is None:
+        return {}
+    lib = {_to_int(a) for a in excluded}
+    lib.discard(None)
+    above = sorted(a for a in lib if a > main)
+    if len(above) < _LAYOUT_MIN_LIB:
+        return {}
+    bound = above[0]
+    adj: dict = {}
+    for e in edges or ():
+        s_, d_ = _to_int(getattr(e, "src_addr", None)), _to_int(getattr(e, "dst_addr", None))
+        if s_ is not None and d_ is not None:
+            adj.setdefault(s_, set()).add(d_)
+    reach, stack = {main}, [main]
+    while stack:
+        u = stack.pop()
+        for v in adj.get(u, ()):
+            if v in reach or v not in by_int or v in lib:
+                continue
+            reach.add(v)
+            if v < bound:                                # traverse only the program's own region
+                stack.append(v)
+    return {by_int[a].addr: "layout-reach" for a in by_int
+            if a >= bound and a not in reach and a not in lib}
+
+
+def library_scope(blob, functions, *, flirt_named=None, edges=None) -> dict:
     """Classify `functions` (objects with `.addr`/`.name`) of the ELF image `blob`.
 
     Returns {"linking", "excluded": {addr: basis}, "basis": {basis: count}, "total", "kept",
     "sample": [names]}. `excluded` is empty -- nothing scoped -- unless the image is statically
     linked. `flirt_named` ({hex_va: name}) overrides the FLIRT pass (tests); default computes it.
+    `edges` (call edges with `.src_addr`/`.dst_addr`) enable the layout-reach basis on a stripped
+    image with no symbol-file marks.
     """
     from .. import elf as elfmod
     out = {"linking": None, "excluded": {}, "basis": {}, "total": len(functions or []),
@@ -213,6 +263,9 @@ def library_scope(blob, functions, *, flirt_named=None) -> dict:
             excluded[f.addr] = "flirt"
         elif is_library_name(name):
             excluded[f.addr] = "name"
+    if edges is not None and not addrs and excluded:
+        for a, b in _layout_reach(functions, excluded, edges).items():
+            excluded.setdefault(a, b)
     kept = sum(1 for f in functions if f.addr not in excluded)
     # Never blind the stage: if scoping would leave nothing, the attribution is wrong.
     if not kept:

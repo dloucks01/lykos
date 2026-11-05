@@ -424,7 +424,7 @@ def _library_scoped(ctx, target, functions, edges, *, off=False):
     from . import libscope
     try:
         blob = ctx.content.path(target.sha256).read_bytes()
-        sc = libscope.library_scope(blob, functions)
+        sc = libscope.library_scope(blob, functions, edges=edges)
     except Exception:                                    # noqa: BLE001 -- scoping is best-effort
         observe.absorbed(_log, "static-binary scoping unavailable; analysing every function")
         return none

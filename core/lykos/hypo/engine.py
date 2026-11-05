@@ -54,6 +54,21 @@ def scoped(cmd: list, mem_mb: int) -> list:
     return list(cmd)
 
 
+def _ifunc_slots(binary) -> list:
+    """[[slot_va, impl_va, name|None, resolver_va]] for a static binary's IFUNC slots (link-time
+    VAs), resolved here because the driver's interpreter cannot import lykos. The driver needs the
+    resolver to keep a by-name model OFF it (see hyp_driver._install_ifuncs). [] for an image with
+    no IRELATIVE relocations."""
+    try:
+        from ..analyze import ifunc
+        data = Path(binary).read_bytes()
+        impls, names = ifunc.resolve(data), ifunc.slot_names(data)
+        res = dict(ifunc.irelative_relocs(data))
+        return [[s, i, names.get(s), res.get(s)] for s, i in sorted(impls.items())]
+    except Exception:                                    # noqa: BLE001 -- an aid, never fatal
+        return []
+
+
 def run_driver(binary, *, argv, input_mode: str, budget: float, input_size: int = 300,
                mem_mb: int = 8192, extra: Optional[dict] = None,
                workdir: Optional[Path] = None, python: Optional[Path] = None) -> dict:
@@ -70,6 +85,8 @@ def run_driver(binary, *, argv, input_mode: str, budget: float, input_size: int 
             "input_size": int(input_size), "max_seconds": float(budget),
             "max_rss_mb": max(1024, int(mem_mb * 0.75))}
     spec.update(extra or {})
+    if "ifunc" not in spec:
+        spec["ifunc"] = _ifunc_slots(binary)
     sp, op, lp = work / "spec.json", work / "out.json", work / "driver.log"
     sp.write_text(json.dumps(spec))
     if op.exists():

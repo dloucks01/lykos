@@ -25,7 +25,7 @@ import os
 import re
 import time
 
-from ..db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, TargetDAO
+from ..db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ..jobs.registry import register_stage
 
 HYPO_STAGE = "hypo_hunt"
@@ -110,6 +110,11 @@ def hypo_stage(ctx) -> dict:
     if p.get("focus", True):
         focus, basis = _focus_functions(ctx.conn, target, int(p.get("max_focus", _MAX_FOCUS)))
     extra = {"focus_funcs": focus} if focus else {}
+    own = _program_functions(ctx, target)
+    if own:
+        # a STATIC binary: propose only in the program's own code, never inside the linked-in
+        # libc (measured: 3,229 proposals on static jhead-3.04, nearly all in glibc, without it)
+        extra["own_funcs"] = own
     seed_fmt = None
     if p.get("seed", True) and mode in ("file", "stdin"):
         seed_fmt, seed = _pick_seed(ctx, target, exe, mode, argv)
@@ -153,6 +158,42 @@ _FOCUS_WEIGHT = {"qasan": 10.0, "fuzz": 8.0, "directed_fuzz": 8.0, "coverage_fuz
 _FOCUS_CWES = {"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125", "CWE-126",
                "CWE-127", "CWE-129", "CWE-131", "CWE-190", "CWE-191", "CWE-369", "CWE-415",
                "CWE-416", "CWE-476", "CWE-787", "CWE-805", "CWE-822", "CWE-823", "CWE-824"}
+
+
+def _program_functions(ctx, target):
+    """Link-time VAs of the program's OWN functions on a statically linked target (libscope's
+    library attribution: symbol files, FLIRT, names, layout + reach), or None when nothing is
+    scoped (dynamic binary, no attribution)."""
+    try:
+        from . import elf as elfmod
+        from .detect import libscope
+        fns = FunctionDAO(ctx.conn).list_by_target(target.id)
+        if not fns:
+            return None
+        blob = ctx.content.path(target.sha256).read_bytes()
+        sc = libscope.library_scope(blob, fns, edges=CallEdgeDAO(ctx.conn).list_by_target(target.id))
+        ex = sc.get("excluded") or {}
+        if not ex:
+            return None
+        base = 0
+        info = elfmod.parse(blob)
+        if info.elf_type and "DYN" in str(info.elf_type).upper():
+            from .debug import rootcause
+            base = rootcause.image_base(fns, info.entry)
+            if base is None:
+                return None
+        out = []
+        for f in fns:
+            if f.addr in ex:
+                continue
+            try:
+                a = int(f.addr, 16) if isinstance(f.addr, str) else int(f.addr)
+            except (TypeError, ValueError):
+                continue
+            out.append(a - base)
+        return sorted(out) or None
+    except Exception:                                    # noqa: BLE001 -- scoping is an aid
+        return None
 
 
 def _focus_functions(conn, target, cap: int):
