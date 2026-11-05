@@ -818,11 +818,12 @@ def detect_stage(ctx) -> dict:
         # reachability from the input sources) instead of being dropped whole; `rk` reports what
         # that selection left out.
         rk: dict = {}
+        capped: set = set()
         tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,
                                               max_funcs=taint_cap, skipped_out=oversized,
                                               heap_regions=heap_regions, ranked_out=rk,
-                                              should_stop=ctx.should_cancel)
+                                              should_stop=ctx.should_cancel, capped_out=capped)
         if rk:
             ctx.emit("detect.taint_ranked", payload={**rk, "cap": taint_cap})
             if rk.get("skipped_reachable", 0) > 0:
@@ -857,6 +858,15 @@ def detect_stage(ctx) -> dict:
                 "note": ("ranked parser entries' buffer parameters seeded as attacker-controlled; "
                          "the new sink sites are filed as candidates (attacker-reachability assumed, "
                          "not demonstrated)")})
+        if capped:
+            names = {f.addr: f.name for f in (dctx.functions or []) if getattr(f, "addr", None)}
+            ctx.emit("detect.functions_work_capped", payload={
+                "count": len(capped), "work_cap": taint._MAX_FN_WORK,
+                "functions": sorted(str(names.get(a) or a) for a in capped)[:20],
+                "note": (f"{len(capped)} function(s) hit the per-function data-flow work cap "
+                         f"({taint._MAX_FN_WORK:,} transfers); their taint is a partial "
+                         f"(under-approximate) result -- flows inside may be missed, none are "
+                         f"invented.")})
         if oversized:
             # One level down from the whole-analysis ceiling: a single function past the block
             # limit is skipped entire, and "no tainted flow here" was indistinguishable from
