@@ -418,6 +418,8 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._static_asset("classic.html")
             if path == "/rebuild.html":        # doc 59 ground-up GUI rebuild (dev entry; old app stays)
                 return self._static_asset("rebuild.html")
+            if path == "/next.html":           # the redesigned workbench (app3/), built screen by screen
+                return self._static_asset("next.html")
             m = _STATIC_ASSET.match(path)
             if m:
                 return self._static_asset(m.group(1))

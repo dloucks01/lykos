@@ -180,6 +180,7 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
         el = max(1e-3, time.time() - t0)
         _live.fuzz("Function harness", final=final, execs=fr.execs, eps=round(fr.execs / el),
                    cov=len(fr.blocks), cov_label="blocks", crashes=len(fr.crashes),
+                   crash_label="raw faults",
                    corpus=len(corpus), status=("done " if final else "driving ") + _label,
                    out=[f"function {_label}, emulated, redzone heap",
                         f"{len(fr.crashes)} fault site(s), {len(fr.oracle_hits)} huge-alloc hit(s)"]

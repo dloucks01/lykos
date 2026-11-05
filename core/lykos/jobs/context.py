@@ -371,7 +371,7 @@ def _console_mirror(type: str, payload) -> None:
         if type in ("job.progress", "job.log"):
             if pl.get("msg"):
                 log.note(pl["msg"])
-        elif type.endswith(".progress") and "execs" in pl:
+        elif type.endswith(".progress") and "execs_per_sec" in pl and "budget" in pl:
             # a sandbox fuzz campaign's heartbeat (fuzz / directed_fuzz / ...): its technique window
             prefix = type[:-len(".progress")]
             outs = pl.get("outcomes") or {}
@@ -392,7 +392,7 @@ def _console_mirror(type: str, payload) -> None:
         elif type.endswith(".done") and not type.startswith("job."):
             import json as _json
             log.write("done", True, event=type, summary=_json.dumps(pl, default=str)[:600])
-            if isinstance(pl.get("execs"), int):
+            if isinstance(pl.get("execs"), int) and pl["execs"] > 0:
                 # a campaign's final numbers: its technique window, even for an engine with no
                 # heartbeat of its own (env_fuzz, net_fuzz, ...)
                 log.fuzz(type[:-len(".done")], final=True, execs=pl.get("execs"),
