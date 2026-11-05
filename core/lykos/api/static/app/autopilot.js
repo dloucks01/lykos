@@ -102,6 +102,7 @@ const PIPELINE = [
   { stage: "directed_fuzz", phase: "search" },
   { stage: "boundary_fuzz", phase: "search" },              // IPC/protocol boundary, if any
   { stage: "firmware_rehost", phase: "search" },            // emulate a carved firmware image
+  { stage: "harness", phase: "search" },                    // drive parsers under the emulator
   { stage: "concolic", isBackend: true, onlyIfNoCrash: true, phase: "search" },
   { stage: "root_cause", needsCrash: true, phase: "prove" },
   { stage: "build_poc", needsCrash: true, phase: "prove" },

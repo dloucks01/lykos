@@ -27,7 +27,7 @@ __attribute__((noinline)) void unsafe(char *buf){
   unsigned int len;
   memcpy(&len, buf, 4);
   char *p = malloc(len);                 /* attacker-controlled allocation SIZE */
-  if (p){ p[0] = 1; free(p); }
+  if (p && len){ p[0] = 1; free(p); }    /* len==0 + p[0] would be a (real) heap overflow */
 }
 __attribute__((noinline)) void safe(char *buf){
   (void)buf;

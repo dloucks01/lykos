@@ -128,7 +128,7 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
                   budget_seconds: float = 60.0, max_crashes: int = 8, max_oracle: int = 2,
                   dictionary: Optional[list] = None, sequence: bool = False,
                   seq_sep: bytes = b"\n", max_messages: int = 6, seed: int = 1337,
-                  load_base: int = 0) -> FuzzResult:
+                  load_base: int = 0, stub_names: Optional[dict] = None) -> FuzzResult:
     """Coverage-guided fuzz of one function. Returns crashing inputs + the corpus it built.
 
     `dictionary` (T4): the function's own constant operands -- magic values, length limits, opcodes
@@ -154,8 +154,10 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
     def _drive(buf: bytes) -> HarnessResult:
         if sequence:
             return run_sequence(elf_bytes, func_addr, _split_messages(buf, seq_sep, max_messages),
+                                stub_names=stub_names,
                                 arg_shape=arg_shape, load_base=load_base)
-        return run_function(elf_bytes, func_addr, buf, arg_shape=arg_shape, load_base=load_base)
+        return run_function(elf_bytes, func_addr, buf, arg_shape=arg_shape, load_base=load_base,
+                            stub_names=stub_names)
 
     seen_crash_sites: set = set()
     exec_errors = 0

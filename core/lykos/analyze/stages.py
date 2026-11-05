@@ -135,6 +135,10 @@ STAGES: tuple[StageSpec, ...] = (
     # the binary counterpart: propose -> solve (angr) -> validate (native crash / QASan at the site)
     StageSpec("hypo_hunt", "Hypothesis loop (propose -> solve -> validate)", "target",
               "..analyze.hypo_stage", "enqueue_hypo_hunt"),
+    # drive the binary's own parsers directly under the emulator (redzone heap), for code no
+    # whole-program path reaches; function-level until a program replay (native / QASan) agrees
+    StageSpec("harness", "Emulated function harness (binary)", "target", "..analyze.harness",
+              "enqueue_harness"),
     StageSpec("uc_symbolic", "Under-constrained symbolic exec (undriven code)", "target",
               "..analyze.symbolic.uc_stage", "enqueue_uc_symbolic"),
     StageSpec("synth_confirm", "Synthesized-driver confirmation", "target",
@@ -181,8 +185,6 @@ STAGES: tuple[StageSpec, ...] = (
     # --- On demand: dispatchable via the API/CLI, deliberately NOT autopilot-scheduled --------
     # Each needs an operator decision a run does not have. Listed (out of the plan) so they are
     # dispatchable and so a stage cannot fall out of the catalogue unseen.
-    StageSpec("harness", "", "target", "..analyze.harness", "enqueue_harness", in_plan=False,
-              on_demand="started from the Code tab's function view on the functions the operator picks"),
     StageSpec("patch_diff", "", "target", "..analyze.patch_diff_stage", "enqueue_patch_diff", in_plan=False,
               on_demand="needs a second build chosen as the baseline to diff against"),
     StageSpec("variant_scan", "", "target", "..analyze.scan_stages", "enqueue_variant_scan", in_plan=False,

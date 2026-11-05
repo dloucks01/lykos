@@ -32,13 +32,65 @@ _ACCESS_CWE = {"read": ("CWE-125", "out-of-bounds read"),
 _X86_64 = {"x86-64", "x86_64", "amd64"}
 
 
+_HEAP_CWE = {"heap-use-after-free": ("CWE-416", "heap use-after-free"),
+             "double-free": ("CWE-415", "double free"),
+             "invalid-free": ("CWE-763", "free of an invalid pointer")}
+
+
 def _fault_cwe(r) -> tuple:
     """(CWE, kind) for a harness fault. An access inside the NULL page is a NULL-pointer
     dereference (CWE-476) whatever its direction -- filing it as CWE-125/787 named an
-    out-of-bounds read/write (and the exploit primitive that implies) for a plain NULL deref."""
+    out-of-bounds read/write (and the exploit primitive that implies) for a plain NULL deref.
+    A redzone-heap verdict names the heap class: an overflow WRITE is CWE-122 (the heap-overflow
+    column chain_primitive grooms), an over-read CWE-125, and UAF / double / invalid free theirs."""
+    hk = getattr(r, "heap_kind", "") or ""
+    if hk in _HEAP_CWE:
+        cwe, kind = _HEAP_CWE[hk]
+        return cwe, (f"{kind} ({r.access})" if r.access in ("read", "write") else kind)
+    if hk == "heap-buffer-overflow":
+        return (("CWE-122", "heap buffer overflow (write)") if r.access == "write"
+                else ("CWE-125", "heap buffer over-read"))
     if r.fault_addr is not None and 0 <= r.fault_addr < 0x1000 and r.access in ("read", "write"):
         return "CWE-476", f"NULL pointer dereference ({r.access})"
     return _ACCESS_CWE.get(r.access, ("CWE-119", "memory fault"))
+
+def _heap_note(r) -> str:
+    return (f" -- redzone heap: {r.heap_kind}, {r.heap_detail}"
+            if getattr(r, "heap_kind", "") else "")
+
+
+def _heap_tag(r) -> str:
+    return f":{r.heap_kind}" if getattr(r, "heap_kind", "") else ""
+
+
+def _qasan_confirm(exe, mode, base_argv, inp: bytes, span, arch) -> Optional[str]:
+    """Program-level confirmation of a heap-class harness lead that does NOT crash natively (a
+    small heap overflow / UAF rarely does): run the WHOLE program under QASan and accept only a
+    report whose in-target site lies inside the harness function, on 2/2 replays -- the same
+    site-attributed bar the hypothesis loop uses. Returns the report summary, else None."""
+    if span is None or mode not in ("file", "stdin"):
+        return None
+    try:
+        from pathlib import Path
+
+        from ..dynamic import qasan
+        blob = Path(exe).read_bytes()
+        if not qasan.applicable(blob, arch)[0]:
+            return None
+        argv = [str(a) for a in (base_argv or [])]
+        if mode == "stdin" and "@@" in argv:
+            argv = ["/dev/stdin" if a == "@@" else a for a in argv]
+        last = None
+        for _ in range(2):
+            rep = qasan.run(exe, inp, argv=argv, mode=mode, timeout=10.0)
+            site = qasan.site_va(rep, blob) if rep is not None else None
+            if site is None or not (span[0] <= site < span[1]):
+                return None
+            last = f"{rep.summary()} at {site:#x}"
+        return last
+    except Exception:                                    # noqa: BLE001 -- an extra oracle, never fatal
+        return None
+
 
 #: Names that are IMPORTED libc routines, not the program's own code: the decompiler recovers their
 #: PLT thunk as a "function", but driving it is pointless (it just jumps through the GOT) and -- since
@@ -208,6 +260,24 @@ def _replay_against_program(ctx, target, p, leads) -> int:
                   note=("harness-replay: " + ("PROGRAM-LEVEL CRASH of the harness function-level "
                         "input" if r.crashed else "no program-level fault -- kept as a reachability "
                         "seed for concolic/directed_fuzz")))
+        if not r.crashed and lead.get("heap_kind"):
+            qrep = _qasan_confirm(exe, mode, base_argv, inp, lead.get("func_span"), target.arch)
+            if qrep:
+                prog_crashes += 1
+                fd.upsert(target.id, target.case_id, {
+                    "cwe": lead["cwe"], "title": lead["title"], "severity": lead["severity"],
+                    "detector": "harness", "channel": "harness-replay-qasan",
+                    "run_id": ctx.run_id, "state": "confirmed",
+                    "confidence": max(lead.get("confidence", 0.8), 0.9),
+                    "site_addr": lead.get("site_addr"), "function_addr": lead.get("function_addr"),
+                    "dedup_key": lead["dedup_key"],
+                    "evidence": [{"channel": "harness-replay-qasan", "detail": (
+                        f"the function-level input {sha[:12]} ({len(inp)} B) does not crash the "
+                        f"whole program natively, but under QASan (QEMU AddressSanitizer) the "
+                        f"WHOLE program reports {qrep}, inside {lead.get('func_name')} on 2/2 "
+                        "replays -- the harness's heap verdict reproduced at PROGRAM level over "
+                        f"'{mode}'.")}]})
+                continue
         if r.crashed:
             prog_crashes += 1
             ours, located = _locate_program_crash(ctx, target, exe, mode, base_argv, inp, lead,
@@ -297,9 +367,33 @@ def harness_stage(ctx) -> dict:
         _ai = _to_int(_f.addr)
         if _ai is not None:
             _id_by_addr[_ai] = _f.id
+    _pie_shift = load_base if load_base else 0
+
+    def _span(addr):
+        """[lo, hi) of the function in LINK-TIME addresses (what QASan's site_va reports)."""
+        fid = _id_by_addr.get(addr)
+        f = FunctionDAO(ctx.conn).get(fid) if fid is not None else None
+        size = getattr(f, "size", None) if f is not None else None
+        if not size:
+            return None
+        return (addr - _pie_shift, addr - _pie_shift + int(size))
+
+    # A STATIC binary's own libc: the routines the stubs model, named by the function table (symbols,
+    # FLIRT, behaviour), are stubbed so its allocations go through the redzone heap.
+    from .. import ifunc
+    from .emulate import _MODELLED
+    stub_names = None
+    if ifunc.is_static(data):
+        stub_names = {}
+        for _f in FunctionDAO(ctx.conn).list_by_target(target.id):
+            _ai, _nm = _to_int(_f.addr), normalize(_f.name or "")
+            if _ai is not None and _nm in _MODELLED:
+                stub_names.setdefault(_ai, _nm)
     findings = 0
     prog_leads = []          # function-level crashes to replay against the whole program (-> L3)
     for rf in cands:
+        if ctx.should_cancel():
+            break
         shape = _drive_shape(rf)
         label = rf.name or hex(rf.addr)
         _full = FunctionDAO(ctx.conn).get(_id_by_addr.get(rf.addr)) if rf.addr in _id_by_addr else None
@@ -308,7 +402,7 @@ def harness_stage(ctx) -> dict:
         try:
             fr = fuzz_function(data, rf.addr, arg_shape=shape, budget_execs=execs,
                                budget_seconds=per_sec, dictionary=dict_words,
-                               load_base=load_base)
+                               load_base=load_base, stub_names=stub_names)
         except Exception as e:                           # noqa: BLE001 -- one function must not sink the stage
             ctx.emit("harness.progress", payload={"func": hex(rf.addr), "error": str(e)[:120]})
             continue
@@ -323,7 +417,7 @@ def harness_stage(ctx) -> dict:
             cwe, kind = _fault_cwe(r)
             fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
             pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
-            dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}"
+            dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}{_heap_tag(r)}"
             title = f"Harness-demonstrated {kind} in {label} (function-level)"[:200]
             fd.upsert(target.id, target.case_id, {
                 "cwe": cwe, "severity": "high",
@@ -334,14 +428,16 @@ def harness_stage(ctx) -> dict:
                 "dedup_key": dedup,
                 "evidence": [{"channel": "harness", "detail": (
                     f"driving {label}({shape}) directly under the emulator, input "
-                    f"{sha[:12]} ({len(inp)} B) faults: {r.access} at {fault}, pc {pc}. "
+                    f"{sha[:12]} ({len(inp)} B) faults: {r.access} at {fault}, pc {pc}"
+                    f"{_heap_note(r)}. "
                     "PROVENANCE: demonstrated at the FUNCTION level (the function was called "
                     "directly with this input) -- a confirmed bug for a library API, and a "
                     "reachable-if-driven lead for a daemon whose entry path a concolic/reachability "
                     "pass must still connect. Not a program-level verified PoC.")}]})
             prog_leads.append({"sha": sha, "input": inp, "cwe": cwe, "title": title,
                                "severity": "high", "confidence": 0.8, "access": r.access,
-                               "func_name": label,
+                               "func_name": label, "heap_kind": r.heap_kind,
+                               "func_span": _span(rf.addr),
                                "site_addr": pc if r.fault_pc is not None else None,
                                "function_addr": hex(rf.addr), "dedup_key": dedup})
             findings += 1
@@ -353,7 +449,7 @@ def harness_stage(ctx) -> dict:
             single_sites = {(c["result"].fault_pc, c["result"].access) for c in fr.crashes}
             try:
                 sfr = fuzz_function(data, rf.addr, arg_shape=shape, dictionary=dict_words,
-                                    sequence=True, load_base=load_base,
+                                    sequence=True, load_base=load_base, stub_names=stub_names,
                                     budget_execs=int(p.get("harness_seq_execs", 3000)),
                                     budget_seconds=float(p.get("harness_seq_seconds", 8.0)))
             except Exception as e:                           # noqa: BLE001 -- never sink the stage
@@ -374,11 +470,12 @@ def harness_stage(ctx) -> dict:
                     fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
                     pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
                     nth = (r.seq_index + 1) if r.seq_index is not None else "?"
-                    dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}"
+                    dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}{_heap_tag(r)}"
                     title = f"Harness-demonstrated {kind} in {label} (stateful sequence)"[:200]
                     prog_leads.append({"sha": sha, "input": inp, "cwe": cwe, "title": title,
                                        "severity": "high", "confidence": 0.8, "access": r.access,
-                                       "func_name": label,
+                                       "func_name": label, "heap_kind": r.heap_kind,
+                                       "func_span": _span(rf.addr),
                                        "site_addr": pc if r.fault_pc is not None else None,
                                        "function_addr": hex(rf.addr), "dedup_key": dedup})
                     fd.upsert(target.id, target.case_id, {
@@ -391,7 +488,7 @@ def harness_stage(ctx) -> dict:
                         "evidence": [{"channel": "harness", "detail": (
                             f"driving {label}({shape}) with an ORDERED SEQUENCE of {len(msgs)} "
                             f"message(s), input {sha[:12]} ({len(inp)} B, '\\n'-framed) faults on "
-                            f"message {nth}: {r.access} at {fault}, pc {pc}. This fault is only "
+                            f"message {nth}: {r.access} at {fault}, pc {pc}{_heap_note(r)}. This fault is only "
                             "reachable after the earlier messages drive the parser into the "
                             "faulting state -- the single-call pass cannot reach it. PROVENANCE: "
                             "demonstrated at the FUNCTION level (the sequence was replayed directly "

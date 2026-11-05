@@ -79,3 +79,52 @@ def test_harness_crash_becomes_a_program_level_dynresult(store, case, pool, gcc,
     # ...and the finding is raised to confirmed by the program-level channel (a channel can only RAISE).
     confirmed = [f for f in hits if (f.state or "") in ("confirmed", "poc-backed")]
     assert confirmed, "a program-level reproduction must raise the harness finding to >= confirmed"
+
+
+# A SMALL heap overflow: parse() copies the whole input into a 16-byte heap chunk. Natively the
+# program does not crash (glibc's chunk slack absorbs a few bytes), so the native replay alone
+# would leave the lead function-level. The redzone heap catches it in the emulator, and QASan
+# reproduces it on the WHOLE program inside parse() -- the program-level confirmation channel.
+_SRC_HEAP = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+__attribute__((noinline)) void parse(const char *s, long n){
+    char *p = malloc(16);
+    if (!p) return;
+    if (n > 0) memcpy(p, s, n < 40 ? n : 40);   /* bounded at 40: past 16 is a heap overflow */
+    write(1, p, 1);
+    free(p);
+}
+int main(void){ static char in[64]; long n = read(0, in, sizeof in); if (n > 0) parse(in, n); return 0; }
+"""
+
+
+def test_small_heap_overflow_is_confirmed_at_program_level_by_qasan(store, case, pool, gcc,
+                                                                     tmp_path):
+    from lykos.analyze.dynamic import qasan
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("the harness executor is x86-64 only")
+    if not qasan.available():
+        pytest.skip("QASan (afl-qemu-trace + libqasan) not available")
+    c = tmp_path / "h.c"
+    c.write_text(_SRC_HEAP)
+    out = tmp_path / "h"
+    if subprocess.run([gcc, "-no-pie", "-O0", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    t = ingest(store, case.id, out, filename="h")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(60)
+    enqueue_disassemble(q, t, force=True); assert pool.wait_idle(120)
+    enqueue_harness(q, t, params={"input_mode": "stdin", "sequence": False}, force=True)
+    assert pool.wait_idle(240)
+
+    hits = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "harness"]
+    heap = [f for f in hits if f.cwe == "CWE-122"]
+    assert heap, [(f.cwe, f.title) for f in hits]
+    # no native crash row: the program survives the overflow natively...
+    assert not [d for d in DynResultDAO(store.conn).list_by_target(t.id)
+                if d.crashed and "harness-replay" in (d.note or "")]
+    # ...but QASan reproduced it inside parse() on the whole program
+    assert any((f.state or "") == "confirmed" for f in heap), [(f.state, f.title) for f in heap]

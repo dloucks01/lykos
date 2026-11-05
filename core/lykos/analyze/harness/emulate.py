@@ -39,6 +39,15 @@ _READ_ONLY_STUBS = frozenset({
     "atoll", "strtol", "strtoul", "strtoll", "puts", "fputs", "printf", "fprintf", "__printf_chk",
     "__fprintf_chk", "perror", "putchar", "putc"})
 _MAX_CALLS = 200_000                 # external-call runaway guard
+#: The libc routines `_emulate_libc` models exactly. In a STATIC binary these are stubbed by name
+#: (symbol table / IFUNC name / the function table's FLIRT name) so its own malloc/free go through
+#: the redzone heap rather than glibc's allocator running on syscalls the emulator does not have.
+_MODELLED = frozenset({
+    "memcpy", "memmove", "__memcpy_chk", "__memmove_chk", "mempcpy", "memset", "__memset_chk",
+    "strlen", "strcpy", "__strcpy_chk", "stpcpy", "strncpy", "__strncpy_chk", "strcat",
+    "__strcat_chk", "strcmp", "strncmp", "memcmp", "malloc", "calloc", "realloc", "free", "cfree",
+    "__stack_chk_fail", "puts", "putchar", "fflush", "setvbuf", "fprintf", "printf", "fwrite",
+    "fputs", "putc", "perror", "__printf_chk", "__fprintf_chk"})
 # T5 oracle (doc 46): a single allocation this large, requested by a parser we fed a SMALL fuzzed
 # input, is an attacker-controlled allocation size -- CWE-789 (unbounded allocation) / CWE-400 DoS.
 # A legitimate parser does not malloc 64 MiB off a few KB of input; a `malloc(len_field)` with the
@@ -61,6 +70,11 @@ class HarnessResult:
     # stubbed to 0, the harness's own 16 MiB heap running out). A NULL-page fault after that is the
     # harness's doing, not the input's -- see _drive_messages.
     artifact_null: bool = False
+    # The redzone heap's verdict on a heap fault: "heap-buffer-overflow" | "heap-use-after-free" |
+    # "double-free" | "invalid-free" ("" for a non-heap fault), and a one-line description of the
+    # chunk involved ("3 bytes right of a 16-byte chunk allocated at call site 0x401234").
+    heap_kind: str = ""
+    heap_detail: str = ""
 
 
 def available() -> bool:
@@ -240,6 +254,25 @@ def _build_plan(data: bytes) -> dict:
             applied += 1
             if applied >= _MAX_RELOCS:
                 break
+    # IFUNC slots (a static glibc binary's memcpy/strlen/...): what the startup would write there.
+    # A slot whose routine the stubs model goes to that stub (so the redzone checks see the call);
+    # any other goes to the implementation its resolver picks. Without this every such call
+    # jumped to the on-disk slot value -- 0.
+    from .. import ifunc as _ifunc
+    irel = _ifunc.irelative_relocs(data)
+    static_names: dict = {}
+    if irel:
+        names, impls = _ifunc.slot_names(data), _ifunc.resolve(data)
+        for slot_va, _res in irel:
+            nm = names.get(slot_va)
+            if nm in _MODELLED:
+                if nm not in stubs:
+                    stubs[nm] = _STUB_ADDR + 16 * len(stubs)
+                put(slot_va, stubs[nm])
+            elif slot_va in impls:
+                put(slot_va, base + impls[slot_va])
+    if _ifunc.is_static(data):
+        static_names = {base + va: nm for va, nm in _ifunc.func_symbols(data, _MODELLED).items()}
     regions, writes = [], []
     lo_img, hi_img = None, None
     for (v, _o, fs, ms, _fl), img in zip(loads, images):
@@ -255,6 +288,7 @@ def _build_plan(data: bytes) -> dict:
         regions.append((_STUB_ADDR, size))
         writes.append((_STUB_ADDR, b"\xc3" * size))     # `ret`: never runs (the hook stops first)
     plt = {base + a: n for a, n in _plt_map(data).items()}
+    plt.update(static_names)
     plt.update({a: n for n, a in stubs.items()})
     return {"e_type": e_type, "base": base, "span": (lo_img, hi_img), "regions": regions,
             "writes": writes + extra, "relocations": applied, "stubs": len(stubs), "plt": plt}
@@ -365,9 +399,108 @@ _IMPOSSIBLE_ALLOC = 1 << 40
 class _StubFault(Exception):
     """A libc stub's argument span is (partly) unmapped: the real call would fault here."""
 
-    def __init__(self, access: str, addr: int):
+    def __init__(self, access: str, addr: int, kind: str = "", detail: str = ""):
         super().__init__(f"{access} fault at {addr:#x}")
-        self.access, self.addr = access, addr
+        self.access, self.addr, self.kind, self.detail = access, addr, kind, detail
+
+
+#: Poisoned bytes between two chunks (both sides of every allocation). An overflow that skips the
+#: whole redzone and lands inside the NEXT live chunk is invisible to it, as with ASan.
+_REDZONE = 32
+
+
+class _Heap:
+    """The harness's malloc: an ASan-style REDZONE + QUARANTINE allocator over the emulator heap.
+
+    Every chunk is 16-aligned and surrounded by `_REDZONE` poisoned bytes; a freed chunk is never
+    handed out again (bump allocation = permanent quarantine). `check` says whether a span lies
+    wholly inside ONE live chunk. The emulated code's heap loads/stores are checked by a memory
+    hook over the heap range (_drive_messages) and the libc stubs check their own spans -- so a
+    one-byte heap overflow, a read of freed memory, a double free and a free of a non-chunk
+    pointer all become faults, where the old bump allocator let them run silently into the next
+    chunk. Sound by construction: only memory the program never obtained from malloc is poisoned.
+    """
+
+    def __init__(self):
+        self.next = _HEAP_ADDR + _REDZONE
+        self.starts: list = []                 # chunk user-starts, ascending (bump order)
+        self.chunks: dict = {}                 # start -> [size, live, alloc_site, free_site]
+        self.site: Optional[int] = None        # call site of the stub being emulated
+
+    def alloc(self, n: int) -> int:
+        """User pointer for an n-byte chunk, or 0 when the harness heap is exhausted."""
+        p = (self.next + 15) & ~15
+        span = (max(int(n), 1) + 15) & ~15
+        if p + span + _REDZONE > _HEAP_ADDR + _HEAP_SZ:
+            return 0
+        self.next = p + span + _REDZONE
+        self.starts.append(p)
+        self.chunks[p] = [int(n), True, self.site, None]
+        return p
+
+    def _owner(self, addr: int):
+        import bisect
+        i = bisect.bisect_right(self.starts, addr) - 1
+        return self.starts[i] if i >= 0 else None
+
+    def check(self, addr: int, n: int, access: str):
+        """None when [addr, addr+n) is inside one live chunk (or not on the heap at all); else
+        (kind, detail) naming the violation."""
+        hi = _HEAP_ADDR + _HEAP_SZ
+        if n <= 0 or addr + n <= _HEAP_ADDR or addr >= hi:
+            return None
+        start = self._owner(addr)
+        if start is not None:
+            size, live, asite, fsite = self.chunks[start]
+            if addr < start + size:
+                if not live:
+                    return ("heap-use-after-free",
+                            f"{access} {addr - start} bytes into a freed {size}-byte chunk"
+                            + (f" (freed at {fsite:#x})" if fsite else ""))
+                if addr + n <= start + size:
+                    return None
+                if access == "read" and n >= 16:
+                    # a vector load that STARTS inside the chunk: SSE2 strlen/strchr/memchr read
+                    # whole 16-byte blocks past a string's end by design (glibc's own code, run
+                    # natively in a static binary). Compiled C does not do this.
+                    return None
+                return ("heap-buffer-overflow",
+                        f"{access} of {n} at {addr - start}: {addr + n - start - size} byte(s) "
+                        f"past a {size}-byte chunk" + (f" allocated at {asite:#x}" if asite else ""))
+            # past this chunk's end: right of it, or left of the next one -- name the nearer
+            import bisect
+            j = bisect.bisect_right(self.starts, addr)
+            nxt = self.starts[j] if j < len(self.starts) else None
+            if nxt is not None and nxt - (addr + n) < addr - (start + size):
+                nsize, _l, nas, _f = self.chunks[nxt]
+                return ("heap-buffer-overflow",
+                        f"{access} {nxt - addr} byte(s) left of a {nsize}-byte chunk"
+                        + (f" allocated at {nas:#x}" if nas else ""))
+            return ("heap-buffer-overflow",
+                    f"{access} {addr - start - size} byte(s) right of a {size}-byte chunk"
+                    + (f" allocated at {asite:#x}" if asite else ""))
+        nxt = self.starts[0] if self.starts else None
+        if nxt is not None:
+            return ("heap-buffer-overflow",
+                    f"{access} {nxt - addr} byte(s) left of a {self.chunks[nxt][0]}-byte chunk")
+        return ("heap-buffer-overflow", f"{access} of heap memory never allocated")
+
+    def free(self, p: int):
+        """None for a valid free (or free(NULL)); else (kind, detail)."""
+        if p == 0:
+            return None
+        c = self.chunks.get(p)
+        if c is None:
+            owner = self._owner(p)
+            inside = owner is not None and p < owner + self.chunks[owner][0]
+            return ("invalid-free", f"free({p:#x}): "
+                    + (f"{p - owner} bytes into a {self.chunks[owner][0]}-byte chunk"
+                       if inside else "not a pointer malloc returned"))
+        if not c[1]:
+            return ("double-free", f"free({p:#x}) of a {c[0]}-byte chunk already freed"
+                    + (f" at {c[3]:#x}" if c[3] else ""))
+        c[1], c[3] = False, self.site
+        return None
 
 
 def _first_unmapped(uc, addr: int, n: int) -> Optional[int]:
@@ -409,6 +542,7 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
                 b = uc.mem_read(addr + len(out), 1)[0]
             except UcError:
                 raise _StubFault("read", addr + len(out)) from None
+            _heap_guard(addr + len(out), 1, "read")
             if b == 0:
                 break
             out.append(b)
@@ -418,12 +552,14 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
         bad = _first_unmapped(uc, addr, n)
         if bad is not None:
             raise _StubFault("read", bad)
+        _heap_guard(addr, n, "read")
         return bytes(uc.mem_read(addr, n)) if n > 0 else b""
 
     def _wr(addr, blob):
         bad = _first_unmapped(uc, addr, len(blob))
         if bad is not None:
             raise _StubFault("write", bad)
+        _heap_guard(addr, len(blob), "write")
         if blob:
             uc.mem_write(addr, blob)
 
@@ -431,22 +567,25 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
         bad = _first_unmapped(uc, addr, n)          # checked BEFORE building n bytes on the host
         if bad is not None:
             raise _StubFault("write", bad)
+        _heap_guard(addr, n, "write")
         if n > 0:
             uc.mem_write(addr, bytes([byte]) * n)
 
     def _alloc(n):
-        n = int(n)
-        if n == 0:
-            n = 16                                       # glibc: malloc(0) is a unique minimum chunk
-        n = (n + 15) & ~15
-        if n <= 0 or heap["next"] + n > _HEAP_ADDR + _HEAP_SZ:
-            if n < _IMPOSSIBLE_ALLOC:
-                res.artifact_null = True                 # the HARNESS heap ran out, not the target's
-            return 0
-        p = heap["next"]
-        heap["next"] += n
+        n = int(n)                                       # malloc(0) is a unique 0-byte chunk
+        if n >= _IMPOSSIBLE_ALLOC:
+            return 0                                     # the real malloc fails too
+        p = heap.alloc(n)
+        if not p:
+            res.artifact_null = True                     # the HARNESS heap ran out, not the target's
         return p
 
+    def _heap_guard(addr, n, access):
+        v = heap.check(addr, n, access)
+        if v is not None:
+            raise _StubFault(access, addr, *v)
+
+    heap.site = call_site
     try:
         if nm in ("memcpy", "memmove", "__memcpy_chk", "__memmove_chk", "mempcpy"):
             _wr(a0, _rd(a1, a2))                         # source checked first: an over-read is a READ
@@ -485,13 +624,35 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
                 res.huge_alloc = int(n)                  # a huge count*size the input drove
             p = _alloc(n)
             if p and n:
-                uc.mem_write(p, b"\x00" * ((n + 15) & ~15))
+                uc.mem_write(p, b"\x00" * n)
             _set(p)
         elif nm == "realloc":
             if a1 >= _HUGE_ALLOC and res.huge_alloc is None:
                 res.huge_alloc = int(a1)
-            _set(_alloc(a1) if a1 else 0)                # fresh block, best-effort (no copy)
-        elif nm in ("free",):
+            if a0 and a0 not in heap.chunks:
+                v = heap.free(a0)                        # realloc of a non-chunk: invalid free
+                if v is not None:
+                    raise _StubFault("free", a0, *v)
+            old = heap.chunks.get(a0) if a0 else None
+            if old is not None and not old[1]:
+                raise _StubFault("free", a0, "double-free",
+                                 f"realloc({a0:#x}) of a {old[0]}-byte chunk already freed")
+            if a0 and not a1:
+                heap.free(a0)                            # realloc(p, 0) frees p
+                _set(0)
+            else:
+                p = _alloc(a1)
+                if p and old is not None:
+                    keep = min(old[0], int(a1))
+                    if keep:
+                        uc.mem_write(p, bytes(uc.mem_read(a0, keep)))
+                if p and a0:
+                    heap.free(a0)                        # moved: the old block is now freed memory
+                _set(p)
+        elif nm in ("free", "cfree"):
+            v = heap.free(a0)
+            if v is not None:
+                raise _StubFault("free", a0, *v)
             _set(0)
         elif nm == "__stack_chk_fail":
             # the stack canary tripped: a stack-buffer overflow was DETECTED.
@@ -512,6 +673,7 @@ def _emulate_libc(uc, name, res, heap, regs, call_site: Optional[int] = None) ->
         res.crashed = True
         res.access = f.access
         res.fault_addr = f.addr
+        res.heap_kind, res.heap_detail = f.kind, f.detail
         if res.fault_pc is None:
             res.fault_pc = call_site
         res.note = (res.note + "; " if res.note else "") + f"fault in {nm}()"
@@ -553,7 +715,7 @@ def _setup(elf_bytes: bytes, res: HarnessResult):
     # __stack_chk_fail). Without this every canary-protected function faults at 0x28 on entry.
     uc.reg_write(UC_X86_REG_FS_BASE, _TLS_ADDR)
     uc.mem_write(_TLS_ADDR + 0x28, b"\x11\x22\x33\x44\x55\x66\x77\x00")
-    return uc, plan, {"next": _HEAP_ADDR}
+    return uc, plan, _Heap()
 
 
 def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap, *,
@@ -567,12 +729,17 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
 
     from unicorn import (
         UC_HOOK_BLOCK,
+        UC_HOOK_INSN,
         UC_HOOK_MEM_FETCH_UNMAPPED,
+        UC_HOOK_MEM_READ,
+        UC_HOOK_MEM_WRITE,
         UC_HOOK_MEM_READ_UNMAPPED,
         UC_HOOK_MEM_WRITE_UNMAPPED,
+        UC_MEM_WRITE,
         UcError,
     )
     from unicorn.x86_const import (
+        UC_X86_INS_SYSCALL,
         UC_X86_REG_RAX,
         UC_X86_REG_RCX,
         UC_X86_REG_RDI,
@@ -601,7 +768,49 @@ def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap,
         res.access = {19: "read", 20: "write", 21: "fetch"}.get(access, str(access))
         return False
 
+    def _on_heap(uc_, access, addr, size, value, _ud):
+        # the redzone check for the EMULATED code's own heap loads/stores (the stubs check theirs)
+        if res.crashed:
+            return
+        acc = "write" if access == UC_MEM_WRITE else "read"
+        v = heap.check(addr, size, acc)
+        if v is not None:
+            res.crashed = True
+            res.fault_addr = addr
+            res.fault_pc = uc_.reg_read(UC_X86_REG_RIP)
+            res.access = acc
+            res.heap_kind, res.heap_detail = v
+            uc_.emu_stop()
+
+    def _on_syscall(uc_, _ud):
+        # libc code that runs natively (a static binary) issues real syscalls. Unhooked, unicorn
+        # treats `syscall` as a no-op that leaves rax = the syscall number: brk "returned" 12 and
+        # glibc's malloc then used address 12 as its heap. Model the harmless ones; fail the rest
+        # honestly and mark the result a harness artifact (a later NULL fault is not the input's).
+        nr = uc_.reg_read(UC_X86_REG_RAX)
+        a2 = uc_.reg_read(UC_X86_REG_RDX)
+        if nr == 1:                                       # write: all of it
+            ret = a2
+        elif nr == 0:                                     # read: EOF
+            ret = 0
+        elif nr in (60, 231):                             # exit / exit_group: a clean end
+            res.returned = True
+            res.note = (res.note + "; " if res.note else "") + "exit()"
+            uc_.emu_stop()
+            return
+        elif nr == 39 or nr == 186:                       # getpid / gettid
+            ret = 4242
+        else:                                             # brk/mmap/open/...: not available
+            ret = -38 if nr not in (9, 12) else (-12 if nr == 9 else 0)
+            res.artifact_null = True
+            if f"syscall:{nr}" not in res.note:
+                res.note = (res.note + "; " if res.note else "") + f"syscall:{nr} failed"
+        uc_.reg_write(UC_X86_REG_RAX, ret & 0xFFFFFFFFFFFFFFFF)
+
+    uc.hook_add(UC_HOOK_INSN, _on_syscall, None, 1, 0, UC_X86_INS_SYSCALL)
     uc.hook_add(UC_HOOK_BLOCK, _on_block)
+    uc.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, _on_heap,
+                begin=_HEAP_ADDR, end=_HEAP_ADDR + _HEAP_SZ - 1)
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
                 | UC_HOOK_MEM_FETCH_UNMAPPED, _on_unmapped)
 
@@ -712,7 +921,7 @@ def _to_decompiler(res: HarnessResult, plan: dict, shift: int) -> HarnessResult:
 
 def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
                  arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS,
-                 load_base: int = 0) -> HarnessResult:
+                 load_base: int = 0, stub_names: Optional[dict] = None) -> HarnessResult:
     """Execute ONE function with `input_bytes` as its buffer argument; report fault + coverage.
 
     `arg_shape`: "ptr_len" -> rdi=&input, rsi=len; "ptr" -> rdi=&input. Reaching the sentinel
@@ -723,12 +932,12 @@ def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
     Ghidra). `func_addr` is in those coordinates and so is every address reported back.
     """
     return run_sequence(elf_bytes, func_addr, [input_bytes], arg_shape=arg_shape,
-                        max_insns=max_insns, load_base=load_base)
+                        max_insns=max_insns, load_base=load_base, stub_names=stub_names)
 
 
 def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
                  arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS,
-                 load_base: int = 0) -> HarnessResult:
+                 load_base: int = 0, stub_names: Optional[dict] = None) -> HarnessResult:
     """Drive a stateful function with a SEQUENCE of messages in one emulator state (T6).
 
     A dispatch-style parser transitions between states as it consumes messages; a bug can live in
@@ -746,6 +955,13 @@ def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
         return res
     uc, plan, heap = setup
     shift = _shift_for(plan, load_base)
-    _drive_messages(uc, func_addr + shift, list(messages), res, plan["plt"], heap,
+    plt = plan["plt"]
+    if stub_names:
+        # names the caller recovered for a stripped static binary (FLIRT / behaviour): only the
+        # routines the stubs model exactly, and only where the image has no import of its own
+        extra = {a + shift: n for a, n in stub_names.items() if n in _MODELLED}
+        if extra:
+            plt = {**extra, **plt}
+    _drive_messages(uc, func_addr + shift, list(messages), res, plt, heap,
                     arg_shape=arg_shape, max_insns=max_insns)
     return _to_decompiler(res, plan, shift)

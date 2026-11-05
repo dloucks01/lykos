@@ -2595,6 +2595,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # shared objects / >32 MB; a source project's binaries are hunted the same way.
                 if not _is_server:
                     _staged(bud, store, t, "hypo_hunt", status, stop, want=150.0)
+                # FUNCTION-LEVEL driving for a binary (doc 62 item 5): the ranked parsers are called
+                # directly under the emulator with a redzone + quarantine heap, so a heap overflow /
+                # UAF / double free in code no whole-program path reaches still surfaces. Filed
+                # function-level ("caller constraint unproven"); each crashing input is replayed on
+                # the whole program and only a native crash or a QASan report INSIDE the function
+                # raises it. Bounded (5 functions x ~17 s); self-gates to x86-64 with recovered
+                # functions. Runs for servers too: it needs no program-level input channel.
+                _staged(bud, store, t, "harness", status, stop,
+                        {"max_functions": 5, "harness_seconds": 12.0,
+                         "harness_seq_seconds": 5.0, "replay_cap": 8}, want=120.0)
                 # UNDER-CONSTRAINED symbolic execution of the UNDRIVEN functions -- discovery for code
                 # no harness reaches (the ladder above and the campaigns below only exercise what a
                 # harness drives). It files CANDIDATE control-hijack leads with an under-constrained
