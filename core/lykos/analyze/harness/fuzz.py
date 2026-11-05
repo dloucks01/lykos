@@ -172,8 +172,22 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
         pending.append(seq_sep.join(dict_words[:max_messages]))
     corpus = []
     deadline = t0 + budget_seconds
+    from ...jobs import runlog
+    _live = runlog.current()
+    _label = f"{func_addr:#x}" + (" (sequences)" if sequence else "")
+
+    def _report(final=False):
+        el = max(1e-3, time.time() - t0)
+        _live.fuzz("Function harness", final=final, execs=fr.execs, eps=round(fr.execs / el),
+                   cov=len(fr.blocks), cov_label="blocks", crashes=len(fr.crashes),
+                   corpus=len(corpus), status=("done " if final else "driving ") + _label,
+                   out=[f"function {_label}, emulated, redzone heap",
+                        f"{len(fr.crashes)} fault site(s), {len(fr.oracle_hits)} huge-alloc hit(s)"]
+                   + ([fr.note] if fr.note else []))
     while (fr.execs < budget_execs and time.time() < deadline
            and len(fr.crashes) < max_crashes):
+        if _live is not None and fr.execs % 256 == 0:
+            _report()
         data = (pending.pop() if pending
                 else _mutate(rng, rng.choice(corpus) if corpus else b"\x00" * 8, words))
         try:
@@ -196,6 +210,11 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
             if site not in seen_crash_sites:
                 seen_crash_sites.add(site)
                 fr.crashes.append({"input": data, "result": r})
+                if _live is not None:
+                    _live.note(f"harness {_label}: {r.access or 'fault'} at "
+                               f"{(r.fault_addr or 0):#x}, pc {(r.fault_pc or 0):#x}"
+                               + (f" -- {r.heap_kind}" if r.heap_kind else "")
+                               + f" ({len(data)} B input)")
         # T5 oracle: a fuzzed input drove an attacker-controlled huge allocation (no fault needed).
         # One or two witnesses suffice -- prefer the smallest input (tiny input -> giant alloc is the
         # strongest shape), but never let bookkeeping sink the campaign.
@@ -209,4 +228,6 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
                     fr.oracle_hits[biggest] = {"input": data, "result": r}
     fr.corpus = corpus
     fr.elapsed = round(time.time() - t0, 2)
+    if _live is not None:
+        _report(final=True)
     return fr

@@ -150,6 +150,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_BACKLOG,
     _CASE_COVERAGE,
     _CASE_CURATION,
+    _CASE_CONSOLE,
     _CASE_EVENTS,
     _CASE_EXPORT,
     _CASE_FIND,
@@ -668,6 +669,10 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             if m:
                 after = _int_param(qs, "after", 0)
                 return self._get_events(m.group(1), after, max(0, _int_param(qs, "tail", 0)))
+            m = _CASE_CONSOLE.match(path)
+            if m:
+                return self._get_console(m.group(1), _int_param(qs, "after", 0),
+                                         _int_param(qs, "tail", 0))
             self._json({"error": "not found"}, 404)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)
@@ -832,6 +837,24 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                           bits=bits, cwd=str(workdir), put_seed=put_seed)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _get_console(self, case_id: str, after: int = 0, tail: int = 0):
+        """The live run console (jobs/runlog): records from byte offset `after`, plus `next` to
+        poll from. `tail=N` (with after=0) starts N bytes from the end instead -- a GUI opening a
+        long-running case does not replay the whole log."""
+        from ..jobs import runlog
+        if after <= 0 and tail > 0:
+            try:
+                size = runlog.console_path(self.server.case_dir, case_id).stat().st_size
+            except OSError:
+                size = 0
+            after = max(0, size - tail)
+            if after:
+                # land on a line boundary: skip the partial first line
+                with open(runlog.console_path(self.server.case_dir, case_id), "rb") as fh:
+                    fh.seek(after)
+                    after += len(fh.readline())
+        return self._json(runlog.read(self.server.case_dir, case_id, after=after))
 
     def _ws_events(self, case_id: Optional[str], after: int = 0):
         key = self.headers.get("Sec-WebSocket-Key")

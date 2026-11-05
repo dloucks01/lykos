@@ -131,6 +131,7 @@ class JobContext:
                 if ("lock" not in msg and "busy" not in msg) or attempt == _EMIT_RETRIES - 1:
                     raise
                 time.sleep(0.05 * (attempt + 1))
+        _console_mirror(type, payload)
         if self.on_event:
             self.on_event({"id": ev.id, "type": ev.type, "level": ev.level,
                            "case_id": ev.case_id, "run_id": ev.run_id, "ts": ev.ts,
@@ -320,6 +321,9 @@ class JobContext:
             # field. A non-zero rc still ships its stderr in `err`, so real failures stay visible.
             failed = rc not in (0, None)
             err_tail = _short(err)
+            from . import runlog
+            runlog.tool(argv, rc=rc, ms=int((time.time() - start) * 1000), out=out,
+                        err=err if failed else None)
             self.emit("job.exec", "info", {
                 "tool": _os.path.basename(argv[0]) if argv else "",
                 "cmd": " ".join(disp)[:500],
@@ -353,3 +357,47 @@ class JobContext:
                 proc.wait(timeout=2)   # reap the child so it does not linger as a zombie
             except (subprocess.TimeoutExpired, OSError):
                 pass
+
+
+def _console_mirror(type: str, payload) -> None:
+    """The events the live run console shows as lines: progress notes, logs, each stage's
+    concluding `*.done` summary. (job.exec reaches it from _emit_exec, with the full command.)"""
+    try:
+        from . import runlog
+        log = runlog.current()
+        if log is None:
+            return
+        pl = payload or {}
+        if type in ("job.progress", "job.log"):
+            if pl.get("msg"):
+                log.note(pl["msg"])
+        elif type.endswith(".progress") and "execs" in pl:
+            # a sandbox fuzz campaign's heartbeat (fuzz / directed_fuzz / ...): its technique window
+            prefix = type[:-len(".progress")]
+            outs = pl.get("outcomes") or {}
+            out = []
+            if outs:
+                out.append("outcomes: " + ", ".join(f"{k} {v}" for k, v in list(outs.items())[:6]))
+            if pl.get("last_gain_s") is not None:
+                out.append(f"last new behaviour/coverage {pl['last_gain_s']} s in; "
+                           f"{pl.get('since_gain_execs', 0)} execs since")
+            if pl.get("timeout_streak"):
+                out.append(f"{pl['timeout_streak']} executions in a row hit the time limit")
+            cov, label = ((pl.get("blocks_hit"), "blocks") if pl.get("blocks_known")
+                          else (pl.get("behaviours"), "behaviours"))
+            log.fuzz(prefix, execs=pl.get("execs"), eps=pl.get("execs_per_sec"), cov=cov,
+                     cov_label=label, crashes=pl.get("crashes"), unique=pl.get("unique"),
+                     corpus=pl.get("corpus"), status=f"running · {pl.get('pct', 0)}% of slice",
+                     out=out)
+        elif type.endswith(".done") and not type.startswith("job."):
+            import json as _json
+            log.write("done", True, event=type, summary=_json.dumps(pl, default=str)[:600])
+            if isinstance(pl.get("execs"), int):
+                # a campaign's final numbers: its technique window, even for an engine with no
+                # heartbeat of its own (env_fuzz, net_fuzz, ...)
+                log.fuzz(type[:-len(".done")], final=True, execs=pl.get("execs"),
+                         eps=pl.get("execs_per_sec"), crashes=pl.get("crashes"),
+                         cov=pl.get("coverage") if isinstance(pl.get("coverage"), int) else None,
+                         status="done", out=[str(pl.get("note"))[:200]] if pl.get("note") else None)
+    except Exception:                                    # noqa: BLE001 -- console telemetry only
+        pass

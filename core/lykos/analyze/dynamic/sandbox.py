@@ -405,7 +405,25 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
                                  # one, `note` stays for a reader that has not been moved over
                                  blocks_hit=tuple(reached) if blocks else None,
                                  note=(",".join(str(x) for x in reached) or None)))
+    _console_batch(exe, base_argv, mode, payloads, results)
     return results
+
+
+def _console_batch(exe, base_argv, mode, payloads, results) -> None:
+    """Record a batch's executions on the live run console (sampled there; crashes in full)."""
+    try:
+        from ...jobs import runlog
+        if runlog.current() is None:
+            return
+        name = Path(str(exe)).name
+        for data, rr in zip(payloads or (), results or ()):
+            runlog.target_run([name] + [str(a) for a in (base_argv or ())], mode=mode,
+                              in_len=len(data or b""), rc=rr.exit_code, signal=rr.signal_name,
+                              crashed=bool(rr.crashed), timed_out=bool(rr.timed_out),
+                              ms=rr.duration_ms, isolation=rr.isolation, out=rr.stdout,
+                              err=rr.stderr, fault_pc=rr.fault_pc, fault_addr=rr.fault_addr)
+    except Exception:                                    # noqa: BLE001 -- console telemetry only
+        pass
 
 
 def kill_quietly(proc, *, reap: float = 2.0) -> None:
@@ -2412,7 +2430,29 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix,
               (None if crashed or not timed else "timed out")))
 
 
-def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
+def run(exe, *, argv=(), stdin: bytes = b"", **kw) -> RunResult:
+    """Run the target once in the sandbox (see `_run` for every option) and record the execution
+    on the live run console (jobs/runlog: a no-op outside a stage)."""
+    import time as _time
+    t0 = _time.time()
+    rr = _run(exe, argv=argv, stdin=stdin, **kw)
+    try:
+        from ...jobs import runlog
+        if runlog.current() is not None:
+            runlog.target_run([Path(str(exe)).name] + [str(a) for a in (argv or ())],
+                              mode="stdin" if stdin else None, in_len=len(stdin or b"") or None,
+                              rc=rr.exit_code, signal=rr.signal_name, crashed=bool(rr.crashed),
+                              timed_out=bool(getattr(rr, "timed_out", False)),
+                              ms=getattr(rr, "duration_ms", None) or int((_time.time() - t0) * 1000),
+                              isolation=rr.isolation, out=rr.stdout, err=rr.stderr,
+                              fault_pc=getattr(rr, "fault_pc", None),
+                              fault_addr=getattr(rr, "fault_addr", None))
+    except Exception:                                    # noqa: BLE001 -- console telemetry only
+        pass
+    return rr
+
+
+def _run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),

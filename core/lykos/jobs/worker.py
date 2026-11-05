@@ -26,6 +26,19 @@ from ..db.connection import connect
 from ..db.models import AnalysisRun
 from .config import JobConfig
 from ..db.provenance import reset_current_stage, set_current_stage
+from . import runlog
+
+
+def _console_params(params) -> Optional[dict]:
+    """The run's params as the console shows them: scalars and short lists only (no seed blobs)."""
+    out = {}
+    for k, v in (params or {}).items():
+        if isinstance(v, (int, float, bool)) or (isinstance(v, str) and len(v) <= 120):
+            out[k] = v
+        elif isinstance(v, (list, tuple)) and len(v) <= 8 and all(
+                isinstance(x, (int, float, str)) and len(str(x)) <= 60 for x in v):
+            out[k] = list(v)
+    return out or None
 from .context import JobContext, StageCancelled, StageTimeout
 from .queue import JobQueue
 from .registry import StageDef, get_stage, validate_params
@@ -364,9 +377,17 @@ class WorkerPool:
         # (doc 49 Themes 1a/2b). Per-thread, so concurrent workers never cross-contaminate; reset in
         # the finally below whatever the stage's outcome.
         _stage_tok = set_current_stage(run.stage)
+        # The live run console (jobs/runlog): this stage's sink, so sandbox.run, the batch runner,
+        # tool commands and the fuzz engines all record what they do as they do it.
+        _rlog = runlog.RunLog(self.content.root, run.case_id, run_id=run_id, stage=run.stage,
+                              target_id=getattr(run, "target_id", None))
+        _rlog_tok = runlog.bind(_rlog)
+        _rlog.stage_event("start", params=_console_params(run.params))
+        _outcome = "error"
         try:
             result = sd.fn(ctx)
             ctx.check_cancel()  # honor cancel/timeout requested during the stage
+            _outcome = "done"
             outputs = [(sha, "output") for sha in (result or {}).get("output_shas", [])]
             # complete() returns False when the lease was lost (reaped/re-claimed) and the
             # result was discarded -- don't count that as a completed job.
@@ -375,9 +396,11 @@ class WorkerPool:
             else:
                 self._bump("discarded")
         except StageCancelled:
+            _outcome = "cancelled"
             q.set_cancelled(run_id)
             self._bump("cancelled")
         except StageTimeout:
+            _outcome = "slice-ended"
             # A campaign that runs out of its BUDGET SLICE has not failed -- it did as much work
             # as the run could afford, which is a decision the orchestrator made, not an error in
             # the stage. Both arrive here as StageTimeout, so they are told apart by whether a
@@ -392,6 +415,8 @@ class WorkerPool:
             #
             # A stage with NO slice that hits its registered ceiling is a different thing: that
             # one really is a hang, and it still fails.
+            if not _slice_expired(run, started):
+                _outcome = "timeout"
             if _slice_expired(run, started):
                 q.set_cancelled(run_id, note=_SLICE_NOTE)
                 self._bump("slice_ended")
@@ -399,9 +424,12 @@ class WorkerPool:
                 q.fail(run_id, "timeout", retryable=False, worker_id=wid)
                 self._bump("timeout")
         except Exception as e:  # crashing stage: fail the job, keep the worker alive
+            _outcome = "error: " + repr(e)[:200]
             q.fail(run_id, repr(e), worker_id=wid)
             self._bump("error")
         finally:
+            _rlog.stage_event("end", outcome=_outcome, secs=round(time.time() - started, 1))
+            runlog.unbind(_rlog_tok)
             reset_current_stage(_stage_tok)
             # Deregister -- but only if the supervisor has not already retired us and handed idx to
             # a replacement worker (identity check avoids clobbering the replacement's record).

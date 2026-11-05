@@ -1910,6 +1910,73 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 }
 
 
+_LF_STATUS = re.compile(r"^#(\d+)\s+(\w+)\s+(?:cov: (\d+))?.*?(?:corp: (\d+))?.*?(?:exec/s: (\d+))?")
+
+
+def _run_group_live(argv, *, timeout: float, cwd=None, env=None):
+    """`_run_group` for the fuzzing run itself: same group-kill timeout and return shape, but
+    libFuzzer's stderr is read AS IT ARRIVES so its status lines (`#1024 NEW cov: 312 ... exec/s:
+    480`) feed this campaign's window on the live run console (jobs/runlog). Outside a stage
+    (no console) it is exactly `_run_group`."""
+    from ..jobs import runlog
+    live = runlog.current()
+    if live is None:
+        return _run_group(argv, timeout=timeout, cwd=cwd, env=env)
+    import signal as _signal
+    import threading
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         stdin=subprocess.DEVNULL, cwd=cwd, env=env, start_new_session=True,
+                         errors="replace")
+    err_lines: list = []
+    out_buf: list = []
+    state = {"execs": None, "cov": None, "corp": None, "eps": None, "crashes": 0}
+
+    def _pump_err():
+        for ln in p.stderr:
+            err_lines.append(ln)
+            m = _LF_STATUS.match(ln)
+            if m:
+                state["execs"] = int(m.group(1))
+                for k, g in (("cov", 3), ("corp", 4), ("eps", 5)):
+                    if m.group(g):
+                        state[k] = int(m.group(g))
+            elif "ERROR: AddressSanitizer" in ln or "==ERROR" in ln or "deadly signal" in ln:
+                state["crashes"] += 1
+            live.fuzz("libFuzzer", execs=state["execs"], eps=state["eps"], cov=state["cov"],
+                      cov_label="cov", crashes=state["crashes"], corpus=state["corp"],
+                      status="running", out=[x.rstrip() for x in err_lines[-6:]])
+
+    def _pump_out():
+        for ln in p.stdout:
+            out_buf.append(ln)
+    t_err = threading.Thread(target=_pump_err, daemon=True)
+    t_out = threading.Thread(target=_pump_out, daemon=True)
+    t_err.start(); t_out.start()
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        try:
+            os.killpg(p.pid, _signal.SIGKILL)
+        except OSError:
+            p.kill()
+        t_err.join(5); t_out.join(5)
+        raise subprocess.TimeoutExpired(argv, timeout, output="".join(out_buf),
+                                        stderr="".join(err_lines)) from e
+    finally:
+        if p.poll() is None:
+            from .dynamic.sandbox import kill_quietly
+            kill_quietly(p)
+    t_err.join(5); t_out.join(5)
+    try:
+        os.killpg(p.pid, _signal.SIGKILL)
+    except OSError:
+        pass
+    live.fuzz("libFuzzer", final=True, execs=state["execs"], eps=state["eps"], cov=state["cov"],
+              cov_label="cov", crashes=state["crashes"], corpus=state["corp"],
+              status=f"exited {p.returncode}", out=[x.rstrip() for x in err_lines[-6:]])
+    return subprocess.CompletedProcess(argv, p.returncode, "".join(out_buf), "".join(err_lines))
+
+
 def _run_group(argv, *, timeout: float, cwd=None, env=None):
     """subprocess.run(capture_output=True, text=True) whose timeout takes the WHOLE process tree.
 
@@ -3134,8 +3201,8 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
     crashes = []
     before = set(art.iterdir())
     try:
-        r = _run_group([str(a) for a in (launcher or [])] + argv, timeout=seconds + 30, env=env,
-                       cwd=str(workdir))
+        r = _run_group_live([str(a) for a in (launcher or [])] + argv, timeout=seconds + 30,
+                            env=env, cwd=str(workdir))
         out = (r.stderr or "") + (r.stdout or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stderr or b"").decode("latin-1", "ignore") if isinstance(e.stderr, bytes) else (e.stderr or "")

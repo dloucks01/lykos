@@ -368,7 +368,8 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
             proc = subprocess.Popen(cmd, env=env, stdout=_o, stderr=_e,
                                     start_new_session=True)
             try:
-                rc = proc.wait(timeout=int(seconds) + 90)
+                rc = _wait_reporting(proc, out_dir, o_path, int(seconds) + 90,
+                                     qasan=qasan, qemu=qemu)
                 overran = False
             except subprocess.TimeoutExpired:
                 _sandbox.kill_quietly(proc)
@@ -567,6 +568,55 @@ def campaign_failed(proc) -> Optional[str]:
     if proc.returncode not in (0, None):
         return f"afl-fuzz exited {proc.returncode}"
     return None
+
+
+def _wait_reporting(proc, out_dir, out_path, timeout: int, *, qasan=False, qemu=True) -> int:
+    """`proc.wait(timeout)` that, once a second while the campaign runs, feeds the live run
+    console (jobs/runlog) this campaign's window: AFL's own fuzzer_stats + its last output lines.
+    Raises subprocess.TimeoutExpired exactly as proc.wait would."""
+    import time as _time
+
+    from ...jobs import runlog
+    engine = "AFL++" + (" QEMU" if qemu else "") + (" + QASan" if qasan else "")
+    t_end = _time.time() + timeout
+    while True:
+        try:
+            rc = proc.wait(timeout=1.0)
+            break
+        except subprocess.TimeoutExpired:
+            if _time.time() >= t_end:
+                raise
+            if runlog.current() is not None:
+                runlog.fuzz(engine, **_live_stats(out_dir, out_path, "running"))
+    if runlog.current() is not None:
+        runlog.fuzz(engine, final=True, **_live_stats(out_dir, out_path, f"exited {rc}"))
+    return rc
+
+
+def _live_stats(out_dir, out_path, status: str) -> dict:
+    st = campaign_stats(out_dir)
+    lines = []
+    try:
+        raw = Path(out_path).read_bytes()[-4096:].decode("utf-8", "replace")
+        import re as _re
+        raw = _re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw)       # strip ANSI
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()][-6:]
+    except OSError:
+        pass
+
+    def _num(k):
+        v = st.get(k)
+        try:
+            return float(v) if v is not None and "." in str(v) else (int(v) if v is not None else None)
+        except ValueError:
+            return None
+    return {"status": status, "execs": _num("execs_done"), "eps": _num("execs_per_sec"),
+            "cov": _num("edges_found"), "cov_label": "edges",
+            "crashes": _num("saved_crashes") if st.get("saved_crashes") is not None
+            else _num("unique_crashes"),
+            "hangs": _num("saved_hangs") if st.get("saved_hangs") is not None
+            else _num("unique_hangs"),
+            "corpus": _num("corpus_count"), "out": lines}
 
 
 def campaign_stats(out_dir) -> dict:
