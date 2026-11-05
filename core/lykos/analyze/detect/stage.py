@@ -357,6 +357,92 @@ def _program_only(ctx, target, functions):
     return keep_fn, keep_ed, dropped
 
 
+def _library_scoped(ctx, target, functions, edges, *, off=False):
+    """(functions, edges, excluded count, (summary functions, summary edges)): a STATICALLY linked
+    target scoped to the program's own functions (see libscope). The library bodies leave the analysed set -- no detector, no taint
+    fixpoint, no bounds pass walks them -- and edges FROM them go with them; edges INTO them stay,
+    carrying the callee's name, so `memcpy`/`read`/`printf` are still recognised as the sink or
+    source they are, exactly as an import is on a dynamic binary. Emits `detect.library_scoped`
+    saying how many were excluded and on what basis. `off` (params.include_static_libc) keeps
+    everything for a deliberate whole-image run; the skip is reported either way."""
+    none = (functions, edges, 0, ([], []))
+    if (target.file_type or "").lower() != "elf" or not functions:
+        return none
+    from . import libscope
+    try:
+        blob = ctx.content.path(target.sha256).read_bytes()
+        sc = libscope.library_scope(blob, functions)
+    except Exception:                                    # noqa: BLE001 -- scoping is best-effort
+        observe.absorbed(_log, "static-binary scoping unavailable; analysing every function")
+        return none
+    ex = sc.get("excluded") or {}
+    if not ex:
+        return none
+    payload = {"linking": sc.get("linking"), "excluded": len(ex), "kept": sc.get("kept"),
+               "total": sc.get("total"), "basis": sc.get("basis"), "sample": sc.get("sample"),
+               "applied": not off}
+    if off:
+        payload["note"] = (f"statically linked: {len(ex)} of {sc.get('total')} functions are the "
+                           f"linked-in library, but params.include_static_libc kept them in scope")
+        ctx.emit("detect.library_scoped", payload=payload)
+        return none
+    payload["note"] = (
+        f"statically linked: {len(ex)} of {sc.get('total')} recovered functions are the linked-in "
+        f"library (" + ", ".join(f"{n} by {b}" for b, n in sorted((sc.get("basis") or {}).items()))
+        + f") and were not analysed; the other {sc.get('kept')} (the program's own, plus anything "
+        f"not confidently library) were. Calls into the "
+        f"library are still recognised by name as sinks/sources, as imports are on a dynamic "
+        f"binary. Pass params.include_static_libc to analyse the whole image.")
+    kept = [f for f in functions if f.addr not in ex]
+    kept_addrs = {f.addr for f in kept}
+    # One level of library SUMMARY for the taint channel: the library functions the program calls
+    # DIRECTLY are walked by taint (never by a detector, and nothing in them is filed) with their
+    # own callees treated as named imports. That keeps the return/parameter flow of the call --
+    # `p = malloc(n)` with `n` read from the file makes `p` an attacker-sized pointer, the shape
+    # of every over-read through it -- which pure name semantics would drop: measured on
+    # jhead-3.04, 26 program-function dereference sites (show_IPTC, ProcessFile) depended on it.
+    callees = {e.dst_addr for e in edges if e.src_addr in kept_addrs and e.dst_addr in ex}
+    summary_fns = [f for f in functions if f.addr in callees]
+    summary_edges = [e for e in edges if e.src_addr in callees]
+    payload["taint_summaries"] = len(summary_fns)
+    ctx.emit("detect.library_scoped", payload=payload)
+    edges = [e for e in edges if e.src_addr not in ex]
+    return kept, edges, len(ex), (summary_fns, summary_edges)
+
+
+def _drop_library_sites(conn, target_id, excluded) -> int:
+    """Remove this channel's earlier sites INSIDE library bodies the scoped run no longer analyses.
+
+    reset_candidate_sites keeps corroborated sites (a dynamic channel may have elevated them), so a
+    case detected before scoping would keep its taint-corroborated sites in `_dl_*`/`_IO_*` forever
+    -- the noise this scoping exists to remove. Only the static detectors' candidate/corroborated
+    sites in the excluded functions go; anything poc-backed or confirmed stays. A finding of
+    those detectors left with no site at all by this (one whose every occurrence was in libc) goes
+    too, unless something past corroborated holds it."""
+    from ...db.connection import transaction
+    dets = list(_STATIC_DETECTORS)
+    addrs = sorted(excluded)
+    n = 0
+    dq = ",".join("?" * len(dets))
+    with transaction(conn, immediate=True):
+        touched: set = set()
+        for i in range(0, len(addrs), 400):
+            chunk = addrs[i:i + 400]
+            where = (f"finding_id IN (SELECT id FROM finding WHERE target_id=? AND detector IN "
+                     f"({dq})) AND function_addr IN ({','.join('?' * len(chunk))}) "
+                     f"AND (state IS NULL OR state IN ('candidate', 'corroborated'))")
+            args = (target_id, *dets, *chunk)
+            touched |= {r[0] for r in conn.execute(
+                f"SELECT DISTINCT finding_id FROM finding_site WHERE {where}", args)}
+            cur = conn.execute(f"DELETE FROM finding_site WHERE {where}", args)
+            n += cur.rowcount or 0
+        for fid in touched:
+            conn.execute(
+                "DELETE FROM finding WHERE id=? AND state IN ('candidate', 'corroborated') "
+                "AND NOT EXISTS (SELECT 1 FROM finding_site WHERE finding_id=?)", (fid, fid))
+    return n
+
+
 # Enough to reach a sink through a few frames, without seeding thousands of exports on a
 # library like libcrypto and spending the budget proving that a crypto primitive copies bytes.
 _MAX_EXPORT_SEEDS = 96
@@ -661,6 +747,14 @@ def detect_stage(ctx) -> dict:
     # can say which code is the program's own, detection listens to it -- the same attribution
     # coverage uses. When it cannot (stripped, no local symbols), nothing is filtered.
     functions, edges, dropped = _program_only(ctx, target, functions)
+    # ...and when it could not (jhead-3.04: the entry point is crt code, so the range attribution
+    # distrusts itself and keeps all 1,429 functions), a STATIC binary's libc bodies are named and
+    # dropped here. Calls INTO them keep their dst_name, so they stay named sinks/sources -- an
+    # import's treatment on a dynamic binary. Never applied to a dynamically linked target.
+    _all_addrs = {f.addr for f in functions}
+    functions, edges, lib_scoped, lib_summary = _library_scoped(
+        ctx, target, functions, edges, off=bool(p_det.get("include_static_libc")))
+    lib_excluded = (_all_addrs - {f.addr for f in functions}) if lib_scoped else set()
     # A RELOCATABLE object -- a Linux kernel module, a firmware object file, any `.o` -- has its
     # call graph in its RELOCATIONS, not its instructions: the displacement of every external call
     # is a placeholder (`call <self+5>`) and the callee's name lives in `.rela.text`. The
@@ -685,6 +779,15 @@ def detect_stage(ctx) -> dict:
         if full.ir:
             func_irs[f.addr] = full.ir
 
+    # Library-summary IR for the taint channel only (see _library_scoped): never a detector input.
+    taint_irs, taint_edges = func_irs, None
+    if lib_summary[0]:
+        taint_irs = dict(func_irs)
+        for f in lib_summary[0]:
+            if f.blocks and f.addr not in taint_irs:
+                full = fdao.get(f.id)
+                if full and full.ir:
+                    taint_irs[f.addr] = full.ir
     # The image is MAPPED (not read whole into memory -- a 100MB target), lazily, once, and only
     # if a detector needs a constant from it (a rodata format literal, a global array's st_size);
     # the view is released after the detector pass.
@@ -759,6 +862,12 @@ def detect_stage(ctx) -> dict:
     # per-function IR already hydrated above instead of loading every function a second time.
     ctx.progress(msg="data-flow taint analysis (inter-procedural)")
     func_irs = dctx.func_irs
+    _lib_sites: set = set()
+    if taint_irs is not func_irs:
+        taint_edges = list(dctx.call_edges) + list(lib_summary[1])
+        _lib_sites = {e.site_addr for e in lib_summary[1] if e.site_addr}
+    else:
+        taint_irs, taint_edges = func_irs, dctx.call_edges
     entry_seeds = entry_seed_params(dctx.functions, dctx.frames)   # argv/envp at main
     # A shared library has no `main`, so that returns nothing and the data-flow channel starts
     # from SOURCES alone -- which for a library that is handed its input by a caller means it
@@ -819,11 +928,15 @@ def detect_stage(ctx) -> dict:
         # that selection left out.
         rk: dict = {}
         capped: set = set()
-        tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
+        tainted_sites = taint.analyze_program(taint_irs, taint_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,
                                               max_funcs=taint_cap, skipped_out=oversized,
                                               heap_regions=heap_regions, ranked_out=rk,
                                               should_stop=ctx.should_cancel, capped_out=capped)
+        if taint_irs is not func_irs:
+            # the library summaries carried flow; nothing INSIDE them is the target's finding
+            derefs[:] = [d for d in derefs if d.get("function_addr") in func_irs]
+            tainted_sites = {x for x in tainted_sites if x not in _lib_sites}
         if rk:
             ctx.emit("detect.taint_ranked", payload={**rk, "cap": taint_cap})
             if rk.get("skipped_reachable", 0) > 0:
@@ -848,11 +961,11 @@ def detect_stage(ctx) -> dict:
             _merged = {a: set(idx) for a, idx in (entry_seeds or {}).items()}
             for a, idx in _buf_seeds.items():
                 _merged[a] = _merged.get(a, set()) | set(idx)
-            _with_buf = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
+            _with_buf = taint.analyze_program(taint_irs, taint_edges, target.arch,
                                               entry_seeds=_merged, max_funcs=taint_cap,
                                               heap_regions=heap_regions,
                                               should_stop=ctx.should_cancel)
-            buffer_only = set(_with_buf) - set(tainted_sites)
+            buffer_only = set(_with_buf) - set(tainted_sites) - _lib_sites
             ctx.emit("taint.buffer_seed", payload={
                 "seeded_parsers": len(_buf_seeds), "new_sites": len(buffer_only),
                 "note": ("ranked parser entries' buffer parameters seeded as attacker-controlled; "
@@ -985,6 +1098,8 @@ def detect_stage(ctx) -> dict:
     # poc-backed/corroborated sites) -- otherwise a site the new run no longer emits persists and
     # the count only grows, and a class the gate drops to zero keeps its stale sites forever.
     fd.reset_candidate_sites(target.id, _STATIC_DETECTORS)
+    if lib_excluded:
+        _drop_library_sites(ctx.conn, target.id, lib_excluded)
     for c in cands:
         # Stamp the run: this channel's verdicts from an EARLIER run are replaced rather than
         # max-merged, which is what lets a demotion (a copy proven bounded, say) actually take
@@ -1006,6 +1121,7 @@ def detect_stage(ctx) -> dict:
                                                        "proof. Pass include_hardening / "
                                                        "include_toctou to run them."),
                                        "library_sites_skipped": dropped,
+                                       "library_functions_scoped": lib_scoped,
                                        "derefs": len(guards), "guarded_derefs": n_guarded})
     # The number the OPERATOR will see on the board, not the pre-dedup candidate list.
     # `cands` is one entry per SITE and upsert merges them by dedup_key, so jhead reported
