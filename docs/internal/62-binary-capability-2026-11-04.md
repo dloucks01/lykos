@@ -126,7 +126,7 @@ writes into a callee's frame, uninit, leaks, type confusion) plus solver reach.
 | 2 binary ground truth | debug twins (3 byte-identical; unzip/jhead-3.04 not reproducible), address matcher, `binary-stripped` surface, one crash = one defect | 780aa48 |
 | 3 hypothesis loop stage | `hypo_hunt` in the autopilot search phase before fuzzing; o04 heap read validated by QASan on a plain build | de44d82 57a7f5a |
 | 4 P-Code detectors | alloc-size overflow (`pcode_alloc_overflow`): Tier-0 2/2 real, 0 on 10,705 real functions | d671f65 |
-| 5 unicorn driver-synth | open | |
+| 5 unicorn driver-synth | DONE (§7): redzone heap, QASan program replay, static + aarch64, autopilot-scheduled | 866a159 dbec837 01ff552 |
 | 6 static-binary scoping | jhead-3.04 detect 39 s -> 3 s, 463/464 program sites kept | cda08a8 |
 
 **Also fixed this session:** taint fixpoints were round-robin (one 1,950-block glibc function: 426 s
@@ -177,3 +177,85 @@ real parsers solver reach + hypothesis RANKING are the bottleneck.
 - **pcode_guards field taint with ranges** (e596e38): real set 0 -> 0 reports on 11,905 functions,
   tainted allocation sizes 12 -> 26 (all correctly bounded), Tier-0 still exactly 2/2.
 - Item 5 (unicorn driver-synth) still open.
+
+## 7. Fourth pass (2026-11-05): item 5, the static-binary reach collapse, stripped static
+
+**Item 5 -- the emulated function harness becomes an autopilot binary driver** (866a159, 6496475,
+dbec837). The `harness` stage existed on demand only, x86-64 only, over a bump allocator:
+* **Redzone + quarantine heap** (`emulate._Heap`): 32-byte poisoned redzones around every chunk,
+  freed chunks never reused; checked on the emulated code's own loads/stores (a heap-range memory
+  hook) and in every libc stub. Heap overflow (CWE-122 write / CWE-125 read), use-after-free
+  (CWE-416), double free (CWE-415) and invalid free (CWE-763) are now faults; before, an overflow
+  ran silently into the next chunk and `free` was a no-op. Vector loads that start inside a chunk
+  are exempt (SSE2 str* over-read by design).
+* **Program-level confirmation through QASan**: a heap-class lead that does not crash natively (a
+  small overflow rarely does) is confirmed only when the WHOLE program under QASan reports inside
+  the harness function on 2/2 runs (`harness-replay-qasan`).
+* **Static binaries**: `analyze/ifunc.py` resolves IRELATIVE slots offline by running each
+  resolver under unicorn (baseline implementations; jhead-3.04 29/29, jhead_aarch64 5/5); modelled
+  routines go to the stubs, the rest run glibc natively. A static binary's own malloc/free are
+  stubbed by name. A syscall model replaces unicorn's silent no-op (`brk` "returned" 12).
+* **No findings from a static binary's own libc**: the first autopilot run with the harness
+  (stripped jhead-3.04) filed 4 function-level findings, all artifacts -- first glibc bodies driven
+  with a fuzzed argument, then (once only program functions were driven) NULL+offset reads inside
+  uninitialised libc (glibc's malloc reading its tcache). Library bodies are not driven, and a
+  NULL-page fault at a PC in library code with no heap verdict is dropped and counted
+  (`libc_init_artifacts`). Now 0 findings there, 4 artifacts counted.
+* **aarch64** (dynamic + static glibc) through an `_Arch` descriptor: x0/x1 arguments, LR return,
+  `bl`/`blr` call sites, `svc`, TPIDR_EL0 TLS, aarch64 relocations + PLT. Stage test end to end.
+* Scheduled after `hypo_hunt` (5 functions x ~17 s, want=120); in the plan and the in-tab GUI run.
+
+**The hypo_hunt reach collapse on static binaries -- the §6 diagnosis was wrong** (3e0e41e). angr's
+loader DOES fill IFUNC slots. The driver hooked its lean `strlen`/`strcpy` models by NAME, and in a
+static glibc binary the symbol `strlen` IS the IFUNC resolver: the static startup's IRELATIVE pass
+called the "resolver", stored the model's return value (0) in the GOT, and every later strlen call
+jumped to 0x0 (`errored_from`, new: all 9,698 from the strlen `.plt` stub at 0x4010f0). The driver
+now moves such hooks onto the implementation the resolver selects. Static jhead-3.04: 0 states to
+0x0; it now executes glibc's real startup and reaches program sites.
+
+**Stripped static scoping** (3e0e41e): libscope's new `layout-reach` basis -- the linker appends
+libc.a members after the program's objects, so a function is library when it lies above the lowest
+identified library body above main AND main cannot reach it through program code. Stripped
+jhead-3.04: 22 -> 634 of 786 functions excluded, 0 of the 86 program functions (truth: the
+unstripped twin's symbol-file attribution); `detect_cwe` 243 s (cancelled at its budget) -> 3 s;
+`hypo_hunt` proposals stay in program code (3,229 mostly-glibc -> 28). With the time back, the
+injection lane reaches its filename probe: **CVE-2022-41751 found blind on the stripped static
+binary, L3 verified** (was 0/12).
+
+**Address-control verdict independent of input length** (1bd690b): the probe flipped 1 byte at 48
+evenly spaced offsets; a 150-byte giflib crash stepped by 3 and skipped its lever byte ("fixed
+address", L1) where an 84-byte input of the same bucket the previous run was swept fully (L2). The
+skipped offsets are now tried when the sample finds no lever (<=1 KiB, <=30 s): same input L1 -> L2.
+
+**Hygiene**: `core/tests/test_triage.py` -> `test_finding_triage.py` (the basename collision);
+CodeQL's on-demand status is by design (its registry entry carries the reason: a 10-20 min DB
+build starves a bounded run).
+
+**Recall, everything in** (bench/recall/runs-binary-20261105d, 600 s):
+
+| surface | defects | proven (verified PoC) | vs 11-04 |
+|---|---|---|---|
+| binary | **4/35** | **4**: giflib L2, jhead-3.04 L3, jhead-3.06 L3, ncompress L2 | = |
+| binary-stripped | **4/35** | **4**: giflib L2, **jhead-3.04 L3 (new)**, jhead-3.06 L3, ncompress L2 | 3 -> 4 |
+
+Stripped binaries now match their symbolized twins. The first attempt at this run
+(runs-binary-20261105c) lost jhead-3.04 to an OOM kill inside the newly scheduled harness: a hooked
+Uc is freed only by the cyclic GC, which counts Python objects, not native memory (3,000 execs on
+static jhead = 2,055 MB without an explicit close, 62 MB with; 379bb64).
+
+**Harness precision on the recall set** (01ff552): that run's harness filed ~17 function-level
+leads, none reproduced by the program -- every one the harness's fabricated arguments breaking the
+function's caller contract: `main(argc, argv)` driven as `f(buf, len)`, NULL fields of the buffer
+handed in as a struct pointer, a pointer read out of the buffer (`comprexx(char **)` at
+0xffffffff00000000), a scan off the end of the input window, a frame deeper than the emulator's
+2 MiB stack. Entry points are no longer driven; these classes are replayed against the program and
+filed only if it crashes in the function; the stack is 8 MiB. All 10 recall cases: **0 harness
+findings** (17 caller-contract leads + 10 uninitialised-libc faults counted, not filed). The
+harness finds nothing real on these five targets -- their CVEs are reached through whole-program
+paths the other lanes already prove; its yield is code no whole-program path reaches (the redzone /
+QASan fixtures).
+
+**Next:** hypo_hunt still solves 0 on the real targets once it reaches them (28 focused proposals
+on stripped jhead-3.04, 0 solved) -- ranking/solving is the bottleneck now, not the 0x0 collapse;
+on dynamic targets the input-file open remains the blocker. pcode_guards' guard_gap / intwidth /
+lifecycle analogues. QASan findings still stop at `confirmed` (no reproducer bundle).
