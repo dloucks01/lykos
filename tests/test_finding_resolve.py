@@ -29,6 +29,7 @@ __attribute__((noinline)) int leak(const unsigned char *s, int n){
   return r;
 }
 __attribute__((noinline)) int never(int x){ volatile int a[4] = {0}; return a[x & 3]; }
+__attribute__((noinline, used)) int orphan(int x){ return x * 3; }   /* called by nothing */
 int main(int c, char **v){
   FILE *f = fopen(v[1], "rb"); if (!f) return 2;
   unsigned char b[64]; int n = (int)fread(b, 1, sizeof b, f); fclose(f);
@@ -58,8 +59,9 @@ def test_resolver_fires_a_reached_site_and_marks_an_unreached_one(store, case, g
         fns = {f.name: f.addr for f in FunctionDAO(store.conn).list_by_target(t.id)}
         leak_a = next(a for n, a in fns.items() if n and n.endswith("leak"))
         never_a = next(a for n, a in fns.items() if n and n.endswith("never"))
+        orphan_a = next(a for n, a in fns.items() if n and n.endswith("orphan"))
         fd = FindingDAO(store.conn)
-        for name, addr in (("leak", leak_a), ("never", never_a)):
+        for name, addr in (("leak", leak_a), ("never", never_a), ("orphan", orphan_a)):
             fd.upsert(t.id, case.id, {"cwe": "CWE-125", "title": f"candidate read in {name}",
                                       "severity": "medium", "detector": "tainted_deref",
                                       "state": "candidate", "confidence": 0.4,
@@ -77,6 +79,9 @@ def test_resolver_fires_a_reached_site_and_marks_an_unreached_one(store, case, g
     assert leak_ev and leak_ev[-1].startswith("[fired]"), leak_ev
     assert by["test:leak"].state == "confirmed"
     assert never_ev and never_ev[-1].startswith("[not-reached]"), never_ev
+    assert "HAS a path" in never_ev[-1]                               # main calls it (c > 5)
+    orphan_ev = [e["detail"] for e in by["test:orphan"].evidence if e.get("channel") == "resolve"]
+    assert orphan_ev and orphan_ev[-1].startswith("[not-reached-no-static-path]"), orphan_ev
     assert by["test:never"].state == "candidate"                     # a verdict never lowers/raises
     crash = [d for d in DynResultDAO(store.conn).list_by_target(t.id) if d.crashed]
     assert crash and "finding_resolve" in (crash[0].note or "")       # handed to the prove loop

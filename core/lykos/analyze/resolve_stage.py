@@ -300,12 +300,20 @@ def resolve_stage(ctx) -> dict:
                      "input this run produced. Next: a solve aimed at that block.")
         else:
             counts["unreached"] += 1
-            _verdict(ctx, target, f, "not-reached",
+            static = _static_reach(ctx, target, s["fn"])
+            _verdict(ctx, target, f, "not-reached" if static is not False else "not-reached-no-static-path",
                      f"neither the site nor {s['fn']} executed under any of {len(inputs)} kept inputs "
                      f"({_origins(inputs)})"
                      + (f", including {len(variants_tried)} documented invocation(s) "
                         f"({'; '.join(variants_tried[:6])})" if variants_tried else "")
-                     + ". Static reachability decides whether it is worth a directed solve.")
+                     + (". The recovered call graph HAS a path from the program's entry to it, so it is "
+                        "reachable in principle: a directed solve toward it is the next step."
+                        if static else
+                        ". The recovered call graph has NO direct path from the program's entry to "
+                        "it -- it is reached, if at all, only through an indirect call (a function "
+                        "pointer / callback table) the static graph does not resolve."
+                        if static is False else
+                        ". Static reachability could not be computed for it."))
     ctx.emit("finding_resolve.done", payload={"supported": True, "findings": len(findings),
              "inputs": len(inputs), "traced": traced, **counts})
     ctx.progress(pct=100, msg=(f"finding_resolve: {counts['fired']} fired at their site, "
@@ -313,6 +321,25 @@ def resolve_stage(ctx) -> dict:
                                f"site, {counts['unreached']} not reached ({len(inputs)} inputs)"))
     _ = fd
     return {"metrics": {"findings": len(findings), "inputs": len(inputs), **counts}}
+
+
+def _static_reach(ctx, target, fn_name):
+    """True/False: is `fn_name` reachable from the target's entries over the recovered call graph;
+    None when it cannot be said (no entry recovered). Cached per stage run on the context."""
+    try:
+        cache = getattr(ctx, "_resolve_reach", None)
+        if cache is None:
+            # the program's entries (main + every caller of an input source), not only fuzz-harness
+            # entry points -- the binary reach spine of doc 62
+            from .taint_reach import _bfs, unified_name_graph
+            adj, entries = unified_name_graph(ctx.conn, target.case_id, program_entries=True)
+            cache = _bfs(adj, set(entries)) if entries else set()
+            ctx._resolve_reach = cache
+        if not cache:
+            return None
+        return fn_name in cache
+    except Exception:                                # noqa: BLE001 -- an extra fact only
+        return None
 
 
 def _diverse(inputs, n) -> list:

@@ -228,6 +228,7 @@ const RESOLVE = {
   "reached-did-not-fire": ["reached · quiet", ""],
   "function-entered-site-cold": ["site cold", ""],
   "not-reached": ["not reached", ""],
+  "not-reached-no-static-path": ["no static path", ""],
   "unmapped": ["unmeasured", ""],
   "untested": ["unmeasured", ""],
 };
