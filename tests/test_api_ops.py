@@ -339,6 +339,7 @@ def test_a_browser_can_no_longer_hand_the_autopilot_a_server_path():
     out = AutopilotMixin._normalize_overrides({"seed_files": ["/etc/shadow"], "seed_dir": "/root",
                                                "argv": "-c @@"})
     assert "seed_files" not in out and "seed_dir" not in out and out["argv"] == ["-c", "@@"]
+    assert "sysroot" not in AutopilotMixin._normalize_overrides({"sysroot": "/"})
 
 
 def test_runs_refuse_server_paths_and_resolve_uploaded_seeds(api):

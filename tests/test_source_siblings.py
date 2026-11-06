@@ -85,3 +85,16 @@ def test_hypo_hunt_is_handed_the_autopilots_channel():
     call = src[src.index('_staged(bud, store, t, "hypo_hunt"'):][:120]
     assert "_hp" in call, call
     assert '_hp = {"input_mode": primary}' in src
+
+
+def test_per_target_summary_survives_the_next_targets_plan(store, case):
+    t = store.targets.upsert(case.id, "a.out", "S1")
+    status = {"plan": [{"stage": "disassemble", "state": "done", "elapsed": 3.0},
+                       {"stage": "libfuzzer", "state": "skipped",
+                        "detail": "budget for the search phase was already spent"},
+                       {"stage": "net_fuzz", "state": "declined"}]}
+    O._record_target_summary(store, t, status)
+    status["plan"] = []                     # the next target rebuilds the plan
+    row = status["per_target"][0]
+    assert row["filename"] == "a.out" and row["stages"] == {"done": 1, "skipped": 1, "declined": 1}
+    assert row["skipped_for_budget"] == 1 and row["elapsed"] == 3.0 and row["findings"] == 0

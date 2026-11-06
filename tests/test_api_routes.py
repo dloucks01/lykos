@@ -331,3 +331,72 @@ def test_orchestrate_prove_stages_receive_params():
     assert not (needs_input & orchestrate._NO_PARAMS), \
         ("stages that raise on a missing params.input_sha but are marked no-param, so the "
          f"autopilot will drop it: {sorted(needs_input & orchestrate._NO_PARAMS)}")
+
+
+def _put_tree(tmp_path, cid, tid, files: dict):
+    import io
+    import tarfile
+
+    from lykos.casestore import CaseStore
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, text in files.items():
+            data = text.encode()
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    st = CaseStore.open(tmp_path / "cs")
+    try:
+        sha = st.targets.get(tid).sha256
+        st.put_artifact(cid, "source-project", data=buf.getvalue(), meta={"binary_sha": sha})
+    finally:
+        st.close()
+
+
+def test_source_tree_files_and_line_windows(triaged, tmp_path):
+    """A source-tree finding names `dc.c:221`; the GUI reads the lines around it. Paths in and
+    out are tree-relative, a basename resolves, an ambiguous one returns candidates, and a path
+    that climbs out of the tree is refused."""
+    sock, cid, tid = triaged
+    src = "\n".join(f"line {i}" for i in range(1, 301))
+    _put_tree(tmp_path, cid, tid, {"lib/dc.c": src, "a/util.h": "x", "b/util.h": "y",
+                                   "README.md": "readme"})
+    st, body = _json(sock, "GET", f"/targets/{tid}/source-tree")
+    assert st == 200 and body["source"] is True
+    assert set(body["files"]) >= {"lib/dc.c", "a/util.h", "b/util.h"}
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=dc.c&line=221&context=2")
+    assert st == 200 and w["path"] == "lib/dc.c" and w["start"] == 219
+    assert w["lines"] == ["line 219", "line 220", "line 221", "line 222", "line 223"]
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=/tmp/build/proj/lib/dc.c&line=1&context=0")
+    assert st == 200 and w["lines"] == ["line 1"]
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=util.h")
+    assert st == 404 and sorted(w["candidates"]) == ["a/util.h", "b/util.h"]
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=../../../etc/passwd")
+    assert st == 404
+
+
+def test_source_tree_for_a_binary_only_case(triaged):
+    sock, _cid, tid = triaged
+    st, body = _json(sock, "GET", f"/targets/{tid}/source-tree")
+    assert st == 200 and body == {"files": [], "source": False}
+
+
+def test_source_file_resolves_a_findings_own_site(triaged, tmp_path):
+    from lykos.casestore import CaseStore
+    sock, cid, tid = triaged
+    body = "static int f(int numBits)\n{\n\tint t = 0;\n\tstop = t & MASKS[numBits];\n\treturn 0;\n}\n"
+    _put_tree(tmp_path, cid, tid, {"codec/clear.c": body})
+    st = CaseStore.open(tmp_path / "cs")
+    try:
+        from lykos.db.dao import FindingDAO
+        FindingDAO(st.conn).upsert(tid, cid, {
+            "cwe": "CWE-129", "title": "Wire value -> index", "severity": "high",
+            "detector": "wire_flow", "state": "candidate", "dedup_key": "wf:t",
+            "evidence": [{"channel": "source", "detail": "codec/clear.c: f() uses wire-read "
+                          "'numBits' as a index -- stop = t & MASKS[numBits];"}]})
+        fid = next(x.id for x in FindingDAO(st.conn).list_by_target(tid) if x.dedup_key == "wf:t")
+    finally:
+        st.close()
+    code, w = _json(sock, "GET", f"/targets/{tid}/source-file?finding={fid}&context=1")
+    assert code == 200 and w["path"] == "codec/clear.c" and w["line"] == 4
+    assert w["lines"][1].strip() == "stop = t & MASKS[numBits];"

@@ -36,6 +36,9 @@ class AutopilotMixin:
         # the web path is `seed_shas` (seeds uploaded into THIS case, resolved in _start_autopilot).
         out.pop("seed_files", None)
         out.pop("seed_dir", None)
+        # `sysroot` is a server directory too (it becomes QEMU_LD_PREFIX, set process-wide): the
+        # same CLI-only rule. On the server it comes from LYKOS_QEMU_SYSROOT / the CLI.
+        out.pop("sysroot", None)
         av = out.get("argv")
         if isinstance(av, str):
             try:

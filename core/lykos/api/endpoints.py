@@ -866,6 +866,60 @@ class EndpointsMixin:
         finally:
             s.close()
 
+    def _get_source_tree(self, tid):
+        """The files of the target's uploaded source tree (tree-relative), for the source view."""
+        from . import source_tree as ST
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            root = ST.tree_root(s, t)
+            if root is None:
+                return self._json({"files": [], "source": False})
+            return self._json({"source": True, **ST.list_files(root)})
+        finally:
+            s.close()
+
+    def _get_source_file(self, tid, qs):
+        """Lines of one file of the target's source tree: ?path=<tree-relative or basename>
+        &line=N&context=K. An ambiguous basename answers with its candidates."""
+        from . import source_tree as ST
+        path = (qs.get("path") or [""])[0]
+        try:
+            line = int((qs.get("line") or ["0"])[0]) or None
+            ctx = int((qs.get("context") or ["12"])[0])
+        except ValueError:
+            return self._json({"error": "line/context must be integers"}, 400)
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            root = ST.tree_root(s, t)
+            if root is None:
+                return self._json({"error": "this target has no source tree"}, 404)
+            fid = (qs.get("finding") or [""])[0]
+            if fid:
+                # the finding's own site, resolved exactly as dedup / the confirm stages do
+                from ..analyze.dedup import site_of
+                from ..db.dao import FindingDAO
+                f = next((x for x in FindingDAO(s.conn).list_by_target(tid) if x.id == fid), None)
+                if f is None:
+                    return self._json({"error": "no such finding on this target"}, 404)
+                fp, fl = site_of(f, root)
+                if not fp:
+                    return self._json({"error": "this finding names no source site"}, 404)
+                path, line = fp, (line or fl)
+            rel, cands = ST.resolve(root, path)
+            if rel is None:
+                return self._json({"error": "no such file in the source tree",
+                                   "candidates": cands}, 404)
+            out = ST.read_window(root, rel, line, ctx)
+            return self._json(out, 404 if out.get("error") else 200)
+        finally:
+            s.close()
+
     def _get_run_output(self, rid):
         """The parsed JSON a stage produced -- what actually happened, for the run log.
 

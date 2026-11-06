@@ -164,6 +164,31 @@ def _plan_set(status, stage, state, detail=None) -> None:
         return
 
 
+def _record_target_summary(store, target, status) -> None:
+    """One line per finished target in `status["per_target"]`. `plan` is rebuilt for every
+    target, so once a multi-target run ends the GUI could only show the LAST target's plan --
+    a FreeRDP run read "52 skipped" for the whole case from its smallest sibling."""
+    try:
+        from collections import Counter
+        plan = status.get("plan") or []
+        by = Counter(p.get("state") for p in plan)
+        elapsed = sum(float(p.get("elapsed") or 0) for p in plan)
+        from ..db.dao import FindingDAO
+        fs = FindingDAO(store.conn).list_by_target(target.id)
+        st = Counter((f.state or "candidate") for f in fs)
+        status.setdefault("per_target", []).append({
+            "target_id": target.id, "filename": target.filename,
+            "stages": {k: by.get(k, 0) for k in ("done", "skipped", "declined", "error", "timeout",
+                                                  "slice-ended", "cancelled") if by.get(k)},
+            "skipped_for_budget": sum(1 for p in plan if p.get("state") == "skipped"
+                                      and "budget" in (p.get("detail") or "")),
+            "elapsed": round(elapsed, 1),
+            "findings": len(fs), "poc_backed": st.get("poc-backed", 0),
+            "confirmed": st.get("confirmed", 0)})
+    except Exception:                                    # noqa: BLE001 -- a summary, never fatal
+        _log.debug("per-target summary failed", exc_info=True)
+
+
 def _finalize_plan(status) -> None:
     for p in status.get("plan", []):
         if p["state"] == "pending":          # a conditional step the run never reached
@@ -3141,6 +3166,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                                                      settled=_settled)
                 except Exception:                            # noqa: BLE001 -- never fail a run on this
                     _log.debug("scorecard failed for %s", tid, exc_info=True)
+                _record_target_summary(store, t, status)
             except Exception as _exc:                   # noqa: BLE001 -- isolate, then record
                 _target_failed(store, case_id, tid, _exc, status)
                 continue

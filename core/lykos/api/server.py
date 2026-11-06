@@ -184,6 +184,8 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _TARGET_POC,
     _TARGET_REPLAY,
     _TARGET_SOURCE,
+    _TARGET_SRCFILE,
+    _TARGET_SRCTREE,
     _TARGET_STR,
     _read_static,
     _read_ui,
@@ -606,6 +608,12 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _TARGET_SOURCE.match(path)
             if m:
                 return self._get_target_source(m.group(1))
+            m = _TARGET_SRCTREE.match(path)
+            if m:
+                return self._get_source_tree(m.group(1))
+            m = _TARGET_SRCFILE.match(path)
+            if m:
+                return self._get_source_file(m.group(1), qs)
             m = _TARGET_CAPS.match(path)
             if m:
                 return self._get_capabilities(m.group(1))
