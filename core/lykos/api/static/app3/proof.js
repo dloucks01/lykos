@@ -220,6 +220,33 @@ function VerifyChip({ v }) {
     title=${`replayed the recorded input ${v.runs}× in the sandbox; crashed ${v.crashed}×${v.signal ? ` (${v.signal})` : ""}`}>${txt}</span>`;
 }
 
+// The finding resolver's latest measured verdict (analyze/resolve_stage.py, evidence channel
+// "resolve": "[kind] detail"). Says what was MEASURED about reach and firing -- never a proof by
+// itself, except "fired", which raised the finding and handed a crash to the prove loop.
+const RESOLVE = {
+  "fired": ["fired at its site", "on"],
+  "reached-did-not-fire": ["reached · quiet", ""],
+  "function-entered-site-cold": ["site cold", ""],
+  "not-reached": ["not reached", ""],
+  "unmapped": ["unmeasured", ""],
+  "untested": ["unmeasured", ""],
+};
+function resolveOf(f) {
+  const ev = (f.evidence || []).filter((e) => e && e.channel === "resolve");
+  const last = ev[ev.length - 1];
+  if (!last) return null;
+  const m = /^\[([a-z-]+)\]\s*(.*)$/s.exec(last.detail || "");
+  if (!m) return null;
+  const reach = (f.evidence || []).filter((e) => e && e.channel === "resolve-reach").pop();
+  return { kind: m[1], detail: m[2], reach: reach ? reach.detail : null };
+}
+function ResolveChip({ f }) {
+  const r = resolveOf(f);
+  if (!r) return null;
+  const [label, cls] = RESOLVE[r.kind] || [r.kind, ""];
+  return html`<span class=${"chip" + (cls ? " " + cls : "")} title=${r.detail}>${label}</span>`;
+}
+
 function VerdictChip({ f }) {
   const vr = f.verification || {};
   const d = VERDICT[vr.verdict];
@@ -312,6 +339,7 @@ function CardFoot({ f, members, open, pocs, pocsBy }) {
     <${CurChip} f=${f} />
     ${vs.slice(0, 1).map(({ v }) => html`<${VerifyChip} v=${v} />`)}
     <${VerdictChip} f=${f} />
+    <${ResolveChip} f=${f} />
     <span style="flex:1 1 auto"></span>
     <${QuickFP} f=${f} members=${members} />
     <${Related} members=${members} open=${open} pocsBy=${pocsBy} />
@@ -369,6 +397,7 @@ function LeadRow({ u, open, showTarget, pocsBy }) {
       <span class="dim" style="font-size:12px;flex:none">${f.severity}</span>
     </button>
     <div class="pf-lead-side">
+      <${ResolveChip} f=${f} />
       <${CurChip} f=${f} />
       <${QuickFP} f=${f} members=${u.members} />
       <${Related} members=${u.members} open=${open} pocsBy=${pocsBy} />
@@ -1047,6 +1076,7 @@ export function FindingDetail({ data, findingId, back, toCode, open = null }) {
         <${CurChip} f=${f} />
         ${vs.length ? html`<${VerifyChip} v=${vs[0].v} />` : null}
         <${VerdictChip} f=${f} />
+        <${ResolveChip} f=${f} />
         <${Meta} f=${f} /></div>
       <h1 class="pf-title">${f.title}</h1>
       ${f.cwe_name ? html`<span class="muted" style="font-size:13px">${f.cwe} — ${f.cwe_name}${f.cwe_desc ? html`<span class="dim"> · ${f.cwe_desc}</span>` : null}</span>` : null}
@@ -1061,6 +1091,11 @@ export function FindingDetail({ data, findingId, back, toCode, open = null }) {
           ${bl ? html`<p class="next" style="margin-top:10px"><b>Technique to build next:</b> ${bl.missing_technique}
             ${bl.reached ? html`<span class="dim"> (reached ${bl.reached}${bl.would_reach ? `, would reach ${bl.would_reach}` : ""})</span>` : null}</p>` : null}
         </section>
+        ${resolveOf(f) ? html`<section class="panel pad">
+          <h2>Resolution <${ResolveChip} f=${f} /></h2>
+          <p class="card-b" style="margin:6px 0 0">${resolveOf(f).detail}</p>
+          ${resolveOf(f).reach ? html`<p class="dim" style="margin:8px 0 0;font-size:12.5px">${resolveOf(f).reach}</p>` : null}
+        </section>` : null}
         ${f.detector === "attack_path" ? html`<section class="panel pad"><h2>Attack path</h2>
           <p class="dim" style="font-size:12px;margin:4px 0 10px">The deepest attacker path the findings compose — each step a real finding (or a weaponization technique edge), with how far it is demonstrated.</p>
           <${AttackPathDiagram} f=${f} findings=${data.findings.filter((x) => x.target_id === f.target_id)} open=${go} /></section>` : null}

@@ -1,6 +1,6 @@
 // Engagement screen: every target of the case and what is PROVEN on each, plus adding a target
 // and starting an analysis (with the CLI's invocation options: argv template, input channel).
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 import { folderArchive, isFolderPick } from "../app/archive.js";
@@ -22,8 +22,41 @@ function summarize(data, t) {
   return { c, top, topLevel };
 }
 
+// A dropped FOLDER arrives as one empty File: walk it with the entry API and hand back every file
+// with its path relative to the dropped folder (what a folder PICK gives), so it packs into one
+// source archive exactly like a picked folder. Plain dropped files pass through unchanged.
+async function droppedFiles(dt) {
+  const items = [...(dt.items || [])];
+  const entries = items.map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null)).filter(Boolean);
+  if (!entries.some((en) => en.isDirectory)) return dt.files;
+  const out = [];
+  const readAll = (reader) => new Promise((res, rej) => {
+    const acc = [];
+    const step = () => reader.readEntries((batch) => (batch.length ? (acc.push(...batch), step()) : res(acc)), rej);
+    step();
+  });
+  const walk = async (en, prefix) => {
+    if (en.isFile) {
+      const f = await new Promise((res, rej) => en.file(res, rej));
+      out.push({ name: f.name, size: f.size, webkitRelativePath: prefix + f.name, arrayBuffer: () => f.arrayBuffer() });
+    } else if (en.isDirectory) {
+      for (const child of await readAll(en.createReader())) await walk(child, prefix + en.name + "/");
+    }
+  };
+  for (const en of entries) await walk(en, "");
+  return out;
+}
+
 function AddTarget({ caseId, onAdded }) {
   const [over, setOver] = useState(false);
+  // A FOLDER picker needs the webkitdirectory ATTRIBUTE. Preact sets it as a DOM property, and
+  // an empty-string value read as false -- the picker opened as a plain file chooser and a
+  // folder could not be selected. Set the attributes on the element itself.
+  const dirInput = useRef(null);
+  useEffect(() => {
+    const el = dirInput.current;
+    if (el) { el.setAttribute("webkitdirectory", ""); el.setAttribute("directory", ""); }
+  }, []);
   const [busy, setBusy] = useState(null);
   const [err, setErr] = useState(null);
   const upload = async (fileList) => {
@@ -45,13 +78,13 @@ function AddTarget({ caseId, onAdded }) {
   };
   return html`<section class=${"drop" + (over ? " over" : "")}
       onDragOver=${(e) => { e.preventDefault(); setOver(true); }} onDragLeave=${() => setOver(false)}
-      onDrop=${(e) => { e.preventDefault(); setOver(false); upload(e.dataTransfer.files); }}>
+      onDrop=${async (e) => { e.preventDefault(); setOver(false); upload(await droppedFiles(e.dataTransfer)); }}>
     <h2>Add a target</h2>
     <span class="muted" style="font-size:13px">Drop a binary or firmware image here, or${" "}
       <label style="color:var(--blue);cursor:pointer">browse files<input type="file" multiple hidden
         onChange=${(e) => upload(e.target.files)} /></label>, or pick a${" "}
-      <label style="color:var(--blue);cursor:pointer">source folder<input type="file" webkitdirectory="" multiple hidden
-        onChange=${(e) => upload(e.target.files)} /></label>.</span>
+      <label style="color:var(--blue);cursor:pointer">source folder<input type="file" multiple hidden
+        ref=${dirInput} onChange=${(e) => upload(e.target.files)} /></label>.</span>
     ${busy ? html`<span class="dim" style="font-size:12px">${busy}</span>` : null}
     ${err ? html`<span style="color:var(--amber-tx);font-size:12px">${err}</span>` : null}
   </section>`;
