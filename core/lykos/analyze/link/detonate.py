@@ -71,7 +71,11 @@ def _wait_ready(channel, deadline):
     if fam == "unix" and key:
         while not os.path.exists(key) and time.time() < deadline:
             time.sleep(0.02)
-    elif fam in ("tcp", "socket") and key:
+    elif fam in ("tcp", "socket") and key and str(key).startswith("/"):
+        # a socket channel named by a filesystem path is an AF_UNIX endpoint, not host:port
+        while not os.path.exists(key) and time.time() < deadline:
+            time.sleep(0.02)
+    elif fam in ("tcp", "socket") and key and str(key).rpartition(":")[2].isdigit():
         host, _, port = str(key).rpartition(":")
         host = host or "127.0.0.1"
         while time.time() < deadline:

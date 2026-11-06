@@ -46,11 +46,12 @@ def identify_allocator(functions: dict, call_edges=None) -> dict | None:
     `*_free`/`*free`/`delete*` is the allocator. libc malloc/free are skipped (the LD_PRELOAD guard
     already covers them). When several match, prefer the pair with the most similar name stem
     (ta_alloc/ta_free), which is what a hand-rolled allocator looks like."""
+    from ..toolchain_runtime import is_toolchain_runtime
     allocs, frees = [], []
     for name, addr in (functions or {}).items():
         base = name.split("@")[0].lstrip("_")
         low = base.lower()
-        if low in _LIBC:
+        if low in _LIBC or is_toolchain_runtime(name):
             continue
         if _ALLOC_RE.search(base) and "free" not in low and "del" not in low:
             allocs.append((name, addr, low))

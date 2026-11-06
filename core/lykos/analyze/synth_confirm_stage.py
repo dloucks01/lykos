@@ -53,12 +53,8 @@ def _candidate_functions(ctx, target, src_root, limit: int) -> list:
         if (f.detector not in _STATIC_SOURCE_DETECTORS
                 or (f.state or "candidate") != "candidate" or len(cands) >= limit):
             continue
-        fp = fline = None
-        for e in (f.evidence or []):
-            if e.get("channel") == "source":
-                fp, fline = _parse_loc(e.get("detail"))
-                if fp:
-                    break
+        from .dedup import site_of
+        fp, fline = site_of(f, src_root)
         if not fp or not fline:
             continue
         try:

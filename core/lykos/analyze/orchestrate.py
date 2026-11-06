@@ -39,6 +39,7 @@ from . import budget as budget_mod
 # literals, so every consumer (the API dispatch tables, the plan, the no-params gate) is
 # preserved; see tests/test_stage_registry.py for the pin.
 from . import stages as _stages
+from . import source_lookup as _src_lookup
 from . import substrate
 
 _stages.check_consistency()  # fail LOUD at import if any descriptor is internally inconsistent
@@ -970,6 +971,38 @@ def _run_case_stage(store, case_id, stage, status, stop) -> None:
 _NONTERM_EXEC_TIMEOUT = 1.0
 
 
+def _is_libfuzzer_harness(store, target) -> bool:
+    """Does this ELF define the libFuzzer entry point (an engine-linked or standalone harness)?"""
+    if (getattr(target, "file_type", None) or "").lower() not in ("elf", ""):
+        return False
+    try:
+        blob = store.content.get_bytes(target.sha256)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return False
+    return b"LLVMFuzzerTestOneInput" in blob
+
+
+def _tree_owners(store, target_ids) -> dict:
+    """{sibling target id: owner filename} for the targets that are only build products of a
+    source tree whose owner is also in the case (see source_lookup.tree_owner)."""
+    out = {}
+    for x in target_ids:
+        try:
+            t = store.targets.get(x)
+            own = _src_lookup.tree_owner(store.conn, t) if t else None
+        except Exception:                                # noqa: BLE001 -- advisory ordering
+            own = None
+        if own is not None and own.id != x:
+            out[x] = own.filename
+    return out
+
+
+def _is_shared_lib_name(store, target_id) -> bool:
+    t = store.targets.get(target_id)
+    fn = (getattr(t, "filename", "") or "")
+    return bool(re.search(r"\.so(\.[0-9.]+)?$", fn)) or fn.endswith(".dylib") or fn.endswith(".dll")
+
+
 def _baseline_timed_out(store, target_id) -> bool:
     """Did the baseline execution fail to terminate? `dynamic_run` records it on its own row."""
     from ..db.dao import DynResultDAO
@@ -1001,6 +1034,13 @@ def _ranked_channels(store, target_id):
         # ran against `arg` on a program whose input is `read(0, ...)`.
         syms = ()
         tgt = TargetDAO(store.conn).get(target_id)
+        # A LIBFUZZER HARNESS reads exactly one channel: the input FILE named on its command line
+        # (it runs that one input and exits). It never reads stdin, and run bare it starts its
+        # own fuzzing loop and never exits. FreeRDP's TestFuzz* harnesses import `read`/`fread`,
+        # so the ranking said stdin: dynamic_run, heap_check and directed_fuzz then waited out a
+        # timeout on every execution (a 12 s directed slice ran 73 s of 1 s timeouts).
+        if tgt is not None and _is_libfuzzer_harness(store, tgt):
+            return ["file"]
         if tgt is not None:
             try:
                 syms = triage_symbols(store.conn, store.content, tgt)
@@ -2167,6 +2207,19 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         #: the targets the operator HANDED (not siblings discovered mid-run); they get the reserved
         #: majority of a whole-run budget (budget.PRIMARY_SHARE).
         _primary = set(target_ids)
+        # A SOURCE BUILD'S SIBLINGS ARE NOT PRIMARIES, however they were handed. Both GUIs send
+        # every target in the case, so a FreeRDP upload (the tree's own binary + 6 harnesses + 3
+        # shared libraries, one tree) split a 600 s run nine ways: ~70 s each, libraries first,
+        # and every detector, libFuzzer and the confirmation ladder were skipped for budget on
+        # all nine. The tree's owner leads and keeps the primary share; executables follow and
+        # shared libraries (which cannot run on their own) go last.
+        _owner_of = _tree_owners(store, worklist)
+        if _owner_of:
+            _sib = set(_owner_of)
+            if _primary - _sib:
+                _primary -= _sib
+            worklist.sort(key=lambda x: (0 if x not in _sib else
+                                         2 if _is_shared_lib_name(store, x) else 1))
         _budget_skipped: list = []
         done_tids: set = set()
         wi = 0
@@ -2249,6 +2302,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 bud = budget_mod.CaseBudget(eff_budget,
                                             overrides=_with_tree_seeds(store, t, overrides),
                                             skip_stages=skip_stages, pause=pause)
+                if tid in _owner_of:
+                    # the tree is analysed once, on its owner; a build product of it is analysed
+                    # as the binary it is (its own execution, heap, harness and fuzz stages)
+                    _why_tree = (f"the source tree is analysed once, on {_owner_of[tid]}; this "
+                                 "target is another build product of the same tree")
+                    bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
+                                          **{k: _why_tree for k in _src_lookup.TREE_SCOPED_STAGES}}
                 status["budget"] = bud.spent()                # serializable; refreshed as we go
                 if not t.file_type:
                     _staged(bud, store, t, "ingest_triage", status, stop)
@@ -2380,58 +2440,73 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     _staged(bud, store, t, "jpeg_overread", status, stop, want=20.0)
                 # THE FLOOR: run once to see the target work, then recover + detect.
                 _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
+
+                def _tree_scans():
+                    # wire-value->dangerous-use flow detector (depth add): the pattern behind every
+                    # confirmed bug; cheap/offline, runs with the other static detectors.
+                    _staged(bud, store, t, "wire_flow", status, stop, want=15.0)
+                    # interprocedural param-sink flows (depth): catches cross-function wire->sink
+                    # bugs the intraprocedural detectors miss (the DSP divide-by-zero class); precise.
+                    _staged(bud, store, t, "param_sink", status, stop, want=15.0)
+                    _staged(bud, store, t, "lifecycle_scan", status, stop, want=15.0)
+                    _staged(bud, store, t, "intwidth_scan", status, stop, want=15.0)
+                    # Data-only (DOP) hijack surface: security-decision variables a write could flip to
+                    # take a privileged path with no control-flow hijack. Cheap/offline source scan.
+                    _staged(bud, store, t, "dop_scan", status, stop, want=15.0)
+                    # Double-fetch (TOCTOU) + uninitialized-pointer deref -- new discovery classes.
+                    _staged(bud, store, t, "race_scan", status, stop, want=15.0)
+                    # Guard-gap: attacker-controlled stream length used as a seek/copy bound with no
+                    # Stream_CheckAndLogRequiredLength / Stream_SafeSeek guard -- the dominant real-bug
+                    # shape in FreeRDP (rediscovered CVE-2026-25941). Variant-analysis cross-checked.
+                    _staged(bud, store, t, "guard_gap", status, stop, want=15.0)
+                    # Allocation-size integer overflow: a wire-derived product/sum used as an alloc/copy
+                    # size with no overflow guard (CWE-190 -> CWE-787). Precise sibling of guard_gap.
+                    _staged(bud, store, t, "alloc_overflow", status, stop, want=15.0)
+                    # Missing-sibling-validation (generalized variant analysis): a bounds/validation
+                    # guard most handlers in a dispatch family make but one omits (found CVE-2026-26955).
+                    _staged(bud, store, t, "sibling_guard", status, stop, want=15.0)
+                    # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
+                    # 10-20 min and would starve the core sequence under a bounded budget (observed:
+                    # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it
+                    # explicitly (enqueue_codeql / the deep profile) to ingest interprocedural dataflow
+                    # findings into the same grounding/triage; it caches its DB by source.
+                    # Known-CVE scan of a built-from-source project's declared dependencies + vendored
+                    # headers -- versions that never survive into the compiled binary's banners.
+                    _staged(bud, store, t, "source_cve_scan", status, stop)
+                    # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
+                    _staged(bud, store, t, "embedded_audit", status, stop)
+                    # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
+                    _staged(bud, store, t, "int_overflow_scan", status, stop)
+                    # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
+                    _staged(bud, store, t, "uaf_scan", status, stop)
+                    # A copy whose only length bound is an assertion: unchecked in release builds (an
+                    # out-of-bounds write) or a remote abort where kept (CWE-787/CWE-617).
+                    _staged(bud, store, t, "assert_guard_scan", status, stop)
+                    # An attacker-controlled / monotonic-unbounded index written into an array with no
+                    # bounds check -- an out-of-bounds write (CWE-787).
+                    _staged(bud, store, t, "oob_write_scan", status, stop)
+                    # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
+                    _staged(bud, store, t, "source_sink_scan", status, stop)
+                    # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
+                    # (CWE-120: strcpy/strcat/gets of untrusted data) and path traversal (CWE-22).
+                    _staged(bud, store, t, "cpg_scan", status, stop)
+
+                # A target that OWNS a source tree is detected from the TREE first. Those scanners
+                # read only the source; binary recovery of the same program (an ASan libFuzzer
+                # harness carries ~3,800 sanitizer-runtime functions) spent 77 s of a 126 s recover
+                # phase on FreeRDP and every tree detector -- guard_gap, oob_write, cpg, sinks, the
+                # ones that found its CVEs -- was skipped for budget. A binary-only target keeps
+                # the old order (its detectors need the disassembly).
+                _tree_first = (tid not in _owner_of
+                               and _src_lookup.source_project_for(store.conn, t) is not None)
+                if _tree_first:
+                    _tree_scans()
                 # Recover + detect.
                 _staged(bud, store, t, "disassemble", status, stop)
                 _staged(bud, store, t, "detect_cwe", status, stop)
-                # wire-value->dangerous-use flow detector (depth add): the pattern behind every
-                # confirmed bug; cheap/offline, runs with the other static detectors.
-                _staged(bud, store, t, "wire_flow", status, stop, want=15.0)
-                # interprocedural param-sink flows (depth): catches cross-function wire->sink
-                # bugs the intraprocedural detectors miss (the DSP divide-by-zero class); precise.
-                _staged(bud, store, t, "param_sink", status, stop, want=15.0)
-                _staged(bud, store, t, "lifecycle_scan", status, stop, want=15.0)
-                _staged(bud, store, t, "intwidth_scan", status, stop, want=15.0)
-                # Data-only (DOP) hijack surface: security-decision variables a write could flip to
-                # take a privileged path with no control-flow hijack. Cheap/offline source scan.
-                _staged(bud, store, t, "dop_scan", status, stop, want=15.0)
-                # Double-fetch (TOCTOU) + uninitialized-pointer deref -- new discovery classes.
-                _staged(bud, store, t, "race_scan", status, stop, want=15.0)
-                # Guard-gap: attacker-controlled stream length used as a seek/copy bound with no
-                # Stream_CheckAndLogRequiredLength / Stream_SafeSeek guard -- the dominant real-bug
-                # shape in FreeRDP (rediscovered CVE-2026-25941). Variant-analysis cross-checked.
-                _staged(bud, store, t, "guard_gap", status, stop, want=15.0)
-                # Allocation-size integer overflow: a wire-derived product/sum used as an alloc/copy
-                # size with no overflow guard (CWE-190 -> CWE-787). Precise sibling of guard_gap.
-                _staged(bud, store, t, "alloc_overflow", status, stop, want=15.0)
-                # Missing-sibling-validation (generalized variant analysis): a bounds/validation
-                # guard most handlers in a dispatch family make but one omits (found CVE-2026-26955).
-                _staged(bud, store, t, "sibling_guard", status, stop, want=15.0)
-                # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
-                # 10-20 min and would starve the core sequence under a bounded budget (observed:
-                # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it
-                # explicitly (enqueue_codeql / the deep profile) to ingest interprocedural dataflow
-                # findings into the same grounding/triage; it caches its DB by source.
+                if not _tree_first:
+                    _tree_scans()
                 _staged(bud, store, t, "cve_scan", status, stop)
-                # Known-CVE scan of a built-from-source project's declared dependencies + vendored
-                # headers -- versions that never survive into the compiled binary's banners.
-                _staged(bud, store, t, "source_cve_scan", status, stop)
-                # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
-                _staged(bud, store, t, "embedded_audit", status, stop)
-                # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
-                _staged(bud, store, t, "int_overflow_scan", status, stop)
-                # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
-                _staged(bud, store, t, "uaf_scan", status, stop)
-                # A copy whose only length bound is an assertion: unchecked in release builds (an
-                # out-of-bounds write) or a remote abort where kept (CWE-787/CWE-617).
-                _staged(bud, store, t, "assert_guard_scan", status, stop)
-                # An attacker-controlled / monotonic-unbounded index written into an array with no
-                # bounds check -- an out-of-bounds write (CWE-787).
-                _staged(bud, store, t, "oob_write_scan", status, stop)
-                # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
-                _staged(bud, store, t, "source_sink_scan", status, stop)
-                # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
-                # (CWE-120: strcpy/strcat/gets of untrusted data) and path traversal (CWE-22).
-                _staged(bud, store, t, "cpg_scan", status, stop)
                 # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
                 # an expected token, a menu command -- by breaking on its comparison functions. Those
                 # are the values every later stage needs in order to get PAST a gate, so this belongs
@@ -2589,6 +2664,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # deliberate skip). heap_check is a single guarded run, already bounded, and keeps the
                 # short per-exec timeout from `dyn`.
                 _ht = {"baseline_nonterm": True} if _nonterm else None
+                if _is_libfuzzer_harness(store, t):
+                    # A libFuzzer harness has no stdin menu to crawl, and the operator new/delete
+                    # pair heap_trace falls back to is the fuzzing ENGINE's: FreeRDP's harnesses
+                    # got the same "use-after-free" from the same op sequence on two different
+                    # harnesses -- input-independent, libFuzzer's own C++ internals. Its heap is
+                    # checked by ASan under the libfuzzer stage and harness replay instead.
+                    bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
+                                          "heap_trace": ("a libFuzzer harness has no stdin menu "
+                                                         "to crawl; its heap is checked by ASan "
+                                                         "under libfuzzer and harness replay")}
+                    _ht = {"baseline_nonterm": True}
                 _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", _ht),
                                               ("oob_index", _ht)], status, stop,
                                    budget=bud, want=90.0)
@@ -2636,7 +2722,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # Before the fuzz campaigns so they do not spend its slice. Declines on non-ELF /
                 # shared objects / >32 MB; a source project's binaries are hunted the same way.
                 if not _is_server:
-                    _staged(bud, store, t, "hypo_hunt", status, stop, want=150.0)
+                    # the autopilot's channel ranking, not hypo_hunt's own edge guess: it knows a
+                    # libFuzzer harness reads only its input FILE (FreeRDP: 4,383 hypotheses were
+                    # solved and replayed over stdin, which the harness never reads)
+                    _hp = {"input_mode": primary} if primary in ("file", "stdin", "arg") else None
+                    _staged(bud, store, t, "hypo_hunt", status, stop, _hp, want=150.0)
                 # FUNCTION-LEVEL driving for a binary (doc 62 item 5): the ranked parsers are called
                 # directly under the emulator with a redzone + quarantine heap, so a heap overflow /
                 # UAF / double free in code no whole-program path reaches still surfaces. Filed

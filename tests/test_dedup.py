@@ -42,7 +42,8 @@ def test_canonical_key_prefers_function_then_file():
     assert D.canonical_key("CWE-190", "parse_hdr", "a/b.c") == ("CWE-190", "fn:parse_hdr")
     assert D.canonical_key("CWE-190", None, "a/b.c") == ("CWE-190", "file:b.c")
     # no function and no file still yields a stable key, never a crash
-    assert D.canonical_key(None, None, None) == ("CWE-unknown", "file:unknown")
+    # no location at all: the finding is its own bug, never "the same place" as another
+    assert D.canonical_key(None, None, None, "k1") == ("CWE-unknown", "id:k1")
 
 
 def test_same_function_same_cwe_collapses_to_one_cluster():
@@ -84,3 +85,42 @@ def test_advanced_findings_are_not_clustered():
     fns = _FnMap({("a.c", 1): "f"})
     fs = [_f("CWE-190", "a.c:1", state="confirmed"), _f("CWE-190", "a.c:1", state="poc-backed")]
     assert D.cluster(fs, fns) == {}                         # nothing raw to dedup
+
+
+def test_newer_detectors_site_channels_are_read():
+    """guard_gap / alloc_overflow / sibling_guard record file:line on their OWN channel."""
+    ev = [{"channel": "guard-gap", "detail": "libfreerdp/codec/planar.c:712: 'rawSizes' is read"}]
+    assert D.parse_loc(ev) == ("libfreerdp/codec/planar.c", 712)
+    wf = [{"channel": "source", "detail": "libfreerdp/codec/clear.c: clear_decompress_subcode_rlex() "
+                                          "uses wire-read 'numBits' as a index"}]
+    assert D.parse_loc(wf) == ("libfreerdp/codec/clear.c", None)
+    assert D.parse_fn(wf) == "clear_decompress_subcode_rlex"
+
+
+def test_unlocated_findings_are_never_merged_together():
+    from types import SimpleNamespace as N
+    a = N(id="a", cwe="CWE-129", state="candidate", confidence=0.5, dedup_key="oobindex:tbl",
+          evidence=[{"channel": "oob-index-static", "detail": "array _ZL11ioctl_table"}])
+    b = N(id="b", cwe="CWE-129", state="candidate", confidence=0.5, dedup_key="wf:clear:numBits",
+          evidence=[{"channel": "source", "detail": "libfreerdp/codec/clear.c: "
+                                                    "clear_decompress_subcode_rlex() uses wire-read"}])
+    c = N(id="c", cwe="CWE-129", state="candidate", confidence=0.5, dedup_key="wf:lic:dwErr",
+          evidence=[{"channel": "source", "detail": "libfreerdp/core/license.c: "
+                                                    "license_read_error_alert_packet() uses wire"}])
+    groups = D.cluster([a, b, c], None)
+    assert len(groups) == 3, groups
+
+
+def test_site_of_recovers_the_sink_line_of_a_function_form_site(tmp_path):
+    from types import SimpleNamespace as N
+    (tmp_path / "codec").mkdir()
+    (tmp_path / "codec" / "clear.c").write_text(
+        "static int helper(int);\n"
+        "static BOOL clear_decompress_subcode_rlex(wStream* s, UINT32 numBits)\n{\n"
+        "\tUINT32 tmp = 0;\n\tstopIndex = tmp & CLEAR_8BIT_MASKS[numBits];\n\treturn TRUE;\n}\n")
+    f = N(evidence=[{"channel": "source", "detail": "codec/clear.c: clear_decompress_subcode_rlex() "
+                     "uses wire-read 'numBits' as a index -- stopIndex = tmp & CLEAR_8BIT_MASKS[numBits];"}])
+    assert D.site_of(f, tmp_path) == ("codec/clear.c", 5)
+    g = N(evidence=[{"channel": "source", "detail": "codec/clear.c: clear_decompress_subcode_rlex() "
+                     "frees 'p'"}])
+    assert D.site_of(g, tmp_path) == ("codec/clear.c", 2)        # no statement: the definition

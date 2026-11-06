@@ -183,7 +183,8 @@ def resolve_stage(ctx) -> dict:
     p = ctx.params or {}
     if (target.file_type or "").lower() != "elf":
         return _decline(ctx, "the block tracer drives native ELF executables")
-    if target.arch and target.arch != sandbox.host_arch():
+    from . import substrate
+    if substrate.foreign_cpu(target.arch, target.file_type, sandbox.host_arch()):
         return _decline(ctx, f"the block tracer is native-only ({target.arch} on a {sandbox.host_arch()} host)")
     findings = _unresolved(ctx.conn, target)
     if not findings:

@@ -35,8 +35,19 @@ _CWE = {"stack-buffer-overflow": "CWE-121", "heap-buffer-overflow": "CWE-122",
 #: the STATIC source detectors whose candidates a ladder crash can confirm by co-location (and whose
 #: functions synth_confirm drives). Includes `cpg` (CWE-120/CWE-22 queries) and `source_sink`.
 _STATIC_SOURCE_DETECTORS = ("source_sink", "cpg", "int_overflow", "uaf", "cve_source",
-                            "embedded_config", "assert_guard", "oob_write")
+                            "embedded_config", "assert_guard", "oob_write",
+                            # the precise tree detectors (doc 60+): they were never handed to the
+                            # ladder / driver synthesis, so their candidates -- FreeRDP's ClearCodec
+                            # index sites among them -- could never be confirmed
+                            "wire_flow", "param_sink", "guard_gap", "alloc_overflow",
+                            "sibling_guard", "lifecycle", "intwidth", "double_fetch", "uninit_ptr")
 _SRC_LOC = re.compile(r"([\w./+\-]+):(\d+)")
+
+
+def _site(finding, root):
+    """(file, line) of a finding's site, from whichever channel its detector records it on."""
+    from .dedup import site_of
+    return site_of(finding, root)
 
 
 def _parse_loc(s):
@@ -89,7 +100,7 @@ def _uc_sites(ctx, target, src) -> list:
     return out[:32]
 
 
-def _steer_sites(ctx, target) -> list:
+def _steer_sites(ctx, target, src_root=None) -> list:
     """The (basename, line) SITES of the static source candidates, to steer the concolic rung toward
     the statically-suspected bug LINES (not the enclosing function entry -- that would stop before the
     guard the defect sits behind). Resolved per harness against its own DWARF line table. Returns a
@@ -99,12 +110,7 @@ def _steer_sites(ctx, target) -> list:
     for f in FindingDAO(ctx.conn).list_by_target(target.id):
         if f.detector not in _STATIC_SOURCE_DETECTORS or len(sites) >= 128:
             continue
-        fp = fline = None
-        for e in (f.evidence or []):
-            if e.get("channel") == "source":
-                fp, fline = _parse_loc(e.get("detail"))
-                if fp:
-                    break
+        fp, fline = _site(f, src_root)
         if not fp or not fline:
             continue
         key = (os.path.basename(fp), fline)
@@ -300,13 +306,8 @@ def _rank_by_surface(ctx, target, surface) -> dict:
         # upsert recomputes state back up from its verdicts).
         if (f.state or "candidate") == "merged":
             continue
-        base, fp, ln = None, None, None
-        for e in (f.evidence or []):
-            if e.get("channel") in ("source", "recipe-source"):
-                fp, ln = _parse_loc(e.get("detail"))
-                if fp:
-                    base = os.path.basename(fp)
-                    break
+        fp, ln = _site(f, None)
+        base = os.path.basename(fp) if fp else None
         if not base:
             continue
         on = base in surface
@@ -337,7 +338,7 @@ def _rank_by_surface(ctx, target, surface) -> dict:
     return {"in_surface": inc, "off_surface": outc, "surface_recipes": recs}
 
 
-def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> int:
+def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness, src_root=None) -> int:
     """Upgrade a co-located STATIC source candidate to `confirmed` when this ladder crash proves it:
     the crash's file:line matches the candidate's AND the CWE agrees. Sound -- an ASan fault at the
     exact site with a matching class confirms the statically-suspected defect there; a mismatched
@@ -353,12 +354,7 @@ def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> in
         if (f.detector not in _STATIC_SOURCE_DETECTORS or f.cwe != crash_cwe
                 or (f.state or "candidate") not in ("candidate", "corroborated")):
             continue
-        fp = fline = None
-        for e in (f.evidence or []):
-            if e.get("channel") == "source":
-                fp, fline = _parse_loc(e.get("detail"))
-                if fp:
-                    break
+        fp, fline = _site(f, src_root)
         if fline != aline or not _suffix_match(ap, fp):
             continue
         fd.upsert(target.id, target.case_id, {
@@ -525,7 +521,7 @@ def source_confirm_stage(ctx) -> dict:
     # rung at the statically-suspected bug lines (resolved per harness against its own DWARF line
     # table). Only computed when a concolic (explore) build exists -- the only rung that consumes it.
     # Steering only affects exploration efficiency, never soundness (replay + negative control gate it).
-    sites = _steer_sites(ctx, target) if (ex_by or exc_by) else []
+    sites = _steer_sites(ctx, target, src) if (ex_by or exc_by) else []
     if ex_by or exc_by:
         # the UC leads' functions first: reaching one from the real entry is the from-entry proof
         sites = [s_ for s_ in _uc_sites(ctx, target, src) if s_ not in sites] + sites

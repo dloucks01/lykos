@@ -16,7 +16,7 @@ import pathlib
 import pkgutil
 
 import lykos.analyze as analyze_pkg
-from lykos.analyze.orchestrate import _CASE, _PLAN_STAGES, _TARGET
+from lykos.analyze.orchestrate import _CASE, _PLAN_STAGES, _TARGET, _enqueue_fn
 
 #: Stages that are deliberately NOT part of an autopilot run, each with the reason.
 _EXEMPT = {
@@ -88,6 +88,28 @@ def test_the_params_free_stages_really_take_no_required_params():
     # library. "Requires no params" and "wants no params" are different questions.
     for stage in ("libfuzzer", "fuzz", "coverage_fuzz", "concolic"):
         assert stage not in _NO_PARAMS, stage
+
+
+def test_a_no_params_stage_does_not_read_params_it_is_never_given():
+    """`_NO_PARAMS` drops ALL params, the budget slice's `max_seconds` included. A stage whose
+    code reads `ctx.params` (beyond the generic control keys) is therefore never told what the
+    autopilot computed for it. heap_trace/oob_index were listed and read `baseline_nonterm`: on a
+    libFuzzer harness (a bare run never exits) heap_trace drove 12 sequences to its own ceiling,
+    ~100 s per FreeRDP harness, on a 70 s target share."""
+    import importlib
+    import re
+
+    from lykos.analyze import stages as _stages
+    bad = []
+    for s in _stages.STAGES:
+        if not s.no_params or s.scope != "target":
+            continue
+        fn = _enqueue_fn(_TARGET[s.name])
+        src = pathlib.Path(importlib.import_module(fn.__module__).__file__).read_text()
+        keys = set(re.findall(r"""\(ctx\.params or \{\}\)\.get\(["'](\w+)""", src))
+        if keys:
+            bad.append((s.name, sorted(keys)))
+    assert not bad, f"no_params stages that read params they never receive: {bad}"
 
 
 def test_every_stage_the_pass_calls_is_in_the_enqueue_map():

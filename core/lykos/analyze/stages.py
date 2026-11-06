@@ -157,8 +157,12 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("directed_fuzz", "Directed fuzzing", "target", "..analyze.fuzz", "enqueue_directed_fuzz"),
     # --- Memory-safety probes -----------------------------------------------------------------
     StageSpec("heap_check", "Heap checks", "target", "..analyze.dynamic", "enqueue_heap_check"),
-    StageSpec("heap_trace", "Heap primitives", "target", "..analyze.dynamic", "enqueue_heap_trace", no_params=True),
-    StageSpec("oob_index", "Array-index probes", "target", "..analyze.dynamic", "enqueue_oob_index", no_params=True),
+    # NOT no_params: both read `baseline_nonterm` and the budget slice's `max_seconds`. Listed as
+    # no_params they got neither, so on a libFuzzer harness (whose bare run never exits)
+    # heap_trace drove 12 sequences to its own ~100 s ceiling on every FreeRDP harness, past the
+    # phase slice the batch had computed for it.
+    StageSpec("heap_trace", "Heap primitives", "target", "..analyze.dynamic", "enqueue_heap_trace"),
+    StageSpec("oob_index", "Array-index probes", "target", "..analyze.dynamic", "enqueue_oob_index"),
     # mem_oracle picks its own probe inputs (a recorded crash if there is one, else an empty probe).
     StageSpec("mem_oracle", "Uninitialised-memory oracle", "target", "..analyze.dynamic", "enqueue_mem_oracle", no_params=True),
     StageSpec("chain_primitive", "Primitive chaining", "target", "..analyze.poc", "enqueue_chain", no_params=True),

@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import functools
 import re
 import shutil
 import subprocess
@@ -2091,6 +2092,101 @@ def _is_elf_exec(p: Path) -> bool:
 _FUZZ_PRELOAD_DIRS = ("ci", "cmake", ".clusterfuzzlite", "tools", "")
 _RE_CMAKE_NOTFOUND = re.compile(r"Could NOT find (\w+)")
 _RE_CMAKE_PROVIDED = re.compile(r'provided by "([\w\-]+)"')
+#: pkg-config's REQUIRED failure: "The following required packages were not found:\n\n - fuse3"
+_RE_PKGCFG_MISSING = re.compile(r"required packages were not found:\s*((?:\s*-\s*[\w.+\-]+(?:[<>=]+[\w.]+)?)+)")
+_RE_CMAKE_FRAME = re.compile(r"^\s*(?:CMake Error at )?([\w./\-]*CMakeLists\.txt|[\w./\-]+\.cmake):(\d+)",
+                             re.M)
+_RE_CMAKE_IF = re.compile(r"^\s*if\s*\(\s*(?:NOT\s+)?([A-Z][A-Z0-9_]+)\s*\)\s*$", re.I)
+
+
+def _cmake_error_blocks(out: str) -> list:
+    """The `CMake Error ...` blocks of a configure log (up to the next blank-line-separated
+    `CMake Warning`/`--` line). Warnings name packages too -- FreeRDP warns that jansson has no
+    CMake config and then finds it through pkg-config -- so a missing-package scan over the whole
+    log disabled a dependency that was present, and missed the one that failed."""
+    blocks, cur = [], None
+    for line in (out or "").splitlines():
+        if line.startswith("CMake Error"):
+            if cur:
+                blocks.append("\n".join(cur))
+            cur = [line]
+        elif cur is not None:
+            if line.startswith(("CMake Warning", "-- ", "CMake Deprecation")):
+                blocks.append("\n".join(cur))
+                cur = None
+            else:
+                cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+
+def _missing_cmake_pkgs(out: str) -> set:
+    """Package names a FAILED configure could not find (error blocks only)."""
+    pk: set = set()
+    for b in _cmake_error_blocks(out):
+        pk |= set(_RE_CMAKE_NOTFOUND.findall(b)) | set(_RE_CMAKE_PROVIDED.findall(b))
+        for m in _RE_PKGCFG_MISSING.finditer(b):
+            pk |= {re.split(r"[<>=]", x.strip(" -"))[0]
+                   for x in m.group(1).split("\n") if x.strip(" -")}
+    return pk
+
+
+def _guarding_options(root, out: str) -> set:
+    """`-DOPT=OFF` for the project option that guards each failing configure call.
+
+    The error's call stack names the project file and line (`client/common/CMakeLists.txt:61
+    (pkg_check_modules)`); the nearest enclosing `if(WITH_FUSE)` whose name the tree declares with
+    `option(...)` is the switch that turns the dependency off. This is the project's own option
+    name, so it works where the WITH_<PKG> naming guess does not (fuse3 -> WITH_FUSE)."""
+    root = Path(root)
+    flags: set = set()
+    for b in _cmake_error_blocks(out):
+        for rel, ln in _RE_CMAKE_FRAME.findall(b):
+            f = (root / rel) if not rel.startswith("/") else Path(rel)
+            try:
+                if root not in f.resolve().parents:
+                    continue
+                lines = f.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            depth = 0
+            for i in range(min(int(ln), len(lines)) - 1, -1, -1):
+                t = lines[i].strip().lower()
+                if t.startswith("endif"):
+                    depth += 1
+                    continue
+                if t.startswith("if") and (t[2:3] in ("(", " ")):
+                    if depth:
+                        depth -= 1
+                        continue
+                    m = _RE_CMAKE_IF.match(lines[i])
+                    if m and not re.match(r"^\s*if\s*\(\s*NOT", lines[i], re.I) \
+                            and _declares_option(root, m.group(1)):
+                        flags.add(f"-D{m.group(1)}=OFF")
+                        break
+    return flags
+
+
+def _declares_option(root: Path, name: str) -> bool:
+    return name.upper() in _declared_options(str(root))
+
+
+@functools.lru_cache(maxsize=8)
+def _declared_options(root: str) -> frozenset:
+    """Every `option(NAME ...)` / `cmake_dependent_option(NAME ...)` the tree declares (our own
+    `_lykos_cmake_*` build dirs excluded)."""
+    pat = re.compile(r"\b(?:option|cmake_dependent_option)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
+    names: set = set()
+    base = Path(root)
+    for f in list(base.rglob("CMakeLists.txt")) + list(base.rglob("*.cmake")):
+        if any(part.startswith("_lykos_cmake") for part in f.relative_to(base).parts):
+            continue
+        try:
+            names |= {n.upper() for n in pat.findall(f.read_text(errors="replace"))}
+        except OSError:
+            continue
+    return frozenset(names)
 
 
 def _find_fuzz_preload(root: Path):
@@ -2292,12 +2388,16 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
         if rc == 0 or _time.time() >= deadline:
             break
         out = (r.stdout or "") + (r.stderr or "")
-        pkgs = (set(_RE_CMAKE_NOTFOUND.findall(out)) | set(_RE_CMAKE_PROVIDED.findall(out))) - disabled
-        if not pkgs:
+        pkgs = _missing_cmake_pkgs(out) - disabled
+        opts = _guarding_options(root, out) - disabled
+        if not pkgs and not opts:
             break
         for pk in pkgs:
             flags += _cmake_disable_flags(pk)
             disabled.add(pk)
+        for o in opts:
+            flags.append(o)
+            disabled.add(o)
     res["log"] = log
     if rc != 0:
         return res

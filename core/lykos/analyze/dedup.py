@@ -31,15 +31,46 @@ _LOC_RE = re.compile(r"([\w./+-]+\.[ch](?:pp|xx|c|h)?):(\d+)")
 _ADVANCED = ("corroborated", "confirmed", "poc-backed", "merged", "rejected")
 
 
-def parse_loc(evidence) -> tuple:
-    """(file, line) from a finding's source-ish evidence, or (None, None). Reads the first
-    `source` / `recipe-source` channel detail -- the site a detector recorded."""
+#: Channels a detector records its SITE under. `source` / `recipe-source` are the original pair;
+#: the newer tree detectors each write their own (`guard-gap`, `alloc-overflow`, ...), and reading
+#: only the original two left every guard_gap / alloc_overflow / sibling_guard finding with an
+#: unknown location -- so all of a run's same-CWE ones collapsed into one "bug".
+_SITE_CHANNELS = ("source", "recipe-source", "guard-gap", "alloc-overflow", "sibling-guard",
+                  "dop-target", "oob-write", "cpg", "source-sink", "int-overflow", "uaf",
+                  "assert-guard")
+#: `path/file.c: fn() ...` -- the site form wire_flow / param_sink / lifecycle / intwidth /
+#: race_scan write (a function, no line).
+_FN_SITE_RE = re.compile(r"^\s*([\w./+-]+\.(?:c|h|cc|cpp|cxx|hpp|hh)):\s*([A-Za-z_]\w*)\(\)")
+
+
+def _site_details(evidence):
     for e in (evidence or []):
-        if e.get("channel") in ("source", "recipe-source"):
-            m = _LOC_RE.search(e.get("detail") or "")
-            if m:
-                return m.group(1), int(m.group(2))
-    return None, None
+        if e.get("channel") in _SITE_CHANNELS:
+            yield e.get("detail") or ""
+
+
+def parse_loc(evidence) -> tuple:
+    """(file, line) from a finding's site evidence, or (None, None): the first detail on a
+    site channel that carries `path:line`; failing that, the file of a `path: fn()` site with
+    line None."""
+    fn_file = None
+    for d in _site_details(evidence):
+        m = _LOC_RE.search(d)
+        if m:
+            return m.group(1), int(m.group(2))
+        mf = _FN_SITE_RE.match(d)
+        if mf and fn_file is None:
+            fn_file = mf.group(1)
+    return fn_file, None
+
+
+def parse_fn(evidence):
+    """The function a `path: fn()` site names, or None."""
+    for d in _site_details(evidence):
+        mf = _FN_SITE_RE.match(d)
+        if mf:
+            return mf.group(2)
+    return None
 
 
 class _FnResolver:
@@ -95,14 +126,18 @@ class _FnResolver:
             return None
 
 
-def canonical_key(cwe, fn, fp):
+def canonical_key(cwe, fn, fp, ident=None):
     """The distinct-bug key. (CWE, enclosing function) when the function resolves -- the prover's
     granularity; otherwise (CWE, file basename), a coarser but still correct fallback that never
-    merges across files."""
+    merges across files. With NO location at all the finding is its own bug (`ident`): "unknown"
+    is not a place two findings can share -- FreeRDP's 8 wire_flow index findings in clear.c,
+    the licence code and ecam were merged into a sanitizer-table oob_index row that way."""
     cwe = cwe or "CWE-unknown"
     if fn:
         return (cwe, "fn:" + fn)
-    return (cwe, "file:" + (os.path.basename(fp) if fp else "unknown"))
+    if fp:
+        return (cwe, "file:" + os.path.basename(fp))
+    return (cwe, "id:" + str(ident))
 
 
 def _rep_rank(f, fp, line):
@@ -119,9 +154,11 @@ def cluster(findings, resolver) -> dict:
     for f in findings:
         if (getattr(f, "state", "candidate") or "candidate") != "candidate":
             continue
-        fp, line = parse_loc(getattr(f, "evidence", None))
-        fn = resolver.enclosing(fp, line) if resolver else None
-        groups.setdefault(canonical_key(f.cwe, fn, fp), []).append((f, fp, line))
+        ev = getattr(f, "evidence", None)
+        fp, line = parse_loc(ev)
+        fn = (resolver.enclosing(fp, line) if resolver else None) or parse_fn(ev)
+        ident = getattr(f, "dedup_key", None) or getattr(f, "id", None)
+        groups.setdefault(canonical_key(f.cwe, fn, fp, ident), []).append((f, fp, line))
     out: dict = {}
     for key, items in groups.items():
         items.sort(key=lambda t: _rep_rank(*t), reverse=True)
@@ -175,3 +212,39 @@ def _set_merged(conn, finding_id, evidence) -> None:
     import time
     conn.execute("UPDATE finding SET state='merged', evidence_json=?, updated_at=? WHERE id=?",
                  (json.dumps(evidence), int(time.time()), finding_id))
+
+
+def site_of(finding, root=None) -> tuple:
+    """(file, line) a finding names, for the confirmation stages that steer to a site.
+
+    `path:line` from any site channel; for the `path: fn() ... -- <statement>` form (wire_flow,
+    param_sink, ...) the line is recovered from the tree: the quoted statement inside `fn`, else
+    `fn`'s definition line. (None, None) when nothing places it."""
+    ev = getattr(finding, "evidence", None)
+    fp, line = parse_loc(ev)
+    if fp and line:
+        return fp, line
+    fn = parse_fn(ev)
+    if not (fp and fn and root):
+        return fp, line
+    p = _FnResolver(root)._find_path(fp)
+    try:
+        lines = p.read_text(errors="ignore").splitlines() if p else []
+    except OSError:
+        lines = []
+    start = next((i for i, l in enumerate(lines)
+                  if re.search(r"\b" + re.escape(fn) + r"\s*\(", l) and not l.rstrip().endswith(";")
+                  and not l.lstrip().startswith(("//", "*", "return"))), None)
+    if start is None:
+        return fp, None
+    stmt = None
+    for d in _site_details(ev):
+        if " -- " in d:
+            stmt = d.rsplit(" -- ", 1)[1].strip()
+            break
+    if stmt:
+        key = re.sub(r"\s+", "", stmt)
+        for i in range(start, min(len(lines), start + 2000)):
+            if key and key in re.sub(r"\s+", "", lines[i]):
+                return fp, i + 1
+    return fp, start + 1

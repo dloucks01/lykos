@@ -78,3 +78,15 @@ def test_heap_op_sequences_include_the_reclaim_shape():
     assert any(heaptrace.RECLAIM_MARKER in s for s in reclaim)
     assert any(b"9999" in s for s in heaptrace.heap_op_sequences(["1", "2"], marker=b"9999"))
     assert any(s.rstrip().endswith(b"3\n0") for s in reclaim)
+
+
+def test_the_sanitizer_runtime_is_not_the_targets_allocator():
+    """On an ASan build `__asan_get_alloc_stack`/`__asan_get_free_stack` match the alloc/free name
+    patterns; picking them traced the sanitizer for ~100 s per FreeRDP harness."""
+    from lykos.analyze.dynamic.heaptrace import identify_allocator
+    fns = {"__asan_get_alloc_stack": 0x10, "__asan_get_free_stack": 0x20,
+           "_ZN11__sanitizer13InternalAllocEmPNS_28SizeClassAllocatorLocalCacheE": 0x30,
+           "_ZN11__sanitizer12InternalFreeEPv": 0x40}
+    assert identify_allocator(fns) is None
+    fns.update({"ta_alloc": 0x50, "ta_free": 0x60})
+    assert identify_allocator(fns)["alloc_name"] == "ta_alloc"
