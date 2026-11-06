@@ -10,7 +10,8 @@ build.
 
 ## Current docs
 
-- **[`62-binary-capability-2026-11-04.md`](62-binary-capability-2026-11-04.md) — start here.** The
+- **[`63-binary-finding-resolution-2026-11-06.md`](63-binary-finding-resolution-2026-11-06.md) — start here.** Every binary finding driven to a measured verdict (finding_resolve: reached? fires at its site? verdict), the precision bugs it exposed, and the remaining foundation (one address model, an execution-evidence index).
+- **[`62-binary-capability-2026-11-04.md`](62-binary-capability-2026-11-04.md)** The
   2026-11-04 audit (review findings + fixes) and the binary-only capability program: the broken
   reach spine, the QASan memory oracle that made silent heap bugs in shipped binaries visible, and
   the prioritized binary build list.
