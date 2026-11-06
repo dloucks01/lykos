@@ -108,3 +108,10 @@ export async function startSettings(mod, opts, caseId) {
   const st = mod.buildRunSettings(opts, seeds);
   return [st.overrides || {}, !!(opts && opts.converge), st.skipStages || []];
 }
+
+// Run time budgets offered when starting a run: 5 minutes, then every 10 minutes up to 2 hours.
+// The value is seconds (what the autopilot API takes); the label reads as minutes / hours.
+export const BUDGET_OPTIONS = [5, ...Array.from({ length: 12 }, (_, i) => (i + 1) * 10)].map((m) => ({
+  secs: m * 60,
+  label: m < 60 ? `${m} min` : (m % 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m / 60} h`),
+}));

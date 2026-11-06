@@ -8,7 +8,7 @@ import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 import { CodeScreen } from "./code.js";
 import { Console, FuzzWindows, NowRunning, PlanStrip } from "./console.js";
-import { startSettings, useCaseData } from "./data.js";
+import { BUDGET_OPTIONS, startSettings, useCaseData } from "./data.js";
 import { Lazy, useModule } from "./lazy.js";
 import { EngagementScreen } from "./engagement.js";
 import { FindingDetail, ProofScreen } from "./proof.js";
@@ -100,8 +100,7 @@ function RunControls({ caseId, targets, ap, onChanged }) {
       : html`
         <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:6px">Budget
           <select value=${budget} onChange=${(e) => setBudget(+e.target.value)}>
-            <option value="300">5 min</option><option value="600">10 min</option>
-            <option value="1800">30 min</option><option value="7200">2 h</option>
+            ${BUDGET_OPTIONS.map((o) => html`<option value=${o.secs}>${o.label}</option>`)}
           </select></label>
         <button class="btn sm" onClick=${() => setShowOpts(!showOpts)} aria-expanded=${showOpts}>Options${showOpts ? " ▴" : " ▾"}</button>
         <button class="btn primary sm" disabled=${busy || !targets.length}

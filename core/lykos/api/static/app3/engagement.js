@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 import { folderArchive, isFolderPick } from "../app/archive.js";
-import { bestLevel, getJSON, laneOf, pocsOf, rankFindings, startSettings } from "./data.js";
+import { BUDGET_OPTIONS, bestLevel, getJSON, laneOf, pocsOf, rankFindings, startSettings } from "./data.js";
 import { Lazy, useModule } from "./lazy.js";
 
 const LEVEL_TEXT = { L3: "working exploit", L2: "control primitive", L1: "crash" };
@@ -124,8 +124,7 @@ function StartPanel({ caseId, targets, onStarted }) {
           <option value="stdin">stdin</option><option value="arg">argument</option></select></label>
       <label class="field">Time budget
         <select value=${budget} onChange=${(e) => setBudget(+e.target.value)}>
-          <option value="300">5 min</option><option value="600">10 min</option>
-          <option value="1800">30 min</option><option value="7200">2 h</option></select></label>
+          ${BUDGET_OPTIONS.map((o) => html`<option value=${o.secs}>${o.label}</option>`)}</select></label>
     </div>
     ${more ? html`<${Lazy} path="./results.js" name="RunOptions" props=${{ value: opts, onChange: setOpts, caseId, hideInvocation: true }}
       fallback=${html`<span class="dim">More options are not available.</span>`} />` : null}
