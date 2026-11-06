@@ -9,6 +9,7 @@
 // never presented as proven; the operator's triage sits BESIDE the tool's state, never over it; a
 // replay result is shown as what it is -- N runs, M crashed -- and changes nothing else.
 import { useEffect, useMemo, useState } from "preact/hooks";
+import { FindingsList } from "./findings_list.js";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 import { backlogFor, bestLevel, functionAt, getJSON, isNoise, laneOf, pocsOf, rankFindings } from "./data.js";
@@ -545,8 +546,10 @@ function ResearchQueue({ backlog, findings, targetId, open }) {
 }
 
 // ── the board ───────────────────────────────────────────────────────────────────────────────
-export function ProofScreen({ data, targetId, open, focusTarget }) {
+export function ProofScreen({ data, targetId, open, focusTarget, toCode = null }) {
   const caseId = caseOf(data);
+  const [view, setViewRaw] = useState(() => { try { return localStorage.getItem("lykos.next.proofView") || "list"; } catch (_e) { return "list"; } });
+  const setView = (v) => { setViewRaw(v); try { localStorage.setItem("lykos.next.proofView", v); } catch (_e) { /* no storage */ } };
   useCaseSide(caseId, data.findings);
   const [seg, setSeg] = useState("all");
   const [q, setQ] = useState("");
@@ -593,6 +596,10 @@ export function ProofScreen({ data, targetId, open, focusTarget }) {
           <option value="">All targets</option>
           ${data.targets.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}
         </select>
+        <div class="seg" role="group" aria-label="View">
+          <button class=${view === "list" ? "on" : ""} onClick=${() => setView("list")} title="one row per finding: what · where · proof">List</button>
+          <button class=${view === "board" ? "on" : ""} onClick=${() => setView("board")} title="lanes by status">Board</button>
+        </div>
       </div>
     </div>
     <div class="seg pf-segs" role="group" aria-label="Show">
@@ -631,10 +638,15 @@ export function ProofScreen({ data, targetId, open, focusTarget }) {
       : seg === "queue" ? html`<${ResearchQueue} backlog=${backlog} findings=${base} targetId=${targetId} open=${open} />`
       : !scoped.length ? html`<div class="panel empty">No findings yet. Start an analysis on the Run screen.</div>`
       : html`
-        ${seg === "all" ? html`<${ChainStrip} targets=${scopeTargets} data=${data} open=${open} />` : null}
-        ${apShown.map((f) => html`<${AttackPathCard} f=${f} pocs=${pocsOf(f, pocs)} findings=${base} open=${open} />`)}
+        ${seg === "all" && view !== "list" ? html`<${ChainStrip} targets=${scopeTargets} data=${data} open=${open} />` : null}
+        ${view !== "list" ? apShown.map((f) => html`<${AttackPathCard} f=${f} pocs=${pocsOf(f, pocs)} findings=${base} open=${open} />`) : null}
         ${!shown.length ? html`<div class="panel empty">No findings match the filters.
             ${filtering ? html`<div style="margin-top:10px"><button class="btn sm" onClick=${clear}>Clear filters</button></div>` : null}</div>`
+        : view === "list" ? html`<${FindingsList} units=${units.filter((u) => show(laneById.get(u.rep.id)))}
+            laneById=${laneById} data=${data} open=${open} toCode=${toCode} showTarget=${showTarget} />
+          ${apShown.length || seg === "all" ? html`<h2 style="margin-top:6px">Chains across findings</h2>` : null}
+          ${seg === "all" ? html`<${ChainStrip} targets=${scopeTargets} data=${data} open=${open} />` : null}
+          ${apShown.map((f) => html`<${AttackPathCard} f=${f} pocs=${pocsOf(f, pocs)} findings=${base} open=${open} />`)}`
         : html`<div class="lanes">
           ${show("proven") ? html`<section class="lane" aria-label="Proven">
             <div class="lane-h blue"><span class="dot live"></span>PROVEN — A POC RAN</div>

@@ -193,7 +193,8 @@ function App() {
       <${EngagementScreen} cases=${cases} caseId=${null} setCaseId=${setCaseId} data=${data} go=${go} reloadCases=${reloadCases} /></div>`;
   else if (r.view === "run") body = html`<${RunScreen} caseId=${caseId} targets=${data.targets} ap=${ap} refreshAp=${refreshAp} go=${go} />`;
   else if (r.view === "proof") body = html`<${ProofScreen} data=${data} targetId=${r.targetId}
-      open=${(id) => go("finding", { findingId: id })} focusTarget=${(t) => setR((o) => ({ ...o, targetId: t }))} />`;
+      open=${(id) => go("finding", { findingId: id })} focusTarget=${(t) => setR((o) => ({ ...o, targetId: t }))}
+      toCode=${(t, addr) => go("code", { targetId: t, addr })} />`;
   else if (r.view === "finding") body = html`<${FindingDetail} data=${data} findingId=${r.findingId}
       back=${() => go("proof")} toCode=${(t, addr) => go("code", { targetId: t, addr })}
       open=${(id) => go("finding", { findingId: id })} />`;
