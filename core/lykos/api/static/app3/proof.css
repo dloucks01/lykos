@@ -216,7 +216,10 @@ a.pf-mini { text-decoration: none; }
 .fl-main:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
 .fl-sev { width: 6px; align-self: stretch; border-radius: 3px; background: var(--tx4); }
 .fl-sev[data-sev="critical"] { background: #FF8A7A; } .fl-sev[data-sev="high"] { background: var(--amber); }
-.fl-sev[data-sev="medium"] { background: #8FA8D8; }
+.fl-sev[data-sev="medium"] { background: #8FA8D8; } .fl-sev[data-sev="low"] { background: var(--tx3); }
+/* severity as text too: the colour bar alone was invisible to screen readers and low == info */
+.fl-sevtx { font-weight: 600; }
+.fl-sevtx.sev-critical { color: #FF8A7A; } .fl-sevtx.sev-high { color: var(--amber-tx); } .fl-sevtx.sev-medium { color: #8FA8D8; }
 .fl-what { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .fl-w1 { font-size: 14px; }
 .fl-w2 { font-size: 12px; color: var(--tx3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -233,6 +236,10 @@ a.pf-mini { text-decoration: none; }
 .fl-code pre div { padding: 0 12px; white-space: pre; }
 .fl-code pre div.hit { background: #2A2010; box-shadow: inset 3px 0 0 var(--amber); }
 .fl-code pre .a { color: var(--tx4); }
+.fl-code pre.fl-src { tab-size: 4; }
+.fl-code pre.fl-src .a { display: inline-block; min-width: 5ch; text-align: right; }
+.fl-more { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 12px; }
+.pf-stale { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
 .fl-label { font-size: 11px; letter-spacing: .05em; margin-top: 10px; }
 .fl-ev { flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 8px; padding-top: 10px; font-size: 12.5px; color: #CBD2DC; }
 .fl-evl { display: flex; gap: 8px; align-items: flex-start; word-break: break-word; }

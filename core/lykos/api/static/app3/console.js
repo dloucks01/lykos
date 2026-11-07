@@ -66,29 +66,50 @@ function lineOf(r) {
   }
 }
 
-export function NowRunning({ recs }) {
-  const live = useMemo(() => {
-    const open = new Map();
-    for (const r of recs) {
-      if (r.k !== "stage") continue;
-      const key = r.run || r.stage;
-      if (r.state === "start") open.set(key, r); else open.delete(key);
-    }
-    return [...open.values()];
-  }, [recs]);
+// How long a poll loop waits: quick while a run is live and the tab is in view, slow when nothing
+// runs, slower still in a hidden tab (a background tab polling at 800 ms forever was the default).
+export function pollDelay(liveMs, idleMs, running) {
+  if (typeof document !== "undefined" && document.hidden) return Math.max(idleMs, 15000);
+  return running ? liveMs : idleMs;
+}
+
+// Re-run `kick` as soon as the tab comes back into view (a poll loop waiting out its hidden delay).
+export function useOnVisible(kick) {
+  const ref = useRef(kick);
+  ref.current = kick;
+  useEffect(() => {
+    const on = () => { if (!document.hidden && ref.current) ref.current(); };
+    document.addEventListener("visibilitychange", on);
+    return () => document.removeEventListener("visibilitychange", on);
+  }, []);
+}
+
+// What is running NOW, from the server's plan (the console is a sliding window of records: a stage
+// that started before it, or one that never logged an end, cannot be judged from it).
+export function NowRunning({ recs, plan, running, now }) {
+  const live = running ? (plan || []).filter((p) => p.state === "running") : [];
   const last = useMemo(() => {
     for (let i = recs.length - 1; i >= 0; i--) if (recs[i].k === "note") return recs[i];
     return null;
   }, [recs]);
   if (!live.length) return null;
   return html`
-    <div class="now">
+    <div class="now" role="status">
       <span style="font-size:11.5px;font-weight:700;letter-spacing:.06em;color:var(--blue-tx)">NOW RUNNING</span>
-      ${live.map((r) => html`<span style="font-weight:600">${r.stage}
-        <span class="mono dim" style="font-size:11.5px;font-weight:400"> since ${clock(r.t)}</span></span>`)}
+      ${live.map((p) => html`<span style="font-weight:600">${p.label || p.stage}
+        ${p.started ? html`<span class="mono dim" style="font-size:11.5px;font-weight:400">${" "}since ${clock(p.started)}${now ? ` · ${fmtSecs(now - p.started)}` : ""}</span>` : null}</span>`)}
       ${last ? html`<span class="muted" style="flex:1 1 100%;font-size:13px">${last.stage}: ${last.text}</span>` : null}
     </div>`;
 }
+
+function fmtSecs(s) {
+  if (s == null || !isFinite(s)) return "";
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : m ? `${m}m ${String(x).padStart(2, "0")}s` : `${x}s`;
+}
+
+const SHOWN_MAX = 1500;     // console rows in the DOM; the rest stay in memory / the download
 
 export function Console({ recs, caseId, targets = [], stage: stageProp, setStage: setStageProp }) {
   const tname = useMemo(() => Object.fromEntries(targets.map((t) => [t.id, t.filename || t.id])), [targets]);
@@ -101,38 +122,40 @@ export function Console({ recs, caseId, targets = [], stage: stageProp, setStage
   const body = useRef(null);
   const set = FILTERS.find((f) => f[0] === filter)[2];
   const stages = useMemo(() => [...new Set(recs.filter((r) => r.k === "stage").map((r) => r.stage))], [recs]);
-  const shown = useMemo(() => recs.filter((r) =>
+  const filtered = useMemo(() => recs.filter((r) =>
     (r.k !== "fuzz" || r.final) && (!set || set.has(r.k)) && (!stage || r.stage === stage)
-  ).slice(-3000), [recs, filter, stage]);
+  ).slice(-SHOWN_MAX), [recs, filter, stage]);
+  // Reading back (follow off): freeze what is on screen, so new lines do not slide it away under
+  // the reader. Following again (or changing the filter) picks the live view back up.
+  const frozen = useRef(null);
+  if (follow) frozen.current = null;
+  else if (!frozen.current || frozen.current.key !== filter + "|" + stage) frozen.current = { key: filter + "|" + stage, rows: filtered };
+  const shown = follow ? filtered : frozen.current.rows;
+  const pending = follow ? 0 : Math.max(0, (filtered.length && shown.length
+    ? filtered.length - filtered.findIndex((r) => r._i === shown[shown.length - 1]._i) - 1 : 0));
   useEffect(() => { if (follow && body.current) body.current.scrollTop = body.current.scrollHeight; }, [shown, follow]);
-  const download = () => {
-    const blob = new Blob([recs.map((r) => JSON.stringify(r)).join("\n") + "\n"], { type: "application/x-ndjson" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `lykos-console-${caseId}.jsonl`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-  };
+  // the WHOLE log from the server (this view only holds a recent window of it)
+  const downloadUrl = `/cases/${caseId}/console?download=1`;
   return html`
     <section class="term" aria-label="Console">
       <div class="term-bar">
         <span style="font-weight:600;font-size:13px;margin-right:6px">Console</span>
-        ${FILTERS.map(([k, label]) => html`<button class=${"tab" + (filter === k ? " on" : "")} onClick=${() => setFilter(k)}>${label}</button>`)}
-        <select value=${stage} onChange=${(e) => setStage(e.target.value)} style="padding:4px 8px;font-size:12px">
+        ${FILTERS.map(([k, label]) => html`<button class=${"tab" + (filter === k ? " on" : "")} aria-pressed=${filter === k} onClick=${() => setFilter(k)}>${label}</button>`)}
+        <select value=${stage} onChange=${(e) => setStage(e.target.value)} style="padding:4px 8px;font-size:12px" aria-label="Show one stage">
           <option value="">all stages</option>
           ${(stage && !stages.includes(stage) ? [stage, ...stages] : stages).map((s) => html`<option value=${s}>${s}</option>`)}
         </select>
         <div style="flex:1 1 auto"></div>
-        <span class="mono dim" style="font-size:11px">${recs.length.toLocaleString()} records · routine executions sampled, crashes in full</span>
-        <button class="btn sm" onClick=${() => setFollow(!follow)}>${follow ? "Pause scroll" : "Follow"}</button>
-        <button class="btn sm" onClick=${download} disabled=${!recs.length}>Download</button>
+        <span class="mono dim" style="font-size:11px">${recs.length.toLocaleString()} recent records${shown.length < recs.length ? ` · ${shown.length.toLocaleString()} shown` : ""} · routine executions sampled, crashes in full</span>
+        <button class="btn sm" onClick=${() => setFollow(!follow)}>${follow ? "Pause scroll" : (pending ? `Follow (${pending.toLocaleString()} new)` : "Follow")}</button>
+        <a class="btn sm" href=${downloadUrl} download=${`lykos-console-${caseId}.jsonl`} title="the whole console log of this case, as JSON lines">Download</a>
       </div>
       <div class="term-body" ref=${body}
            onScroll=${(e) => { const el = e.currentTarget; const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
                                if (atEnd !== follow) setFollow(atEnd); }}>
         ${shown.length ? shown.map((r) => {
           const [text, extra] = lineOf(r);
-          return html`<div>
+          return html`<div key=${r._i}>
             <div class="ln"><span class="t">${clock(r.t)}</span><span class=${"k k-" + r.k}>${KIND[r.k] || r.k}</span>
               <span class="st">${r.stage}${multi && r.target ? html`<br /><span class="dim" style="font-size:10.5px">${(tname[r.target] || r.target).slice(0, 18)}</span>` : null}</span><span class=${r.k === "crash" ? "k-crash" : r.k === "stage" ? "k-stage" : ""}>${text}</span></div>
             ${extra.map((x) => html`<div class="ln x-out">${x}</div>`)}
@@ -152,7 +175,6 @@ const ENGINE = { fuzz: "Mutation fuzzing", directed: "Directed fuzzing", directe
 
 export function FuzzWindows({ recs }) {
   const [now, setNow] = useState(Date.now() / 1000);
-  useEffect(() => { const t = setInterval(() => setNow(Date.now() / 1000), 1000); return () => clearInterval(t); }, []);
   const wins = useMemo(() => {
     const m = new Map();
     for (const r of recs) {
@@ -166,6 +188,14 @@ export function FuzzWindows({ recs }) {
     }
     return [...m.values()].sort((a, b) => b.last.t - a.last.t);
   }, [recs]);
+  // The 1 s clock that ages a window from "live" to finished runs only while some campaign could
+  // still be live, and not in a hidden tab (it re-rendered every window every second, forever).
+  const maybeLive = wins.some((w) => !w.last.final && Date.now() / 1000 - w.last.t < 30);
+  useEffect(() => {
+    if (!maybeLive) { setNow(Date.now() / 1000); return undefined; }
+    const t = setInterval(() => { if (!document.hidden) setNow(Date.now() / 1000); }, 1000);
+    return () => clearInterval(t);
+  }, [maybeLive]);
   return html`
     <section style="display:flex;flex-direction:column;gap:10px" aria-label="Fuzzing techniques">
       <div style="display:flex;align-items:baseline;gap:12px">
@@ -204,14 +234,14 @@ const PLAN_STYLE = {
   skipped: "background:transparent;border:1px dashed #3A4352", error: "background:var(--amber)",
   timeout: "background:var(--amber)", cancelled: "background:#4A3F2A",
 };
-export function PlanStrip({ plan, stage, setStage }) {
+export function PlanStrip({ plan, stage, setStage, title }) {
   if (!plan || !plan.length) return null;
   const count = {};
   for (const p of plan) count[p.state] = (count[p.state] || 0) + 1;
   const order = ["running", "done", "pending", "declined", "skipped", "error", "timeout", "cancelled"];
   return html`<section class="panel pad" style="display:flex;flex-direction:column;gap:9px">
     <div class="row-c" style="flex-wrap:wrap;gap:12px">
-      <h2>Plan</h2>
+      <h2>${title || "Plan"}</h2>
       ${order.filter((k) => count[k]).map((k) => html`<span class="dim" style="font-size:12px">
         <span style=${"display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px;" + (PLAN_STYLE[k] || "")}></span>${count[k]} ${k === "declined" ? "not applicable" : k}</span>`)}
       ${stage ? html`<button class="btn sm" style="margin-left:auto" onClick=${() => setStage("")}>Show all stages</button>` : null}
@@ -220,8 +250,62 @@ export function PlanStrip({ plan, stage, setStage }) {
       ${plan.map((p) => html`<button aria-label=${`${p.label || p.stage}: ${p.state}`}
         title=${`${p.label || p.stage} — ${p.state}${p.detail ? ": " + p.detail : ""}`}
         onClick=${() => setStage(stage === p.stage ? "" : p.stage)}
-        style=${"width:15px;height:15px;border-radius:3px;border:none;padding:0;cursor:pointer;"
+        style=${"width:18px;height:18px;border-radius:3px;border:none;padding:0;cursor:pointer;"
           + (PLAN_STYLE[p.state] || PLAN_STYLE.pending) + (stage === p.stage ? ";outline:2px solid var(--tx);outline-offset:1px" : "")}></button>`)}
+    </div>
+  </section>`;
+}
+
+// The live run's progress line: which target of how many, the run's clock against its ceiling,
+// the current target's phase and what is left of its slice, and Stop / Pause feedback. Reads only
+// the autopilot status (GET /cases/{id}/autopilot).
+export function RunProgress({ ap }) {
+  if (!ap) return null;
+  const b = (ap.budget && typeof ap.budget === "object") ? ap.budget : {};
+  // whole-run clock against the whole-run ceiling (budget_seconds); `budget` is the CURRENT
+  // target's slice, so its total must not be paired with the run's elapsed time
+  const el = ap.now && ap.started ? ap.now - ap.started : null;
+  const tot = ap.budget_seconds;
+  const bits = [];
+  if (ap.stopping) bits.push("stopping — finishing the current stage");
+  else if (ap.paused) bits.push(ap.pause_waiting ? "paused between stages" : "pausing after the current stage");
+  if (ap.targets > 1) bits.push(`target ${ap.target || 1} of ${ap.targets}${ap.target_name ? ` · ${ap.target_name}` : ""}`);
+  else if (ap.target_name) bits.push(ap.target_name);
+  if (el != null) bits.push(`${fmtSecs(el)}${tot ? ` of ${fmtSecs(tot)}` : ap.converge ? " · to convergence" : ""}`);
+  if (b.phase) bits.push(`${b.phase} phase`);
+  if (b.remaining != null && b.total) bits.push(`${fmtSecs(b.remaining)} left for this target`);
+  return html`<span class="mono dim" style="font-size:12px" role="status">${bits.join(" · ")}</span>`;
+}
+
+// One row per target the run has FINISHED (status.per_target, written as each target ends): the
+// plan strip is rebuilt for every target, so without this a finished multi-target run showed only
+// its last target's plan.
+const SUM_STATES = [["done", "done"], ["declined", "not applicable"], ["skipped", "skipped"],
+                    ["error", "error"], ["timeout", "timeout"], ["slice-ended", "slice ended"], ["cancelled", "cancelled"]];
+export function TargetSummary({ perTarget, running, onFocusTarget }) {
+  const rows = Array.isArray(perTarget) ? perTarget : [];
+  if (!rows.length) return null;
+  return html`<section class="panel" style="overflow:hidden" aria-label="Targets finished in this run">
+    <div class="pad" style="padding-bottom:6px;display:flex;flex-wrap:wrap;gap:10px;align-items:baseline">
+      <h2>${running ? "Targets finished so far" : "Every target in this run"}</h2>
+      <span class="dim" style="font-size:12px">${rows.length} target${rows.length === 1 ? "" : "s"} · stages per state, time, and what each produced</span>
+    </div>
+    <div class="ts-t" role="table">
+      <div class="ts-r head" role="row"><span>target</span><span>stages</span><span class="n">time</span>
+        <span class="n">findings</span><span class="n">confirmed</span><span class="n">PoC-backed</span></div>
+      ${rows.map((r) => {
+        const st = r.stages || {};
+        return html`<div class="ts-r" role="row" key=${r.target_id}>
+          <span class="mono" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=${r.filename}>${onFocusTarget
+            ? html`<button class="xref" style="color:var(--tx)" onClick=${() => onFocusTarget(r.target_id)}>${r.filename || r.target_id}</button>`
+            : (r.filename || r.target_id)}</span>
+          <span class="dim" style="font-size:12px">${SUM_STATES.filter(([k]) => st[k]).map(([k, l]) => `${st[k]} ${l}`).join(" · ") || "—"}${r.skipped_for_budget ? html`${" "}<b class="rs-amber" title="skipped because this target's budget was spent">(${r.skipped_for_budget} for budget)</b>` : null}</span>
+          <span class="n mono" data-l="time">${fmtSecs(r.elapsed) || "—"}</span>
+          <span class="n" data-l="findings">${r.findings ?? "—"}</span>
+          <span class="n" data-l="confirmed">${r.confirmed ?? "—"}</span>
+          <span class=${"n" + (r.poc_backed ? " ts-hi" : "")} data-l="PoC-backed">${r.poc_backed ?? "—"}</span>
+        </div>`;
+      })}
     </div>
   </section>`;
 }

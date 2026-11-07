@@ -6,15 +6,15 @@
 //   Strings    every recovered string, with the functions that reference it
 //   Target     identity, mitigations posture, sections, imports, what to do next (advice), what
 //              lykos can and cannot do here and why (capabilities), and the invocation helper
-//   Source     the compiled source, finding lines marked (source targets only)
-//   Scans      operator scans: variant hunt, weggli source patterns, differential test
+//   Source     the uploaded source tree (or the compiled single file), finding lines marked
+//   Scans      operator scans: variant hunt, weggli, CodeQL, hypothesis hunt, differential test
 //   Diff       two builds compared: findings fixed / new, patch-diff leads, PoC re-run
 //   Classes    heap / taint / known-CVE findings (when the target has any)
 // Every number on it comes from the server; nothing is invented when a field is absent.
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api, waitForRun } from "../app/api.js";
-import { getJSON, hexToInt } from "./data.js";
+import { getJSON, hexToInt, isNoise } from "./data.js";
 
 const asList = (r) => (Array.isArray(r) ? r : (r && Object.values(r).find(Array.isArray)) || []);
 const parseMaybe = (v) => {
@@ -37,6 +37,51 @@ const bare = (n) => (n || "").replace(/^(sym\.imp\.|sym\.|imp\.|_+)/, "").replac
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 // Is the decompiled text real code, or a tool's "install me" placeholder / empty stub?
 const usableDecompile = (s) => !!s && s.trim().length >= 24 && !/you need to install|r2pm|not available|no decompiler/i.test(s);
+// A PLT / import thunk: rizin types it `sym.imp.X` (it has one block, so `blocks` alone missed all 29
+// of gif2rgb's).
+const isStub = (f) => !f.blocks || /\bsym\.imp\./.test(f.signature || "") || /^(sym\.)?imp\./.test(f.name || "");
+const live = (fs) => (fs || []).filter((f) => !isNoise(f));
+
+// A GET whose error body matters (an ambiguous source path answers 404 with its candidates).
+async function fetchJSON(path) {
+  const r = await fetch(path);
+  let body = null;
+  try { body = await r.json(); } catch (_e) { body = null; }
+  return { ok: r.ok, status: r.status, body };
+}
+
+// Per-target lists that outlive a screen mount: finding -> code -> finding re-fetched a multi-MB
+// function list every time. An EMPTY or failed answer is not kept (disassembly may still be running).
+const FN_CACHE = new Map(), EDGE_CACHE = new Map(), SRC_CACHE = new Map();
+function cached(map, key, fetcher, keep = (v) => asList(v).length > 0) {
+  let p = map.get(key);
+  if (!p) {
+    p = fetcher();
+    map.set(key, p);
+    p.then((v) => { if (!keep(v)) map.delete(key); }, () => map.delete(key));
+  }
+  return p;
+}
+const loadFuncs = (tid) => cached(FN_CACHE, tid, () => getJSON(`/targets/${tid}/functions`).then(asList));
+const loadCallgraph = (tid) => cached(EDGE_CACHE, tid, () => api.callgraph(tid).then(asList));
+// The target's source: the uploaded tree (source-tree), else the single compiled file (/source).
+const loadSource = (tid) => cached(SRC_CACHE, tid, async () => {
+  const t = await fetchJSON(`/targets/${tid}/source-tree`).catch(() => null);
+  if (t && t.ok && t.body && t.body.source && (t.body.files || []).length) {
+    return { kind: "tree", files: t.body.files, truncated: !!t.body.truncated };
+  }
+  const r = await api.targetSource(tid).catch(() => null);
+  if (r && typeof r.source === "string") {
+    return { kind: "single", files: [r.filename || "source"], text: r.source, compiler: r.compiler, sanitizers: r.sanitizers };
+  }
+  return null;
+}, (v) => !!v);
+// Function detail, a few kept: arrowing back and forth through the list re-fetched each one.
+const FN_DETAIL = new Map();
+function keepDetail(id, d) {
+  FN_DETAIL.set(id, d);
+  if (FN_DETAIL.size > 24) FN_DETAIL.delete(FN_DETAIL.keys().next().value);
+}
 
 // A per-viewer convenience (last sub-view, last graph depth). Never state that must persist.
 function useLocal(key, init) {
@@ -47,8 +92,8 @@ function useLocal(key, init) {
   return [v, set];
 }
 
-// Address -> function, by binary search over sorted starts (functionAt is linear; a 10k-function
-// target with a 5k-instruction listing needs this to stay fast).
+// Address -> function, by binary search over sorted starts (a 10k-function target with a
+// 5k-instruction listing needs this to stay fast).
 function makeIndex(funcs) {
   const arr = [];
   for (const f of funcs) { const a = hexToInt(f.addr); if (a != null) arr.push([a, f]); }
@@ -65,17 +110,69 @@ function makeIndex(funcs) {
     }
     return null;
   };
-  return { starts, at, byId: new Map(funcs.map((f) => [f.id, f])) };
+  return { starts, at, byId: new Map(funcs.map((f) => [f.id, f])), byName: new Map(funcs.map((f) => [f.name, f])) };
 }
 
-// `path.ext:line` inside a finding's evidence (the report reads source locations the same way).
-const SRC_LOC = /([\w./+-]+\.(?:c|cc|cpp|cxx|h|hpp|hh|cs|go|rs|py|java|js|ts)):(\d+)/;
-function srcLocOf(f) {
+// The function a finding sits in: its site, its function address, else the function its title /
+// evidence names (uc_symbolic files "... in fcn.00004b16()" with no address at all).
+const FN_REF = /\b(fcn\.[0-9a-fA-F]{4,}|sub_[0-9a-fA-F]{4,})\b/;
+function fnOfFinding(f, index) {
+  const fn = index.at(f.site_addr || f.function_addr) || index.at(f.function_addr);
+  if (fn) return fn;
+  for (const s of [f.title, ...(f.evidence || []).map((e) => e && e.detail)]) {
+    const m = FN_REF.exec(String(s || ""));
+    if (!m) continue;
+    const g = index.byName.get(m[1]) || index.starts.get(parseInt(m[1].replace(/^(fcn\.|sub_)/, ""), 16));
+    if (g) return g;
+  }
+  return null;
+}
+
+// A source finding's site, read as the server's dedup.parse_loc does: `path:line` on a site
+// channel, else a `path: fn()` site (file, no line), else any `path:line` it carries.
+const SRC_LOC = /([\w./+-]+\.(?:c|cc|cpp|cxx|h|hpp|hh|hxx|cs|go|rs|py|java|js|ts)):(\d+)/;
+const FN_SITE = /^\s*([\w./+-]+\.(?:c|h|cc|cpp|cxx|hpp|hh)):\s*([A-Za-z_]\w*)\(\)/;
+const SITE_CH = new Set(["source", "recipe-source", "guard-gap", "alloc-overflow", "sibling-guard", "dop-target",
+  "oob-write", "cpg", "source-sink", "int-overflow", "uaf", "assert-guard"]);
+function srcSiteOf(f) {
+  let fnFile = null;
   for (const e of f.evidence || []) {
-    const m = SRC_LOC.exec(String((e && e.detail) || ""));
+    if (!e || !SITE_CH.has(e.channel)) continue;
+    const d = String(e.detail || "");
+    const m = SRC_LOC.exec(d);
+    if (m) return { path: m[1], line: +m[2] };
+    const mf = FN_SITE.exec(d);
+    if (mf && !fnFile) fnFile = mf[1];
+  }
+  if (fnFile) return { path: fnFile, line: null };
+  const rest = [f.dedup_key, ...(f.evidence || []).filter((e) => e && e.channel !== "triage").map((e) => e.detail), f.title];
+  for (const c of rest) {
+    const m = SRC_LOC.exec(String(c || ""));
     if (m) return { path: m[1], line: +m[2] };
   }
   return null;
+}
+// Tree-relative resolution, the same order as the server's source_tree.resolve: exact, the longest
+// suffix of a longer (build-dir / absolute) path, else a basename that names exactly one file.
+function treeIndex(files) {
+  const set = new Set(files), byBase = new Map();
+  for (const p of files) { const b = p.slice(p.lastIndexOf("/") + 1); if (!byBase.has(b)) byBase.set(b, []); byBase.get(b).push(p); }
+  const resolve = (path) => {
+    const p = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/^(\.\/)+/, "");
+    if (!p) return { rel: null, cands: [] };
+    if (set.has(p)) return { rel: p, cands: [] };
+    const parts = p.split("/");
+    for (let i = 1; i < parts.length; i++) { const s = parts.slice(i).join("/"); if (set.has(s)) return { rel: s, cands: [] }; }
+    const c = byBase.get(parts[parts.length - 1]) || [];
+    return c.length === 1 ? { rel: c[0], cands: [] } : { rel: null, cands: c };
+  };
+  return { set, resolve };
+}
+// "tree/relative/path.c:LINE" (or a bare path) -> {path, line}
+function parseSrcRef(s) {
+  if (!s) return null;
+  const m = /^(.*?):(\d+)$/.exec(String(s));
+  return m ? { path: m[1], line: +m[2] } : { path: String(s), line: null };
 }
 
 // A quote-aware split of an argv string ("-c @@", `--name "a b"`), for the invocation helper.
@@ -98,45 +195,85 @@ function b64utf8(s) {
   return btoa(bin);
 }
 
-// Operator-launched stages (scans, diffs, harness): one record per kind, kept on the screen so a
-// run started on one sub-view is still visible after switching away and back.
-// A stage that declines returns no output record and says why in its `<stage>.done` event only;
-// read that event so the operator sees the reason, not an empty result.
-async function stageVerdict(caseId, runId) {
+// Operator-launched stages (scans, diffs, harness). A stage that declines returns no output record
+// and says why in its `<stage>.done` event only; read that event (by run id, paging forward from
+// the cursor taken before the run started -- a busy autopilot pushes it out of any fixed tail) so
+// the operator sees the reason, not an empty result. No `.done` event: the run's last progress line.
+async function eventCursor(caseId) {
+  try { const t = asList(await api.eventsTail(caseId, 1)); return t.length ? t[t.length - 1].id : 0; } catch (_e) { return null; }
+}
+async function stageVerdict(caseId, runId, cursor) {
   if (!caseId) return null;
+  let done = null, prog = null;
+  const scan = (evs) => {
+    for (const x of evs) {
+      if (x.run_id !== runId) continue;
+      if (/\.done$/.test(x.type || "") && x.type !== "job.done" && x.payload) done = x.payload;
+      else if (x.type === "job.progress" && x.payload && x.payload.msg) prog = x.payload.msg;
+    }
+  };
   try {
-    const evs = asList(await api.eventsTail(caseId, 500));
-    const e = evs.filter((x) => x.run_id === runId && /\.done$/.test(x.type || "") && x.type !== "job.done" && x.payload).pop();
-    return e ? e.payload : null;
-  } catch (_e) { return null; }
+    if (cursor != null) {
+      let after = cursor;
+      for (let i = 0; i < 80; i++) {                       // 500 a page: up to 40k events
+        const evs = asList(await api.events(caseId, after));
+        scan(evs);
+        if (evs.length < 500) break;
+        after = evs[evs.length - 1].id;
+      }
+    } else {
+      scan(asList(await api.eventsTail(caseId, 2000)));
+    }
+  } catch (_e) { /* best effort: the Run console has it */ }
+  return done || (prog ? { note: prog } : null);
 }
 
+// Runs live in a module store per case, not in the screen: opening a finding unmounts the Code
+// screen, and a scan's status and result vanished while its poll kept running.
+const STAGE_RUNS = new Map();
+function stageStore(caseId) {
+  let s = STAGE_RUNS.get(caseId);
+  if (!s) { s = { runs: {}, subs: new Set() }; STAGE_RUNS.set(caseId, s); }
+  return s;
+}
 function useStageRuns(caseId, onDone) {
-  const [runs, setRuns] = useState({});
-  const patch = (k, p) => setRuns((c) => ({ ...c, [k]: { ...(c[k] || {}), ...p } }));
+  const st = stageStore(caseId || "");
+  const [, bump] = useState(0);
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
+  useEffect(() => {
+    const f = () => bump((x) => x + 1);
+    st.subs.add(f);
+    return () => { st.subs.delete(f); };
+  }, [st]);
+  const notify = () => st.subs.forEach((f) => f());
+  const patch = (k, p) => { st.runs = { ...st.runs, [k]: { ...(st.runs[k] || {}), ...p } }; notify(); };
   const start = async (kind, stage, opts, meta = {}) => {
-    setRuns((c) => ({ ...c, [kind]: { running: true, stage, started: Date.now(), meta } }));
+    st.runs = { ...st.runs, [kind]: { running: true, stage, started: Date.now(), meta } };
+    notify();
     try {
+      const cursor = await eventCursor(caseId);
       const r = await api.createRun(stage, opts);
       patch(kind, { runId: r.run_id, fromCache: !!r.from_cache });
-      const done = await waitForRun(r.run_id, { onTick: (run) => patch(kind, { run }), timeoutMs: meta.timeoutMs });
+      // polled until the run ends: the stage bounds itself, and Cancel is offered meanwhile
+      const done = await waitForRun(r.run_id, { onTick: (run) => patch(kind, { run }), timeoutMs: 12 * 3600 * 1000 });
       const out = await api.runOutput(r.run_id).catch(() => null);
       if (done.status !== "done") throw new Error(done.error || `the run ended ${done.status}`);
       let data = out ? out.output : null;
       if (!data || (typeof data === "object" && !Array.isArray(data) && !Object.keys(data).length)) {
-        data = (await stageVerdict(caseId, r.run_id)) || data;
+        data = (await stageVerdict(caseId, r.run_id, cursor)) || data;
       }
       patch(kind, { running: false, run: done, data, ended: Date.now() });
-      onDone && onDone();
+      if (doneRef.current) doneRef.current();
     } catch (e) {
       patch(kind, { running: false, error: errText(e), ended: Date.now() });
     }
   };
   const cancel = (kind) => {
-    const id = runs[kind] && runs[kind].runId;
+    const id = st.runs[kind] && st.runs[kind].runId;
     if (id) api.cancelRun(id).catch(() => {});
   };
-  return { runs, start, cancel };
+  return { runs: st.runs, start, cancel };
 }
 
 function RunStatus({ st, what, cancel }) {
@@ -158,8 +295,10 @@ function RunStatus({ st, what, cancel }) {
 }
 
 // A fixed-row-height virtual list: only the rows in view (plus a margin) are rendered, so a
-// 10k-function or 50k-string list scrolls as fast as a 50-row one.
-function VList({ items, rowH = 28, maxH = 640, render, selIdx = -1, onKeyDown, label, cls = "" }) {
+// 10k-function or 50k-string list scrolls as fast as a 50-row one. `center` puts the selected
+// row mid-view (a source site), `selKey` re-scrolls to an unchanged index (the same chip twice).
+function VList({ items, rowH = 28, maxH = 640, render, selIdx = -1, selKey = null, center = false, onKeyDown, label,
+  cls = "", role, activeId }) {
   const box = useRef(null);
   const [top, setTop] = useState(0);
   const [h, setH] = useState(maxH);
@@ -175,38 +314,40 @@ function VList({ items, rowH = 28, maxH = 640, render, selIdx = -1, onKeyDown, l
   }, []);
   useEffect(() => {
     const el = box.current;
-    if (!el || selIdx < 0) return;
+    if (!el || selIdx < 0 || selIdx >= n) return;
     const y = selIdx * rowH;
-    if (y < el.scrollTop) el.scrollTop = y;
+    if (center) el.scrollTop = Math.max(0, y - el.clientHeight / 2 + rowH / 2);
+    else if (y < el.scrollTop) el.scrollTop = y;
     else if (y + rowH > el.scrollTop + el.clientHeight) el.scrollTop = y + rowH - el.clientHeight;
-  }, [selIdx]);
+  }, [selIdx, selKey, selIdx < n]);
   useEffect(() => { if (box.current && top > n * rowH) { box.current.scrollTop = 0; setTop(0); } }, [n]);
   const first = Math.max(0, Math.floor(top / rowH) - 12);
   const last = Math.min(n, Math.ceil((top + h) / rowH) + 12);
   const rows = [];
   for (let i = first; i < last; i++) rows.push(render(items[i], i));
-  return html`<div class=${"cx-vlist " + cls} ref=${box} aria-label=${label} tabindex=${onKeyDown ? "0" : undefined}
-      onKeyDown=${onKeyDown} style=${`max-height:${maxH}px;height:${Math.min(maxH, n * rowH + 2)}px`}
+  return html`<div class=${"cx-vlist " + cls} ref=${box} aria-label=${label} role=${role} aria-activedescendant=${activeId}
+      tabindex=${onKeyDown ? "0" : undefined} onKeyDown=${onKeyDown}
+      style=${`max-height:${maxH}px;height:${Math.min(maxH, n * rowH + 2)}px`}
       onScroll=${(e) => setTop(e.currentTarget.scrollTop)}>
     <div style=${`height:${n * rowH}px;position:relative`}>
-      <div style=${`position:absolute;left:0;right:0;top:${first * rowH}px`}>${rows}</div>
+      <div class="cx-vrows" style=${`position:absolute;left:0;right:0;top:${first * rowH}px`}>${rows}</div>
     </div></div>`;
 }
 
 const Empty = ({ children }) => html`<div class="panel empty">${children}</div>`;
-const Sect = ({ children, right }) => html`<div class="cx-sect"><span>${children}</span>${right || null}</div>`;
 function KV({ k, v, mono, title }) {
   if (v == null || v === "") return null;
   return html`<div class="cx-kv"><span class="k">${k}</span><span class=${"v" + (mono ? " mono" : "")} title=${title}>${v}</span></div>`;
 }
-function Copy({ text }) {
+function Copy({ text, label = "copy", what }) {
   const [ok, setOk] = useState(false);
   const go = () => {
     try {
-      navigator.clipboard.writeText(text).then(() => { setOk(true); setTimeout(() => setOk(false), 1200); }, () => {});
+      const t = typeof text === "function" ? text() : text;
+      navigator.clipboard.writeText(t).then(() => { setOk(true); setTimeout(() => setOk(false), 1200); }, () => {});
     } catch (_e) { /* no clipboard in this context */ }
   };
-  return html`<button class="cx-copy" onClick=${go} aria-label="copy">${ok ? "copied" : "copy"}</button>`;
+  return html`<button class="cx-copy" onClick=${go} aria-label=${what ? `copy ${what}` : "copy"} title=${what ? `copy ${what}` : "copy"}>${ok ? "copied" : label}</button>`;
 }
 
 const VIEWS = [
@@ -219,15 +360,37 @@ const isHeap = (f) => HEAP_DET.has(f.detector) || /CWE-(122|415|416)\b/.test(f.c
 const isTaint = (f) => TAINT_DET.has(f.detector);
 const isCve = (f) => f.detector === "cve_scan" || /^CVE-/i.test(f.cwe || "");
 
-export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding, initialView = null }) {
-  const tid = targetId || (data.targets[0] && data.targets[0].id);
+// Props: focusAddr / focusSrc ("path.c:LINE") open a site; onLocate({addr} | {src}), when given,
+// is told where the operator now is so the route can carry it (reload / Back / a shared link).
+export function CodeScreen({ data, targetId, focusTarget, focusAddr, focusSrc = null, openFinding, onLocate = null,
+  initialView = null }) {
+  // no target asked for: the one with the most (non-noise) findings, pinned once the case loaded --
+  // FreeRDP opened on a 0-function harness when it took the first in the list
+  const pinned = useRef(null);
+  const bestTid = useMemo(() => {
+    if (!data.targets.length) return null;
+    if (pinned.current && data.targets.some((t) => t.id === pinned.current)) return pinned.current;
+    if (data.loading) return null;
+    const n = new Map();
+    for (const f of data.findings) if (!isNoise(f)) n.set(f.target_id, (n.get(f.target_id) || 0) + 1);
+    let best = data.targets[0].id, bn = -1;
+    for (const t of data.targets) { const c = n.get(t.id) || 0; if (c > bn) { best = t.id; bn = c; } }
+    pinned.current = best;
+    return best;
+  }, [data.targets, data.findings, data.loading]);
+  const tid = targetId || bestTid;
   const target = data.targets.find((t) => t.id === tid) || null;
   const caseId = (target && target.case_id) || (data.targets[0] && data.targets[0].case_id) || null;
   const [view, setView] = useLocal("lykos.code.view", initialView || "functions");
-  const [funcs, setFuncs] = useState(null);           // null = loading
-  const [sel, setSel] = useState(null);               // function id
+  const [pick, setPick] = useState({ tid: null, v: null });   // a sub-view the operator chose here
+  // the function list belongs to the target it was loaded for: a cross-binary jump used to be
+  // resolved against the PREVIOUS target's list in the commit where the target changed
+  const [fst, setFst] = useState({ tid: null, v: null });
+  const funcs = fst.tid === tid ? fst.v : null;          // null = loading
+  const [sel, setSel] = useState(null);                  // function id
   const [detail, setDetail] = useState(null);
   const [focus, setFocus] = useState(focusAddr || null);
+  const [focusMiss, setFocusMiss] = useState(null);      // a requested address no function holds
   const [edgesSt, setEdgesSt] = useState({ tid: null, v: null });   // call graph, lazily
   const [strsSt, setStrsSt] = useState({ tid: null, v: null });     // {items,total,complete,loading,error}
   const strsRef = useRef(strsSt);
@@ -235,19 +398,21 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
   const edges = edgesSt.tid === tid ? edgesSt.v : null;
   const strs = strsSt.tid === tid ? strsSt.v : null;
   const setStrsFor = (t, v) => { strsRef.current = { tid: t, v }; setStrsSt(strsRef.current); };
-  const [source, setSource] = useState(undefined);    // undefined = not asked, null = none
+  const [srcSt, setSrcSt] = useState({ tid: null, v: undefined });  // undefined = not known yet, null = none
+  const source = srcSt.tid === tid ? srcSt.v : undefined;
+  const [srcFocus, setSrcFocus] = useState(null);       // {path, line, n}
   const [sysmap, setSysmap] = useState(null);
   const [jumpErr, setJumpErr] = useState(null);
-  const pending = useRef(null);                       // a cross-binary jump waiting for its target
+  const pending = useRef(null);                          // a cross-binary jump waiting for its target
+  const located = useRef({ addr: focusAddr || null, src: focusSrc || null });
   const stage = useStageRuns(caseId, () => data.reload && data.reload());
 
   useEffect(() => {
     if (!tid) return undefined;
     let stop = false;
-    setFuncs(null); setDetail(null); setSel(null); setSource(undefined);
-    getJSON(`/targets/${tid}/functions`).then((r) => { if (!stop) setFuncs(asList(r)); }).catch(() => { if (!stop) setFuncs([]); });
-    api.targetSource(tid).then((r) => { if (!stop) setSource(r && (r.source || (r.files && r.files.length)) ? r : null); })
-      .catch(() => { if (!stop) setSource(null); });
+    setDetail(null); setSel(null); setFocusMiss(null);
+    loadFuncs(tid).then((l) => { if (!stop) setFst({ tid, v: l }); }).catch(() => { if (!stop) setFst({ tid, v: [] }); });
+    loadSource(tid).then((s) => { if (!stop) setSrcSt({ tid, v: s }); }).catch(() => { if (!stop) setSrcSt({ tid, v: null }); });
     return () => { stop = true; };
   }, [tid]);
   useEffect(() => {
@@ -261,20 +426,22 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
   const byFunc = useMemo(() => {
     const m = new Map();
     for (const f of findings) {
-      const fn = index.at(f.site_addr || f.function_addr) || index.at(f.function_addr);
+      const fn = fnOfFinding(f, index);
       if (!fn) continue;
       if (!m.has(fn.id)) m.set(fn.id, []);
       m.get(fn.id).push(f);
     }
     return m;
   }, [findings, index]);
+  const nLiveFns = useMemo(() => [...byFunc.values()].filter((fs) => live(fs).length).length, [byFunc]);
 
   const loadEdges = () => {
-    if (!tid || (edgesRef.current.tid === tid && edgesRef.current.v)) return;
+    const c = edgesRef.current;
+    if (!tid || (c.tid === tid && c.v && !c.v.error)) return;
     const t = tid;
     edgesRef.current = { tid: t, v: "loading" }; setEdgesSt(edgesRef.current);
     const done = (v) => { if (edgesRef.current.tid === t) { edgesRef.current = { tid: t, v }; setEdgesSt(edgesRef.current); } };
-    api.callgraph(t).then((r) => done(asList(r))).catch(() => done([]));
+    loadCallgraph(t).then(done, (e) => done({ error: errText(e) }));
   };
   // Strings come in 5000-row pages (the server's cap); `all` keeps paging until every one is in.
   const loadStrings = async (all) => {
@@ -300,12 +467,24 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
     }
   };
 
-  // a requested address (from a finding / the route): open the function containing it
+  // a requested address (from a finding / the route): open the function containing it -- unless it
+  // is the address this screen itself just reported (the route echoing a selection back)
   useEffect(() => {
     if (!focusAddr || !funcs) return;
+    if (located.current.addr === focusAddr && sel) return;
+    located.current = { ...located.current, addr: focusAddr };
     const fn = index.at(focusAddr);
-    if (fn) { setSel(fn.id); setFocus(focusAddr); setView("functions"); }
+    if (fn) { setSel(fn.id); setFocus(focusAddr); setFocusMiss(null); setView("functions"); setPick({ tid, v: "functions" }); }
+    else setFocusMiss(focusAddr);
   }, [focusAddr, funcs]);
+  // a requested source site: open the Source view at that file and line
+  useEffect(() => {
+    if (!focusSrc) return;
+    if (located.current.src === focusSrc && srcFocus) return;
+    located.current = { ...located.current, src: focusSrc };
+    const r = parseSrcRef(focusSrc);
+    if (r) { setSrcFocus({ ...r, n: Date.now() }); setView("source"); setPick({ tid, v: "source" }); }
+  }, [focusSrc, tid]);
   // a cross-binary jump lands once the other target's functions are in
   useEffect(() => {
     const p = pending.current;
@@ -313,19 +492,42 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
     pending.current = null;
     const fn = (p.fnId && index.byId.get(p.fnId)) || (p.addr && index.at(p.addr));
     if (fn) { setSel(fn.id); setFocus(p.addr || null); setView("functions"); }
+    else setJumpErr("The jump target is not among this binary's recovered functions.");
   }, [funcs, tid]);
+  // the function's detail, debounced (holding ↓ through the list fetched every row) and kept
   useEffect(() => {
     if (!sel) return undefined;
+    const hit = FN_DETAIL.get(sel);
+    if (hit) { setDetail(hit); return undefined; }
     let stop = false;
     setDetail(null);
-    api.getFunction(sel).then((d) => { if (!stop) setDetail(d); }).catch(() => { if (!stop) setDetail({ error: true }); });
-    return () => { stop = true; };
+    const t = setTimeout(() => {
+      api.getFunction(sel).then((d) => { keepDetail(sel, d); if (!stop) setDetail(d); })
+        .catch(() => { if (!stop) setDetail({ id: sel, error: true }); });
+    }, 120);
+    return () => { stop = true; clearTimeout(t); };
   }, [sel]);
-  useEffect(() => { if (sel) loadStrings(false); }, [sel]);  // string annotations in the listing
+  useEffect(() => { if (sel) loadStrings(true); }, [sel]);  // string annotations in the listing
+  // tell the route where the operator is (only what changed, so the echo above is recognised)
+  const selFn = sel ? index.byId.get(sel) : null;
+  useEffect(() => {
+    if (!onLocate || !selFn) return;
+    const addr = focus || selFn.addr;
+    if (located.current.addr === addr) return;
+    located.current = { ...located.current, addr };
+    onLocate({ addr });
+  }, [sel, focus, !!selFn]);
+  const locateSrc = (path, line) => {
+    const src = line ? `${path}:${line}` : path;
+    if (!onLocate || located.current.src === src) return;
+    located.current = { ...located.current, src };
+    onLocate({ src });
+  };
 
   const goAddr = (addr) => {
     const fn = index.at(addr);
-    if (fn) { setSel(fn.id); setFocus(addr); setView("functions"); }
+    if (fn) { setSel(fn.id); setFocus(addr); setFocusMiss(null); setView("functions"); }
+    else setFocusMiss(addr);
   };
   const openFn = (id, addr = null) => { setSel(id); setFocus(addr); setView("functions"); };
   const jumpTarget = (otherTid, { fnId, addr }) => {
@@ -342,8 +544,8 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
       && (x.symbols || (x.symbol ? [x.symbol] : [])).some((s) => bare(s) === want));
     if (!e) return;
     try {
-      const fns = asList(await api.functions(e.dst));
-      const m = fns.find((f) => bare(f.name) === want && f.blocks) || fns.find((f) => bare(f.name) === want);
+      const fns = await loadFuncs(e.dst);
+      const m = fns.find((f) => bare(f.name) === want && !isStub(f)) || fns.find((f) => bare(f.name) === want);
       if (!m) { setJumpErr(`${want} is exported by another component, but no function of that name was recovered there.`); return; }
       jumpTarget(e.dst, { fnId: m.id });
     } catch (err) { setJumpErr(errText(err)); }
@@ -351,49 +553,63 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
   const followCaller = async (xc) => {
     setJumpErr(null);
     try {
-      const cg = asList(await api.callgraph(xc.targetId));
+      const cg = await loadCallgraph(xc.targetId);
       const edge = cg.find((x) => bare(x.dst_name) === xc.symbol);
-      const fns = asList(await api.functions(xc.targetId));
-      const idx = makeIndex(fns);
+      const idx = makeIndex(await loadFuncs(xc.targetId));
       const caller = edge ? idx.at(edge.src_addr) : null;
       if (!caller) { setJumpErr(`Could not locate the function in ${xc.filename} that calls ${xc.symbol}.`); return; }
       jumpTarget(xc.targetId, { fnId: caller.id, addr: edge.site_addr });
     } catch (err) { setJumpErr(errText(err)); }
   };
 
-  const strByAddr = useMemo(() => (strs && strs.items.length ? new Map(strs.items.map((x) => [hexToInt(x.addr), x.value])) : null), [strs]);
+  // instruction address -> the string it references, from the strings' own xrefs (rizin prints
+  // `lea rcx, str.GIFVER`, never the string's address, so keying on operands annotated 1 line)
+  const strByIns = useMemo(() => {
+    if (!strs || !strs.items.length) return null;
+    const m = new Map();
+    for (const s of strs.items) for (const x of (Array.isArray(s.xrefs) ? s.xrefs : [])) {
+      const a = hexToInt(typeof x === "object" && x ? (x.from || x.addr || x.src_addr || x.site_addr) : x);
+      if (a != null && !m.has(a)) m.set(a, s.value);
+    }
+    return m.size ? m : null;
+  }, [strs]);
   const classes = useMemo(() => ({ heap: findings.filter(isHeap), taint: findings.filter(isTaint), cve: findings.filter(isCve) }), [findings]);
   const nClasses = classes.heap.length + classes.taint.length + classes.cve.length;
   const patchLeads = findings.filter((f) => f.detector === "patch_diff");
-  const avail = {
-    source: !!source, classes: nClasses > 0,
-  };
+  const avail = { source: !!source, classes: nClasses > 0 };
   const views = VIEWS.filter(([k]) => avail[k] !== false);
-  const cur = views.some(([k]) => k === view) ? view : "functions";
+  // a source project with no recovered functions opens on its source, unless the operator chose
+  const preferSrc = !!source && funcs != null && !funcs.length && pick.tid !== tid;
+  const want = preferSrc && (view === "functions" || view === "graph" || view === "strings") ? "source" : view;
+  const cur = views.some(([k]) => k === want) ? want : "functions";
+  const choose = (k) => { setView(k); setPick({ tid, v: k }); };
   useEffect(() => { if (cur === "graph") loadEdges(); if (cur === "strings") loadStrings(false); }, [cur, tid]);
 
-  if (!tid) return html`<h1>Code</h1><${Empty}>No target in this case yet.</${Empty}>`;
+  if (!tid) {
+    return html`<h1>Code</h1><${Empty}>${data.loading ? "Loading the case…" : "No target in this case yet."}</${Empty}>`;
+  }
 
   let body;
   if (cur === "functions") {
-    body = html`<${FunctionsView} funcs=${funcs} index=${index} byFunc=${byFunc} sel=${sel} detail=${detail}
-      focus=${focus} setSel=${(id) => { setSel(id); setFocus(null); }} goAddr=${goAddr} openFinding=${openFinding}
-      target=${target} targets=${data.targets} strByAddr=${strByAddr} sysmap=${sysmap}
-      resolveImport=${resolveImport} followCaller=${followCaller}
-      openGraph=${() => setView("graph")} stage=${stage} tid=${tid} findings=${findings} />`;
+    body = html`<${FunctionsView} funcs=${funcs} index=${index} byFunc=${byFunc} sel=${sel} detail=${detail && detail.id === sel ? detail : null}
+      focus=${focus} setSel=${(id) => { setSel(id); setFocus(null); }} goAddr=${goAddr} setFocus=${setFocus} openFinding=${openFinding}
+      target=${target} targets=${data.targets} strByIns=${strByIns} sysmap=${sysmap}
+      resolveImport=${resolveImport} followCaller=${followCaller} hasSource=${!!source} openSource=${() => choose("source")}
+      openGraph=${() => choose("graph")} stage=${stage} tid=${tid} findings=${findings} />`;
   } else if (cur === "graph") {
     body = html`<${CallGraphView} funcs=${funcs} edges=${edges} index=${index} byFunc=${byFunc} sel=${sel}
-      openFn=${openFn} key=${tid} />`;
+      openFn=${openFn} retry=${loadEdges} key=${tid} />`;
   } else if (cur === "strings") {
     body = html`<${StringsView} strs=${strs} loadAll=${() => loadStrings(true)} index=${index} goAddr=${goAddr}
       funcsLoaded=${!!funcs} />`;
   } else if (cur === "target") {
     body = html`<${TargetView} target=${target} caseId=${caseId} nFuncs=${funcs ? funcs.length : null} key=${tid} />`;
   } else if (cur === "source") {
-    body = html`<${SourceView} source=${source} findings=${findings} openFinding=${openFinding} key=${tid} />`;
+    body = html`<${SourceView} tid=${tid} source=${source} findings=${findings} openFinding=${openFinding}
+      focus=${srcFocus} locate=${locateSrc} key=${tid} />`;
   } else if (cur === "scans") {
     body = html`<${ScansView} targets=${data.targets} tid=${tid} caseId=${caseId} stage=${stage} findings=${findings}
-      hasSource=${!!source} />`;
+      allFindings=${data.findings} hasSource=${!!source} />`;
   } else if (cur === "diff") {
     body = html`<${DiffView} targets=${data.targets} tid=${tid} findings=${data.findings} stage=${stage}
       patchLeads=${patchLeads} index=${index} openFn=${openFn} openFinding=${openFinding} />`;
@@ -401,52 +617,62 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, openFinding
     body = html`<${ClassesView} classes=${classes} index=${index} openFn=${openFn} openFinding=${openFinding} />`;
   }
 
+  const counts = funcs == null ? "loading functions…"
+    : !funcs.length && source && source.kind === "tree" ? `${plural(source.files.length, "source file")} · ${plural(live(findings).length, "finding")}`
+    : `${plural(funcs.length, "function")} · ${nLiveFns} with findings`;
   return html`
     <div class="cx-head">
       <h1>Code</h1>
       <select value=${tid || ""} aria-label="Target" onChange=${(e) => focusTarget(e.target.value)}>
         ${data.targets.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}
       </select>
-      <span class="dim" style="font-size:12px">${funcs == null ? "loading functions…"
-        : `${plural(funcs.length, "function")} · ${byFunc.size} with findings`}</span>
+      <span class="dim" style="font-size:12px">${counts}</span>
     </div>
     <div class="seg cx-nav" role="tablist" aria-label="Code views">
       ${views.map(([k, l]) => html`<button role="tab" aria-selected=${cur === k} class=${cur === k ? "on" : ""}
-        onClick=${() => setView(k)}>${l}${k === "classes" ? html` <span class="dim">${nClasses}</span>`
+        onClick=${() => choose(k)}>${l}${k === "classes" ? html` <span class="dim">${nClasses}</span>`
           : k === "diff" && patchLeads.length ? html` <span class="dim">${patchLeads.length}</span>` : null}</button>`)}
     </div>
     ${jumpErr ? html`<div class="cx-note warn">${jumpErr} <button class="xref" onClick=${() => setJumpErr(null)}>dismiss</button></div>` : null}
+    ${focusMiss && cur === "functions" ? html`<div class="cx-note warn"><span class="mono">${focusMiss}</span> is not inside any recovered function of this target${funcs && !funcs.length ? " (no functions were recovered)" : ""}. <button class="xref" onClick=${() => setFocusMiss(null)}>dismiss</button></div>` : null}
     ${body}`;
 }
 
 // ── Functions ────────────────────────────────────────────────────────────────────────────
 const SORTS = [["findings", "Findings first"], ["addr", "Address"], ["size", "Size"], ["name", "Name"]];
+const HEXQ = /^(0x)?[0-9a-f]{3,16}$/i;
 function FunctionsView(p) {
-  const { funcs, index, byFunc, sel, detail, setSel, stage, tid } = p;
+  const { funcs, index, byFunc, sel, detail, setSel, goAddr, stage, tid } = p;
   const [q, setQ] = useState("");
   const [only, setOnly] = useState(false);
   const [stubs, setStubs] = useState(true);
   const [sort, setSort] = useLocal("lykos.code.sort", "findings");
+  const nLive = (id) => live(byFunc.get(id)).length;
   const shown = useMemo(() => {
     const qq = q.trim().toLowerCase();
-    const xs = (funcs || []).filter((f) => (!only || byFunc.has(f.id)) && (stubs || f.blocks)
+    const xs = (funcs || []).filter((f) => (!only || nLive(f.id)) && (stubs || !isStub(f))
       && (!qq || (f.name || "").toLowerCase().includes(qq) || (f.addr || "").toLowerCase().includes(qq)));
     const a = (f) => hexToInt(f.addr) || 0;
     const cmp = {
-      findings: (x, y) => ((byFunc.get(y.id) || []).length - (byFunc.get(x.id) || []).length) || ((+y.size || 0) - (+x.size || 0)),
+      findings: (x, y) => (nLive(y.id) - nLive(x.id)) || ((+y.size || 0) - (+x.size || 0)),
       addr: (x, y) => a(x) - a(y),
       size: (x, y) => (+y.size || 0) - (+x.size || 0),
       name: (x, y) => (x.name || "").localeCompare(y.name || ""),
     }[sort] || (() => 0);
     return xs.sort(cmp);
   }, [funcs, q, only, stubs, sort, byFunc]);
+  // an address typed into the filter: the function that CONTAINS it (substring matching found
+  // nothing for an address inside a function)
+  const qt = q.trim();
+  const addrHit = HEXQ.test(qt) && funcs ? index.at(qt.startsWith("0x") || qt.startsWith("0X") ? qt : "0x" + qt) : null;
   const selIdx = shown.findIndex((f) => f.id === sel);
   const onKey = (e) => {
-    if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Home" && e.key !== "End") return;
+    const step = { ArrowDown: 1, ArrowUp: -1, PageDown: 10, PageUp: -10 }[e.key];
+    if (step == null && e.key !== "Home" && e.key !== "End") return;
     e.preventDefault();
     if (!shown.length) return;
     const i = e.key === "Home" ? 0 : e.key === "End" ? shown.length - 1
-      : Math.min(shown.length - 1, Math.max(0, (selIdx < 0 ? -1 : selIdx) + (e.key === "ArrowDown" ? 1 : -1)));
+      : Math.min(shown.length - 1, Math.max(0, (selIdx < 0 ? -1 : selIdx) + step));
     setSel(shown[i].id);
   };
   const h = stage.runs.harness;
@@ -454,29 +680,38 @@ function FunctionsView(p) {
     <div class="code">
       <section class="panel flist">
         <div class="pad" style="display:flex;flex-direction:column;gap:8px;padding-bottom:10px">
-          <input type="text" placeholder="filter by name or address" aria-label="Filter functions" value=${q}
-            onInput=${(e) => setQ(e.target.value)} />
+          <input type="text" placeholder="filter by name, or go to an address" aria-label="Filter functions or go to an address" value=${q}
+            onInput=${(e) => setQ(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === "Enter" && addrHit) goAddr(qt.toLowerCase().startsWith("0x") ? qt : "0x" + qt); }} />
+          ${addrHit ? html`<button class="xref cx-goto" onClick=${() => goAddr(qt.toLowerCase().startsWith("0x") ? qt : "0x" + qt)}>
+            ↵ go to ${qt.toLowerCase().startsWith("0x") ? qt : "0x" + qt} in ${addrHit.name}</button>` : null}
           <div class="row-c" style="flex-wrap:wrap;gap:6px 12px">
             <label class="cx-chk"><input type="checkbox" checked=${only} onChange=${(e) => setOnly(e.target.checked)} />with findings</label>
-            <label class="cx-chk"><input type="checkbox" checked=${stubs} onChange=${(e) => setStubs(e.target.checked)} />stubs</label>
+            <label class="cx-chk" title="import / PLT thunks and empty functions"><input type="checkbox" checked=${stubs} onChange=${(e) => setStubs(e.target.checked)} />import stubs</label>
             <select value=${sort} aria-label="Sort functions" onChange=${(e) => setSort(e.target.value)} style="padding:3px 6px;font-size:12px">
               ${SORTS.map(([k, l]) => html`<option value=${k}>${l}</option>`)}</select>
           </div>
-          <span class="dim" style="font-size:11.5px">${funcs == null ? "loading…" : `${shown.length} of ${funcs.length}`} · ↑↓ to move</span>
+          <span class="dim" style="font-size:11.5px">${funcs == null ? "loading…" : `${shown.length} of ${funcs.length}`} · ↑↓ PgUp PgDn to move</span>
         </div>
         ${funcs == null ? html`<div class="dim pad">Loading functions…</div>`
-          : !funcs.length ? html`<div class="dim pad" style="font-size:12.5px">No functions were recovered for this target — the disassemble stage has not run on it, or recovered nothing.</div>`
+          : !funcs.length ? html`<div class="dim pad" style="font-size:12.5px">No functions were recovered for this target — the disassemble stage has not run on it, or recovered nothing.${p.hasSource ? html` <button class="xref" onClick=${p.openSource}>Read its source</button>` : null}</div>`
           : !shown.length ? html`<div class="dim pad" style="font-size:12.5px">No function matches.</div>`
           : html`<${VList} items=${shown} rowH=${30} maxH=${620} selIdx=${selIdx} onKeyDown=${onKey} label="Functions"
-              render=${(f) => html`<button key=${f.id} class=${"fitem cx-frow" + (sel === f.id ? " on" : "") + (f.blocks ? "" : " stub")}
+              role="listbox" activeId=${sel ? "cx-fn-" + sel : undefined}
+              render=${(f) => {
+                const all = byFunc.get(f.id) || [], n = live(all).length;
+                return html`<button key=${f.id} id=${"cx-fn-" + f.id} role="option" aria-selected=${sel === f.id ? "true" : "false"}
+                  class=${"fitem cx-frow" + (sel === f.id ? " on" : "") + (isStub(f) ? " stub" : "")}
                   tabindex="-1" onClick=${() => setSel(f.id)} title=${f.signature || f.name}>
                 <span class="nm">${f.name || f.addr}</span>
-                ${byFunc.has(f.id) ? html`<span class="lvl amber cx-n">${byFunc.get(f.id).length}</span>` : null}
-                <span class="dim">${f.addr}</span></button>`} />`}
+                ${n ? html`<span class="lvl amber cx-n">${n}</span>`
+                  : all.length ? html`<span class="cx-n dim" title="only findings flagged as noise">${all.length}</span>` : null}
+                <span class="dim">${f.addr}</span></button>`;
+              }} />`}
         <div class="pad cx-harness">
           <button class="btn sm" disabled=${!tid || (h && h.running)}
             title="Rank this binary's functions and fuzz the most promising ones directly under the emulator (constant-guided inputs, an unbounded-allocation oracle, stateful sequences). Operator-initiated, bounded; not part of a normal run. x86-64, after disassembly."
-            onClick=${() => stage.start("harness", "harness", { targetId: tid, params: {} }, { timeoutMs: 300000 })}>
+            onClick=${() => stage.start("harness", "harness", { targetId: tid, params: {} })}>
             Deep function fuzzing</button>
           <${RunStatus} st=${h} what="Deep function fuzzing" cancel=${() => stage.cancel("harness")} />
           ${h && !h.running && !h.error ? html`<div class="dim" style="font-size:12px">${(() => {
@@ -498,7 +733,10 @@ function FunctionsView(p) {
     </div>`;
 }
 
-function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target, targets, strByAddr, sysmap,
+const BRANCH = /^\s*(call|jmp|j[a-z]{1,4}|bl?x?|bl?r|b\.[a-z]{2}|b[a-z]{2,3}|jalr?|cbn?z|tbn?z)\b/i;
+const CAP = 6000;
+
+function FunctionView({ fn, findings, focus, goAddr, setFocus, openFinding, index, target, targets, strByIns, sysmap,
   resolveImport, followCaller, openGraph, tid }) {
   const dec = usableDecompile(fn.decompiled);
   const frame = parseMaybe(fn.frame) || null;
@@ -509,20 +747,42 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
   const blocks = ir.blocks || [];
   const callers = parseMaybe(fn.callers) || [];
   const callees = parseMaybe(fn.callees) || [];
-  const [all, setAll] = useState(false);
   const nIns = blocks.reduce((n, b) => n + (b.instructions || []).length, 0);
-  const CAP = 6000;
   const sites = useMemo(() => {
     const m = new Map();
     for (const f of findings) { const a = hexToInt(f.site_addr); if (a != null) { if (!m.has(a)) m.set(a, []); m.get(a).push(f); } }
     return m;
   }, [findings]);
-  const focusInt = hexToInt(focus);
+  // the instruction holding the focused address (a typed / reported address may fall mid-instruction)
+  const focusInt = useMemo(() => {
+    const f = hexToInt(focus);
+    if (f == null) return null;
+    let best = null;
+    for (const b of blocks) for (const i of b.instructions || []) { const a = hexToInt(i.addr); if (a != null && a <= f && (best == null || a > best)) best = a; }
+    return best != null && f - best < 16 ? best : f;
+  }, [fn.id, focus]);
+  // where the listing must reach: the focused instruction, else the first finding site. Beyond
+  // the CAP-instruction first render it was never drawn, so nothing was highlighted.
+  const needIdx = useMemo(() => {
+    let k = 0, firstSite = -1;
+    for (const b of blocks) for (const i of b.instructions || []) {
+      const a = hexToInt(i.addr);
+      if (focusInt != null && a === focusInt) return k;
+      if (firstSite < 0 && sites.has(a)) firstSite = k;
+      k++;
+    }
+    return firstSite;
+  }, [fn.id, focusInt, sites]);
+  const [all, setAll] = useState(needIdx >= CAP);
+  useEffect(() => { if (needIdx >= CAP) setAll(true); }, [needIdx]);
+  // scroll the LISTING only (scrollIntoView also scrolled the page, pushing the header and xrefs away)
   useEffect(() => {
     if (tab !== "asm") return;
-    const el = box.current && (box.current.querySelector(".ins.focus") || box.current.querySelector(".ins.site"));
-    if (el) el.scrollIntoView({ block: "center" });
-  }, [fn.id, focus, tab]);
+    const c = box.current;
+    const el = c && (c.querySelector(".ins.focus") || c.querySelector(".ins.site"));
+    if (!el) return;
+    c.scrollTop += el.getBoundingClientRect().top - c.getBoundingClientRect().top - c.clientHeight / 2;
+  }, [fn.id, focus, tab, all]);
   useEffect(() => { if (focusInt != null) setTab("asm"); }, [focus]);
   const uniq = (xs, k) => [...new Map(xs.map((x) => [x[k], x])).values()];
   const ups = uniq(callers, "src_addr");
@@ -540,19 +800,21 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
     const want = bare(fn.name);
     return sysmap.edges.filter((e) => e.dst === tid && (e.symbols || (e.symbol ? [e.symbol] : [])).some((s) => bare(s) === want))
       .map((e) => ({ targetId: e.src, filename: (targets.find((t) => t.id === e.src) || {}).filename || "other", symbol: want }));
-  }, [fn.id, sysmap, tid]);
+  }, [fn.id, sysmap, tid, targets]);
 
-  // operands that name a function (0x..., fcn.XXXX) become links; string addresses get the string
+  // Operands that name a function become links. A non-branch operand links only when it is
+  // EXACTLY a function start (`lea rdi, [0x8d9a]` -> main): `[rbp-0x2054]` and `cmp eax, 0x7fff`
+  // used to link into whatever function happened to span that number.
   const renderText = (text, selfStart) => {
     const parts = [];
-    let last = 0, note = null;
+    let last = 0, m;
+    const branch = BRANCH.test(text);
     const re = /\b(0x[0-9a-fA-F]{3,}|fcn\.[0-9a-fA-F]{4,}|sub_[0-9a-fA-F]{4,})\b/g;
-    let m;
     while ((m = re.exec(text))) {
       const tok = m[1];
+      if (/[-+]\s*$/.test(text.slice(Math.max(0, m.index - 3), m.index))) continue;     // a displacement
       const a = tok.startsWith("0x") ? parseInt(tok, 16) : parseInt(tok.replace(/^(fcn\.|sub_)/, ""), 16);
-      const f = index.at(a);
-      if (strByAddr && !note && strByAddr.has(a)) note = strByAddr.get(a);
+      const f = index.starts.get(a) || (branch ? index.at(a) : null);
       if (!f) continue;
       parts.push(text.slice(last, m.index));
       const local = hexToInt(f.addr) === selfStart;
@@ -561,23 +823,32 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
       last = m.index + tok.length;
     }
     parts.push(text.slice(last));
-    if (note != null) parts.push(html`<span class="cx-str"> ; "${note.length > 60 ? note.slice(0, 59) + "…" : note}"</span>`);
     return parts;
   };
   const selfStart = hexToInt(fn.addr);
+  const listingText = () => blocks.map((b) => `${b.addr}:\n` + (b.instructions || []).map((i) => `  ${i.addr}  ${i.text || ""}`).join("\n")).join("\n");
+  // a chip scrolls to its site in the listing; "open" opens the finding
+  const toSite = (f) => {
+    if (f.site_addr && hexToInt(f.site_addr) != null) { setTab("asm"); setFocus(f.site_addr); } else openFinding(f.id);
+  };
   let shownIns = 0;
 
   return html`
     <section class="panel pad" style="display:flex;flex-direction:column;gap:6px">
       <div class="row-c" style="flex-wrap:wrap"><h2 class="mono" style="word-break:break-all">${fn.name}</h2>
+        <${Copy} text=${fn.name} what="function name" />
         <span class="mono dim" style="font-size:12px">${[fn.addr, fn.size != null ? `${fn.size} bytes` : null,
           fn.blocks != null ? plural(fn.blocks, "block") : null, nIns ? plural(nIns, "instruction") : null].filter(Boolean).join(" · ")}</span>
+        <${Copy} text=${fn.addr} what="address" />
         <span style="flex:1 1 auto"></span>
         <button class="btn sm" onClick=${openGraph}>Show in call graph</button></div>
       ${fn.signature ? html`<span class="mono muted" style="font-size:12px;word-break:break-word">${fn.signature}</span>` : null}
       ${findings.length ? html`<div class="row-c" style="flex-wrap:wrap;margin-top:4px">
-        ${findings.map((f) => html`<button class="chip cx-fchip" onClick=${() => openFinding(f.id)} title=${f.title}>
-          ${f.cwe} · ${f.state} @ ${f.site_addr || "fn"}</button>`)}</div>` : null}
+        ${findings.map((f) => html`<span class=${"cx-fchipw" + (isNoise(f) ? " noise" : "")}>
+          <button class="chip cx-fchip" onClick=${() => toSite(f)}
+            title=${(f.site_addr ? "show the site in the listing — " : "") + (f.title || "") + (isNoise(f) ? " (flagged as noise)" : "")}>
+            ${f.cwe} · ${f.state} @ ${f.site_addr || "fn"}</button>
+          <button class="xref cx-fopen" onClick=${() => openFinding(f.id)} aria-label=${`open finding: ${f.title || f.cwe}`}>open</button></span>`)}</div>` : null}
     </section>
     <div class="row-c" style="flex-wrap:wrap;align-items:flex-start">
       <section class="panel pad cx-xr">
@@ -595,7 +866,9 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
         <div class="cx-lbl">CALLS (${downsU.length})</div>
         ${!downsU.length ? html`<div class="dim" style="font-size:12px">leaf — calls nothing recovered</div>` : null}
         ${downsU.slice(0, 50).map((e) => {
-          const internal = e.dst_addr && index.at(e.dst_addr);
+          // an import resolves to its 6-byte PLT thunk, which is not where it is defined: offer the
+          // component that exports it instead (it never was offered while the thunk counted as internal)
+          const internal = !e.external && e.dst_addr && index.at(e.dst_addr);
           const xb = !internal && e.dst_name ? exportedBy(e.dst_name) : null;
           return html`<div class="cx-xrow">
             ${internal ? html`<button class="xref" onClick=${() => goAddr(e.dst_addr)}>${e.dst_name || nameAt(e.dst_addr) || e.dst_addr}</button>`
@@ -607,12 +880,17 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
         ${downsU.length > 50 ? html`<div class="dim" style="font-size:11.5px">+${downsU.length - 50} more — see the call graph</div>` : null}
       </section>
     </div>
-    <div class="seg" role="tablist" aria-label="Function view" style="align-self:flex-start">
-      <button role="tab" aria-selected=${tab === "asm"} class=${tab === "asm" ? "on" : ""} onClick=${() => setTab("asm")}>Disassembly</button>
-      <button role="tab" aria-selected=${tab === "src"} class=${tab === "src" ? "on" : ""} onClick=${() => setTab("src")} disabled=${!dec}
-        title=${dec ? "" : "the decompiler produced no usable C for this function"}>Decompiled</button>
-      <button role="tab" aria-selected=${tab === "frame"} class=${tab === "frame" ? "on" : ""} onClick=${() => setTab("frame")} disabled=${!hasFrame}
-        title=${hasFrame ? "" : "no stack frame was recovered for this function"}>Stack frame</button>
+    <div class="row-c" style="flex-wrap:wrap">
+      <div class="seg" role="tablist" aria-label="Function view">
+        <button role="tab" aria-selected=${tab === "asm"} class=${tab === "asm" ? "on" : ""} onClick=${() => setTab("asm")}>Disassembly</button>
+        <button role="tab" aria-selected=${tab === "src"} class=${tab === "src" ? "on" : ""} onClick=${() => setTab("src")} disabled=${!dec}
+          title=${dec ? "" : "the decompiler produced no usable C for this function"}>Decompiled</button>
+        <button role="tab" aria-selected=${tab === "frame"} class=${tab === "frame" ? "on" : ""} onClick=${() => setTab("frame")} disabled=${!hasFrame}
+          title=${hasFrame ? "" : "no stack frame was recovered for this function"}>Stack frame</button>
+      </div>
+      <span style="flex:1 1 auto"></span>
+      ${tab === "asm" && blocks.length ? html`<${Copy} text=${listingText} label="copy listing" what="the disassembly listing" />` : null}
+      ${tab === "src" && dec ? html`<${Copy} text=${fn.decompiled} label="copy C" what="the decompiled C" />` : null}
     </div>
     ${tab === "src" && dec ? html`<pre class="asm" style="padding:12px 14px;margin:0;white-space:pre-wrap">${fn.decompiled}</pre>`
       : tab === "frame" && hasFrame ? html`<${StackFrame} frame=${frame} />`
@@ -626,9 +904,11 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
             shownIns++;
             const a = hexToInt(i.addr);
             const fs = sites.get(a);
-            const cls = "ins" + (fs ? " site" : "") + (focusInt != null && a === focusInt ? " focus" : "");
-            return html`<div class=${cls}><span class="a">${i.addr}</span><span class="cx-t">${renderText(String(i.text || ""), selfStart)}</span>
-              ${fs ? html`<button class="xref cx-site" onClick=${() => openFinding(fs[0].id)}>◂ ${fs[0].cwe} ${fs[0].state}${fs.length > 1 ? ` +${fs.length - 1}` : ""}</button>` : null}</div>`;
+            const allNoise = fs && fs.every(isNoise);
+            const note = strByIns ? strByIns.get(a) : null;
+            const cls = "ins" + (fs ? " site" + (allNoise ? " noise" : "") : "") + (focusInt != null && a === focusInt ? " focus" : "");
+            return html`<div class=${cls}><span class="a">${i.addr}</span><span class="cx-t">${renderText(String(i.text || ""), selfStart)}${note != null ? html`<span class="cx-str"> ; "${note.length > 60 ? note.slice(0, 59) + "…" : note}"</span>` : null}</span>
+              ${fs ? html`<button class="xref cx-site" onClick=${() => openFinding(fs[0].id)} title=${fs.map((f) => f.title).join("\n")}>◂ ${fs[0].cwe} ${fs[0].state}${fs.length > 1 ? ` +${fs.length - 1}` : ""}</button>` : null}</div>`;
           })}</div>`;
         }) : html`<div class="dim" style="padding:12px 14px">No instruction listing recovered for this function.</div>`}
         ${!all && nIns > CAP ? html`<div style="padding:8px 14px"><button class="btn sm" onClick=${() => setAll(true)}>
@@ -638,7 +918,7 @@ function FunctionView({ fn, findings, focus, goAddr, openFinding, index, target,
 
 // The recovered stack frame as a memory diagram, highest offset first. Offsets are shown in the
 // decompiler's own frame coordinates exactly as recovered (rizin numbers from the frame pointer,
-// Ghidra from the return slot -- the frame says which via ret_offset); no return-address distance
+// Ghidra from the return slot -- `coords` / ret_offset say which); no return-address distance
 // is claimed here, because that conversion is the PoC engine's job and it checks it.
 function StackFrame({ frame }) {
   const vars = (frame.vars || []).slice().sort((a, b) => (b.offset || 0) - (a.offset || 0));
@@ -661,6 +941,7 @@ function StackFrame({ frame }) {
       <${KV} k="locals" v=${frame.local_size != null ? `${frame.local_size} B` : null} />
       <${KV} k="params" v=${frame.param_size ? `${frame.param_size} B` : null} />
       <${KV} k="ret_offset" v=${frame.ret_offset != null ? String(frame.ret_offset) : null} mono=${true} />
+      <${KV} k="offsets from" v=${frame.coords === "fp" ? "frame pointer" : frame.coords || null} />
       ${nbuf ? html`<span class="chip cx-amb">${plural(nbuf, "buffer")}</span>` : null}
     </div>
     <div class="cx-stack" role="table" aria-label="Stack frame">
@@ -692,7 +973,15 @@ function buildGraph(edges, index) {
     const s = index.starts.get(hexToInt(e.src_addr)) || index.at(e.src_addr);
     if (!s) continue;
     let dk = null;
-    if (e.dst_addr != null) { const d = index.starts.get(hexToInt(e.dst_addr)) || index.at(e.dst_addr); if (d) dk = d.id; }
+    // an import is an import node, not its PLT thunk (every one resolved to the thunk, so the
+    // "imports" toggle did nothing and libc calls ate the node budget)
+    if (e.external) {
+      const nm = e.dst_name || e.dst_addr;
+      if (nm) { dk = "x:" + nm; ext.set(dk, bare(String(nm))); }
+    } else if (e.dst_addr != null) {
+      const d = index.starts.get(hexToInt(e.dst_addr)) || index.at(e.dst_addr);
+      if (d) dk = d.id;
+    }
     if (!dk && e.dst_name) { dk = "x:" + e.dst_name; ext.set(dk, e.dst_name); }
     if (!dk || dk === s.id) continue;
     add(out, s.id, dk);
@@ -760,7 +1049,7 @@ function layout(layerMap, E) {
   return pos;
 }
 
-function CallGraphView({ funcs, edges, index, byFunc, sel, openFn }) {
+function CallGraphView({ funcs, edges, index, byFunc, sel, openFn, retry }) {
   const [hops, setHops] = useLocal("lykos.code.hops", 2);
   const [showExt, setShowExt] = useLocal("lykos.code.imports", false);
   const [clickMode, setClickMode] = useLocal("lykos.code.click", "open");
@@ -776,7 +1065,7 @@ function CallGraphView({ funcs, edges, index, byFunc, sel, openFn }) {
   const fallback = useMemo(() => {
     if (!funcs || !funcs.length) return null;
     let best = null, bn = 0;
-    for (const [id, fs] of byFunc) if (fs.length > bn) { best = id; bn = fs.length; }
+    for (const [id, fs] of byFunc) { const n = live(fs).length; if (n > bn) { best = id; bn = n; } }
     if (best) return best;
     const m = funcs.find((f) => /^(sym\.)?main$|^entry0?$/.test(f.name || ""));
     return (m || funcs.slice().sort((a, b) => (+b.size || 0) - (+a.size || 0))[0]).id;
@@ -804,6 +1093,9 @@ function CallGraphView({ funcs, edges, index, byFunc, sel, openFn }) {
   };
   useEffect(() => { fit(); }, [pos]);
 
+  if (edges && edges.error) {
+    return html`<${Empty}>Could not load the call graph: ${edges.error} <button class="btn sm" onClick=${retry}>Retry</button></${Empty}>`;
+  }
   if (edges === "loading" || edges == null || funcs == null) return html`<${Empty}>Loading the call graph…</${Empty}>`;
   if (!edges.length) return html`<${Empty}>No call edges were recovered for this target (the disassemble stage has not run, or found no calls).</${Empty}>`;
   if (!c) return html`<${Empty}>No functions to draw.</${Empty}>`;
@@ -890,19 +1182,20 @@ function CallGraphView({ funcs, edges, index, byFunc, sel, openFn }) {
           })}
           ${[...pos.entries()].map(([id, p]) => {
             const ext = id.startsWith("x:");
-            const fs = ext ? null : byFunc.get(id);
+            const fs = ext ? null : live(byFunc.get(id));
+            const hot = fs && fs.length;
             const nm = label(id) || "";
-            const cls = "cx-node" + (id === c ? " center" : "") + (fs ? " hot" : "") + (ext ? " ext" : "") + (hl && !hl.has(id) ? " fade" : "");
+            const cls = "cx-node" + (id === c ? " center" : "") + (hot ? " hot" : "") + (ext ? " ext" : "") + (hl && !hl.has(id) ? " fade" : "");
             return html`<g key=${id} class=${cls} transform=${`translate(${p.x - NODE_W / 2},${p.y})`}
                 tabindex=${ext ? undefined : "0"} role=${ext ? undefined : "button"}
-                aria-label=${`${nm}${fs ? `, ${plural(fs.length, "finding")}` : ""}${p.d < 0 ? ", caller" : p.d > 0 ? ", callee" : ", centre"}`}
+                aria-label=${`${nm}${hot ? `, ${plural(fs.length, "finding")}` : ""}${p.d < 0 ? ", caller" : p.d > 0 ? ", callee" : ", centre"}`}
                 onClick=${() => activate(id)} onKeyDown=${(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(id); } }}
                 onPointerEnter=${() => setHover(id)} onPointerLeave=${() => setHover(null)} onFocus=${() => setHover(id)} onBlur=${() => setHover(null)}>
               <rect width=${NODE_W} height=${NODE_H} rx="8"></rect>
               <text x=${NODE_W / 2} y=${NODE_H / 2 + 4} text-anchor="middle">${nm.length > 19 ? nm.slice(0, 18) + "…" : nm}</text>
-              ${fs ? html`<g transform=${`translate(${NODE_W - 9},-7)`}><circle r="9" class="cx-badge"></circle>
+              ${hot ? html`<g transform=${`translate(${NODE_W - 9},-7)`}><circle r="9" class="cx-badge"></circle>
                 <text y="3.5" text-anchor="middle" class="cx-badge-t">${fs.length}</text></g>` : null}
-              <title>${nm}${ext ? " (import)" : ""}${fs ? ` — ${plural(fs.length, "finding")}` : ""}</title>
+              <title>${nm}${ext ? " (import)" : ""}${hot ? ` — ${plural(fs.length, "finding")}` : ""}</title>
             </g>`;
           })}
         </g>
@@ -920,10 +1213,12 @@ function StringsView({ strs, loadAll, index, goAddr, funcsLoaded }) {
   const [q, setQ] = useState("");
   const [refd, setRefd] = useState(false);
   const qq = q.trim().toLowerCase();
-  useEffect(() => { if ((qq || refd) && strs && !strs.complete && !strs.loading) loadAll(); }, [qq, refd]);
+  // re-checked when a page finishes too: a filter typed while the first page loaded never loaded the rest
+  useEffect(() => { if ((qq || refd) && strs && !strs.complete && !strs.loading && !strs.error) loadAll(); },
+    [qq, refd, strs && strs.loading, strs && strs.complete]);
   const rows = useMemo(() => {
     const xs = (strs && strs.items) || [];
-    return xs.filter((s) => (!qq || (s.value || "").toLowerCase().includes(qq) || (s.addr || "").includes(qq))
+    return xs.filter((s) => (!qq || (s.value || "").toLowerCase().includes(qq) || (s.addr || "").toLowerCase().includes(qq))
       && (!refd || (Array.isArray(s.xrefs) && s.xrefs.length)));
   }, [strs, qq, refd]);
   if (!strs || (strs.loading && !strs.items.length)) return html`<${Empty}>Loading strings…</${Empty}>`;
@@ -938,7 +1233,7 @@ function StringsView({ strs, loadAll, index, goAddr, funcsLoaded }) {
       <span class="dim" style="font-size:12px">${qq || refd ? `${rows.length} ${rows.length === 1 ? "match" : "matches"} · ` : ""}${strs.items.length}${strs.total != null && strs.total !== strs.items.length ? ` of ${strs.total}` : ""} loaded</span>
       ${!strs.complete ? html`<button class="btn sm" disabled=${strs.loading} onClick=${loadAll}>${strs.loading ? "Loading…" : `Load all ${strs.total}`}</button>` : null}
     </div>
-    ${(qq || refd) && !strs.complete ? html`<div class="cx-note" style="margin:0 16px 10px">Filtering the strings loaded so far; the rest are loading.</div>` : null}
+    ${(qq || refd) && !strs.complete ? html`<div class="cx-note" style="margin:0 16px 10px">${strs.loading ? "Filtering the strings loaded so far; the rest are loading." : `Filtering the ${strs.items.length} strings loaded so far${strs.error ? ` (loading the rest failed: ${strs.error})` : ""}.`}</div>` : null}
     ${!anyX ? html`<div class="dim" style="font-size:12px;padding:0 16px 8px">No code references were recorded for these strings (the xref pass did not run or did not finish), so they are not linked to functions.</div>` : null}
     <div class="cx-strhead"><span>address</span><span>value</span><span>referenced from</span></div>
     <${VList} items=${rows} rowH=${30} maxH=${600} label="Strings" render=${(s, i) => {
@@ -965,7 +1260,17 @@ const MITS = [
 const DANGEROUS = new Set(["strcpy", "strcat", "sprintf", "vsprintf", "gets", "scanf", "sscanf", "memcpy", "memmove",
   "alloca", "system", "popen", "execve", "execl", "execlp", "execvp", "exec", "fscanf", "printf", "fprintf", "snprintf",
   "read", "recv", "fread", "getenv", "strncpy", "strncat"]);
-const posture = (v) => (v === "partial" ? "part" : (v === "on" || v === "full" || v === true) ? "on" : "off");
+// the libc variants name the same API: __isoc23_sscanf, __printf_chk, __memcpy_chk
+const apiName = (s) => bare(s).replace(/^isoc\d+_/, "").replace(/^_+/, "").replace(/_chk$/, "");
+// "unknown" is NOT absent: it rendered amber "favours exploitation" (libwinpr's pie:"unknown")
+const posture = (v) => {
+  const s = String(v).toLowerCase();
+  if (v === true || s === "on" || s === "full" || s === "yes" || s === "enabled") return "on";
+  if (s === "partial") return "part";
+  if (v === false || s === "off" || s === "none" || s === "no" || s === "disabled") return "off";
+  return "unk";
+};
+const POSTURE_TITLE = { off: "absent — favours exploitation", part: "partial", on: "present", unk: "not determined" };
 
 function TargetView({ target, caseId, nFuncs }) {
   const [details, setDetails] = useState(undefined);
@@ -989,18 +1294,18 @@ function TargetView({ target, caseId, nFuncs }) {
   }, [tid]);
   if (!target) return html`<${Empty}>No target selected.</${Empty}>`;
   const t = target, d = details || {};
-  const m = t.mitigations || {};
+  const m = parseMaybe(t.mitigations) || {};
   const elf = (d.format_details && d.format_details.elf) || {};
   const imp = d.imports || {};
   const syms = imp.symbols || [];
-  const dang = syms.filter((s) => DANGEROUS.has(bare(s)));
+  const dang = syms.filter((s) => DANGEROUS.has(apiName(s)));
   const ent = d.entropy && typeof d.entropy === "object" ? d.entropy : null;
   const sections = Array.isArray(d.sections) ? d.sections.filter((s) => s.name || s.size) : [];
   const exportsN = d.exports_count != null ? d.exports_count : (d.exports && d.exports.count);
   return html`
     <div class="cx-grid">
       <section class="panel pad">
-        <h2 class="mono" style="word-break:break-all">${t.filename}</h2>
+        <div class="row-c" style="flex-wrap:wrap"><h2 class="mono" style="word-break:break-all">${t.filename}</h2><${Copy} text=${t.filename} what="file name" /></div>
         <div class="muted" style="font-size:12.5px;margin:2px 0 10px">${d.detected || [String(t.file_type || "").toUpperCase(), t.arch, t.bits ? `${t.bits}-bit` : null, t.endianness, t.linking, t.stripped ? "stripped" : "with symbols"].filter(Boolean).join(" · ")}</div>
         <${KV} k="Type" v=${t.file_type} />
         <${KV} k="Arch" v=${[t.arch, t.bits ? `${t.bits}-bit` : null, t.endianness].filter(Boolean).join(" ")} />
@@ -1020,7 +1325,7 @@ function TargetView({ target, caseId, nFuncs }) {
         ${ent && ent.reasons && ent.reasons.length ? html`<div class="dim" style="font-size:12px">${ent.reasons.join("; ")}</div>` : null}
         <div class="cx-hashes">
           ${[["SHA-256", t.sha256], ["SHA-1", t.sha1], ["MD5", t.md5]].filter(([, v]) => v).map(([k, v]) => html`
-            <div class="cx-hash"><span class="k">${k}</span><code title=${v}>${v}</code><${Copy} text=${v} /></div>`)}
+            <div class="cx-hash"><span class="k">${k}</span><code title=${v}>${v}</code><${Copy} text=${v} what=${k} /></div>`)}
         </div>
         ${details === undefined ? html`<div class="dim" style="font-size:12px;margin-top:6px">loading the triage record…</div>`
           : details === null ? html`<div class="dim" style="font-size:12px;margin-top:6px">No triage record for this target (sections and imports come from it).</div>` : null}
@@ -1028,14 +1333,14 @@ function TargetView({ target, caseId, nFuncs }) {
       </section>
       <section class="panel pad">
         <h2>Mitigations</h2>
-        <div class="dim" style="font-size:12px;margin:2px 0 10px">Amber = absent, which favours exploitation.</div>
+        <div class="dim" style="font-size:12px;margin:2px 0 10px">Amber = absent, which favours exploitation. Dashed = not determined.</div>
         ${Object.keys(m).length ? html`<div class="cx-posture">${MITS.filter(([k]) => m[k] != null).map(([k, l, desc]) => {
           const p = posture(m[k]);
-          return html`<div class=${"cx-pm " + p} title=${p === "off" ? "absent — favours exploitation" : p === "part" ? "partial" : "present"}>
+          return html`<div class=${"cx-pm " + p} title=${POSTURE_TITLE[p]}>
             <div class="row-c" style="justify-content:space-between"><b>${l}</b><span class="mono">${typeof m[k] === "boolean" ? (m[k] ? "on" : "off") : m[k]}</span></div>
             <span class="dim">${desc}</span></div>`;
         })}
-          ${Object.keys(m).filter((k) => !MITS.some(([x]) => x === k)).map((k) => html`<div class=${"cx-pm " + posture(m[k])}>
+          ${Object.keys(m).filter((k) => !MITS.some(([x]) => x === k)).map((k) => html`<div class=${"cx-pm " + posture(m[k])} title=${POSTURE_TITLE[posture(m[k])]}>
             <div class="row-c" style="justify-content:space-between"><b>${k}</b><span class="mono">${String(m[k])}</span></div></div>`)}
         </div>` : html`<div class="dim">No mitigation posture was recorded for this target.</div>`}
         ${dang.length ? html`<div style="margin-top:14px"><div class="cx-lbl">DANGEROUS IMPORTS</div>
@@ -1057,6 +1362,7 @@ function TargetView({ target, caseId, nFuncs }) {
     <${InvocationHelper} tid=${tid} advice=${advice} />
     <${CapabilitiesPanel} caps=${caps} />`;
 }
+
 
 function AdvicePanel({ advice }) {
   if (advice === undefined) return html`<section class="panel pad dim">Loading advice…</section>`;
@@ -1177,98 +1483,244 @@ function CapabilitiesPanel({ caps }) {
 }
 
 // ── Source ───────────────────────────────────────────────────────────────────────────────
-function SourceView({ source, findings, openFinding }) {
-  const files = useMemo(() => {
-    if (!source) return [];
-    if (Array.isArray(source.files)) {
-      return source.files.map((f) => ({ path: f.path || f.name || f.filename, text: f.text != null ? f.text : f.source }))
-        .filter((f) => f.path && typeof f.text === "string");
+// A tree file is read in 801-line windows (the server's max context is 400 either side of a line).
+const SRC_CHUNK = 400, SRC_MAX_LINES = 60000;
+const FILE_CACHE = new Map();     // tid \0 path -> {lines, total, complete, capped}
+const SITE_CACHE = new Map();     // tid \0 finding id -> {path, line} | false: the server's own site_of
+function useSourceFile(tid, source, path) {
+  const key = `${tid}\0${path}`;
+  const [st, setSt] = useState(null);
+  useEffect(() => {
+    if (!path || !source) { setSt(null); return undefined; }
+    if (source.kind === "single") {
+      const lines = String(source.text || "").split("\n");
+      setSt({ lines, total: lines.length, complete: true });
+      return undefined;
     }
-    return source.source ? [{ path: source.filename || "source", text: source.source }] : [];
-  }, [source]);
-  const [cur, setCur] = useState(0);
+    const hit = FILE_CACHE.get(key);
+    if (hit) { setSt(hit); return undefined; }
+    let stop = false;
+    (async () => {
+      let lines = [], total = null;
+      setSt({ lines, total, complete: false, loading: true });
+      try {
+        for (let guard = 0; guard < 200; guard++) {
+          const from = lines.length + 1;
+          const want = total == null ? from + SRC_CHUNK : Math.min(total, from + SRC_CHUNK);
+          const r = await fetchJSON(`/targets/${tid}/source-file?path=${encodeURIComponent(path)}&line=${want}&context=${SRC_CHUNK}`);
+          if (stop) return;
+          if (!r.ok || !r.body) throw new Error((r.body && r.body.error) || `HTTP ${r.status}`);
+          total = r.body.total;
+          const got = r.body.lines || [];
+          const off = from - (r.body.start || 1);
+          if (off < 0 || off >= got.length) break;               // nothing past what is in
+          lines = lines.concat(got.slice(off));
+          if (lines.length >= total || lines.length >= SRC_MAX_LINES) break;
+          setSt({ lines, total, complete: false, loading: true });
+        }
+        if (stop) return;
+        const v = { lines, total: total == null ? lines.length : total, complete: true,
+                    capped: total != null && lines.length < total };
+        FILE_CACHE.set(key, v);
+        if (FILE_CACHE.size > 40) FILE_CACHE.delete(FILE_CACHE.keys().next().value);
+        setSt(v);
+      } catch (e) {
+        if (!stop) setSt({ lines, total, complete: false, loading: false, error: errText(e) });
+      }
+    })();
+    return () => { stop = true; };
+  }, [key, source]);
+  return st;
+}
+
+function SourceView({ tid, source, findings, openFinding, focus, locate }) {
+  const files = (source && source.files) || [];
+  const tix = useMemo(() => treeIndex(files), [source]);
+  const [tick, setTick] = useState(0);                 // server-resolved sites arrived
+  // every finding with a source site, placed in a tree file when it names one unambiguously; the
+  // server's own resolution (?finding=) wins once asked
+  const locs = useMemo(() => findings.map((f) => {
+    const srv = SITE_CACHE.get(`${tid}\0${f.id}`);
+    if (srv) return { f, rel: srv.path, line: srv.line, cands: [], server: true };
+    const site = srcSiteOf(f);
+    if (!site) return null;
+    const r = tix.resolve(site.path);
+    return { f, rel: r.rel, line: site.line, cands: r.cands, path: site.path, asked: srv === false };
+  }).filter(Boolean), [findings, tix, tick, tid]);
+  const byFile = useMemo(() => {
+    const m = new Map();
+    for (const l of locs) if (l.rel && l.line) { if (!m.has(l.rel)) m.set(l.rel, []); m.get(l.rel).push(l); }
+    return m;
+  }, [locs]);
+  const unplaced = locs.filter((l) => !l.rel && !l.cands.length);
+  const noSite = findings.length - locs.length;
+  const [cur, setCur] = useState(null);
+  const [jump, setJump] = useState({ idx: -1, n: 0 });
+  const [ambig, setAmbig] = useState(null);           // {path, line, cands}: a focus naming several files
+  const [fq, setFq] = useState("");
+  const [onlyF, setOnlyF] = useState(null);           // null = "with findings" when there are any
   const [q, setQ] = useState("");
   const [hit, setHit] = useState(-1);
-  const [fq, setFq] = useState("");
-  const locs = useMemo(() => findings.map((f) => ({ f, loc: srcLocOf(f) })).filter((x) => x.loc), [findings]);
-  const matchFile = (path, loc) => {
-    const a = path.replace(/^\.\//, ""), b = loc.path.replace(/^\.\//, "");
-    return a === b || a.endsWith("/" + b) || b.endsWith("/" + a) || (a.split("/").pop() === b.split("/").pop() && !b.includes("/"));
+  const open = (rel, line = null) => {
+    setCur(rel); setAmbig(null); setHit(-1);
+    setJump({ idx: line ? line - 1 : -1, n: Date.now() });
+    locate(rel, line);
   };
-  const file = files[cur] || files[0];
-  const lines = useMemo(() => (file ? file.text.split("\n") : []), [file]);
+  // a requested site (the route / a finding): resolve it in the tree
+  useEffect(() => {
+    if (!focus || !files.length) return;
+    const r = tix.resolve(focus.path);
+    if (r.rel) { setCur(r.rel); setAmbig(null); setJump({ idx: focus.line ? focus.line - 1 : -1, n: focus.n }); }
+    else setAmbig({ path: focus.path, line: focus.line, cands: r.cands });
+  }, [focus && focus.n, source]);
+  // nothing asked for: the file with the most findings
+  useEffect(() => {
+    if (cur || focus || !files.length) return;
+    let best = null, bn = 0;
+    for (const [p, ls] of byFile) { const n = live(ls.map((l) => l.f)).length || ls.length * 0.001; if (n > bn) { best = p; bn = n; } }
+    const first = byFile.size && best ? best : (files.find((p) => /^readme(\.|$)/i.test(p)) || files[0]);
+    setCur(first);
+    const ls = byFile.get(first);
+    if (ls && ls.length) setJump({ idx: Math.min(...ls.map((l) => l.line)) - 1, n: Date.now() });
+  }, [source, byFile.size]);
+  // a site the client cannot place in THIS file (an ambiguous basename, a `file: fn()` site with no
+  // line): ask the server, which resolves it exactly as the confirm stages do
+  useEffect(() => {
+    if (!cur || !source || source.kind !== "tree") return undefined;
+    const want = locs.filter((l) => !l.server && !l.asked && ((l.rel === cur && !l.line) || (!l.rel && l.cands.includes(cur))))
+      .slice(0, 60);
+    if (!want.length) return undefined;
+    let stop = false;
+    (async () => {
+      const q2 = want.slice();
+      const worker = async () => {
+        while (q2.length && !stop) {
+          const l = q2.shift();
+          const k = `${tid}\0${l.f.id}`;
+          if (SITE_CACHE.has(k)) continue;
+          try {
+            const r = await fetchJSON(`/targets/${tid}/source-file?finding=${encodeURIComponent(l.f.id)}&context=0`);
+            SITE_CACHE.set(k, r.ok && r.body && r.body.path ? { path: r.body.path, line: r.body.line || r.body.start || null } : false);
+          } catch (_e) { SITE_CACHE.set(k, false); }
+        }
+      };
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      if (!stop) setTick((x) => x + 1);
+    })();
+    return () => { stop = true; };
+  }, [cur, source, locs]);
+
+  const fileSt = useSourceFile(tid, source, cur);
+  const lines = (fileSt && fileSt.lines) || [];
   const marks = useMemo(() => {
     const m = new Map();
-    if (!file) return m;
-    for (const { f, loc } of locs) if (matchFile(file.path, loc)) { if (!m.has(loc.line)) m.set(loc.line, []); m.get(loc.line).push(f); }
+    for (const l of byFile.get(cur) || []) { if (!m.has(l.line)) m.set(l.line, []); m.get(l.line).push(l.f); }
     return m;
-  }, [file, locs]);
-  const elsewhere = locs.filter(({ loc }) => !files.some((x) => matchFile(x.path, loc)));
+  }, [byFile, cur]);
+  const markLines = useMemo(() => [...marks.keys()].sort((a, b) => a - b), [marks]);
   const qq = q.trim().toLowerCase();
   const hits = useMemo(() => (qq ? lines.map((l, i) => (l.toLowerCase().includes(qq) ? i : -1)).filter((i) => i >= 0) : []), [lines, qq]);
-  const firstMark = marks.size ? Math.min(...marks.keys()) - 1 : -1;
-  const [jump, setJump] = useState(firstMark);
-  useEffect(() => { setJump(firstMark); }, [file && file.path]);
+  const showOnly = onlyF == null ? byFile.size > 0 : onlyF;
+  const shownFiles = useMemo(() => {
+    const ff = fq.trim().toLowerCase();
+    const xs = files.filter((p) => (!showOnly || byFile.has(p)) && (!ff || p.toLowerCase().includes(ff)));
+    return showOnly ? xs.sort((a, b) => (byFile.get(b).length - byFile.get(a).length) || a.localeCompare(b)) : xs;
+  }, [files, fq, showOnly, byFile]);
+
+  if (source === undefined) return html`<${Empty}>Loading the source…</${Empty}>`;
   if (!files.length) return html`<${Empty}>No source is recorded for this target.</${Empty}>`;
-  const shownFiles = fq ? files.filter((f) => f.path.toLowerCase().includes(fq.toLowerCase())) : files;
   const nextHit = (dir) => {
     if (!hits.length) return;
-    const k = hit < 0 ? 0 : (hit + dir + hits.length) % hits.length;
-    setHit(k); setJump(hits[k]);
+    const k = hit < 0 ? (dir > 0 ? 0 : hits.length - 1) : (hit + dir + hits.length) % hits.length;
+    setHit(k); setJump({ idx: hits[k], n: Date.now() });
   };
-  const markLines = [...marks.keys()].sort((a, b) => a - b);
+  const nextMark = (dir) => {
+    if (!markLines.length) return;
+    const at = jump.idx + 1;
+    const ln = dir > 0 ? (markLines.find((x) => x > at) || markLines[0])
+      : ([...markLines].reverse().find((x) => x < at) || markLines[markLines.length - 1]);
+    setJump({ idx: ln - 1, n: Date.now() }); locate(cur, ln);
+  };
+  const selIdx = files.length ? shownFiles.indexOf(cur) : -1;
+  const onKey = (e) => {
+    const step = { ArrowDown: 1, ArrowUp: -1, PageDown: 10, PageUp: -10 }[e.key];
+    if (step == null || !shownFiles.length) return;
+    e.preventDefault();
+    open(shownFiles[Math.min(shownFiles.length - 1, Math.max(0, (selIdx < 0 ? -1 : selIdx) + step))]);
+  };
+  const line1 = jump.idx >= 0 ? jump.idx + 1 : null;
   return html`
     <div class="code">
       <section class="panel flist">
         <div class="pad" style="display:flex;flex-direction:column;gap:6px;padding-bottom:8px">
-          <div class="cx-lbl">FILES (${files.length})</div>
-          ${files.length > 8 ? html`<input type="text" placeholder="filter files" aria-label="Filter files" value=${fq} onInput=${(e) => setFq(e.target.value)} />` : null}
+          <div class="cx-lbl">FILES (${files.length}${source.truncated ? "+, list truncated" : ""})</div>
+          <input type="text" placeholder="filter files" aria-label="Filter files" value=${fq} onInput=${(e) => setFq(e.target.value)} />
+          ${byFile.size ? html`<label class="cx-chk"><input type="checkbox" checked=${showOnly} onChange=${(e) => setOnlyF(e.target.checked)} />with findings (${byFile.size} files)</label>` : null}
+          <span class="dim" style="font-size:11.5px">${shownFiles.length} shown · ↑↓ to move</span>
         </div>
-        <div class="items">${shownFiles.map((f) => {
-          const i = files.indexOf(f);
-          const n = locs.filter(({ loc }) => matchFile(f.path, loc)).length;
-          return html`<button class=${"fitem" + (i === cur ? " on" : "")} onClick=${() => setCur(i)} title=${f.path}>
-            <span class="nm">${f.path}</span>${n ? html`<span class="lvl amber cx-n">${n}</span>` : null}</button>`;
-        })}</div>
+        ${!shownFiles.length ? html`<div class="dim pad" style="font-size:12.5px">No file matches.</div>`
+          : html`<${VList} items=${shownFiles} rowH=${28} maxH=${620} selIdx=${selIdx} onKeyDown=${onKey} label="Source files"
+            role="listbox" activeId=${selIdx >= 0 ? "cx-sf-" + selIdx : undefined}
+            render=${(p, i) => {
+              const ls = byFile.get(p), n = ls ? live(ls.map((l) => l.f)).length : 0;
+              const cut = p.lastIndexOf("/");
+              return html`<button key=${p} id=${"cx-sf-" + i} role="option" aria-selected=${p === cur ? "true" : "false"}
+                  class=${"fitem cx-frow" + (p === cur ? " on" : "")} tabindex="-1" onClick=${() => open(p)} title=${p}>
+                <span class="nm">${p.slice(cut + 1)}${cut >= 0 ? html`<span class="dim">${"  " + p.slice(0, cut)}</span>` : null}</span>
+                ${n ? html`<span class="lvl amber cx-n">${n}</span>` : ls ? html`<span class="cx-n dim">${ls.length}</span>` : null}</button>`;
+            }} />`}
         <div class="pad dim" style="font-size:12px">
-          ${[source.compiler ? `compiled with ${source.compiler}` : null, source.sanitizers ? `sanitizers: ${source.sanitizers}` : null].filter(Boolean).join(" · ")}
+          ${[source.compiler ? `compiled with ${source.compiler}` : null, source.sanitizers ? `sanitizers: ${source.sanitizers}` : null,
+            noSite ? `${plural(noSite, "finding")} on this target name no source location` : null].filter(Boolean).join(" · ")}
         </div>
       </section>
       <div class="fview">
+        ${ambig ? html`<div class="cx-note warn">${ambig.path} names ${ambig.cands.length ? `${ambig.cands.length} files in the tree — pick one:` : "no file in the source tree."}
+          ${ambig.cands.slice(0, 20).map((c) => html` <button class="xref" onClick=${() => open(c, ambig.line)}>${c}</button>`)}</div>` : null}
+        ${!cur ? html`<${Empty}>Pick a file.</${Empty}>` : html`
         <section class="panel pad row-c" style="flex-wrap:wrap;gap:8px 12px">
-          <h2 class="mono" style="word-break:break-all">${file.path}</h2>
-          <span class="dim" style="font-size:12px">${plural(lines.length, "line")}${marks.size ? ` · ${plural(marks.size, "finding line")}` : ""}</span>
+          <h2 class="mono" style="word-break:break-all">${cur}</h2>
+          <${Copy} text=${line1 ? `${cur}:${line1}` : cur} what=${line1 ? "path:line" : "path"} />
+          <span class="dim" style="font-size:12px">${fileSt && fileSt.total != null ? plural(fileSt.total, "line") : ""}${fileSt && fileSt.loading ? ` · loading ${lines.length}…` : ""}${fileSt && fileSt.capped ? ` · first ${lines.length} shown` : ""}${marks.size ? ` · ${plural(marks.size, "finding line")}` : ""}</span>
           <span style="flex:1 1 auto"></span>
+          ${markLines.length ? html`<button class="btn sm" onClick=${() => nextMark(-1)} aria-label="previous finding line">◂ finding</button>
+            <button class="btn sm" onClick=${() => nextMark(1)} aria-label="next finding line">finding ▸</button>` : null}
           <input type="text" placeholder="find in file" aria-label="Find in file" value=${q} style="width:180px"
             onInput=${(e) => { setQ(e.target.value); setHit(-1); }} onKeyDown=${(e) => { if (e.key === "Enter") nextHit(e.shiftKey ? -1 : 1); }} />
           ${qq ? html`<span class="dim" style="font-size:12px">${hits.length ? `${hit + 1 || 0}/${hits.length}` : "no match"}</span>
             <button class="btn sm" onClick=${() => nextHit(-1)} aria-label="previous match">↑</button>
             <button class="btn sm" onClick=${() => nextHit(1)} aria-label="next match">↓</button>` : null}
         </section>
+        ${fileSt && fileSt.error ? html`<div class="cx-note warn">Could not read ${cur}: ${fileSt.error}</div>` : null}
         ${markLines.length ? html`<div class="row-c" style="flex-wrap:wrap;gap:6px">${markLines.map((ln) => marks.get(ln).map((f) => html`
-          <button class="chip cx-fchip" onClick=${() => setJump(ln - 1)} title=${f.title}>line ${ln} · ${f.cwe} · ${f.state}</button>`))}</div>` : null}
-        <${SrcLines} lines=${lines} marks=${marks} jump=${jump} hits=${hits} hit=${hit} qq=${qq} openFinding=${openFinding} />
-        ${elsewhere.length ? html`<section class="panel pad"><div class="cx-lbl">FINDINGS IN FILES NOT SHOWN HERE (${elsewhere.length})</div>
-          <div class="dim" style="font-size:12px;margin-bottom:6px">The server holds the compiled source file shown above; these findings point into other files of the project.</div>
-          ${elsewhere.slice(0, 60).map(({ f, loc }) => html`<div><button class="xref" onClick=${() => openFinding(f.id)}>${loc.path}:${loc.line}</button>
-            <span class="dim" style="font-size:12px"> ${f.cwe} · ${f.title}</span></div>`)}</section>` : null}
+          <span class=${"cx-fchipw" + (isNoise(f) ? " noise" : "")}>
+            <button class="chip cx-fchip" onClick=${() => { setJump({ idx: ln - 1, n: Date.now() }); locate(cur, ln); }}
+              title=${"show the line — " + (f.title || "")}>line ${ln} · ${f.cwe} · ${f.state}</button>
+            <button class="xref cx-fopen" onClick=${() => openFinding(f.id)} aria-label=${`open finding: ${f.title || f.cwe}`}>open</button></span>`))}</div>` : null}
+        ${fileSt && !lines.length && fileSt.loading ? html`<${Empty}>Loading ${cur}…</${Empty}>`
+          : html`<${SrcLines} lines=${lines} marks=${marks} jump=${jump} hits=${hits} qq=${qq} openFinding=${openFinding} />`}`}
+        ${unplaced.length ? html`<section class="panel pad"><div class="cx-lbl">FINDINGS WHOSE FILE IS NOT IN THE TREE (${unplaced.length})</div>
+          <div class="dim" style="font-size:12px;margin-bottom:6px">These name a file the uploaded tree does not hold (a generated or build-directory file).</div>
+          ${unplaced.slice(0, 60).map(({ f, path, line }) => html`<div><button class="xref" onClick=${() => openFinding(f.id)}>${path}${line ? `:${line}` : ""}</button>
+            <span class="dim" style="font-size:12px"> ${f.cwe} · ${f.title}</span></div>`)}
+          ${unplaced.length > 60 ? html`<div class="dim" style="font-size:12px">+${unplaced.length - 60} more</div>` : null}</section>` : null}
       </div>
     </div>`;
 }
 
-function SrcLines({ lines, marks, jump, hits, hit, qq, openFinding }) {
+function SrcLines({ lines, marks, jump, hits, qq, openFinding }) {
   const ROW = 20;
   const hitSet = useMemo(() => new Set(hits), [hits]);
-  return html`<${VList} items=${lines} rowH=${ROW} maxH=${640} selIdx=${jump} label="Source" cls="asm cx-src" render=${(l, i) => {
+  return html`<${VList} items=${lines} rowH=${ROW} maxH=${640} selIdx=${jump.idx} selKey=${jump.n} center=${true} label="Source" cls="asm cx-src" render=${(l, i) => {
     const fs = marks.get(i + 1);
-    const cls = "cx-sl" + (fs ? " site" : "") + (i === jump ? " focus" : "") + (qq && hitSet.has(i) ? " hit" : "");
+    const cls = "cx-sl" + (fs ? " site" + (fs.every(isNoise) ? " noise" : "") : "") + (i === jump.idx ? " focus" : "") + (qq && hitSet.has(i) ? " hit" : "");
     return html`<div class=${cls} key=${i}><span class="n">${i + 1}</span><span class="t">${l || " "}</span>
-      ${fs ? html`<button class="xref cx-site" onClick=${() => openFinding(fs[0].id)}>◂ ${fs[0].cwe} ${fs[0].state}${fs.length > 1 ? ` +${fs.length - 1}` : ""}</button>` : null}</div>`;
+      ${fs ? html`<button class="xref cx-site" onClick=${() => openFinding(fs[0].id)} title=${fs.map((f) => f.title).join("\n")}>◂ ${fs[0].cwe} ${fs[0].state}${fs.length > 1 ? ` +${fs.length - 1}` : ""}</button>` : null}</div>`;
   }} />`;
 }
 
 // ── Scans ────────────────────────────────────────────────────────────────────────────────
-function ScansView({ targets, tid, caseId, stage, hasSource }) {
+function ScansView({ targets, tid, caseId, stage, hasSource, allFindings }) {
   const ts = targets;
   const [seeds, setSeeds] = useState([]);
   useEffect(() => { if (caseId) api.seeds(caseId).then((r) => setSeeds((r && r.seeds) || [])).catch(() => setSeeds([])); }, [caseId]);
@@ -1277,15 +1729,25 @@ function ScansView({ targets, tid, caseId, stage, hasSource }) {
   const [thr, setThr] = useState("0.9");
   const [src, setSrc] = useState(tid);
   const [cpp, setCpp] = useState(false);
+  const [cq, setCq] = useState(tid);
+  const [hy, setHy] = useState(tid);
+  const [hyMode, setHyMode] = useState("");
+  const [hySize, setHySize] = useState("300");
+  const [hyMem, setHyMem] = useState("8192");
+  const [hyBudget, setHyBudget] = useState("150");
   const [picked, setPicked] = useState(() => ts.slice(0, 2).map((t) => t.id));
   const [mode, setMode] = useState("stdin");
   const [compare, setCompare] = useState("status");
   const [iters, setIters] = useState("2000");
   const [useSeeds, setUseSeeds] = useState(true);
+  // the selects follow the screen's target when it changes (they kept the previous one)
+  useEffect(() => { setRef(tid); setSrc(tid); setCq(tid); setHy(tid); }, [tid]);
   const opt = (t) => html`<option value=${t.id}>${t.filename}</option>`;
   const R = stage.runs;
-  const run = (kind, st, opts) => stage.start(kind, st, opts);
+  const run = (kind, st, opts, meta) => stage.start(kind, st, opts, meta);
   const toggle = (id) => setPicked((c) => (c.includes(id) ? c.filter((x) => x !== id) : [...c, id]));
+  const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && v !== "" ? n : d; };
+  const nCodeql = (t) => (allFindings || []).filter((f) => f.target_id === t && f.detector === "codeql").length;
   return html`
     <section class="panel pad cx-scan">
       <h2>Variant hunt</h2>
@@ -1296,7 +1758,7 @@ function ScansView({ targets, tid, caseId, stage, hasSource }) {
         <label class="field" style="width:120px">similarity ≥<input type="number" min="0" max="1" step="0.05" value=${thr} onInput=${(e) => setThr(e.target.value)} /></label>
         <button class="btn primary sm" disabled=${!fn.trim() || ts.length < 2 || (R.variant && R.variant.running)}
           title=${ts.length < 2 ? "add the other builds to this case first" : "scan every other target in the case"}
-          onClick=${() => run("variant", "variant_scan", { targetId: ref, params: { function: fn.trim(), threshold: Number(thr) || 0.9 } })}>Hunt variants</button>
+          onClick=${() => run("variant", "variant_scan", { targetId: ref, params: { function: fn.trim(), threshold: num(thr, 0.9) } })}>Hunt variants</button>
       </div>
       ${ts.length < 2 ? html`<div class="dim" style="font-size:12px">Needs at least two targets in the case — the reference and the builds to search.</div>` : null}
       <${RunStatus} st=${R.variant} what="Variant hunt" cancel=${() => stage.cancel("variant")} />
@@ -1313,6 +1775,40 @@ function ScansView({ targets, tid, caseId, stage, hasSource }) {
       ${!hasSource && src === tid ? html`<div class="dim" style="font-size:12px">This target has no source recorded; the scan will say so if there is nothing to read.</div>` : null}
       <${RunStatus} st=${R.weggli} what="Source-pattern scan" cancel=${() => stage.cancel("weggli")} />
       <${ScanResult} kind="weggli" st=${R.weggli} />
+    </section>
+    <section class="panel pad cx-scan">
+      <h2>Deep CodeQL pass</h2>
+      <div class="muted cx-sub">Build a CodeQL database of the target's source project and run the C/C++ security query suite (the CLI's on-demand codeql stage). Results are filed as findings; it declines on a binary with no source project.</div>
+      <div class="cx-form">
+        <label class="field">target<select value=${cq} onChange=${(e) => setCq(e.target.value)}>${ts.map(opt)}</select></label>
+        <button class="btn primary sm" disabled=${!cq || (R.codeql && R.codeql.running)}
+          onClick=${() => run("codeql", "codeql", { targetId: cq }, { before: nCodeql(cq), tid: cq })}>Run CodeQL</button>
+      </div>
+      <${RunStatus} st=${R.codeql} what="CodeQL pass" cancel=${() => stage.cancel("codeql")} />
+      ${R.codeql && !R.codeql.running && !R.codeql.error ? html`<div class="cx-note">${(() => {
+        const st = R.codeql, r = st.data || {}, t = (st.meta && st.meta.tid) || cq;
+        const n = nCodeql(t), before = st.meta && st.meta.before != null ? st.meta.before : null;
+        const said = r.note || (r.metrics && (r.metrics.codeql || null));
+        return `${said ? said + " — " : ""}${plural(n, "CodeQL finding")} on this target${before != null && n > before ? ` (${n - before} new)` : ""}${n ? " — see Proof" : ""}.`;
+      })()}</div>` : null}
+    </section>
+    <section class="panel pad cx-scan">
+      <h2>Hypothesis hunt</h2>
+      <div class="muted cx-sub">Propose a defect predicate per suspicious site, solve it symbolically (angr), and keep only the inputs that replay and fault at that site. ELF executables; bounded by the budget.</div>
+      <div class="cx-form">
+        <label class="field">target<select value=${hy} onChange=${(e) => setHy(e.target.value)}>${ts.map(opt)}</select></label>
+        <label class="field" style="width:130px">input via<select value=${hyMode} onChange=${(e) => setHyMode(e.target.value)}>
+          <option value="">auto</option><option value="file">file</option><option value="stdin">stdin</option><option value="arg">argument</option></select></label>
+        <label class="field" style="width:120px">input size (B)<input type="number" min="1" max="65536" value=${hySize} onInput=${(e) => setHySize(e.target.value)} /></label>
+        <label class="field" style="width:120px">memory (MB)<input type="number" min="512" max="65536" value=${hyMem} onInput=${(e) => setHyMem(e.target.value)} /></label>
+        <label class="field" style="width:110px">budget (s)<input type="number" min="30" max="7200" value=${hyBudget} onInput=${(e) => setHyBudget(e.target.value)} /></label>
+        <button class="btn primary sm" disabled=${!hy || (R.hypo && R.hypo.running)}
+          onClick=${() => run("hypo", "hypo_hunt", { targetId: hy, params: {
+            input_size: num(hySize, 300), mem_mb: num(hyMem, 8192), budget: num(hyBudget, 150),
+            ...(hyMode ? { input_mode: hyMode } : {}) } })}>Hunt</button>
+      </div>
+      <${RunStatus} st=${R.hypo} what="Hypothesis hunt" cancel=${() => stage.cancel("hypo")} />
+      <${ScanResult} kind="hypo" st=${R.hypo} />
     </section>
     <section class="panel pad cx-scan">
       <h2>Differential test</h2>
@@ -1339,7 +1835,7 @@ function ScanResult({ kind, st }) {
   if (!st || st.running || st.error) return null;
   const r = st.data;
   if (!r || (typeof r === "object" && !Object.keys(r).length)) return html`<div class="cx-note">The stage returned no result record — its reason is on the Run console.</div>`;
-  if (r.applicable === false) return html`<div class="cx-note">${r.note || "Not applicable here."}</div>`;
+  if (r.applicable === false || r.supported === false) return html`<div class="cx-note">${r.note || "Not applicable here."}</div>`;
   if (kind === "variant") {
     const res = r.results || [];
     return html`<div class="cx-res">
@@ -1354,22 +1850,38 @@ function ScanResult({ kind, st }) {
     const fs = r.findings || [];
     return html`<div class="cx-res">
       <div class="muted">${plural(fs.length, "pattern")} matched over ${r.queries_run} queries${fs.length ? " — filed as candidate findings (see Proof)" : ""}.${r.note ? " " + r.note : ""}</div>
-      ${fs.map((f) => html`<div class="cx-rrow" title=${f.why}><span class="chip">${f.severity}</span> <span class="mono">${f.cwe}</span> ${f.name} ×${f.count}:
-        <span class="mono dim">${(f.files || []).slice(0, 4).join(", ")}${(f.files || []).length > 4 ? ` (+${f.files.length - 4} more)` : ""}</span></div>`)}
+      ${fs.map((f) => html`<div class="cx-rrow" title=${f.why}><span class="chip">${f.severity}</span> <span class="mono">${f.cwe}</span> ${f.name} ×${f.count}:${" "}<span class="mono dim">${(f.files || []).slice(0, 4).join(", ")}${(f.files || []).length > 4 ? ` (+${f.files.length - 4} more)` : ""}</span></div>`)}
+    </div>`;
+  }
+  if (kind === "hypo") {
+    if (r.proposed == null) return html`<div class="cx-note">${r.note || "The hunt finished; its record is on the Run console."}</div>`;
+    const kinds = Object.entries(r.by_kind || {}).sort((a, b) => b[1] - a[1]);
+    return html`<div class="cx-res">
+      <div class=${"cx-verdict " + (r.confirmed ? "ok" : "")}><b>${r.confirmed || 0} ${r.confirmed === 1 ? "hypothesis" : "hypotheses"} confirmed</b> — ${r.proposed} proposed, ${r.solved} solved (${r.mode || "auto"} input, ${r.budget_s} s).${r.note ? " " + r.note : ""}</div>
+      ${kinds.length ? html`<div class="dim">${kinds.map(([k, n]) => `${k} ×${n}`).join(" · ")}</div>` : null}
+      ${r.error ? html`<div class="cx-note warn">${r.error}</div>` : null}
     </div>`;
   }
   const ds = r.discrepancies || [], inc = Object.entries(r.inconclusive || {});
   return html`<div class="cx-res">
     <div class=${"cx-verdict " + (r.compared ? (ds.length ? "no" : "ok") : "")}>${r.execs} input(s), ${r.delta_diversity} distinct behaviour combination(s), ${plural(ds.length, "disagreement")}.${r.note ? " " + r.note : ""}</div>
     ${inc.length ? html`<div class="dim">Inconclusive runs (never started or timed out — not counted): ${inc.map(([n, c]) => `${n} ×${c}`).join(", ")}</div>` : null}
-    ${ds.slice(0, 40).map((x) => html`<div class="cx-rrow"><b>${x.kind}</b> on <code class="mono">${String(x.input).slice(0, 48)}${String(x.input).length > 48 ? "…" : ""}</code> —
-      <span class="mono dim">${Object.entries(x.partitions || {}).map(([o, names]) => `[${o}] ${names.join(", ")}`).join("  ")}</span></div>`)}
+    ${ds.slice(0, 40).map((x) => html`<div class="cx-rrow"><b>${x.kind}</b> on <code class="mono">${String(x.input).slice(0, 48)}${String(x.input).length > 48 ? "…" : ""}</code> —${" "}<span class="mono dim">${Object.entries(x.partitions || {}).map(([o, names]) => `[${o}] ${names.join(", ")}`).join("  ")}</span></div>`)}
     ${ds.length > 40 ? html`<div class="dim">+${ds.length - 40} more disagreements</div>` : null}
   </div>`;
 }
 
 // ── Diff ─────────────────────────────────────────────────────────────────────────────────
-const diffKey = (f) => `${f.cwe || "?"}::${(f.title || "").replace(/\s*\(.*$/, "").replace(/[:—-].*$/, "").trim().toLowerCase()}`;
+// A finding's identity across two builds: CWE + its title with the build-specific parts (addresses,
+// fcn./sub_ names, a trailing parenthetical) normalized. Cutting the title at the first "-" or ":"
+// made every "Out-of-bounds ..." one key, and a Map kept one finding per key.
+const diffKey = (f) => `${f.cwe || "?"}::${String(f.title || "").replace(/\s*\([^()]*\)\s*$/, "")
+  .replace(/\b(?:0x[0-9a-f]+|fcn\.[0-9a-f]+|sub_[0-9a-f]+)\b/gi, "#").replace(/\s+/g, " ").trim().toLowerCase()}`;
+function groupBy(fs, key) {
+  const m = new Map();
+  for (const f of fs) { const k = key(f); if (!m.has(k)) m.set(k, []); m.get(k).push(f); }
+  return m;
+}
 function diffRowVerdict(r) {
   if (r.error) return "skipped (" + r.error + ")";
   if (r.method) {
@@ -1390,13 +1902,22 @@ function DiffView({ targets, tid, findings, stage, patchLeads, index, openFn, op
   const other = ts.find((t) => t.id !== tid);
   const [a, setA] = useState(other ? other.id : tid);
   const [b, setB] = useState(tid);
+  const [maxLeads, setMaxLeads] = useState("12");
   const name = (id) => (ts.find((x) => x.id === id) || {}).filename || id;
+  // A = the vulnerable baseline (its PoCs are replayed), B = the patched candidate. Same-key
+  // findings pair up one to one; the surplus on a side is what was fixed / what is new.
   const rows = useMemo(() => {
-    const fa = findings.filter((f) => f.target_id === a), fb = findings.filter((f) => f.target_id === b);
-    const ka = new Map(fa.map((f) => [diffKey(f), f])), kb = new Map(fb.map((f) => [diffKey(f), f]));
+    const ga = groupBy(findings.filter((f) => f.target_id === a && !isNoise(f)), diffKey);
+    const gb = groupBy(findings.filter((f) => f.target_id === b && !isNoise(f)), diffKey);
     const out = [];
-    for (const [k, f] of ka) out.push(kb.has(k) ? { d: "same", f, g: kb.get(k), a: f.state, b: kb.get(k).state } : { d: "fixed", f, a: f.state, b: null });
-    for (const [k, f] of kb) if (!ka.has(k)) out.push({ d: "new", f, a: null, b: f.state });
+    for (const [k, xs] of ga) {
+      const ys = gb.get(k) || [];
+      xs.forEach((f, i) => out.push(i < ys.length ? { d: "same", f, g: ys[i], a: f.state, b: ys[i].state } : { d: "fixed", f, a: f.state, b: null }));
+    }
+    for (const [k, ys] of gb) {
+      const n = (ga.get(k) || []).length;
+      ys.slice(n).forEach((f) => out.push({ d: "new", f, a: null, b: f.state }));
+    }
     const o = { fixed: 0, new: 1, same: 2 };
     return out.sort((x, y) => o[x.d] - o[y.d]);
   }, [findings, a, b]);
@@ -1427,12 +1948,13 @@ function DiffView({ targets, tid, findings, stage, patchLeads, index, openFn, op
       ${ts.length < 2 ? html`<div class="muted" style="font-size:13px">Add a second build of this program to the case to compare — lykos diffs the findings,
           localizes the functions that changed (patch-diff) and, when a version has a working PoC, re-runs it against the other to confirm a fix.</div>` : html`
       <div class="cx-form">
-        <label class="field">A — baseline<select value=${a} onChange=${(e) => setA(e.target.value)}>${ts.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}</select></label>
+        <label class="field">A — vulnerable (baseline, its PoCs are replayed)<select value=${a} onChange=${(e) => setA(e.target.value)}>${ts.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}</select></label>
         <span class="dim" style="align-self:center">→</span>
-        <label class="field">B — candidate<select value=${b} onChange=${(e) => setB(e.target.value)}>${ts.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}</select></label>
+        <label class="field">B — patched (candidate)<select value=${b} onChange=${(e) => setB(e.target.value)}>${ts.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}</select></label>
+        <label class="field" style="width:110px" title="at most this many changed functions are filed as leads, highest-ranked first">max leads<input type="number" min="1" max="500" value=${maxLeads} onInput=${(e) => setMaxLeads(e.target.value)} /></label>
         <button class="btn sm" disabled=${same || (pd && pd.running)}
-          title="localize the functions whose body changed between A and B, and file them as leads the search then steers at (N-day)"
-          onClick=${() => stage.start("patch", "patch_diff", { targetId: b, params: { baseline_target_id: a } }, { a, b })}>Find changed functions</button>
+          title="localize the functions whose body changed between A and B, and file them as leads on B that the search then steers at (N-day)"
+          onClick=${() => stage.start("patch", "patch_diff", { targetId: b, params: { baseline_target_id: a, max_leads: Math.max(1, Number(maxLeads) || 12) } }, { a, b })}>Find changed functions</button>
         <button class="btn primary sm" disabled=${same || (pv && pv.running)}
           onClick=${() => stage.start("pocdiff", "poc_diff", { targetId: b, params: { baseline_target_id: a } }, { a, b })}>Verify fix — re-run A's PoCs on B</button>
       </div>
@@ -1458,9 +1980,9 @@ function DiffView({ targets, tid, findings, stage, patchLeads, index, openFn, op
           ${(r.results || []).map((x) => html`<div class="mono" style="font-size:12px">${x.level} · ${x.cwe || "input"} — ${diffRowVerdict(x)}</div>`)}</div>`;
       })() : null}
       ${!same ? html`<div class="row-c" style="gap:12px;font-size:12.5px">
-        <span class="chip on">${nF} fixed</span><span class="chip cx-amb">${nN} new</span><span class="dim">${rows.length - nF - nN} unchanged</span></div>
+        <span class="chip on">${nF} fixed</span><span class="chip cx-amb">${nN} new</span><span class="dim">${rows.length - nF - nN} unchanged · noise excluded</span></div>
       ${rows.length ? html`<div class="cx-table" role="table">
-        <div class="cx-tr df head" role="row"><span>Δ</span><span>CWE</span><span>finding</span><span>${name(a)}</span><span>${name(b)}</span></div>
+        <div class="cx-tr df head" role="row"><span>Δ</span><span>CWE</span><span>finding</span><span title="A — vulnerable">${name(a)}</span><span title="B — patched">${name(b)}</span></div>
         ${rows.map((r) => html`<div class=${"cx-tr df " + r.d} role="row">
           <span><span class=${"chip" + (r.d === "fixed" ? " on" : r.d === "new" ? " cx-amb" : "")}>${r.d}</span></span>
           <span class="mono">${(r.f.cwe || "").replace(/^CWE-/, "")}</span>
@@ -1482,13 +2004,13 @@ function ClassesView({ classes, index, openFn, openFinding }) {
     <div class="pad" style="padding-bottom:8px"><h2>${l} <span class="dim" style="font-weight:400;font-size:12.5px">${classes[k].length}</span></h2>
       <div class="muted cx-sub">${why}</div></div>
     ${classes[k].map((f) => {
-      const fn = index.at(f.site_addr || f.function_addr);
-      return html`<div class="lead" style="cursor:default">
+      const fn = fnOfFinding(f, index);
+      return html`<div class=${"lead" + (isNoise(f) ? " cx-noise" : "")} style="cursor:default">
         <span class="mono dim" style="flex:none;width:86px;font-size:11.5px">${f.cwe || "—"}</span>
         <span style="flex:1 1 auto;min-width:0;display:flex;flex-direction:column;text-align:left">
           <button class="xref" style="font:inherit;font-size:13.5px;color:var(--tx)" onClick=${() => openFinding(f.id)}>${f.title}</button>
-          <span class="dim" style="font-size:11.5px">${[f.state, f.stage_label || f.detector, f.severity].filter(Boolean).join(" · ")}</span></span>
-        ${fn ? html`<button class="btn sm" onClick=${() => openFn(fn.id, f.site_addr || f.function_addr)}>Code</button>` : null}
+          <span class="dim" style="font-size:11.5px">${[f.state, f.stage_label || f.detector, f.severity, isNoise(f) ? "flagged as noise" : null].filter(Boolean).join(" · ")}</span></span>
+        ${fn ? html`<button class="btn sm" onClick=${() => openFn(fn.id, f.site_addr || null)}>Code</button>` : null}
       </div>`;
     })}</section>`);
 }

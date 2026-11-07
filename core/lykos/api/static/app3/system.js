@@ -86,13 +86,19 @@ function useDoctor() {
   const token = useRef(0);
   const load = async (refresh = false) => {
     const me = ++token.current;
+    let d = null;
     for (let i = 0; i < 120; i++) {
-      let d;
       try { d = await api.doctor(refresh && i === 0); } catch (e) { d = { state: "error", error: e.message || String(e) }; }
       if (me !== token.current) return;
       setDoc(d);
       if (!d || d.state !== "probing") return;
       await sleep(1500);
+    }
+    // Gave up waiting (3 min): say so and re-enable Re-check, instead of a "probing…" chip and a
+    // disabled button forever. The probe may still finish server-side; Re-check reads it.
+    if (me === token.current) {
+      setDoc({ ...(d || {}), state: "stalled",
+               error: "the engine probe is still running after 3 minutes — Re-check to read it again" });
     }
   };
   useEffect(() => { load(false); return () => { token.current++; }; }, []);
@@ -140,7 +146,7 @@ function DoctorPanel() {
       ${!doc ? html`<div class="pad dim">Asking the server…</div>`
         : !tools.length ? html`<div class="pad">
             ${probing ? html`<span class="muted">Checking which engines work on this machine — each tool is run, not just looked up.</span>`
-              : html`<span class="sy-warn">Engine check unavailable${doc.error ? ` — ${doc.error}` : ""}.</span>`}</div>`
+              : html`<span class="sy-warn">${doc.state === "stalled" ? "Engine check not finished" : "Engine check unavailable"}${doc.error ? ` — ${doc.error}` : ""}.</span>`}</div>`
         : html`
         <div class=${"sy-verdict t-" + tone}>
           ${tone === "bad" ? html`<b>${missBy("required")} required engine${missBy("required") === 1 ? "" : "s"} missing</b> — analyses on this host will not work until ${missBy("required") === 1 ? "it is" : "they are"} installed.`
@@ -225,6 +231,7 @@ function SelftestPanel() {
   const [hist, setHist] = useState(null);
   const [histBusy, setHistBusy] = useState(false);
   const [now, setNow] = useState(Date.now() / 1000);
+  const [starting, setStarting] = useState(false);
   const token = useRef(0);
   const poll = async () => {
     const me = ++token.current;
@@ -244,9 +251,26 @@ function SelftestPanel() {
     const t = setInterval(() => setNow(Date.now() / 1000), 1000);
     return () => clearInterval(t);
   }, [running]);
+  // The CLI's gate options: --only / --timeout (archgate, realgate), --min-state and --record
+  // (eval). Each gate gets only the options it takes.
+  const [gopt, setGopt] = useState({ only: "", timeout: "", min_state: "candidate", record: false, label: "" });
+  const optsFor = (g) => {
+    const o = { ...(g.opts || {}) };
+    if (g.kind === "archgate" || g.kind === "realgate") {
+      if (gopt.only.trim()) o.only = gopt.only.split(",").map((x) => x.trim()).filter(Boolean);
+      const t = parseFloat(gopt.timeout);
+      if (isFinite(t) && t > 0) o.timeout = t;
+    } else if (g.kind === "eval") {
+      if (o.stage === "static" && gopt.min_state !== "candidate") o.min_state = gopt.min_state;
+      if (gopt.record) { o.record = true; if (gopt.label.trim()) o.label = gopt.label.trim(); }
+    }
+    return o;
+  };
   const start = async (g) => {
-    setErr(null);
-    try { await startGate(g.kind, g.opts || {}); } catch (e) { setErr(String(e.message || e)); }
+    if (running || starting) return;
+    setErr(null); setStarting(true);
+    try { await startGate(g.kind, optsFor(g)); } catch (e) { setErr(String(e.message || e)); }
+    setStarting(false);
     poll();
   };
   const loadHist = async () => {
@@ -268,10 +292,27 @@ function SelftestPanel() {
         <div class="sy-note muted">Each gate takes minutes and runs to completion once started — it cannot be stopped from here.
           One at a time; it keeps running if you leave this screen.</div>
         <div class="sy-gates">
-          ${GATES.map((g) => html`<button class="sy-gate" disabled=${running} onClick=${() => start(g)}
+          ${GATES.map((g) => html`<button class="sy-gate" disabled=${running || starting} onClick=${() => start(g)}
               title=${`${g.what} (${g.cli})`}>
             <b>${g.label}</b><span class="muted">${g.what}</span><span class="mono dim">${g.cli}</span></button>`)}
         </div>
+        <details class="sy-opts">
+          <summary>Gate options <span class="dim">— the CLI's flags; each gate uses the ones it takes</span></summary>
+          <div class="sy-opts-b">
+            <label class="field">Only these cases <span class="dim">(architecture / real-program gate; comma-separated labels — the CLI's --only)</span>
+              <input type="text" class="mono" placeholder="all cases" value=${gopt.only} onInput=${(e) => setGopt({ ...gopt, only: e.target.value })} /></label>
+            <label class="field">Per-detonation timeout, s <span class="dim">(architecture / real-program gate; default 30)</span>
+              <input type="number" min="1" step="1" placeholder="30" value=${gopt.timeout} onInput=${(e) => setGopt({ ...gopt, timeout: e.target.value })} /></label>
+            <label class="field">Lowest finding state counted <span class="dim">(detection benchmark — the CLI's --min-state)</span>
+              <select value=${gopt.min_state} onChange=${(e) => setGopt({ ...gopt, min_state: e.target.value })}>
+                ${["candidate", "corroborated", "confirmed"].map((x) => html`<option value=${x}>${x}</option>`)}</select></label>
+            <label class="row-c" style="gap:6px;font-size:12.5px"><input type="checkbox" checked=${gopt.record}
+              onChange=${(e) => setGopt({ ...gopt, record: e.target.checked })} />
+              Record benchmark runs in the history <span class="dim">(the CLI's eval --record; shown under Benchmark history)</span></label>
+            ${gopt.record ? html`<label class="field">History label
+              <input type="text" placeholder="gui" value=${gopt.label} onInput=${(e) => setGopt({ ...gopt, label: e.target.value })} /></label>` : null}
+          </div>
+        </details>
         ${err ? html`<div class="sy-warn">Could not start: ${err}</div>` : null}
         ${st && st.state !== "idle" ? html`
           <div class="sy-run">

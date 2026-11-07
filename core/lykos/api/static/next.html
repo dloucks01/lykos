@@ -164,6 +164,19 @@
   .asm .ins.focus { background: #13233C; box-shadow: inset 3px 0 0 var(--blue); }
   .xref { font: 12px var(--mono); border: none; background: transparent; color: var(--blue); cursor: pointer; padding: 2px 0; text-align: left; }
   .xref:disabled { color: var(--tx3); cursor: default; }
+  /* run: per-target summary */
+  .ts-r { display: grid; grid-template-columns: minmax(0,2fr) minmax(0,3fr) 72px 72px 84px 90px; gap: 10px;
+          align-items: baseline; padding: 8px 16px; border-top: 1px solid var(--line); font-size: 13px; }
+  .ts-r.head { color: var(--tx3); font-size: 11.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+  .ts-r .n { text-align: right; } .ts-hi { color: var(--blue-tx); font-weight: 700; }
+  /* engagement: target pick, report filters */
+  .tpick { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 8px 10px; border: 1px solid var(--border);
+           border-radius: 8px; max-height: 140px; overflow: auto; }
+  .tpick-i { display: flex; align-items: center; gap: 6px; font-size: 12.5px; min-width: 0; max-width: 100%; }
+  .tpick-i .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rep-states { border: none; margin: 0; padding: 0; }
+  .rep-states legend { padding: 0; margin-bottom: 5px; }
+  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
   /* narrow windows: the nav becomes one scrollable row across the top */
   @media (max-width: 860px) {
     .body { flex-direction: column; flex-wrap: nowrap; }
@@ -175,7 +188,11 @@
     .main { padding: 16px 14px; }
   }
   @media (max-width: 700px) { .x-out { padding-left: 0; } .ln .st { min-width: 0; }
-    .trow { grid-template-columns: 1fr 1fr; } .flist { max-width: none; } }
+    .trow { grid-template-columns: 1fr 1fr; } .flist { max-width: none; }
+    /* the header row cannot line up with a 2-column card: drop it, label each count instead */
+    .trow.head, .ts-r.head { display: none; }
+    .trow [data-l]::before, .ts-r [data-l]::before { content: attr(data-l) " "; color: var(--tx3); font-size: 11.5px; font-weight: 400; }
+    .ts-r { grid-template-columns: 1fr 1fr; } .ts-r .n { text-align: left; } }
 </style>
 <link rel="stylesheet" href="./app3/proof.css">
 <link rel="stylesheet" href="./app3/code.css">

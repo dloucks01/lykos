@@ -64,3 +64,6 @@
 .sy-reg { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--amber-tx); }
 
 @media (max-width: 700px) { .sy-dl { grid-template-columns: 1fr; } .sy-dl dd { margin-bottom: 4px; } }
+.sy-opts { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; }
+.sy-opts summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.sy-opts-b { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }

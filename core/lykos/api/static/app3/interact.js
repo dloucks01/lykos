@@ -7,8 +7,10 @@ import { html } from "../app2/html.js";
 
 const MAX_OUT = 200000;
 
-function b64ToText(b64) {
-  try { return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); }
+// One decoder per connection, in streaming mode: a multi-byte character split across two PTY
+// reads is joined instead of turning into two U+FFFD.
+function b64ToText(b64, dec) {
+  try { return dec.decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)), { stream: true }); }
   catch (_e) { return ""; }
 }
 function textToB64(s) {
@@ -18,7 +20,7 @@ function textToB64(s) {
   return btoa(bin);
 }
 
-export function InteractiveConsole({ targets = [] }) {
+export function InteractiveConsole({ targets = [], caseId }) {
   const [tid, setTid] = useState(targets[0] ? targets[0].id : "");
   const [argv, setArgv] = useState("");
   const [status, setStatus] = useState("disconnected");
@@ -28,7 +30,10 @@ export function InteractiveConsole({ targets = [] }) {
   const [saved, setSaved] = useState(null);
   const ws = useRef(null);
   const box = useRef(null);
-  useEffect(() => { if (!tid && targets[0]) setTid(targets[0].id); }, [targets]);
+  // keep the pick valid: a removed target (or another case's list) falls back to the first one
+  useEffect(() => {
+    if (!targets.some((t) => t.id === tid)) setTid(targets[0] ? targets[0].id : "");
+  }, [targets]);
   useEffect(() => () => { try { ws.current && ws.current.close(); } catch (_e) { /* closed */ } }, []);
   useEffect(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; }, [out]);
   const append = (s) => setOut((o) => { const n = o + s; return n.length > MAX_OUT ? n.slice(-150000) : n; });
@@ -37,20 +42,30 @@ export function InteractiveConsole({ targets = [] }) {
   const connect = () => {
     try { ws.current && ws.current.close(); } catch (_e) { /* closed */ }
     setOut(""); setSaved(null);
-    const qs = `target_id=${encodeURIComponent(tid)}` + (argv.trim() ? `&argv=${encodeURIComponent(argv.trim())}` : "");
+    // `args` is shell-quoted ("-c @@", `--name "a b"`), split on the server like the CLI's --argv
+    const qs = `target_id=${encodeURIComponent(tid)}` + (argv.trim() ? `&args=${encodeURIComponent(argv.trim())}` : "");
     const proto = location.protocol === "https:" ? "wss" : "ws";
     setStatus("connecting…");
     const w = new WebSocket(`${proto}://${location.host}/console?${qs}`);
+    const dec = new TextDecoder();
     ws.current = w;
-    w.onopen = () => setStatus("running");
-    w.onclose = () => setStatus((s) => (s === "exited" ? s : "disconnected"));
-    w.onerror = () => setStatus("error");
+    // Every handler checks it still belongs to the CURRENT socket: after a Restart the old one's
+    // late close used to mark the new, running process "disconnected" (and lock the input).
+    const mine = () => ws.current === w;
+    w.onopen = () => { if (mine()) setStatus("running"); };
+    w.onclose = () => { if (mine()) setStatus((s) => (s === "exited" ? s : "disconnected")); };
+    w.onerror = () => { if (mine()) setStatus("error"); };
     w.onmessage = (ev) => {
+      if (!mine()) return;
       let m; try { m = JSON.parse(ev.data); } catch (_e) { return; }
-      if (m.t === "out") append(b64ToText(m.b64));
+      if (m.t === "out") append(b64ToText(m.b64, dec));
       else if (m.t === "info") append(`\n[·] ${m.msg}\n`);
       else if (m.t === "exit") { append(`\n[exited${m.code != null ? " code " + m.code : ""}${m.signal != null ? " signal " + m.signal : ""}]\n`); setStatus("exited"); }
-      else if (m.t === "saved") setSaved(m);
+      else if (m.t === "saved") {
+        setSaved(m);
+        // the seed is one of the case's seeds now: the seed lists / run picker re-read
+        try { document.dispatchEvent(new CustomEvent("lykos:seeds-changed", { detail: { caseId, added: [m.sha] } })); } catch (_e) { /* no DOM */ }
+      }
     };
   };
   const sendLine = () => { send({ t: "in", b64: textToB64(nl ? line + "\n" : line) }); setLine(""); };
@@ -64,7 +79,7 @@ export function InteractiveConsole({ targets = [] }) {
       <select value=${tid} onChange=${(e) => setTid(e.target.value)} aria-label="Target">
         ${targets.map((t) => html`<option value=${t.id}>${t.filename}</option>`)}
       </select>
-      <input type="text" class="mono" placeholder="arguments (comma-separated)" value=${argv}
+      <input type="text" class="mono" placeholder="arguments, shell-quoted (e.g. -v 'a b')" value=${argv}
         onInput=${(e) => setArgv(e.target.value)} style="flex:1 1 200px" aria-label="Arguments" />
       <button class="btn sm primary" onClick=${connect} disabled=${!tid}>${live ? "Restart" : "Start"}</button>
       <span class=${"chip" + (live ? " on" : "")}>${live ? html`<span class="dot live"></span>` : null}${status}</span>
@@ -81,7 +96,7 @@ export function InteractiveConsole({ targets = [] }) {
       <button class="btn sm" disabled=${!live} onClick=${() => send({ t: "eof" })}>EOF</button>
       <button class="btn sm" disabled=${!live} onClick=${() => send({ t: "signal", sig: "INT" })}>Ctrl-C</button>
       <button class="btn sm" disabled=${!live} onClick=${() => send({ t: "signal", sig: "TERM" })}>Terminate</button>
-      <button class="btn sm" disabled=${status === "disconnected"} onClick=${() => send({ t: "save" })}
+      <button class="btn sm" disabled=${!(live || status === "exited")} onClick=${() => send({ t: "save" })}
         title="save every byte sent so far as a seed the next analysis starts from">Save as seed</button>
     </div>
     ${saved ? html`<span class="chip on" style="align-self:flex-start">seed saved · ${saved.bytes} B · ${String(saved.sha || "").slice(0, 12)}</span>` : null}

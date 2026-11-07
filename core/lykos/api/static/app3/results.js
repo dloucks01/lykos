@@ -125,7 +125,8 @@ function useRunResults(caseId, running) {
         });
         return n;
       });
-      if (running && !stop) timer = setTimeout(load, POLL_MS);
+      // while the run is live; a hidden tab reads far less often
+      if (running && !stop) timer = setTimeout(load, document.hidden ? POLL_MS * 4 : POLL_MS);
     };
     load();
     return () => { stop = true; clearTimeout(timer); };
@@ -166,7 +167,7 @@ function DynamicBanner({ health }) {
     ${health.note ? html`<div class="rs-dyn-b">${health.note}</div>` : null}
     ${v === "none" ? html`<div class="rs-dyn-b muted">The deterministic analysis — static recovery, taint, the exploit
       synthesizers — ran regardless and produced findings and PoC / exploit recipes without executing anything; those
-      are the deliverable. Running the target (point <b>target libraries dir</b> at its loader and .so files, or ingest
+      are the deliverable. Running the target (start the server with <span class="mono">LYKOS_QEMU_SYSROOT</span> pointing at its loader and .so files, or ingest
       it as a directory) only adds confirmation: it turns a candidate rung into an executed one.</div>` : null}
   </div>`;
 }
@@ -395,13 +396,13 @@ function Ledger({ ledger, onOpenFinding, onFilterCwe, onShortlist }) {
         <div class="rs-ax-h"><b>Findings weaponized</b><span class="dim">verified PoC or corroborated recipe</span>
           <span class="rs-ax-v">${wpn.weaponized || 0}/${wpn.findings || 0}${wpn.pct != null ? ` · ${wpn.pct}%` : ""}</span></div>
         <${Bar} pct=${wpn.pct} tone=${covTone(wpn.pct)} />
-        ${wpn.distinct && wpn.distinct.raw && wpn.distinct.issues < wpn.distinct.raw ? html`<div class="rs-ax-n"><b>${wpn.distinct.issues}</b> distinct issues,
+        ${wpn.distinct && wpn.distinct.raw && wpn.distinct.issues < wpn.distinct.raw ? html`<div class="rs-ax-n"><b>${wpn.distinct.issues}</b> distinct issues,${" "}
           ${wpn.distinct.weaponized} weaponized <span class="dim">(${wpn.distinct.raw} raw: one source bug counts once per target that compiles it)</span></div>` : null}
         ${ver.shortlist || ver.off_surface || ver.noise ? html`<div class="rs-ax-n">
           ${onShortlist && ver.shortlist ? html`<button class="rs-link" onClick=${() => onShortlist()}><b>${ver.shortlist}</b> on the prove-out shortlist →</button>`
             : html`<span><b>${ver.shortlist || 0}</b> on the prove-out shortlist</span>`}
           <span class="dim"> · ${ver.off_surface || 0} off the attack surface · ${ver.noise || 0} instrumentation artifacts</span></div>` : null}
-        ${ledger.grounding && ledger.grounding.annotated ? html`<div class="rs-ax-n"><b>${ledger.grounding.shortlist}</b> of ${ledger.grounding.annotated} grounded findings are attacker-reachable
+        ${ledger.grounding && ledger.grounding.annotated ? html`<div class="rs-ax-n"><b>${ledger.grounding.shortlist}</b> of ${ledger.grounding.annotated} grounded findings are attacker-reachable${" "}
           <span class="dim">— set aside: ${Object.entries(ledger.grounding.by_verdict || {}).filter(([k]) => k !== "exploitable-candidate" && k !== "unreached").map(([k, n]) => `${k} ${n}`).join(", ") || "none"}</span></div>` : null}
         ${Object.keys(wpn.by_state || {}).length ? html`<div class="rs-chips">${Object.entries(wpn.by_state).sort().map(([s, n]) => html`<span class=${"chip rs-state " + (STATE_TONE[s] || "")}>${s} · ${n}</span>`)}</div>` : null}
         ${candTotal ? html`<${Fold} label="Weaponization worklist: bare candidates" n=${candTotal}>
@@ -430,7 +431,7 @@ function Ledger({ ledger, onOpenFinding, onFilterCwe, onShortlist }) {
 
 function stageList(bld) {
   if (!bld || !bld.stage || !bld.stage.length) return null;
-  return html`<div style="margin-top:6px">Stage these before re-ingesting <span class="dim">(<span class="mono">lykos deps &lt;dir&gt;</span> for detail)</span>:
+  return html`<div style="margin-top:6px">Stage these before re-ingesting <span class="dim">(<span class="mono">${"lykos deps <dir>"}</span> for detail)</span>:
     <div class="rs-chips">${bld.stage.map((t) => html`<span class="chip mono">${t}</span>`)}</div></div>`;
 }
 
@@ -656,7 +657,8 @@ export function RunResults({ caseId, running, ap, targets, onOpenStage, onOpenFi
 // GUI's behaviour), the operator's pick in "pick" mode.
 export const DEFAULT_RUN_OPTIONS = {
   converge: false, blackBox: true, covFuzz: true, dirFuzz: true, concolicOn: true, libfuzzerOn: true,
-  deepSeed: false, sysroot: "", invArgv: "", invMode: "auto",
+  noFuzz: false,        // the CLI's --no-fuzz: every sampling campaign off, the non-fuzzing pipeline only
+  deepSeed: false, invArgv: "", invMode: "auto",
   seedMode: "all",      // "all" = every seed in the case | "pick" = only `seeds`
   seeds: [],            // [sha256]; kept current by RunOptions while it is mounted
 };
@@ -667,23 +669,36 @@ export function buildRunSettings(value, caseSeeds) {
   const v = { ...DEFAULT_RUN_OPTIONS, ...(value || {}) };
   const raw = v.seedMode !== "pick" && Array.isArray(caseSeeds) ? caseSeeds : (v.seeds || []);
   const seeds = raw.map((x) => (typeof x === "string" ? { sha256: x } : x)).filter((x) => x && x.sha256);
-  return operatorSettings({ invArgv: v.invArgv || "", invMode: v.invMode || "auto", sysroot: v.sysroot || "",
+  // No sysroot: a server directory is a CLI-only channel (the server drops it from a browser
+  // request); the host's LYKOS_QEMU_SYSROOT or a directory ingest supplies the target's libraries.
+  const st = operatorSettings({ invArgv: v.invArgv || "", invMode: v.invMode || "auto",
     deepSeed: !!v.deepSeed, seeds, blackBox: v.blackBox !== false, covFuzz: v.covFuzz !== false,
     dirFuzz: v.dirFuzz !== false, concolicOn: v.concolicOn !== false, libfuzzerOn: v.libfuzzerOn !== false });
+  if (v.noFuzz) st.skipStages = [...new Set([...(st.skipStages || []), ...SAMPLER_STAGES])];
+  return st;
 }
+
+// The CLI's --no-fuzz set (analyze/budget.py SAMPLER_STAGES); the server's skip allowlist is
+// exactly these plus "concolic".
+export const SAMPLER_STAGES = ["fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz", "boundary_fuzz", "libfuzzer"];
+// Kept per browser: search / engine choices. NOT kept: the invocation (argv, input channel) --
+// it belongs to one target, and a remembered argv was silently sent for the next case's run --
+// nor the seed pick (per case), nor the retired server-path field.
+const NOT_KEPT = ["seeds", "seedMode", "invArgv", "invMode", "sysroot"];
 
 const RUNOPTS_KEY = "lykos.next.runopts";
 // Per-browser convenience: the last options used. The seed choice is per case, so it is not kept.
 export function loadRunOptions() {
   try {
     const o = JSON.parse(localStorage.getItem(RUNOPTS_KEY) || "{}") || {};
-    delete o.seeds; delete o.seedMode;
+    for (const k of NOT_KEPT) delete o[k];
     return { ...DEFAULT_RUN_OPTIONS, ...o };
   } catch (_e) { return { ...DEFAULT_RUN_OPTIONS }; }
 }
 export function saveRunOptions(value) {
   try {
-    const { seeds: _s, seedMode: _m, ...rest } = value || {};
+    const rest = { ...(value || {}) };
+    for (const k of NOT_KEPT) delete rest[k];
     localStorage.setItem(RUNOPTS_KEY, JSON.stringify(rest));
   } catch (_e) { /* storage off: options just are not remembered */ }
 }
@@ -737,6 +752,7 @@ export function RunOptions({ value, onChange, caseId, hideInvocation }) {
     set({ seedMode: "pick", seeds: allSeeds.map((s) => s.sha256).filter((s) => cur.has(s)) });
   };
   const off = ENGINES.filter(([k]) => v[k] === false);
+  const noFuzz = !!v.noFuzz;
   return html`<div class="rs-opts">
     <fieldset class="rs-fs"><legend>Search</legend>
       <label class="rs-chk" title="Keep fuzzing until coverage stops growing; the budget becomes the safety ceiling instead of a fixed clock">
@@ -745,21 +761,24 @@ export function RunOptions({ value, onChange, caseId, hideInvocation }) {
       <label class="rs-chk" title="Synthesize parser-buffer seeds for daemon / library functions entry-point seeding cannot reach">
         <input type="checkbox" checked=${v.deepSeed} onChange=${(e) => set({ deepSeed: e.target.checked })} />
         <span><b>Deep seed discovery</b> <span class="dim">— parser-buffer seeds for code the entry point cannot reach; its findings are candidate-tier (reachability assumed, not proven). Normal auto-seeding runs regardless.</span></span></label>
+      <label class="rs-chk" title="The CLI's --no-fuzz: skip every sampling campaign (black-box, coverage-guided, directed, network, environment, IPC-boundary, libFuzzer)">
+        <input type="checkbox" checked=${noFuzz} onChange=${(e) => set({ noFuzz: e.target.checked })} />
+        <span><b>No fuzzing</b> <span class="dim">— every fuzzing campaign off (the CLI's <span class="mono">--no-fuzz</span>). Static detection, the solvers and PoC construction still run; the clock goes to them.</span></span></label>
     </fieldset>
     <fieldset class="rs-fs"><legend>Engines</legend>
-      <div class="rs-eng">${ENGINES.map(([k, label, stage, gloss]) => html`
-        <label class=${"rs-engb" + (v[k] !== false ? " on" : "")} title=${`${gloss} (stage ${stage})`}>
-          <input type="checkbox" checked=${v[k] !== false} onChange=${(e) => set({ [k]: e.target.checked })} />
-          <span>${label}</span></label>`)}</div>
-      <div class="dim" style="font-size:12px">${off.length ? `Off for this run: ${off.map(([, l]) => l).join(", ")} — the server skips those stages; everything else (static analysis, the exploit ladder) still runs.`
+      <div class="rs-eng">${ENGINES.map(([k, label, stage, gloss]) => {
+        const sampler = SAMPLER_STAGES.includes(stage);
+        const on = v[k] !== false && !(noFuzz && sampler);
+        return html`<label class=${"rs-engb" + (on ? " on" : "")} title=${`${gloss} (stage ${stage})${noFuzz && sampler ? " — off: No fuzzing is on" : ""}`}>
+          <input type="checkbox" checked=${on} disabled=${noFuzz && sampler} onChange=${(e) => set({ [k]: e.target.checked })} />
+          <span>${label}</span></label>`;
+      })}</div>
+      <div class="dim" style="font-size:12px">${noFuzz ? `No fuzzing: every sampling campaign is skipped${v.concolicOn === false ? ", and the concolic solver is off too" : "; the concolic solver still runs"}.`
+        : off.length ? `Off for this run: ${off.map(([, l]) => l).join(", ")} — the server skips those stages; everything else (static analysis, the exploit ladder) still runs.`
         : "Every engine on. Each one still declines on its own when it does not apply to the target."}</div>
     </fieldset>
-    <fieldset class="rs-fs"><legend>Target environment</legend>
-      <label class="field">Target libraries directory
-        <input type="text" placeholder="blank = this host's libraries" value=${v.sysroot} onInput=${(e) => set({ sysroot: e.target.value })} />
-        <span class="dim" style="font-size:11.5px">A directory on the server with the target's own loader (ld-linux…) and .so files, used as QEMU_LD_PREFIX —
-          the fix for "symbol lookup error" or "fork server handshake failed" on a binary built against another glibc.</span></label>
-      ${hideInvocation ? null : html`<div class="rs-inv">
+    ${hideInvocation ? null : html`<fieldset class="rs-fs"><legend>Invocation</legend>
+      <div class="rs-inv">
         <label class="field" style="flex:2 1 220px">Invocation
           <input type="text" class="mono" placeholder="blank = discovered (e.g.  -c @@)" value=${v.invArgv} onInput=${(e) => set({ invArgv: e.target.value })} />
           <span class="dim" style="font-size:11.5px">How the binary is really run; <span class="mono">@@</span> is the input file. Same as the CLI's --argv.</span></label>
@@ -767,8 +786,11 @@ export function RunOptions({ value, onChange, caseId, hideInvocation }) {
           <select value=${v.invMode} onChange=${(e) => set({ invMode: e.target.value })}>
             <option value="auto">auto</option><option value="stdin">stdin</option><option value="file">file (@@)</option>
             <option value="arg">first argument</option><option value="env">environment variable</option></select></label>
-      </div>`}
-    </fieldset>
+      </div>
+      <div class="dim" style="font-size:11.5px">For a binary built against another glibc ("symbol lookup error", "fork server handshake
+        failed"), upload its loader and .so files with it (a folder or archive) or start the server with${" "}
+        <span class="mono">LYKOS_QEMU_SYSROOT</span>; a server path is not taken from the browser.</div>
+    </fieldset>`}
     ${caseId ? html`<fieldset class="rs-fs"><legend>Seeds for this run</legend>
       ${seedList && seedList.error ? html`<div class="rs-amber" style="font-size:12px">Could not list the case's seeds: ${seedList.error}</div>` : null}
       ${allSeeds.length ? html`<div class="dim" style="font-size:12px">${chosen.size} of ${allSeeds.length} used${v.seedMode === "pick" ? "" : " (all, by default)"}
