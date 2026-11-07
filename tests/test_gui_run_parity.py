@@ -129,15 +129,21 @@ def test_run_env_settings_do_not_leak(tmp_path, monkeypatch):
     st.close()
     seen = []
 
-    class Status(dict):                      # records the env the run sees while it is running
+    from lykos.jobs import runenv
+
+    class Status(dict):                      # records what the run's stages would see, mid-run
         def update(self, *a, **k):
-            seen.append((os.environ.get("LYKOS_BUFFER_SEED"), os.environ.get("LYKOS_QEMU_SYSROOT")))
+            env = runenv.for_case(cid)
+            seen.append((env.get("LYKOS_BUFFER_SEED"), env.get("LYKOS_QEMU_SYSROOT"),
+                         os.environ.get("LYKOS_QEMU_SYSROOT")))
             return super().update(*a, **k)
 
     status = Status()
     orchestrate.run_case_autopilot(tmp_path / "cs", cid, [], status, threading.Event(), 30.0,
                                    {"deep_seed": True, "sysroot": "/tmp/other"})
-    assert seen and seen[0] == ("1", "/tmp/other")          # in force DURING the run
+    # in force for THIS case during the run, and never written into the process environment
+    assert seen and seen[0] == ("1", "/tmp/other", "/srv/original")
+    assert runenv.for_case(cid) == {}                        # cleared when the run ends
     assert "LYKOS_BUFFER_SEED" not in os.environ
     assert os.environ["LYKOS_QEMU_SYSROOT"] == "/srv/original"
 

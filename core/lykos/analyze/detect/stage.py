@@ -547,8 +547,8 @@ def _parser_buffer_seeds(ctx, target, functions) -> dict:
     seed their BUFFER parameter as attacker-controlled. Findings from these seeds are tiered as
     CANDIDATES by the caller -- attacker-reachability is ASSUMED, not demonstrated. Gated behind
     LYKOS_BUFFER_SEED so the precision effect is measurable before/after; empty when off."""
-    import os as _os
-    if _os.environ.get("LYKOS_BUFFER_SEED", "0") != "1":
+    from ...jobs import runenv as _runenv
+    if _runenv.get("LYKOS_BUFFER_SEED", "0") != "1":
         return {}
     try:
         from ..harness.rank import _to_int, rank_functions

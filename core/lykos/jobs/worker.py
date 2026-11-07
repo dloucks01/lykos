@@ -39,6 +39,7 @@ def _console_params(params) -> Optional[dict]:
                 isinstance(x, (int, float, str)) and len(str(x)) <= 60 for x in v):
             out[k] = list(v)
     return out or None
+from . import runenv
 from .context import JobContext, StageCancelled, StageTimeout
 from .queue import JobQueue
 from .registry import StageDef, get_stage, validate_params
@@ -343,6 +344,23 @@ class WorkerPool:
         avail = _mem_available_mb()
         return avail is None or avail >= self.cfg.mem_min_mb_for_heavy
 
+    def _run_env(self, q: JobQueue, run) -> dict:
+        env = runenv.for_case(getattr(run, "case_id", None))
+        sha = (run.params or {}).get("sysroot_sha") if isinstance(run.params, dict) else None
+        if sha:
+            try:
+                from pathlib import Path
+
+                from ..api import sysroot as _sr
+                d, err = _sr.resolve(Path(self.db_path).parent, self.content, q.conn, run.case_id, sha)
+                if d:
+                    env[runenv.SYSROOT] = str(d)
+                else:
+                    _log.warning("run %s: sysroot %s not resolved: %s", run.id, str(sha)[:12], err)
+            except Exception:                            # noqa: BLE001 -- run without it, said in the log
+                _log.warning("run %s: sysroot resolution failed", run.id, exc_info=True)
+        return env
+
     def _execute(self, q: JobQueue, wid: str, run_id: str, idx: int, slot: "_Slot") -> None:
         run = q.runs.get(run_id)
         if run is None:
@@ -382,6 +400,9 @@ class WorkerPool:
         _rlog = runlog.RunLog(self.content.root, run.case_id, run_id=run_id, stage=run.stage,
                               target_id=getattr(run, "target_id", None))
         _rlog_tok = runlog.bind(_rlog)
+        # this run's own settings (target libraries, deep-seed): its case's autopilot registration,
+        # then a single-stage run's `sysroot_sha` resolved here -- bound per job, never os.environ
+        _env_tok = runenv.bind(self._run_env(q, run))
         _rlog.stage_event("start", params=_console_params(run.params))
         _outcome = "error"
         try:
@@ -430,6 +451,7 @@ class WorkerPool:
         finally:
             _rlog.stage_event("end", outcome=_outcome, secs=round(time.time() - started, 1))
             runlog.unbind(_rlog_tok)
+            runenv.unbind(_env_tok)
             reset_current_stage(_stage_tok)
             # Deregister -- but only if the supervisor has not already retired us and handed idx to
             # a replacement worker (identity check avoids clobbering the replacement's record).

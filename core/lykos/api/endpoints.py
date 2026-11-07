@@ -62,7 +62,7 @@ _MAX_BUNDLE_MEMBERS = 20_000
 
 #: Stage params that name a server-side path or tool binary: CLI-only (see `_create_run`).
 _CLI_ONLY_PARAMS = frozenset({"seed_files", "seed_dir", "afl_path", "gdb_path", "symqemu_path",
-                              "angr_python", "unicorn_python"})
+                              "angr_python", "unicorn_python", "sysroot"})
 #: Stages that take operator seeds (`seed_shas` from the browser, resolved to `seed_files`).
 _SEEDED_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "diff_test"})
 
@@ -1373,6 +1373,16 @@ class EndpointsMixin:
             out["seed_files"] = paths
         return out, None
 
+    def _check_sysroot_param(self, cid, params):
+        """A single-stage run's target libraries arrive as `sysroot_sha` (an archive uploaded into
+        THIS case); the worker resolves it when the run starts (jobs/runenv). Checked here so a
+        foreign or unknown hash is a 400 at the edge, not a run that silently goes without."""
+        sha = (params or {}).get("sysroot_sha")
+        if not sha:
+            return None
+        _d, err = self._resolve_sysroot_sha(cid, sha)
+        return err
+
     def _create_run(self):
         from ..jobs.registry import reproject_cache_hit
         body = self._json_body()
@@ -1419,6 +1429,9 @@ class EndpointsMixin:
                 params, err = self._seed_params(cid, params)
                 if err:
                     return self._json({"error": err}, 400)
+                err = self._check_sysroot_param(cid, params)
+                if err:
+                    return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._CASE_STAGES[stage])
                 run = fn(q, cid) if stage in ("link_case", "ipc_model", "cross_taint") \
                     else fn(q, cid, params=params)
@@ -1429,6 +1442,9 @@ class EndpointsMixin:
                 if not target:
                     return self._json({"error": "no target"}, 404)
                 params, err = self._seed_params(target.case_id, params)
+                if err:
+                    return self._json({"error": err}, 400)
+                err = self._check_sysroot_param(target.case_id, params)
                 if err:
                     return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._TARGET_STAGES[stage])

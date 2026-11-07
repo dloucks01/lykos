@@ -2202,28 +2202,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
     # (the symbol-lookup -> handshake fix, now reachable without the CLI), and deep-seed enables the
     # aggressive parser-buffer seeding for daemon targets whose entry the autopilot cannot seed
     # (candidate-tier, honest). A GUI-supplied value wins; absent, the server's own env stands.
-    # SCOPED TO THIS RUN: the previous values are put back in the `finally` below. They used to be
-    # set and never restored, so one run with deep-seed (or a sysroot) on left every later run in
-    # the server process -- any case -- running with it, even with the box unchecked.
-    import os as _os
+    # PER RUN, not process-wide: registered under this case and bound for each of its stages by
+    # the worker (jobs/runenv). os.environ was shared by every case's stages in the server, so two
+    # cases running at once got the last writer's target libraries.
+    from ..jobs import runenv as _runenv
     _ov = overrides or {}
-    _env_prev: dict = {}
-
-    def _env_set(key: str, val: str) -> None:
-        _env_prev.setdefault(key, _os.environ.get(key))
-        _os.environ[key] = val
-
-    def _env_restore() -> None:
-        for key, old in _env_prev.items():
-            if old is None:
-                _os.environ.pop(key, None)
-            else:
-                _os.environ[key] = old
-
+    _renv = {}
     if _ov.get("sysroot"):
-        _env_set("LYKOS_QEMU_SYSROOT", str(_ov["sysroot"]))
+        _renv[_runenv.SYSROOT] = str(_ov["sysroot"])
     if _ov.get("deep_seed"):
-        _env_set("LYKOS_BUFFER_SEED", "1")
+        _renv[_runenv.BUFFER_SEED] = "1"
+    if _renv:
+        _runenv.set_case(case_id, _renv)
     from . import run_history as _run_history     # durable run record (start here, end in finally)
     _run_rec = None
     try:
@@ -3253,5 +3243,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             observe.absorbed(_log, "continuing")
     finally:
         _run_history.record_end(store, case_id, _run_rec, status)   # done / stopped / error
-        _env_restore()
+        if _renv:
+            _runenv.clear_case(case_id)
         store.close()

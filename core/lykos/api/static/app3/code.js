@@ -15,7 +15,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api, waitForRun } from "../app/api.js";
 import { getJSON, hexToInt, isNoise } from "./data.js";
-import { setFormatSpec } from "./results.js";
+import { setFormatSpec, sysrootPick } from "./results.js";
 
 const asList = (r) => (Array.isArray(r) ? r : (r && Object.values(r).find(Array.isArray)) || []);
 const parseMaybe = (v) => {
@@ -254,7 +254,9 @@ function useStageRuns(caseId, onDone) {
     notify();
     try {
       const cursor = await eventCursor(caseId);
-      const r = await api.createRun(stage, opts);
+      // the case's chosen target libraries go with every one-off run too (resolved server-side)
+      const sr = sysrootPick(caseId);
+      const r = await api.createRun(stage, sr ? { ...opts, params: { ...(opts.params || {}), sysroot_sha: sr } } : opts);
       patch(kind, { runId: r.run_id, fromCache: !!r.from_cache });
       // polled until the run ends: the stage bounds itself, and Cancel is offered meanwhile
       const done = await waitForRun(r.run_id, { onTick: (run) => patch(kind, { run }), timeoutMs: 12 * 3600 * 1000 });
@@ -604,7 +606,7 @@ export function CodeScreen({ data, targetId, focusTarget, focusAddr, focusSrc = 
     body = html`<${StringsView} strs=${strs} loadAll=${() => loadStrings(true)} index=${index} goAddr=${goAddr}
       funcsLoaded=${!!funcs} />`;
   } else if (cur === "target") {
-    body = html`<${TargetView} target=${target} caseId=${caseId} nFuncs=${funcs ? funcs.length : null} key=${tid} />`;
+    body = html`<${TargetView} target=${target} caseId=${caseId} nFuncs=${funcs ? funcs.length : null} stage=${stage} key=${tid} />`;
   } else if (cur === "source") {
     body = html`<${SourceView} tid=${tid} source=${source} findings=${findings} openFinding=${openFinding}
       focus=${srcFocus} locate=${locateSrc} key=${tid} />`;
@@ -1273,7 +1275,7 @@ const posture = (v) => {
 };
 const POSTURE_TITLE = { off: "absent — favours exploitation", part: "partial", on: "present", unk: "not determined" };
 
-function TargetView({ target, caseId, nFuncs }) {
+function TargetView({ target, caseId, nFuncs, stage }) {
   const [details, setDetails] = useState(undefined);
   const [advice, setAdvice] = useState(undefined);
   const [caps, setCaps] = useState(undefined);
@@ -1362,7 +1364,7 @@ function TargetView({ target, caseId, nFuncs }) {
     <${DepsPanel} tid=${tid} />
     <${AdvicePanel} advice=${advice} />
     <${InvocationHelper} tid=${tid} advice=${advice} />
-    <${FormatPanel} />
+    <${FormatPanel} tid=${tid} caseId=${caseId} stage=${stage} />
     <${CapabilitiesPanel} caps=${caps} />`;
 }
 
@@ -1456,7 +1458,18 @@ function bytesToB64(u8) {
   for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
   return btoa(s);
 }
-function FormatPanel() {
+function FmtFuzzStatus({ r, cancel }) {
+  const d = r.data && typeof r.data === "object" ? r.data : {};
+  const ex = d.execs ?? (d.metrics && d.metrics.execs), cr = d.crashes ?? (d.metrics && d.metrics.crashes);
+  return html`<div class="cx-note" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <b>Structure-aware fuzz run</b>
+    ${r.running ? html`<span>running…${" "}<button class="xref" onClick=${cancel}>cancel</button></span>`
+      : r.error ? html`<span class="warn">${r.error}</span>`
+      : html`<span>${ex != null ? `${Number(ex).toLocaleString()} executions` : "done"}${cr != null ? ` · ${cr} crash${cr === 1 ? "" : "es"}` : ""}${cr ? " — see Proof → Crashes" : ""}</span>`}
+  </div>`;
+}
+
+function FormatPanel({ tid, caseId, stage }) {
   const [sample, setSample] = useState(null);     // {name, size, b64, truncated}
   const [paste, setPaste] = useState("");
   const [spec, setSpec] = useState("");
@@ -1524,8 +1537,15 @@ function FormatPanel() {
         onClick=${() => { try { const j = JSON.parse(spec); const cid = new URLSearchParams(location.hash.slice(1)).get("case");
           if (Array.isArray(j) && j.length && cid) { setFormatSpec(cid, j); setErr(null); setUsed(true); } else setErr("the spec must be a non-empty JSON list of fields"); }
           catch (e) { setErr("spec is not valid JSON: " + e.message); } }}>${used ? "Used for the next analysis ✓" : "Use for the next analysis"}</button>` : null}
+      ${spec.trim() && stage && tid ? html`<button class="btn sm" disabled=${!!(stage.runs.fmtfuzz && stage.runs.fmtfuzz.running)}
+        title="one bounded structure-aware fuzz run of this target now, with this spec (and the case's target libraries, if picked)"
+        onClick=${() => { try { const j = JSON.parse(spec);
+          if (!Array.isArray(j) || !j.length) { setErr("the spec must be a non-empty JSON list of fields"); return; }
+          setErr(null); stage.start("fmtfuzz", "fuzz", { targetId: tid, params: { format: j, max_seconds: 120 } }); }
+          catch (e) { setErr("spec is not valid JSON: " + e.message); } }}>Fuzz with this spec now (2 min)</button>` : null}
     </div>
     ${err ? html`<div class="cx-note warn">${err}</div>` : null}
+    ${stage && stage.runs.fmtfuzz ? html`<${FmtFuzzStatus} r=${stage.runs.fmtfuzz} cancel=${() => stage.cancel("fmtfuzz")} />` : null}
     ${sug ? html`<div class="cx-fm-sug">
       <div class="row-c" style="flex-wrap:wrap;gap:8px"><b>${sug.detected ? `Detected: ${sug.detected}` : "No known format detected"}</b>
         ${sug.builtin ? html`<span class="chip on">built-in model: ${sug.builtin}</span>` : html`<span class="chip">derived from the bytes</span>`}

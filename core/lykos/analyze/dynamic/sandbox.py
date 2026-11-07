@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+from ...jobs import runenv as _runenv     # per-run target libraries (not os.environ)
 import platform
 import re
 import resource
@@ -744,7 +745,7 @@ def qemu_ld_prefix(arch, endianness=None, bits=None, exedir=None) -> Optional[st
          a relocated bundle that stages the guest libs next to the target.
       3. The host cross-arch sysroot /usr/<triple> (present on a box with the cross toolchains).
     """
-    env_ovr = os.environ.get("LYKOS_QEMU_SYSROOT")
+    env_ovr = _runenv.get("LYKOS_QEMU_SYSROOT")
     if env_ovr and Path(env_ovr).is_dir():
         return env_ovr
     if exedir and _dir_has_guest_loader(exedir):
@@ -2580,7 +2581,7 @@ def _run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         if _sysroot:
             env = dict(env if env is not None else os.environ)
             env.setdefault("QEMU_LD_PREFIX", _sysroot)
-    elif os.environ.get("LYKOS_QEMU_SYSROOT"):
+    elif _runenv.get("LYKOS_QEMU_SYSROOT"):
         # NATIVE dynamically-linked target off its own system: the operator supplies its libraries
         # via LYKOS_QEMU_SYSROOT (a rootfs or a flat lib dir). Prepend its lib dirs to
         # LD_LIBRARY_PATH so the host loader finds the deps and the program reaches main() --
@@ -2591,14 +2592,14 @@ def _run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # are already present is unaffected; it can turn a not-runnable into a run, never the
         # reverse. Mirrors the native dep wiring aflpp.run_campaign already does for the afl path.
         try:
-            _libdirs = [str(d) for d in _sysroot_lib_dirs(os.environ["LYKOS_QEMU_SYSROOT"])]
+            _libdirs = [str(d) for d in _sysroot_lib_dirs(_runenv.get("LYKOS_QEMU_SYSROOT"))]
         except Exception:                                # noqa: BLE001 -- best-effort
             _libdirs = []
         if _libdirs:
             env = dict(env if env is not None else os.environ)
             _ld = env.get("LD_LIBRARY_PATH")
             env["LD_LIBRARY_PATH"] = ":".join(_libdirs + ([_ld] if _ld else []))
-            native_sysroot = os.environ["LYKOS_QEMU_SYSROOT"]
+            native_sysroot = _runenv.get("LYKOS_QEMU_SYSROOT")
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner

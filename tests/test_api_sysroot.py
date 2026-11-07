@@ -295,3 +295,37 @@ def test_a_missing_extraction_is_rebuilt_from_the_stored_archive(api, monkeypatc
     _wait_done(sock, cid)
     assert seen["over"]["sysroot"] == str(d / "rootfs")
     assert (d / "rootfs/lib/libc.so.6").read_bytes() == b"C"
+
+
+def test_a_single_stage_run_takes_a_sysroot_by_hash_and_the_worker_resolves_it(api):
+    """POST /runs (the Code screen's one-off stages): `sysroot_sha` of an archive in THIS case is
+    accepted and resolved by the worker; an unknown hash or a raw path is refused at the edge."""
+    from types import SimpleNamespace
+
+    from lykos.casestore import CaseStore
+    from lykos.jobs import runenv
+    from lykos.jobs.config import JobConfig
+    from lykos.jobs.queue import JobQueue
+    from lykos.jobs.worker import WorkerPool
+    sock, cs = api
+    cid = _case(sock, cs)
+    code, rec = _up(sock, cid, _tar(GOOD))
+    assert code == 201, rec
+    st = CaseStore.open(cs)
+    try:
+        tid = st.targets.list_by_case(cid)[0].id
+        pool = WorkerPool(st.db_path, st.content, JobConfig(workers=1))
+        env = pool._run_env(JobQueue(st.conn), SimpleNamespace(id="r1", case_id=cid,
+                                                               params={"sysroot_sha": rec["sha256"]}))
+        assert env[runenv.SYSROOT] == str(sr.sysroot_dir(cs, cid, rec["sha256"]))
+    finally:
+        st.close()
+    code, body = _jreq(sock, "POST", "/runs", {"stage": "dynamic_run", "target_id": tid,
+                                               "params": {"sysroot_sha": "ab" * 32}})
+    assert code == 400 and "not in this case" in body["error"]
+    code, body = _jreq(sock, "POST", "/runs", {"stage": "dynamic_run", "target_id": tid,
+                                               "params": {"sysroot": "/"}})
+    assert code == 400
+    code, body = _jreq(sock, "POST", "/runs", {"stage": "dynamic_run", "target_id": tid,
+                                               "params": {"sysroot_sha": rec["sha256"]}})
+    assert code == 201, body
