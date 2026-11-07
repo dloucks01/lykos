@@ -684,6 +684,8 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._get_events(m.group(1), after, max(0, _int_param(qs, "tail", 0)))
             m = _CASE_CONSOLE.match(path)
             if m:
+                if (qs.get("download") or [""])[0] == "1":
+                    return self._download_console(m.group(1))
                 return self._get_console(m.group(1), _int_param(qs, "after", 0),
                                          _int_param(qs, "tail", 0))
             self._json({"error": "not found"}, 404)
@@ -836,12 +838,25 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
         exe = workdir / "target.bin"
         exe.write_bytes(blob)
         os.chmod(exe, 0o755)
-        argv = _csv(qs.get("argv")) or []
+        # `args` is a shell-quoted string ("-c @@", `--name "a b"`), split exactly like the
+        # autopilot's argv and the CLI's --argv. `argv` (comma-separated) is the older form.
+        args = (qs.get("args") or [None])[0]
+        if args is not None:
+            import shlex
+            try:
+                argv = shlex.split(args)
+            except ValueError:                           # unbalanced quotes: plain words
+                argv = args.split()
+        else:
+            argv = _csv(qs.get("argv")) or []
 
         def put_seed(data: bytes) -> str:
+            # A real case seed (artifact + operator.seed event): it shows in the seed list and
+            # the next run's seed picker. A bare artifact was never used by any analysis.
+            from .ops import register_seed
             st = CaseStore(self.server.case_dir)
             try:
-                return st.put_artifact(case_id, "console-seed", data=data).sha256
+                return register_seed(st, case_id, data, "console-session.bin")["sha256"]
             finally:
                 st.close()
 
@@ -850,6 +865,24 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                           bits=bits, cwd=str(workdir), put_seed=put_seed)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _download_console(self, case_id: str):
+        """The WHOLE run console of a case as JSON lines (GET /cases/{id}/console?download=1).
+        The GUI only keeps a window of recent records in memory; this is the full log, streamed
+        from disk."""
+        from ..jobs import runlog
+        s = self._store()
+        try:
+            if not s.cases.get(case_id):
+                return self._json({"error": "no case"}, 404)
+        finally:
+            s.close()
+        p = runlog.console_path(self.server.case_dir, case_id)
+        if not p.is_file():
+            return self._bytes(b"", "application/x-ndjson",
+                               filename=f"lykos-console-{case_id}.jsonl")
+        return self._stream_file(p, "application/x-ndjson",
+                                 filename=f"lykos-console-{case_id}.jsonl")
 
     def _get_console(self, case_id: str, after: int = 0, tail: int = 0):
         """The live run console (jobs/runlog): records from byte offset `after`, plus `next` to

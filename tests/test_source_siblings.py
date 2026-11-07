@@ -98,3 +98,12 @@ def test_per_target_summary_survives_the_next_targets_plan(store, case):
     row = status["per_target"][0]
     assert row["filename"] == "a.out" and row["stages"] == {"done": 1, "skipped": 1, "declined": 1}
     assert row["skipped_for_budget"] == 1 and row["elapsed"] == 3.0 and row["findings"] == 0
+
+
+def test_an_operator_chosen_subset_is_not_widened_with_siblings():
+    import inspect
+    src = inspect.getsource(O.run_case_autopilot)
+    assert "for _sib in ([] if only_handed else store.targets.list_by_case(case_id)):" in src
+    from lykos.api import autopilot as A
+    assert 'only_handed = bool(body.get("target_ids")) and set(target_ids) != set(in_case)' \
+        in inspect.getsource(A)

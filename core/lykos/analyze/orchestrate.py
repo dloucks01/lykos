@@ -2181,7 +2181,7 @@ def _target_failed(store, case_id: str, tid: str, exc: BaseException, status: di
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        stop: threading.Event, budget_seconds: Optional[float] = None,
                        overrides: Optional[dict] = None, converge: bool = False,
-                       skip_stages=None, pause=None) -> None:
+                       skip_stages=None, pause=None, only_handed: bool = False) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
 
     `budget_seconds` is the WHOLE-RUN wall-clock ceiling, shared across the case's targets: each
@@ -2199,13 +2199,28 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
     # (the symbol-lookup -> handshake fix, now reachable without the CLI), and deep-seed enables the
     # aggressive parser-buffer seeding for daemon targets whose entry the autopilot cannot seed
     # (candidate-tier, honest). A GUI-supplied value wins; absent, the server's own env stands.
+    # SCOPED TO THIS RUN: the previous values are put back in the `finally` below. They used to be
+    # set and never restored, so one run with deep-seed (or a sysroot) on left every later run in
+    # the server process -- any case -- running with it, even with the box unchecked.
+    import os as _os
     _ov = overrides or {}
-    if _ov.get("sysroot") or _ov.get("deep_seed"):
-        import os as _os
-        if _ov.get("sysroot"):
-            _os.environ["LYKOS_QEMU_SYSROOT"] = str(_ov["sysroot"])
-        if _ov.get("deep_seed"):
-            _os.environ["LYKOS_BUFFER_SEED"] = "1"
+    _env_prev: dict = {}
+
+    def _env_set(key: str, val: str) -> None:
+        _env_prev.setdefault(key, _os.environ.get(key))
+        _os.environ[key] = val
+
+    def _env_restore() -> None:
+        for key, old in _env_prev.items():
+            if old is None:
+                _os.environ.pop(key, None)
+            else:
+                _os.environ[key] = old
+
+    if _ov.get("sysroot"):
+        _env_set("LYKOS_QEMU_SYSROOT", str(_ov["sysroot"]))
+    if _ov.get("deep_seed"):
+        _env_set("LYKOS_BUFFER_SEED", "1")
     try:
         status.update({"state": "running", "targets": len(target_ids), "started": time.time(),
                         "converge": bool(converge)})
@@ -2218,7 +2233,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         # reached: a source PROJECT registers one target per executable it built (libtiff builds
         # ~20 tools, each a different parser front end), and the pass analysed exactly the one it
         # was handed. Any target in the case that nobody has analysed is work this pass should do.
-        for _sib in store.targets.list_by_case(case_id):
+        # An operator who PICKED a subset (`only_handed`, the GUI's target checkboxes) gets that
+        # subset: the case's other targets are not added. Targets discovered mid-run (firmware
+        # carving, unpacking) are still appended where they are discovered.
+        for _sib in ([] if only_handed else store.targets.list_by_case(case_id)):
             if _sib.id not in worklist:
                 worklist.append(_sib.id)
         # --budget is a WHOLE-RUN ceiling, not per target. Before this, `budget_seconds` was handed
@@ -3226,4 +3244,5 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         except Exception:
             observe.absorbed(_log, "continuing")
     finally:
+        _env_restore()
         store.close()

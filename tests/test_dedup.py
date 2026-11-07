@@ -124,3 +124,10 @@ def test_site_of_recovers_the_sink_line_of_a_function_form_site(tmp_path):
     g = N(evidence=[{"channel": "source", "detail": "codec/clear.c: clear_decompress_subcode_rlex() "
                      "frees 'p'"}])
     assert D.site_of(g, tmp_path) == ("codec/clear.c", 2)        # no statement: the definition
+
+
+def test_a_surface_recipe_names_its_site_on_the_recipe_channel():
+    ev = [{"channel": "triage", "detail": "drivable: reachable"},
+          {"channel": "recipe", "detail": "CWE-787 at audin_main.c:251 is in a file compiled into "
+                                          "an in-tree fuzz harness"}]
+    assert D.parse_loc(ev) == ("audin_main.c", 251)

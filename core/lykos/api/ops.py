@@ -57,6 +57,31 @@ def case_seeds(conn, case_id: str) -> list[dict]:
     return list(seeds.values())
 
 
+def register_seed(store, case_id: str, data: bytes, name: str) -> dict:
+    """Store `data` as one of the case's operator seeds -- the content-addressed artifact AND the
+    `operator.seed` add event that `case_seeds` (the seed picker, `seed_shas`) reads. Both the
+    upload endpoint and the interactive console's "save as seed" go through here: a seed saved
+    from the console used to be a bare `console-seed` artifact no seed list or run ever saw.
+    Raises ValueError when the bytes are empty / too large or the case's seed set is full."""
+    if not data:
+        raise ValueError("empty seed")
+    if len(data) > MAX_SEED_BYTES:
+        raise ValueError(f"seed too large (max {MAX_SEED_BYTES} bytes)")
+    current = case_seeds(store.conn, case_id)
+    name = Path(name or "seed.bin").name or "seed.bin"
+    name = "".join(ch for ch in name if ch.isprintable())[:120] or "seed.bin"
+    import hashlib
+    sha = hashlib.sha256(data).hexdigest()
+    if not any(x["sha256"] == sha for x in current) and len(current) >= MAX_CASE_SEEDS:
+        raise ValueError(f"a case holds at most {MAX_CASE_SEEDS} seeds; remove one first")
+    art = store.put_artifact(case_id, "operator-seed", data=data, meta={"name": name})
+    if not any(x["sha256"] == art.sha256 for x in current):
+        store.events.append(SEED_EVENT, case_id=case_id,
+                            payload={"action": "add", "sha256": art.sha256, "name": name,
+                                     "size": len(data)})
+    return {"sha256": art.sha256, "name": name, "size": len(data)}
+
+
 def _run_survey():
     from .. import toolchain, vendorenv
     try:
@@ -134,7 +159,7 @@ class OpsMixin:
             s.close()
 
     def _upload_seed(self, cid):
-        from .endpoints import _extract_upload
+        from .endpoints import _extract_upload, x_filename
         s = self._store()
         try:
             if not s.cases.get(cid):
@@ -151,7 +176,7 @@ class OpsMixin:
                                                 "or malformed body"}, 413, close=True)
                 try:
                     filename, path = _extract_upload(self.headers.get("Content-Type", ""), raw,
-                                                     tdp, self.headers.get("X-Filename"))
+                                                     tdp, x_filename(self.headers))
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400, close=True)
                 size = path.stat().st_size
@@ -162,15 +187,11 @@ class OpsMixin:
                     return self._json({"error": "empty seed"}, 400)
                 data = path.read_bytes()
             # The name is display-only (never a path on this side): basename, printable, bounded.
-            name = Path(filename or "seed.bin").name or "seed.bin"
-            name = "".join(ch for ch in name if ch.isprintable())[:120] or "seed.bin"
-            art = s.put_artifact(cid, "operator-seed", data=data, meta={"name": name})
-            sha = art.sha256
-            if not any(x["sha256"] == sha for x in current):
-                s.events.append(SEED_EVENT, case_id=cid,
-                                payload={"action": "add", "sha256": sha, "name": name,
-                                         "size": size})
-            return self._json({"sha256": sha, "name": name, "size": size}, 201)
+            try:
+                rec = register_seed(s, cid, data, filename or "seed.bin")
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json(rec, 201)
         finally:
             s.close()
 

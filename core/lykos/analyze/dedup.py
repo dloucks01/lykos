@@ -35,7 +35,7 @@ _ADVANCED = ("corroborated", "confirmed", "poc-backed", "merged", "rejected")
 #: the newer tree detectors each write their own (`guard-gap`, `alloc-overflow`, ...), and reading
 #: only the original two left every guard_gap / alloc_overflow / sibling_guard finding with an
 #: unknown location -- so all of a run's same-CWE ones collapsed into one "bug".
-_SITE_CHANNELS = ("source", "recipe-source", "guard-gap", "alloc-overflow", "sibling-guard",
+_SITE_CHANNELS = ("source", "recipe-source", "recipe", "guard-gap", "alloc-overflow", "sibling-guard",
                   "dop-target", "oob-write", "cpg", "source-sink", "int-overflow", "uaf",
                   "assert-guard")
 #: `path/file.c: fn() ...` -- the site form wire_flow / param_sink / lifecycle / intwidth /

@@ -162,6 +162,20 @@ def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
     return None
 
 
+def x_filename(headers):
+    """The upload's display name from `X-Filename`. A header value is Latin-1 only, so a browser
+    cannot send a name like `测试.bin` raw (fetch throws); the GUI percent-encodes it and says so
+    with `X-Filename-Encoding: uri`. Without that header the value is taken as-is (older clients)."""
+    v = headers.get("X-Filename")
+    if v and (headers.get("X-Filename-Encoding") or "").lower() == "uri":
+        from urllib.parse import unquote
+        try:
+            v = unquote(v, errors="strict")
+        except UnicodeDecodeError:
+            pass
+    return v
+
+
 def _extract_upload(ctype: str, raw: Path, td: Path, x_filename):
     """(filename, path) of the file to ingest from a body already streamed to `raw`.
 
@@ -1115,7 +1129,7 @@ class EndpointsMixin:
                                       413, close=True)
                 try:
                     filename, upload = _extract_upload(ctype, raw, tdp,
-                                                       self.headers.get("X-Filename"))
+                                                       x_filename(self.headers))
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400, close=True)
                 # The client-supplied filename must never influence where we write: an absolute
