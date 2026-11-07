@@ -184,7 +184,9 @@ function RunScreen({ caseId, targets, ap, refreshAp, go }) {
       props=${{ caseId, ap, targets, running,
                 onOpenStage: (st) => { setStage(st); window.scrollTo({ top: 0, behavior: "smooth" }); },
                 onOpenFinding: go ? (id) => go("finding", { findingId: id }) : undefined,
-                onFocusTarget: go ? (tid) => go("proof", { targetId: targets.some((t) => t.id === tid) ? tid : null }) : undefined }} />`;
+                onFocusTarget: go ? (tid) => go("proof", { targetId: targets.some((t) => t.id === tid) ? tid : null }) : undefined }} />
+    <${Lazy} path="./history.js" name="RunHistory" fallback=${html``}
+      props=${{ caseId, running, onOpenFinding: go ? (id) => go("finding", { findingId: id }) : undefined }} />`;
 }
 
 const NAV = [["engagement", "Engagement"], ["run", "Run"], ["proof", "Proof"], ["code", "Code"], ["system", "System"]];

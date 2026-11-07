@@ -218,6 +218,124 @@ def _hexdump(data: bytes, limit: int = 1024) -> str:
     return "\n".join(lines)
 
 
+# ---- build-dependency pre-flight (`lykos deps`) for the GUI ----------------------------------
+# Deterministic for one source artifact on one host (it reads the tree and asks this host's
+# compiler / pkg-config / ldconfig), so it is computed once per (store, artifact, include-scan).
+_DEPS_CACHE: dict = {}
+_DEPS_LOCK = __import__("threading").Lock()
+#: Package names for the build TOOLS themselves (apt, dnf): a missing cmake is as stageable as a
+#: missing library, and the operator needs the install line for it too.
+_TOOL_PKG = {"cc": ("gcc", "gcc"), "c++": ("g++", "gcc-c++"), "make": ("make", "make"),
+             "pkg-config": ("pkg-config", "pkgconf-pkg-config"), "cmake": ("cmake", "cmake"),
+             "autoconf": ("autoconf", "autoconf"), "automake": ("automake", "automake")}
+
+
+def _deps_view(pf: dict, tree: Path, store_dir: Path) -> dict:
+    """The pre-flight dict made safe and useful for the browser: the project root reported
+    TREE-relative (never a server path, and every string scrubbed of the tree / store location as
+    a backstop), plus the aggregated stage-these install lines and the gaps no package maps."""
+    root = Path(pf.get("root") or tree)
+    try:
+        rel = root.resolve().relative_to(tree.resolve()).as_posix() or "."
+    except ValueError:
+        rel = "."
+    view = {k: v for k, v in pf.items() if k != "root"}
+    view["project_root"] = rel
+    apt: list = []
+    dnf: list = []
+    for tool in pf.get("toolchain_missing") or []:
+        a, d = _TOOL_PKG.get(tool, (None, None))
+        if a and a not in apt:
+            apt.append(a)
+        if d and d not in dnf:
+            dnf.append(d)
+    no_pkg: list = []
+    for r in pf.get("missing") or []:
+        h = r.get("hint")
+        if h:
+            if h.get("apt") and h["apt"] not in apt:
+                apt.append(h["apt"])
+            if h.get("dnf") and h["dnf"] not in dnf:
+                dnf.append(h["dnf"])
+        else:
+            no_pkg.append({"kind": r["kind"], "name": r["name"]})
+    view["stage"] = {
+        "apt": ("sudo apt-get install -y " + " ".join(apt)) if apt else None,
+        "dnf": ("sudo dnf install -y " + " ".join(dnf)) if dnf else None,
+        "apt_download": ("apt-get download " + " ".join(apt)) if apt else None,
+        "packages": {"apt": apt, "dnf": dnf},
+        "no_package_hint": no_pkg,
+    }
+    view["source"] = True
+    view["checked_on"] = "this lykos server host"
+    text = json.dumps(view)
+    for p in {str(tree), str(tree.resolve()), str(store_dir), str(Path(store_dir).resolve())}:
+        if p and p != "/":
+            text = text.replace(json.dumps(p)[1:-1], "<tree>")
+    return json.loads(text)
+
+
+# ---- weakness-class coverage (`lykos cwe-coverage`) for the GUI ------------------------------
+#: How a detection METHOD finds a class (cwe_catalog.method), in the operator's words.
+_CWE_METHOD = {
+    "pattern": "static pattern, run over every function",
+    "taint": "source-to-sink taint (the sink is located by pattern; a hit is a lead)",
+    "runtime": "sanitizer / execution oracle (ASan, UBSan, LSan, MSan, TSan)",
+    "binary": "recovered from the compiled image (imports, rodata, symbols)",
+    "na": "not applicable to C / native code (excluded explicitly)",
+}
+#: The furthest rung lykos can carry a SOUND exploit of a class today, and what that rung means.
+#: L3 is class-specific (code execution / validated disclosure / demonstrated DoS / the weakness
+#: reached). A lower rung, or none, is lykos's current reach -- the technique not yet built -- and
+#: never a property of any target.
+_CWE_RUNG = {
+    "rce": ("L3", "a working code / command-execution exploit is modelled for this class"),
+    "primitive": ("L2", "a corruption primitive; the technique that turns it into code execution "
+                  "is not yet built for this class"),
+    "leak": ("L3", "a validated disclosure (secret or pointer bytes exfiltrated under a control)"),
+    "dos": ("L3", "a demonstrated denial of service — the class gives availability, not control"),
+    "logic": ("L3", "the weakness demonstrated by reaching it (auth, traversal, crypto) — the "
+              "finding is the impact"),
+}
+_CWE_MATRIX: dict = {}
+
+
+def _cwe_matrix() -> dict:
+    """The static class matrix: cwe_coverage.capability_matrix() (the CLI's ~92 classes) joined
+    with the catalog's detection method, plus the catalog-only classes the sweep also covers."""
+    if _CWE_MATRIX:
+        return _CWE_MATRIX
+    from ..analyze import cwe_catalog
+    from ..analyze import cwe_coverage as cc
+    rows = []
+    seen = set()
+
+    def row(cwe, name, ceiling, catalog_only):
+        e = cwe_catalog.CATALOG.get(cwe)
+        method = e.method if e else None
+        lvl, why = _CWE_RUNG.get(ceiling, (None, "no exploit path modelled yet — not yet built"))
+        return {"cwe": cwe, "name": name, "family": e.family if e else None,
+                "severity": e.severity if e else None, "method": method,
+                "method_label": _CWE_METHOD.get(method) if method else None,
+                # the CLI's classes are all named by a detector; a catalog-only "na" class is not
+                "detected": (method != "na") if catalog_only else True,
+                "ceiling": ceiling, "ceiling_label": cc._CEILING_WORD.get(ceiling) if ceiling else None,
+                "ceiling_level": lvl, "ceiling_why": why, "rce_capable": ceiling == "rce",
+                "catalog_only": catalog_only}
+
+    for m in cc.capability_matrix():
+        rows.append(row(m["cwe"], m["name"], m["ceiling"], False))
+        seen.add(m["cwe"])
+    for cwe, e in cwe_catalog.CATALOG.items():
+        if cwe not in seen:
+            rows.append(row(cwe, e.name, cc.weaponizable(cwe), True))
+    rows.sort(key=lambda r: int(r["cwe"].split("-")[1]))
+    _CWE_MATRIX.update({"schema": "lykos.cwe-coverage/1", "classes": rows,
+                        "methods": _CWE_METHOD,
+                        "rungs": {k: {"level": v[0], "why": v[1]} for k, v in _CWE_RUNG.items()}})
+    return _CWE_MATRIX
+
+
 class EndpointsMixin:
     # ---- operator curation (doc 47 P3) -- see api/curation.py for the event-sourced model ----
     @staticmethod
@@ -934,6 +1052,58 @@ class EndpointsMixin:
         finally:
             s.close()
 
+    def _get_target_deps(self, tid, qs):
+        """`lykos deps` for the target's uploaded source tree: what the project declares it needs
+        vs. what THIS server host has, the build toolchain, and the install lines to stage the
+        gaps before going offline. ?include_scan=0 is the CLI's --no-include-scan. A binary target
+        with no source tree answers {source: false}. Paths are tree-relative only."""
+        from . import source_tree as ST
+        scan = (qs.get("include_scan") or ["1"])[0] not in ("0", "false", "no")
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            art = ST.project_for(s, t)
+            root = ST.tree_root(s, t) if art is not None else None
+            if root is None:
+                return self._json({"source": False})
+            key = (str(s.dir), art.sha256, scan)
+            with _DEPS_LOCK:
+                hit = _DEPS_CACHE.get(key)
+            if hit is None:
+                from ..analyze import dep_preflight
+                hit = _deps_view(dep_preflight.scan_dependencies(root, scan_includes=scan),
+                                 Path(root), Path(s.dir))
+                with _DEPS_LOCK:
+                    _DEPS_CACHE[key] = hit
+            return self._json(hit)
+        finally:
+            s.close()
+
+    def _get_cwe_coverage(self, qs):
+        """`lykos cwe-coverage`: every weakness class -- how lykos detects it and the furthest
+        rung it can carry a sound exploit of it today -- plus, with ?case=<id>, how far each class
+        that actually appeared on that case was carried. Server-wide; the case overlay is optional."""
+        from ..analyze import cwe_coverage as cc
+        out = dict(_cwe_matrix())
+        out["summary"] = cc.summary()
+        out["case"] = None
+        cid = (qs.get("case") or [""])[0]
+        if cid:
+            s = self._store()
+            try:
+                c = s.cases.get(cid)
+                if not c:
+                    return self._json({"error": "no case"}, 404)
+                findings = FindingDAO(s.conn).list_by_case(cid)
+                pocs = [{"finding_id": r[0], "level": r[1]} for r in s.conn.execute(
+                    "SELECT finding_id, level FROM poc WHERE case_id=?", (cid,)).fetchall()]
+                out["case"] = {"id": c.id, "name": c.name, **cc.run_matrix(findings, pocs)}
+            finally:
+                s.close()
+        return self._json(out)
+
     def _get_run_output(self, rid):
         """The parsed JSON a stage produced -- what actually happened, for the run log.
 
@@ -1174,7 +1344,13 @@ class EndpointsMixin:
         sample = sample[:65536]                          # cap: previews stay fast
         spec = body.get("spec")
         if spec is not None:
-            return self._json({"preview": structure.describe(spec, sample)})
+            # a hand-written spec the model cannot build (wrong field type, bad length_of) is the
+            # operator's input error, not a server fault: say what was wrong, as a 400
+            try:
+                preview = structure.describe(spec, sample)
+            except Exception as e:                       # noqa: BLE001 -- reported to the UI
+                return self._json({"error": f"the spec could not be used: {e}"}, 400)
+            return self._json({"preview": preview})
         return self._json({"suggestion": structure.suggest_spec(sample)})
 
     @staticmethod

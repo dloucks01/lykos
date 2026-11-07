@@ -2,7 +2,7 @@
 // serving (GET /version, GET /health), and the tool's own validation gates (GET/POST /selftest,
 // GET /selftest/history = `lykos archgate` / `realgate` / `eval` / `dashboard`).
 // Everything shown is what the server returned; nothing here is example data.
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
 
@@ -344,15 +344,144 @@ function SelftestPanel() {
     </section>`;
 }
 
+// ---- weakness classes (GET /cwe-coverage = `lykos cwe-coverage`) -------------------------------
+// Every CWE class: how lykos detects it, and the furthest rung it can carry a sound exploit of the
+// class TODAY. A rung below L3 (or none) is lykos's reach -- a technique not yet built -- never a
+// property of any target. With a case open, the classes that case actually has, and how far each got.
+const CEIL = {
+  rce: ["code execution", 0], primitive: ["corruption primitive", 1], leak: ["disclosure", 2],
+  dos: ["denial of service", 3], logic: ["logic / auth / crypto", 4],
+};
+const CEIL_NONE = ["not yet built", 5];
+const METHOD = { pattern: "static pattern", taint: "taint", runtime: "runtime oracle", binary: "binary image", na: "not applicable" };
+const STATE_RANK = { candidate: 0, corroborated: 1, confirmed: 2, "poc-backed": 3 };
+const RUNG_RANK = { L0: 0, L1: 1, L2: 2, L3: 3 };
+const cweNum = (c) => Number(String(c || "").replace(/^CWE-/i, "")) || 1e9;
+const ceilOf = (r) => (r.ceiling && CEIL[r.ceiling]) || CEIL_NONE;
+const caseFromHash = () => {
+  try { return new URLSearchParams(location.hash.slice(1)).get("case"); } catch (_e) { return null; }
+};
+const CWE_SORTS = {
+  cwe: (a, b) => cweNum(a.cwe) - cweNum(b.cwe),
+  name: (a, b) => String(a.name).localeCompare(String(b.name)),
+  method: (a, b) => String(a.method || "~").localeCompare(String(b.method || "~")) || cweNum(a.cwe) - cweNum(b.cwe),
+  ceiling: (a, b) => ((RUNG_RANK[b.ceiling_level] ?? -1) - (RUNG_RANK[a.ceiling_level] ?? -1))
+    || ceilOf(a)[1] - ceilOf(b)[1] || cweNum(a.cwe) - cweNum(b.cwe),
+  here: (a, b) => ((b.here && b.here.count) || 0) - ((a.here && a.here.count) || 0) || cweNum(a.cwe) - cweNum(b.cwe),
+};
+
+function CweCoveragePanel() {
+  const [caseId, setCaseId] = useState(caseFromHash);
+  const [m, setM] = useState(undefined);
+  const [err, setErr] = useState(null);
+  const [q, setQ] = useState("");
+  const [method, setMethod] = useState("");
+  const [ceil, setCeil] = useState("");
+  const [onlyHere, setOnlyHere] = useState(false);
+  const [sort, setSort] = useState({ key: "cwe", dir: 1 });
+  useEffect(() => {
+    const f = () => setCaseId(caseFromHash());
+    window.addEventListener("hashchange", f);
+    window.addEventListener("popstate", f);
+    return () => { window.removeEventListener("hashchange", f); window.removeEventListener("popstate", f); };
+  }, []);
+  useEffect(() => {
+    let stop = false;
+    const get = async (cid) => {
+      const r = await fetch(`/cwe-coverage${cid ? `?case=${encodeURIComponent(cid)}` : ""}`);
+      if (r.status === 404 && cid) return get(null);           // a deleted case: the matrix alone
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    };
+    get(caseId).then((d) => { if (!stop) { setM(d); setErr(null); } })
+      .catch((e) => { if (!stop) { setErr(String(e.message || e)); setM(null); } });
+    return () => { stop = true; };
+  }, [caseId]);
+  const cs = m && m.case;
+  const all = useMemo(() => {
+    if (!m) return [];
+    const here = new Map(((cs && cs.rows) || []).map((r) => [r.cwe, r]));
+    return (m.classes || []).map((r) => ({ ...r, here: here.get(r.cwe) || null }));
+  }, [m]);
+  if (m === undefined) return html`<section class="panel pad dim">Loading the weakness-class matrix…</section>`;
+  if (!m) return html`<section class="panel pad"><h2>Weakness classes</h2><div class="sy-warn">Could not read the class matrix: ${err}</div></section>`;
+  const known = new Set(all.map((r) => r.cwe));
+  const outside = ((cs && cs.rows) || []).filter((r) => !known.has(r.cwe));
+  const ql = q.trim().toLowerCase();
+  const rows = all.filter((r) => (!ql || r.cwe.toLowerCase().includes(ql) || String(r.name).toLowerCase().includes(ql)
+      || String(r.family || "").toLowerCase().includes(ql))
+    && (!method || r.method === method)
+    && (!ceil || (ceil === "none" ? !r.ceiling : r.ceiling === ceil))
+    && (!onlyHere || r.here));
+  rows.sort((a, b) => sort.dir * CWE_SORTS[sort.key](a, b));
+  const dist = {};
+  for (const r of all) { const k = r.ceiling || "none"; dist[k] = (dist[k] || 0) + 1; }
+  const nCli = all.filter((r) => !r.catalog_only).length;
+  const th = (key, label) => html`<button class=${"sy-th" + (sort.key === key ? " on" : "")} role="columnheader"
+      aria-sort=${sort.key === key ? (sort.dir > 0 ? "ascending" : "descending") : "none"}
+      onClick=${() => setSort((s) => ({ key, dir: s.key === key ? -s.dir : 1 }))}>${label}${sort.key === key ? (sort.dir > 0 ? " ▲" : " ▼") : ""}</button>`;
+  return html`
+    <section class="panel pad sy-cwe">
+      <div class="sy-h"><h2>Weakness classes</h2>
+        <span class="dim" style="font-size:12.5px">every CWE class — how lykos detects it, and the furthest rung it carries a sound exploit of it today (lykos cwe-coverage)</span></div>
+      <div class="sy-cwe-sum">
+        <span><b>${all.length}</b> classes${all.length !== nCli ? html`${" "}<span class="dim">(${nCli} named by the detectors, ${all.length - nCli} more covered by the function sweep)</span>` : null}</span>
+        ${Object.entries(CEIL).concat([["none", CEIL_NONE]]).filter(([k]) => dist[k]).map(([k, [label]]) => html`
+          <button class=${"sy-cwe-d c-" + k + (ceil === k ? " on" : "")} onClick=${() => setCeil(ceil === k ? "" : k)}
+            title=${ceil === k ? "show every ceiling" : `show only: ${label}`}><b>${dist[k]}</b>${" "}${label}</button>`)}
+      </div>
+      ${cs ? html`<div class="sy-cwe-case">On case${" "}<b>${cs.name || cs.id}</b>: ${cs.classes_present} ${cs.classes_present === 1 ? "class" : "classes"} found ·${" "}
+        ${cs.demonstrated_classes} carried to confirmed or PoC-backed ·${" "}${cs.l3_class_count} driven to a validated L3${(cs.l3_classes || []).length ? html`${" "}<span class="mono dim">(${cs.l3_classes.join(", ")})</span>` : null}</div>` : null}
+      <div class="dim sy-note">The ceiling is lykos's current reach for the class: below L3, or none, means the technique is not yet built — never a property of a target. L3 means the class's own validated impact: code execution, a validated disclosure, a demonstrated denial of service, or the logic weakness reached.</div>
+      <div class="sy-cwe-f">
+        <input type="text" placeholder="filter: CWE number, name, family" value=${q} onInput=${(e) => setQ(e.target.value)} aria-label="filter classes" />
+        <select value=${method} onChange=${(e) => setMethod(e.target.value)} aria-label="detection method">
+          <option value="">every detection method</option>
+          ${Object.entries(METHOD).map(([k, l]) => html`<option value=${k}>${l}</option>`)}</select>
+        <select value=${ceil} onChange=${(e) => setCeil(e.target.value)} aria-label="ceiling">
+          <option value="">every ceiling</option>
+          ${Object.entries(CEIL).concat([["none", CEIL_NONE]]).map(([k, [l]]) => html`<option value=${k}>${l}</option>`)}</select>
+        ${cs ? html`<label class="row-c" style="gap:6px;font-size:12.5px"><input type="checkbox" checked=${onlyHere} onChange=${(e) => setOnlyHere(e.target.checked)} /> only classes found on this case</label>` : null}
+        <span class="dim" style="font-size:12px;margin-left:auto">${rows.length} of ${all.length}</span>
+      </div>
+      <details class="sy-cwe-leg"><summary class="muted">How each detection method works</summary>
+        <dl class="sy-dl">${Object.entries(m.methods || {}).map(([k, v]) => html`<dt><span class=${"sy-mchip m-" + k}>${METHOD[k] || k}</span></dt><dd>${v}</dd>`)}</dl></details>
+      <div class=${"sy-cwe-t" + (cs ? " here" : "")} role="table" aria-label="weakness classes">
+        <div class="sy-cwe-r head" role="row">${th("cwe", "CWE")}${th("name", "Class")}${th("method", "Detection")}${th("ceiling", "Ceiling today")}${cs ? th("here", "Found here") : null}</div>
+        ${rows.map((r) => {
+          const [cl] = ceilOf(r);
+          return html`<div class=${"sy-cwe-r" + (r.here ? " hit" : "")} role="row">
+            <span class="mono sy-cwe-id">${r.cwe}</span>
+            <span class="sy-cwe-nm">${r.name}${r.family ? html`${" "}<span class="dim">· ${r.family}</span>` : null}</span>
+            <span class="sy-cwe-m">${r.method ? html`<span class=${"sy-mchip m-" + r.method} title=${r.method_label || ""}>${METHOD[r.method] || r.method}</span>` : html`<span class="dim">—</span>`}
+              ${r.severity ? html`<span class="dim">${r.severity} severity${r.detected === false ? " · excluded" : ""}</span>` : null}</span>
+            <span class="sy-cwe-c">
+              <span class="row-c" style="gap:6px;flex-wrap:wrap">${r.ceiling_level ? html`<span class=${"sy-rung r-" + r.ceiling_level}>${r.ceiling_level}</span>` : html`<span class="sy-rung r-none">—</span>`}
+                <span class=${"c-" + (r.ceiling || "none")}>${cl}</span></span>
+              <span class="dim">${r.ceiling_why}</span></span>
+            ${cs ? html`<span class="sy-cwe-h">${r.here ? html`<span><b>${r.here.count}</b>${" "}<span class="dim">${r.here.count === 1 ? "finding" : "findings"}</span></span>
+                <span class="row-c" style="gap:4px;flex-wrap:wrap"><span class=${"sy-st s-" + r.here.best_state}>${r.here.best_state}</span>
+                  ${r.here.best_level ? html`<span class=${"sy-rung r-" + r.here.best_level}>PoC ${r.here.best_level}</span>` : null}</span>`
+              : html`<span class="dim">—</span>`}</span>` : null}
+          </div>`;
+        })}
+        ${!rows.length ? html`<div class="dim" style="padding:12px 14px;font-size:12.5px">No class matches the filter.</div>` : null}
+      </div>
+      ${outside.length ? html`<div class="sy-note"><span class="dim">Also found on this case, outside the class catalog:</span>${" "}
+        ${outside.map((r) => html`<span class="chip" style="margin:2px 4px 0 0" title=${`${r.count} finding(s), best ${r.best_state}`}><span class="mono">${r.cwe}</span>${" "}${r.count}</span>`)}</div>` : null}
+    </section>`;
+}
+
 export function SystemScreen() {
   return html`
     <div style="display:flex;flex-direction:column;gap:2px">
       <h1>System</h1>
       <span class="muted" style="font-size:13px">What this machine can run, which lykos build is serving,
-        and the tool's own validation gates.</span>
+        the tool's own validation gates, and what it covers across every weakness class.</span>
     </div>
     <div class="sy-grid">
       <div class="sy-col"><${DoctorPanel} /></div>
       <div class="sy-col"><${BuildPanel} /><${SelftestPanel} /></div>
-    </div>`;
+    </div>
+    <${CweCoveragePanel} />`;
 }

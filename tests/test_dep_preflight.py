@@ -54,6 +54,39 @@ def test_parse_pc_requires():
     assert "glib-2.0" in s and "zlib" in s and "libssl" in s
 
 
+def test_parse_pc_empty_requires_does_not_read_the_next_line():
+    """An empty `Requires.private:` let the pattern run over the newline and read `Libs: -L...`
+    as modules "Libs", "L", "libdir" -- FreeRDP's generated .pc files filed all three missing."""
+    out = DP._parse_pc("Requires.private:\nLibs: -L${libdir} -lfoo\nRequires: zlib\n")
+    assert {n for _, n, _ in out} == {"zlib"}
+
+
+def test_parse_cmake_variable_references_are_not_dependency_names():
+    """`pkg_check_modules(${name} ${module})` is a helper macro's body: "module" is no package."""
+    out = DP._parse_cmake("pkg_check_modules(${name} ${module})\n"
+                          "pkg_check_modules(${p} libfoo>=1)\n"
+                          "find_library(${p}_LIBRARY NAMES bar)\nfind_package(${X})\n")
+    assert {(k, n) for k, n, _ in out} == {("pkg-config", "libfoo"), ("library", "bar")}
+
+
+def test_lykos_build_dirs_and_build_trees_are_not_scanned(tmp_path):
+    """A source tree lykos has built in carries generated .pc files (`_lykos_cmake_sh_asan/...`,
+    `_asan_forced/...`, any configured CMake build dir) naming the project's OWN outputs; those are
+    not dependencies to stage. And only TREE-relative segments skip: a store under /x/tests/ must
+    not skip the whole project."""
+    root = tmp_path / "tests" / "proj"
+    root.mkdir(parents=True)
+    (root / "CMakeLists.txt").write_text("project(p)\n")
+    (root / "p.pc").write_text("Requires: realdep\n")
+    for d in ("_lykos_cmake_sh_asan", "_asan_forced", "out"):
+        (root / d).mkdir()
+        (root / d / "self.pc").write_text("Requires: selfout3\n")
+    (root / "out" / "CMakeCache.txt").write_text("")
+    pf = DP.scan_dependencies(root, scan_includes=False)
+    names = {r["name"] for r in pf["requirements"]}
+    assert "realdep" in names and "selfout3" not in names
+
+
 def test_include_scan_only_flags_known_library_headers(tmp_path):
     (tmp_path / "a.c").write_text(
         '#include <stdio.h>\n#include <openssl/ssl.h>\n#include "local.h"\n'

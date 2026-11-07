@@ -548,3 +548,15 @@ def test_a_zip_bomb_upload_is_a_413(api, monkeypatch):
     code, body = _req(sock, "POST", f"/cases/{case['id']}/targets", buf.getvalue(),
                       {"Content-Type": "application/octet-stream", "X-Filename": "b.zip"})
     assert code == 413 and "refusing" in body["error"]
+
+
+def test_a_format_spec_override_reaches_only_the_fuzz_stage_and_is_validated():
+    """The GUI's format analyzer hands its spec to the next run as overrides.format; it must be a
+    non-empty JSON list (the /format/analyze shape) and reach the structure-aware fuzz stage."""
+    from lykos.analyze.orchestrate import _OVERRIDE_SCOPE
+    from lykos.api.autopilot import AutopilotMixin
+    spec = [{"type": "magic", "value": "GIF89a"}, {"type": "blob", "name": "rest"}]
+    assert AutopilotMixin._normalize_overrides({"format": spec})["format"] == spec
+    for bad in ("GIF", [], {"type": "u8"}, [{"type": "blob", "name": "x" * 70000}]):
+        assert "format" not in AutopilotMixin._normalize_overrides({"format": bad})
+    assert _OVERRIDE_SCOPE["format"] == frozenset({"fuzz"})

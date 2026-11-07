@@ -27,6 +27,10 @@ _CASE_EVENTS = re.compile(r"^/cases/([^/]+)/events$")
 _CASE_CONSOLE = re.compile(r"^/cases/([^/]+)/console$")
 _CASE_TARGETS = re.compile(r"^/cases/([^/]+)/targets$")
 _CASE_RUNS = re.compile(r"^/cases/([^/]+)/runs$")
+# Durable AUTOPILOT run history + comparison (api/run_history.py) -- not the stage runs above.
+_CASE_RUNS_HISTORY = re.compile(r"^/cases/([^/]+)/runs-history$")
+_AUTOPILOT_RUN_COMPARE = re.compile(r"^/autopilot-runs/compare$")
+_AUTOPILOT_RUN_ID = re.compile(r"^/autopilot-runs/([^/]+)$")
 _TARGET_FUNCS = re.compile(r"^/targets/([^/]+)/functions$")
 _FUNC_ID = re.compile(r"^/functions/([^/]+)$")
 _TARGET_CG = re.compile(r"^/targets/([^/]+)/callgraph$")
@@ -48,6 +52,8 @@ _TARGET_ADVICE = re.compile(r"^/targets/([^/]+)/advice$")
 _TARGET_SOURCE = re.compile(r"^/targets/([^/]+)/source$")
 _TARGET_SRCFILE = re.compile(r"^/targets/([^/]+)/source-file$")
 _TARGET_SRCTREE = re.compile(r"^/targets/([^/]+)/source-tree$")
+# `lykos deps` parity: the build-dependency pre-flight of the target's uploaded source tree.
+_TARGET_DEPS = re.compile(r"^/targets/([^/]+)/deps$")
 _CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
 _CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
 _CASE_SYSMAP = re.compile(r"^/cases/([^/]+)/systemmap$")
@@ -62,6 +68,9 @@ _CASE_RUN_SIGNALS = re.compile(r"^/cases/([^/]+)/run-signals$")
 _TARGET_CRASH_TRIAGE = re.compile(r"^/targets/([^/]+)/crash-triage$")
 _CASE_SEEDS = re.compile(r"^/cases/([^/]+)/seeds$")
 _CASE_SEED_ID = re.compile(r"^/cases/([^/]+)/seeds/([0-9a-fA-F]{64})$")
+# Uploaded target-library archives (the GUI's LYKOS_QEMU_SYSROOT) -- see api/sysroot.py.
+_CASE_SYSROOTS = re.compile(r"^/cases/([^/]+)/sysroots$")
+_CASE_SYSROOT_ID = re.compile(r"^/cases/([^/]+)/sysroots/([0-9a-fA-F]{64})$")
 
 # Assets the SPA loads after index.html: the vendored ESM runtime and the app modules. Only these
 # subtrees are served, and only plain web asset types -- nothing else under the package is

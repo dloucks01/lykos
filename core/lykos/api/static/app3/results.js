@@ -8,8 +8,9 @@
 //   GET /cases/{id}/coverage      the coverage ledger (checks run, weaponization, code exercised, CWEs)
 //   GET /cases/{id}/attempt-logs  per-attempt fuzz logs; GET /artifacts/{sha}/attempts pages one
 //   GET/POST/DELETE /cases/{id}/seeds   operator seed files (the CLI's --seed)
+//   GET/POST/DELETE /cases/{id}/sysroots   target-library archives (the CLI's LYKOS_QEMU_SYSROOT)
 // Exports: RunResults, RunOptions, buildRunSettings, DEFAULT_RUN_OPTIONS, loadRunOptions,
-//          saveRunOptions, SeedsField, AttemptLogModal.
+//          saveRunOptions, SeedsField, SysrootField, AttemptLogModal.
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api } from "../app/api.js";
@@ -565,6 +566,133 @@ export function SeedsField({ caseId, seeds, maxBytes, maxSeeds, onChanged, selec
   </div>`;
 }
 
+// ---- target libraries (sysroots) ----------------------------------------------------------------
+// The GUI's LYKOS_QEMU_SYSROOT without a server path: the operator uploads an ARCHIVE of the
+// target's lib dirs; the server extracts it once into the case (api/sysroot.py) and resolves the
+// chosen one by hash when the run starts (`overrides.sysroot_sha`). The choice is per case and
+// per browser (localStorage), so a quick start from the Engagement screen uses it too.
+const SYSROOT_KEY = (caseId) => `lykos.next.sysroot.${caseId}`;
+// The input-format spec chosen in Code -> Target -> "Describe the input format", per case: the
+// next analysis hands it to the structure-aware fuzzer as `overrides.format` (the CLI/classic
+// GUI's params.format). Stored per browser like the sysroot pick.
+const FMT_KEY = (caseId) => `lykos.next.fmtspec.${caseId}`;
+export function formatSpecFor(caseId) {
+  if (!caseId) return null;
+  try { const s = localStorage.getItem(FMT_KEY(caseId)); return s ? JSON.parse(s) : null; } catch (_e) { return null; }
+}
+export function setFormatSpec(caseId, spec) {
+  try {
+    if (spec) localStorage.setItem(FMT_KEY(caseId), JSON.stringify(spec));
+    else localStorage.removeItem(FMT_KEY(caseId));
+  } catch (_e) { /* storage off */ }
+  try { window.dispatchEvent(new CustomEvent("lykos:fmtspec-changed")); } catch (_e) { /* no window */ }
+}
+function FormatSpecNote({ caseId }) {
+  const [spec, setSp] = useState(() => formatSpecFor(caseId));
+  useEffect(() => {
+    const on = () => setSp(formatSpecFor(caseId));
+    on();
+    window.addEventListener("lykos:fmtspec-changed", on);
+    return () => window.removeEventListener("lykos:fmtspec-changed", on);
+  }, [caseId]);
+  if (!spec) return html`<span class="dim" style="font-size:12px">none — the fuzzer infers the format. Describe one in Code → Target → "Describe the input format".</span>`;
+  return html`<span style="font-size:12px">${spec.length}-field spec set for this case${" "}
+    <button class="xref" onClick=${() => setFormatSpec(caseId, null)}>clear</button></span>`;
+}
+export function sysrootPick(caseId) {
+  if (!caseId) return "";
+  try { return localStorage.getItem(SYSROOT_KEY(caseId)) || ""; } catch (_e) { return ""; }
+}
+function setSysrootPick(caseId, sha) {
+  try {
+    if (sha) localStorage.setItem(SYSROOT_KEY(caseId), sha);
+    else localStorage.removeItem(SYSROOT_KEY(caseId));
+  } catch (_e) { /* storage off: the pick lasts while the screen is open */ }
+}
+async function sysrootReq(method, path, file) {
+  const opts = { method };
+  if (file) {
+    opts.body = file;
+    // percent-encoded: a header value is Latin-1 only (api/endpoints.py x_filename)
+    opts.headers = { "Content-Type": "application/octet-stream",
+      "X-Filename": encodeURIComponent(file.name || "sysroot.tar"), "X-Filename-Encoding": "uri" };
+  }
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let d = null;
+  try { d = text ? JSON.parse(text) : null; } catch (_e) { d = { error: text }; }
+  if (!res.ok) throw new Error((d && (d.error || d.message)) || `${res.status} ${res.statusText}`);
+  return d;
+}
+function fmtBytes(n) {
+  n = +n || 0;
+  return n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MiB` : n >= 1024 ? `${Math.round(n / 1024)} KiB` : `${n} B`;
+}
+
+// SysrootField({ caseId, selected, onSelect }) -- list / upload / remove the case's sysroots and
+// pick the one this run uses ("" = none).
+export function SysrootField({ caseId, selected, onSelect }) {
+  const [info, setInfo] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const sel = useRef(selected); sel.current = selected;
+  const load = () => {
+    if (!caseId) return;
+    sysrootReq("GET", `/cases/${encodeURIComponent(caseId)}/sysroots`).then((r) => {
+      setInfo(r || { sysroots: [] });
+      const have = ((r && r.sysroots) || []).map((x) => x.sha256);
+      if (sel.current && !have.includes(sel.current)) onSelect && onSelect("");   // removed elsewhere
+    }).catch((e) => setInfo({ sysroots: [], error: String(e.message || e) }));
+  };
+  useEffect(() => { setInfo(null); load(); }, [caseId]);
+  const list = (info && info.sysroots) || [];
+  const add = async (file) => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await sysrootReq("POST", `/cases/${encodeURIComponent(caseId)}/sysroots`, file);
+      if (r && r.sha256 && onSelect) onSelect(r.sha256);     // uploading one means: use it
+    } catch (e) { setErr(`${file.name}: ${e.message || e}`); }
+    setBusy(false);
+    load();
+  };
+  const rm = async (sha) => {
+    setErr(null);
+    try { await sysrootReq("DELETE", `/cases/${encodeURIComponent(caseId)}/sysroots/${sha}`); }
+    catch (e) { setErr(`could not remove it: ${e.message || e}`); }
+    if (sha === sel.current && onSelect) onSelect("");
+    load();
+  };
+  return html`<div class="rs-seeds">
+    <div class="dim" style="font-size:12px">For a foreign-architecture or old-glibc binary ("symbol lookup error",
+      "fork server handshake failed", "Could not open '/lib/ld-…'"): upload a .tar / .tar.gz / .zip of the target's lib dirs
+      (or a firmware rootfs subset). It is extracted once into this case and used as the emulator's library root for the run
+      (the CLI's <span class="mono">LYKOS_QEMU_SYSROOT</span>)${info && info.max_bytes ? `; at most ${fmtBytes(info.max_bytes)} per archive` : ""}.</div>
+    ${info && info.error ? html`<div class="rs-amber" style="font-size:12px">Could not list the case's target libraries: ${info.error}</div>` : null}
+    <div class="rs-chips" role="radiogroup" aria-label="Target libraries for this run">
+      ${list.length ? html`<label class=${"rs-seed" + (!selected ? " on" : "")} style="padding-right:10px">
+        <input type="radio" name=${`sysroot-${caseId}`} checked=${!selected} onChange=${() => onSelect && onSelect("")} />
+        <span>none</span></label>` : null}
+      ${list.map((x) => html`<span class=${"rs-seed" + (selected === x.sha256 ? " on" : "")} key=${x.sha256}
+          title=${`${x.name} · ${fmtBytes(x.size)} archive · ${fmtI(x.files || 0)} files, ${fmtBytes(x.bytes)} extracted`
+            + `${x.lib_dirs && x.lib_dirs.length ? ` · lib dirs: ${x.lib_dirs.join(", ")}` : ""}${x.base ? ` · root: ${x.base}/` : ""}`
+            + `${x.skipped ? ` · ${x.skipped} unsafe or special entries skipped` : ""} · sha256 ${x.sha256}`}>
+        <input type="radio" name=${`sysroot-${caseId}`} checked=${selected === x.sha256} aria-label=${`use ${x.name}`}
+          onChange=${() => onSelect && onSelect(x.sha256)} />
+        <span class="mono">${x.name}</span>
+        <span class="dim">${fmtI(x.files || 0)} files</span>
+        ${x.loaders && x.loaders.length ? html`<span class="dim mono" title="dynamic loader found">${x.loaders[0]}</span>`
+          : html`<span class="rs-amber" title="no ld-*.so loader in its lib dirs: a dynamically linked guest cannot start from it">no loader</span>`}
+        <button class="rs-x" aria-label=${`remove ${x.name}`} onClick=${() => rm(x.sha256)}>✕</button></span>`)}
+      <label class=${"btn sm" + (busy ? " busy" : "")} style="display:inline-flex;align-items:center">
+        ${busy ? "uploading and extracting…" : "Upload libraries archive"}
+        <input type="file" hidden disabled=${busy || !caseId} accept=".tar,.tgz,.gz,.tar.gz,.xz,.txz,.tar.xz,.bz2,.tbz2,.tar.bz2,.zip"
+          onChange=${(e) => { const f = (e.target.files || [])[0]; e.target.value = ""; if (f) add(f); }} /></label>
+    </div>
+    ${info && !list.length ? html`<div class="dim" style="font-size:12px">None uploaded — the run uses the server's own (a host cross-sysroot, a loader staged beside the binary, or the server's <span class="mono">LYKOS_QEMU_SYSROOT</span>).</div>` : null}
+    ${err ? html`<div class="rs-amber" style="font-size:12px">${err}</div>` : null}
+  </div>`;
+}
+
 // ---- the panel set ----------------------------------------------------------------------------
 // RunResults({ caseId, running, ap?, targets?, onOpenStage?, onOpenFinding?, onFilterCwe?,
 //              onFocusTarget?, onShortlist? })
@@ -661,20 +789,24 @@ export const DEFAULT_RUN_OPTIONS = {
   deepSeed: false, invArgv: "", invMode: "auto",
   seedMode: "all",      // "all" = every seed in the case | "pick" = only `seeds`
   seeds: [],            // [sha256]; kept current by RunOptions while it is mounted
+  sysrootSha: "",       // the uploaded target-libraries archive for this run ("" = none); per case
 };
 
 // caseSeeds (optional, [{sha256}] from api.seeds) resolves "all" mode when RunOptions was never
-// mounted to resolve it.
-export function buildRunSettings(value, caseSeeds) {
+// mounted to resolve it. caseId (optional) reads that case's target-libraries pick.
+export function buildRunSettings(value, caseSeeds, caseId) {
   const v = { ...DEFAULT_RUN_OPTIONS, ...(value || {}) };
   const raw = v.seedMode !== "pick" && Array.isArray(caseSeeds) ? caseSeeds : (v.seeds || []);
   const seeds = raw.map((x) => (typeof x === "string" ? { sha256: x } : x)).filter((x) => x && x.sha256);
-  // No sysroot: a server directory is a CLI-only channel (the server drops it from a browser
-  // request); the host's LYKOS_QEMU_SYSROOT or a directory ingest supplies the target's libraries.
+  // Never a sysroot PATH (the server drops one from a browser): an uploaded archive, by hash.
   const st = operatorSettings({ invArgv: v.invArgv || "", invMode: v.invMode || "auto",
     deepSeed: !!v.deepSeed, seeds, blackBox: v.blackBox !== false, covFuzz: v.covFuzz !== false,
     dirFuzz: v.dirFuzz !== false, concolicOn: v.concolicOn !== false, libfuzzerOn: v.libfuzzerOn !== false });
   if (v.noFuzz) st.skipStages = [...new Set([...(st.skipStages || []), ...SAMPLER_STAGES])];
+  const sysroot = caseId ? sysrootPick(caseId) : v.sysrootSha;
+  if (sysroot) st.overrides = { ...(st.overrides || {}), sysroot_sha: sysroot };
+  const fmt = caseId ? formatSpecFor(caseId) : null;
+  if (Array.isArray(fmt) && fmt.length) st.overrides = { ...(st.overrides || {}), format: fmt };
   return st;
 }
 
@@ -683,8 +815,8 @@ export function buildRunSettings(value, caseSeeds) {
 export const SAMPLER_STAGES = ["fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz", "boundary_fuzz", "libfuzzer"];
 // Kept per browser: search / engine choices. NOT kept: the invocation (argv, input channel) --
 // it belongs to one target, and a remembered argv was silently sent for the next case's run --
-// nor the seed pick (per case), nor the retired server-path field.
-const NOT_KEPT = ["seeds", "seedMode", "invArgv", "invMode", "sysroot"];
+// nor the seed pick or target libraries (per case), nor the retired server-path field.
+const NOT_KEPT = ["seeds", "seedMode", "invArgv", "invMode", "sysroot", "sysrootSha"];
 
 const RUNOPTS_KEY = "lykos.next.runopts";
 // Per-browser convenience: the last options used. The seed choice is per case, so it is not kept.
@@ -753,6 +885,9 @@ export function RunOptions({ value, onChange, caseId, hideInvocation }) {
   };
   const off = ENGINES.filter(([k]) => v[k] === false);
   const noFuzz = !!v.noFuzz;
+  // the target-libraries pick lives per case (sysrootPick); v.sysrootSha mirrors it for render
+  useEffect(() => { if (caseId) set({ sysrootSha: sysrootPick(caseId) }); }, [caseId]);
+  const pickSysroot = (sha) => { if (caseId) setSysrootPick(caseId, sha); set({ sysrootSha: sha }); };
   return html`<div class="rs-opts">
     <fieldset class="rs-fs"><legend>Search</legend>
       <label class="rs-chk" title="Keep fuzzing until coverage stops growing; the budget becomes the safety ceiling instead of a fixed clock">
@@ -787,9 +922,9 @@ export function RunOptions({ value, onChange, caseId, hideInvocation }) {
             <option value="auto">auto</option><option value="stdin">stdin</option><option value="file">file (@@)</option>
             <option value="arg">first argument</option><option value="env">environment variable</option></select></label>
       </div>
-      <div class="dim" style="font-size:11.5px">For a binary built against another glibc ("symbol lookup error", "fork server handshake
-        failed"), upload its loader and .so files with it (a folder or archive) or start the server with${" "}
-        <span class="mono">LYKOS_QEMU_SYSROOT</span>; a server path is not taken from the browser.</div>
+      <div class="dim" style="font-size:11.5px">For a binary built against another glibc or for another architecture
+        ("symbol lookup error", "fork server handshake failed"), upload its loader and .so files under${" "}
+        <b>Target libraries</b>${caseId ? " below" : " (open a case)"}.</div>
     </fieldset>`}
     ${caseId ? html`<fieldset class="rs-fs"><legend>Seeds for this run</legend>
       ${seedList && seedList.error ? html`<div class="rs-amber" style="font-size:12px">Could not list the case's seeds: ${seedList.error}</div>` : null}
@@ -798,5 +933,9 @@ export function RunOptions({ value, onChange, caseId, hideInvocation }) {
       <${SeedsField} caseId=${caseId} seeds=${allSeeds} maxBytes=${seedList && seedList.max_bytes} maxSeeds=${seedList && seedList.max_seeds}
         selected=${chosen} onSelect=${pickSeed} />
     </fieldset>` : null}
+    ${caseId ? html`<fieldset class="rs-fs"><legend>Target libraries</legend>
+      <${SysrootField} caseId=${caseId} selected=${v.sysrootSha || ""} onSelect=${pickSysroot} />
+    </fieldset>` : null}
+    ${caseId ? html`<fieldset class="rs-fs"><legend>Input format</legend><${FormatSpecNote} caseId=${caseId} /></fieldset>` : null}
   </div>`;
 }

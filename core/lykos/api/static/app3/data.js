@@ -192,7 +192,7 @@ export async function startSettings(mod, opts, caseId) {
   try { const r = await api.seeds(caseId); seeds = Array.isArray(r) ? r : (r && (r.seeds || Object.values(r).find(Array.isArray))) || []; }
   catch (_e) { seeds = null; }
   if (mod.saveRunOptions) mod.saveRunOptions(opts);
-  const st = mod.buildRunSettings(opts, seeds);
+  const st = mod.buildRunSettings(opts, seeds, caseId);   // caseId: its target-libraries pick
   return [st.overrides || {}, !!(opts && opts.converge), st.skipStages || []];
 }
 

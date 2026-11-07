@@ -37,7 +37,8 @@ class AutopilotMixin:
         out.pop("seed_files", None)
         out.pop("seed_dir", None)
         # `sysroot` is a server directory too (it becomes QEMU_LD_PREFIX, set process-wide): the
-        # same CLI-only rule. On the server it comes from LYKOS_QEMU_SYSROOT / the CLI.
+        # same CLI-only rule. On the server it comes from LYKOS_QEMU_SYSROOT / the CLI; from the
+        # browser it is `sysroot_sha` (an archive uploaded into the case, api/sysroot.py).
         out.pop("sysroot", None)
         av = out.get("argv")
         if isinstance(av, str):
@@ -45,6 +46,13 @@ class AutopilotMixin:
                 out["argv"] = shlex.split(av)
             except ValueError:
                 out.pop("argv", None)                    # unbalanced quotes: ignore rather than 500
+        # a format spec is a JSON list of fields (POST /format/analyze's shape); anything else,
+        # or an oversized one, is dropped rather than handed to the fuzzer
+        fmt = out.get("format")
+        if fmt is not None:
+            import json as _json
+            if not isinstance(fmt, list) or not fmt or len(_json.dumps(fmt)) > 65536:
+                out.pop("format", None)
         im = out.get("input_mode")
         if im not in ("stdin", "arg", "file", "env", "none"):
             out.pop("input_mode", None)                  # "auto"/blank/garbage -> let discovery decide
@@ -72,6 +80,14 @@ class AutopilotMixin:
         seed_paths = None
         if _over.get("seed_shas"):
             seed_paths, err = self._resolve_seed_shas(cid, _over.get("seed_shas"))
+            if err:
+                return self._json({"error": err}, 400)
+        # Target libraries (the GUI's LYKOS_QEMU_SYSROOT): the hash of an archive uploaded into
+        # THIS case, resolved to its extracted directory here. A raw `sysroot` path from the
+        # browser is still dropped by _normalize_overrides; an unknown hash is refused.
+        sysroot_path = None
+        if _over.get("sysroot_sha"):
+            sysroot_path, err = self._resolve_sysroot_sha(cid, _over.get("sysroot_sha"))
             if err:
                 return self._json({"error": err}, 400)
         target_ids = body.get("target_ids")
@@ -112,6 +128,11 @@ class AutopilotMixin:
             if over:
                 over = self._normalize_overrides(over)
                 over.pop("seed_shas", None)
+                over.pop("sysroot_sha", None)
+            if sysroot_path:
+                over = dict(over or {})
+                over["sysroot"] = sysroot_path
+                status["sysroot_sha"] = str(_over.get("sysroot_sha")).lower()
             if seed_paths:
                 over = dict(over or {})
                 over["seed_files"] = seed_paths

@@ -5,6 +5,9 @@
   GET    /cases/<id>/seeds              operator seed files stored in the case
   POST   /cases/<id>/seeds              upload one seed (raw body + X-Filename, or multipart)
   DELETE /cases/<id>/seeds/<sha>        drop a seed from the case's seed set
+  GET    /cases/<id>/sysroots           uploaded target-library archives (api/sysroot.py)
+  POST   /cases/<id>/sysroots           upload a .tar/.tar.gz/.zip of the target's lib dirs
+  DELETE /cases/<id>/sysroots/<sha>     drop one (and its extracted directory)
   GET    /doctor                        engine readiness on this host (`lykos doctor`)
   GET    /version                       which build is serving (api/buildinfo.py)
 
@@ -18,6 +21,7 @@ the server's filesystem.
 from __future__ import annotations
 
 import logging
+import shutil
 import tempfile
 import threading
 import time
@@ -226,6 +230,106 @@ class OpsMixin:
                 return None, f"seed {sha[:12]} is missing from the case store"
             paths.append(str(p))
         return paths, None
+
+    # ---- target libraries (sysroots) -----------------------------------------------------
+    # The GUI's LYKOS_QEMU_SYSROOT: an uploaded archive of the target's lib dirs, extracted once
+    # into the case (api/sysroot.py) and resolved by hash at autopilot start (`sysroot_sha`).
+    def _get_sysroots(self, cid):
+        from . import sysroot as sr
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            return self._json({"sysroots": sr.case_sysroots(s.conn, cid),
+                               "max_bytes": sr.MAX_ARCHIVE_BYTES,
+                               "max_extracted_bytes": sr.MAX_EXTRACTED_BYTES,
+                               "max_sysroots": sr.MAX_CASE_SYSROOTS})
+        finally:
+            s.close()
+
+    def _upload_sysroot(self, cid):
+        from . import sysroot as sr
+        from .endpoints import _extract_upload, x_filename
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404, close=True)
+            current = sr.case_sysroots(s.conn, cid)
+            if len(current) >= sr.MAX_CASE_SYSROOTS:
+                return self._json({"error": f"a case holds at most {sr.MAX_CASE_SYSROOTS} "
+                                            "sysroots; remove one first"}, 400, close=True)
+            try:
+                parent = sr.staging_parent(self.server.case_dir, cid)
+            except sr.SysrootError as e:
+                return self._json({"error": str(e)}, 400, close=True)
+            # staged next to where it is extracted (not /tmp, often a small tmpfs)
+            with tempfile.TemporaryDirectory(prefix=".upload-", dir=parent) as td:
+                tdp = Path(td)
+                raw = tdp / "body.bin"
+                if not self._read_body_to_file(raw, sr.MAX_ARCHIVE_BYTES + _SEED_BODY_SLACK):
+                    return self._json({"error": "archive too large (max "
+                                                f"{sr.MAX_ARCHIVE_BYTES >> 20} MiB) or malformed body"},
+                                      413, close=True)
+                try:
+                    filename, path = _extract_upload(self.headers.get("Content-Type", ""), raw,
+                                                     tdp, x_filename(self.headers))
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400, close=True)
+                size = path.stat().st_size
+                if size == 0:
+                    return self._json({"error": "empty archive"}, 400)
+                if size > sr.MAX_ARCHIVE_BYTES:
+                    return self._json({"error": "archive too large (max "
+                                                f"{sr.MAX_ARCHIVE_BYTES >> 20} MiB)"}, 413)
+                sha = sr.sha256_file(path)
+                name = Path(filename or "sysroot.tar").name or "sysroot.tar"
+                name = "".join(ch for ch in name if ch.isprintable())[:120] or "sysroot.tar"
+                known = next((x for x in current if x["sha256"] == sha), None)
+                if known and sr.sysroot_dir(self.server.case_dir, cid, sha).is_dir():
+                    return self._json(known, 200)                # same archive: already extracted
+                try:
+                    info = sr.extract(path, sr.sysroot_dir(self.server.case_dir, cid, sha))
+                except sr.SysrootError as e:
+                    return self._json({"error": f"archive refused: {e}"}, 400)
+                art = s.put_artifact(cid, sr.SYSROOT_KIND, src=path, meta={"name": name})
+            rec = {"sha256": art.sha256, "name": name, "size": size, **info}
+            if not known:
+                s.events.append(sr.SYSROOT_EVENT, case_id=cid, payload={"action": "add", **rec})
+            return self._json(rec, 201)
+        finally:
+            s.close()
+
+    def _delete_sysroot(self, cid, sha):
+        from . import sysroot as sr
+        from .autopilot import AutopilotMixin
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            if not any(x["sha256"] == sha for x in sr.case_sysroots(s.conn, cid)):
+                return self._json({"error": "no such sysroot in this case"}, 404)
+            with AutopilotMixin._AUTOPILOTS_LOCK:
+                rec = AutopilotMixin._AUTOPILOTS.get(cid)
+                busy = bool(rec and rec["thread"].is_alive()
+                            and rec["status"].get("sysroot_sha") == sha)
+            if busy:
+                return self._json({"error": "the running analysis uses this sysroot; "
+                                            "stop it first"}, 409)
+            s.events.append(sr.SYSROOT_EVENT, case_id=cid,
+                            payload={"action": "remove", "sha256": sha})
+            shutil.rmtree(sr.sysroot_dir(self.server.case_dir, cid, sha), ignore_errors=True)
+            return self._json({"removed": sha})
+        finally:
+            s.close()
+
+    def _resolve_sysroot_sha(self, cid, sha):
+        """sysroot_sha from an autopilot request -> (extracted dir, None) or (None, error)."""
+        from . import sysroot as sr
+        s = self._store()
+        try:
+            return sr.resolve(self.server.case_dir, self.server.content, s.conn, cid, sha)
+        finally:
+            s.close()
 
     # ---- engine readiness (doctor) -------------------------------------------------------
     def _get_doctor(self, qs):

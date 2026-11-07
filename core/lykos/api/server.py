@@ -158,6 +158,9 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_REPORT,
     _CASE_RUN_SIGNALS,
     _CASE_RUNS,
+    _CASE_RUNS_HISTORY,
+    _AUTOPILOT_RUN_COMPARE,
+    _AUTOPILOT_RUN_ID,
     _CASE_SCORECARD,
     _CASE_SEED_ID,
     _CASE_SEEDS,
@@ -176,6 +179,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _TARGET_CAPS,
     _TARGET_CG,
     _TARGET_CRASH_TRIAGE,
+    _TARGET_DEPS,
     _TARGET_DYN,
     _TARGET_FIND,
     _TARGET_FUNCS,
@@ -190,6 +194,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _read_static,
     _read_ui,
 )
+from .routes import _CASE_SYSROOT_ID, _CASE_SYSROOTS  # uploaded target libraries (api/sysroot.py)
 
 _log = logging.getLogger(__name__)
 
@@ -442,6 +447,11 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._get_selftest()
             if path == "/selftest/history":
                 return self._get_selftest_history()
+            if path == "/cwe-coverage":         # `lykos cwe-coverage` parity (?case= overlay)
+                return self._get_cwe_coverage(qs)
+            m = _TARGET_DEPS.match(path)
+            if m:
+                return self._get_target_deps(m.group(1), qs)
             m = _CASE_RUN_SIGNALS.match(path)
             if m:
                 return self._get_run_signals(m.group(1))
@@ -451,6 +461,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_SEEDS.match(path)
             if m:
                 return self._get_seeds(m.group(1))
+            m = _CASE_SYSROOTS.match(path)
+            if m:
+                return self._get_sysroots(m.group(1))
             if path == "/cases":
                 s = self._store()
                 try:
@@ -469,6 +482,18 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                     return self._json([_target(t) for t in s.targets.list_by_case(m.group(1))])
                 finally:
                     s.close()
+            # Durable autopilot run history + compare (api/run_history.py): read-only.
+            m = _CASE_RUNS_HISTORY.match(path)
+            if m:
+                from . import run_history as _rh
+                return _rh.get_runs_history(self, m.group(1))
+            if _AUTOPILOT_RUN_COMPARE.match(path):
+                from . import run_history as _rh
+                return _rh.compare_autopilot_runs(self, qs)
+            m = _AUTOPILOT_RUN_ID.match(path)
+            if m:
+                from . import run_history as _rh
+                return _rh.get_autopilot_run(self, m.group(1))
             m = _CASE_RUNS.match(path)
             if m:
                 s = self._store()
@@ -708,6 +733,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_SEEDS.match(path)
             if m:
                 return self._upload_seed(m.group(1))
+            m = _CASE_SYSROOTS.match(path)
+            if m:
+                return self._upload_sysroot(m.group(1))
             if path == "/runs":
                 return self._create_run()
             if path == "/selftest":
@@ -765,6 +793,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_SEED_ID.match(path)
             if m:
                 return self._delete_seed(m.group(1), m.group(2).lower())
+            m = _CASE_SYSROOT_ID.match(path)
+            if m:
+                return self._delete_sysroot(m.group(1), m.group(2).lower())
             self._json({"error": "not found"}, 404, close=True)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)
@@ -860,9 +891,12 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             finally:
                 st.close()
 
+        # `stdin=pipe` = exact bytes + a real EOF (binary protocols); default = the terminal.
+        stdin_mode = (qs.get("stdin") or ["pty"])[0]
         try:
             console.serve(self.connection, exe, argv=argv, arch=arch, endianness=endianness,
-                          bits=bits, cwd=str(workdir), put_seed=put_seed)
+                          bits=bits, cwd=str(workdir), put_seed=put_seed,
+                          stdin_mode=stdin_mode if stdin_mode in console.STDIN_MODES else "pty")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 

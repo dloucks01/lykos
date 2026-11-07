@@ -483,6 +483,9 @@ _OVERRIDE_SCOPE: dict = {
     "input_mode": None,
     "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
     "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
+    # an operator's input-format spec (the GUI's format analyzer): the structure-aware mutator
+    # of the black-box fuzz stage reads it as params["format"]
+    "format": frozenset({"fuzz"}),
     "sessions": frozenset({"net_fuzz"}),                 # cross-run corpus for the session engine
     "seeds": frozenset({"net_fuzz"}),
 }
@@ -2221,9 +2224,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         _env_set("LYKOS_QEMU_SYSROOT", str(_ov["sysroot"]))
     if _ov.get("deep_seed"):
         _env_set("LYKOS_BUFFER_SEED", "1")
+    from . import run_history as _run_history     # durable run record (start here, end in finally)
+    _run_rec = None
     try:
         status.update({"state": "running", "targets": len(target_ids), "started": time.time(),
                         "converge": bool(converge)})
+        _run_rec = _run_history.record_start(store, case_id, target_ids, status, overrides=_ov,
+                                             budget_seconds=budget_seconds, converge=converge,
+                                             skip_stages=skip_stages)
         # Worklist, not a fixed loop: a firmware image is a CONTAINER whose embedded binaries are
         # discovered mid-run (firmware_carve registers them as sub-targets). Those get appended and
         # analysed in the same pass.
@@ -3244,5 +3252,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         except Exception:
             observe.absorbed(_log, "continuing")
     finally:
+        _run_history.record_end(store, case_id, _run_rec, status)   # done / stopped / error
         _env_restore()
         store.close()

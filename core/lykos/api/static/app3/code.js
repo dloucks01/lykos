@@ -15,6 +15,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html } from "../app2/html.js";
 import { api, waitForRun } from "../app/api.js";
 import { getJSON, hexToInt, isNoise } from "./data.js";
+import { setFormatSpec } from "./results.js";
 
 const asList = (r) => (Array.isArray(r) ? r : (r && Object.values(r).find(Array.isArray)) || []);
 const parseMaybe = (v) => {
@@ -1358,9 +1359,211 @@ function TargetView({ target, caseId, nFuncs }) {
           <span class="mono">${s.size != null ? s.size.toLocaleString() : ""}</span>
           <span class="mono">${s.entropy != null ? s.entropy : "—"}${s.entropy != null ? html`<i class="cx-ebar" style=${`width:${Math.round(s.entropy / 8 * 60)}px`}></i>` : null}</span></div>`)}
       </div></section>` : null}
+    <${DepsPanel} tid=${tid} />
     <${AdvicePanel} advice=${advice} />
     <${InvocationHelper} tid=${tid} advice=${advice} />
+    <${FormatPanel} />
     <${CapabilitiesPanel} caps=${caps} />`;
+}
+
+// ── Build dependencies (GET /targets/{id}/deps = `lykos deps`) ───────────────────────────────
+// Shown only for a target with an uploaded source tree. Presence is THIS server host's answer
+// (its compiler / pkg-config / ldconfig); a declared dependency may be optional for the build.
+const DEP_KIND = [["header", "Headers"], ["library", "Libraries (-l)"], ["pkg-config", "pkg-config modules"],
+  ["cmake-package", "CMake packages"]];
+const DEPS_CACHE = new Map();
+function DepsPanel({ tid }) {
+  const [scan, setScan] = useState(true);
+  const [d, setD] = useState(undefined);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    if (!tid) return undefined;
+    let stop = false;
+    const key = `${tid}\0${scan ? 1 : 0}`;
+    setErr(null);
+    if (DEPS_CACHE.has(key)) { setD(DEPS_CACHE.get(key)); return undefined; }
+    setD(undefined);
+    fetchJSON(`/targets/${tid}/deps${scan ? "" : "?include_scan=0"}`).then((r) => {
+      if (stop) return;
+      if (!r.ok) { setErr((r.body && r.body.error) || `HTTP ${r.status}`); setD(null); return; }
+      DEPS_CACHE.set(key, r.body);
+      setD(r.body);
+    }).catch((e) => { if (!stop) { setErr(errText(e)); setD(null); } });
+    return () => { stop = true; };
+  }, [tid, scan]);
+  if (d && d.source === false) return null;                 // a binary target: nothing to pre-flight
+  if (d === undefined) return html`<section class="panel pad dim">Checking the source tree's build dependencies…</section>`;
+  if (!d) return html`<section class="panel pad"><h2>Build dependencies</h2><div class="cx-note warn">The pre-flight could not run: ${err}</div></section>`;
+  const s = d.summary || {};
+  const tc = d.toolchain || {};
+  const stage = d.stage || {};
+  const miss = d.missing || [];
+  const unk = d.unknown || [];
+  const present = (d.requirements || []).filter((r) => r.present === true);
+  const allOk = !miss.length && !(d.toolchain_missing || []).length;
+  return html`<section class="panel pad cx-dp" style="display:flex;flex-direction:column;gap:12px">
+    <div class="row-c" style="flex-wrap:wrap"><h2>Build dependencies</h2>
+      <span class="dim" style="font-size:12.5px">what the project declares it needs vs what this lykos server host has — stage the gaps before the box goes offline (lykos deps)</span></div>
+    <div class="row-c" style="flex-wrap:wrap;gap:8px">
+      <span class="chip">${d.build_system || "unknown"} build</span>
+      ${d.project_root && d.project_root !== "." ? html`<span class="dim" style="font-size:12px">project at${" "}<span class="mono">${d.project_root}/</span></span>` : null}
+      <label class="row-c" style="gap:6px;font-size:12.5px;margin-left:auto" title="the CLI's --no-include-scan when unticked">
+        <input type="checkbox" checked=${scan} onChange=${(e) => setScan(e.target.checked)} /> also scan #include lines</label>
+    </div>
+    <div class="cx-dp-kpis">
+      <div class="cx-dp-kpi"><b>${s.declared ?? 0}</b><span>declared</span></div>
+      <div class="cx-dp-kpi ok"><b>${s.present ?? 0}</b><span>present here</span></div>
+      <div class=${"cx-dp-kpi" + (s.missing ? " miss" : "")}><b>${s.missing ?? 0}</b><span>missing</span></div>
+      <div class="cx-dp-kpi unk"><b>${s.unknown ?? 0}</b><span>cannot check here</span></div>
+      <div class=${"cx-dp-kpi" + (s.toolchain_missing ? " miss" : "")}><b>${s.toolchain_missing ?? 0}</b><span>build tools missing</span></div>
+    </div>
+    <div><div class="cx-lbl">TOOLCHAIN</div>
+      <div class="row-c" style="flex-wrap:wrap;gap:6px">${Object.entries(tc).map(([k, v]) => html`<span class=${"chip cx-dp-tool" + (v ? " on" : " cx-amb")}
+        title=${v ? "present on this host" : "missing on this host"}>${v ? "✓" : "✕"}${" "}<span class="mono">${k}</span></span>`)}</div></div>
+    ${allOk ? html`<div class="cx-verdict ok"><b>Nothing to stage.</b> Every declared dependency this host can check is present, and the toolchain is complete.</div>` : null}
+    ${stage.apt || stage.dnf ? html`<div class="cx-dp-stage">
+      <div class="cx-lbl">STAGE THESE BEFORE GOING OFFLINE</div>
+      ${[["apt (Debian / Ubuntu)", stage.apt], ["dnf (Fedora / RHEL)", stage.dnf], ["download the .debs to carry over", stage.apt_download]]
+        .filter(([, c]) => c).map(([l, c]) => html`<div class="cx-dp-cmd"><span class="dim">${l}</span>
+          <div class="row-c" style="gap:8px;min-width:0"><code class="mono">${c}</code><${Copy} text=${c} what=${l + " command"} /></div></div>`)}
+      ${(stage.no_package_hint || []).length ? html`<div class="dim" style="font-size:12px">These lines cover the ${miss.length - stage.no_package_hint.length} missing
+        ${" "}${miss.length - stage.no_package_hint.length === 1 ? "dependency" : "dependencies"} with a known package; ${stage.no_package_hint.length} more have no package mapped (listed below) — find their providers by hand.</div>` : null}
+    </div>` : (stage.no_package_hint || []).length ? html`<div class="cx-note warn">No missing dependency maps to a known package — find the providers of the ${stage.no_package_hint.length} listed below by hand.</div>` : null}
+    ${miss.length ? html`<div><div class="cx-lbl">MISSING ON THIS HOST — ${miss.length}</div>
+      <div class="dim" style="font-size:12px;margin-bottom:6px">A declared dependency can be optional for the build (a CMake option); missing means this host cannot satisfy it, not that the build must fail.</div>
+      ${DEP_KIND.map(([k, label]) => {
+        const rows = miss.filter((r) => r.kind === k);
+        return rows.length ? html`<div class="cx-dp-grp"><div class="cx-dp-gh">${label}</div>
+          ${rows.map((r) => html`<div class="cx-dp-row"><span class="cx-dp-x" aria-label="missing">✕</span>
+            <span class="mono cx-dp-nm">${r.name}</span>
+            ${r.hint ? html`<span class="cx-dp-pk"><span class="dim">apt</span>${" "}<span class="mono">${r.hint.apt}</span>${" "}<span class="dim">· dnf</span>${" "}<span class="mono">${r.hint.dnf}</span></span>`
+              : html`<span class="dim cx-dp-pk">no package mapped — find its provider by hand</span>`}</div>`)}</div>` : null;
+      })}</div>` : null}
+    ${unk.length ? html`<details><summary class="muted" style="cursor:pointer;font-size:12.5px">${unk.length} declared ${unk.length === 1 ? "dependency" : "dependencies"} this host cannot confirm${" "}<span class="dim">— check by hand</span></summary>
+      <div class="cx-dp-grp">${unk.map((r) => html`<div class="cx-dp-row"><span class="cx-dp-x unk" aria-label="unknown">?</span>
+        <span class="mono cx-dp-nm">${r.name}</span><span class="dim cx-dp-pk">${r.detail}</span></div>`)}</div></details>` : null}
+    ${present.length ? html`<details><summary class="muted" style="cursor:pointer;font-size:12.5px">${present.length} present on this host</summary>
+      <div class="row-c" style="flex-wrap:wrap;gap:6px;margin-top:6px">${present.map((r) => html`<code class="chip" title=${r.detail || r.kind}>${r.name}</code>`)}</div></details>` : null}
+  </section>`;
+}
+
+// ── Describe the input format (POST /format/analyze) ─────────────────────────────────────────
+// The fuzzer's own format model: with only a sample it detects the format (a built-in grammar) or
+// hunts a length field; with a spec it shows how that spec carves the sample. Nothing is stored.
+const FMT_MAX = 65536;          // the server previews the first 64 KiB
+function bytesToB64(u8) {
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function FormatPanel() {
+  const [sample, setSample] = useState(null);     // {name, size, b64, truncated}
+  const [paste, setPaste] = useState("");
+  const [spec, setSpec] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [sug, setSug] = useState(null);
+  const [pv, setPv] = useState(null);
+  const [err, setErr] = useState(null);
+  const [used, setUsed] = useState(false);
+  const pick = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    try {
+      const buf = new Uint8Array(await f.slice(0, FMT_MAX).arrayBuffer());
+      setSample({ name: f.name, size: f.size, b64: bytesToB64(buf), truncated: f.size > FMT_MAX });
+      setSug(null); setPv(null); setErr(null);
+    } catch (x) { setErr(`could not read the file: ${errText(x)}`); }
+  };
+  const sampleB64 = () => (sample ? sample.b64 : paste ? b64utf8(paste.slice(0, FMT_MAX)) : "");
+  const post = async (body) => {
+    const r = await fetch("/format/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    let j = null;
+    try { j = await r.json(); } catch (_e) { j = null; }
+    if (!r.ok) throw new Error((j && j.error) || `HTTP ${r.status}`);
+    return j || {};
+  };
+  const go = async () => {
+    const b64 = sampleB64();
+    if (!b64) { setErr("Choose a sample file or paste a sample first."); return; }
+    let useSpec = null;
+    if (spec.trim()) {
+      try { useSpec = JSON.parse(spec); } catch (x) { setErr(`The spec is not valid JSON: ${errText(x)}`); return; }
+    }
+    setBusy(true); setErr(null); setPv(null);
+    try {
+      if (!useSpec) {
+        const s = (await post({ sample_b64: b64 })).suggestion || null;
+        setSug(s);
+        useSpec = s && s.spec && s.spec.length ? s.spec : null;
+        if (useSpec) setSpec(JSON.stringify(useSpec, null, 2));
+      }
+      if (useSpec) setPv((await post({ sample_b64: b64, spec: useSpec })).preview || null);
+    } catch (x) { setErr(errText(x)); }
+    setBusy(false);
+  };
+  const fields = (pv && pv.fields) || [];
+  return html`<section class="panel pad" style="display:flex;flex-direction:column;gap:10px">
+    <div class="row-c" style="flex-wrap:wrap"><h2>Describe the input format</h2>
+      <span class="dim" style="font-size:12.5px">give lykos a sample input: it names the format (or finds a length field) and shows how the fuzzer's model carves the bytes</span></div>
+    <div class="row-c" style="flex-wrap:wrap;gap:10px;align-items:flex-end">
+      <label class="field" style="flex:1 1 240px">sample file <span class="dim">(read in the browser; the first 64 KiB are analysed)</span>
+        <input type="file" onChange=${pick} /></label>
+      ${sample ? html`<span class="dim" style="font-size:12px"><span class="mono">${sample.name}</span> · ${fmtBytes(sample.size)}${sample.truncated ? " — first 64 KiB used" : ""}
+        ${" "}<button class="xref" onClick=${() => { setSample(null); setSug(null); setPv(null); }}>clear</button></span>` : null}
+    </div>
+    ${sample ? null : html`<label class="field">or paste a sample as text
+      <textarea class="cx-ta mono" rows="2" value=${paste} onInput=${(e) => setPaste(e.target.value)} placeholder="e.g. a config line, a request, a header"></textarea></label>`}
+    <label class="field">spec <span class="dim">(optional JSON: a list of fields — magic / u8…u64 / blob / group / array; blank = let lykos propose one)</span>
+      <textarea class="cx-ta mono" rows=${spec ? 6 : 2} value=${spec} onInput=${(e) => setSpec(e.target.value)}
+        placeholder='[{"type":"magic","value":"ABCD"},{"type":"u32","endian":"little","name":"len","length_of":"data"},{"type":"blob","name":"data"}]'></textarea></label>
+    <div class="row-c" style="flex-wrap:wrap">
+      <button class="btn primary sm" disabled=${busy} onClick=${go}>${busy ? "Analysing…" : spec.trim() ? "Carve the sample with this spec" : "Analyse the sample"}</button>
+      ${spec.trim() ? html`<button class="btn sm" disabled=${busy} onClick=${() => { setSpec(""); setPv(null); setSug(null); }}>Clear spec</button>` : null}
+      ${spec.trim() ? html`<${Copy} text=${spec} label="copy spec" what="format spec JSON" />` : null}
+      ${spec.trim() ? html`<button class="btn sm" title="the next analysis of this case fuzzes with this structure"
+        onClick=${() => { try { const j = JSON.parse(spec); const cid = new URLSearchParams(location.hash.slice(1)).get("case");
+          if (Array.isArray(j) && j.length && cid) { setFormatSpec(cid, j); setErr(null); setUsed(true); } else setErr("the spec must be a non-empty JSON list of fields"); }
+          catch (e) { setErr("spec is not valid JSON: " + e.message); } }}>${used ? "Used for the next analysis ✓" : "Use for the next analysis"}</button>` : null}
+    </div>
+    ${err ? html`<div class="cx-note warn">${err}</div>` : null}
+    ${sug ? html`<div class="cx-fm-sug">
+      <div class="row-c" style="flex-wrap:wrap;gap:8px"><b>${sug.detected ? `Detected: ${sug.detected}` : "No known format detected"}</b>
+        ${sug.builtin ? html`<span class="chip on">built-in model: ${sug.builtin}</span>` : html`<span class="chip">derived from the bytes</span>`}
+        <span class="dim" style="font-size:12px">${fmtBytes(sug.sample_size || 0)} analysed</span></div>
+      ${(sug.notes || []).map((n) => html`<div class="muted" style="font-size:12.5px">${n}</div>`)}
+    </div>` : null}
+    ${pv ? html`<div class="cx-fm-pv">
+      ${pv.error ? html`<div class="cx-note warn">The spec does not parse this sample: ${pv.error}</div>` : null}
+      ${fields.length ? html`<div class="cx-table" role="table">
+        <div class="cx-tr cx-fm-tr head" role="row"><span>offset</span><span>size</span><span>type</span><span>name</span><span>value</span></div>
+        ${fields.map((f) => html`<div class="cx-tr cx-fm-tr" role="row">
+          <span class="mono">${f.offset}</span><span class="mono">${f.type === "group" || f.type === "array" ? `(${f.span || 0})` : f.size}</span>
+          <span class="mono">${f.type}</span>
+          <span class="mono" style=${`padding-left:${Math.min(6, Number(f.depth) || 0) * 12}px`}>${f.name || ""}</span>
+          <span class="cx-fm-val">${fmtFieldVal(f)}</span></div>`)}
+      </div>` : html`<div class="dim">The spec carved no fields from this sample.</div>`}
+      <div class="row-c" style="flex-wrap:wrap;gap:6px;margin-top:8px">
+        <span class=${"chip" + (pv.roundtrip ? " on" : " cx-amb")}>${pv.roundtrip ? "✓ re-serializes byte-identical" : "✕ does not re-serialize identically"}</span>
+        <span class=${"chip" + (pv.consumed === pv.sample_size ? " on" : " cx-amb")}>${pv.consumed === pv.sample_size ? `covers all ${pv.sample_size} bytes` : `carves ${pv.consumed} of ${pv.sample_size} bytes`}</span>
+        ${fields.some((f) => f.length_of != null) ? null : html`<span class="dim" style="font-size:12px">tip: mark an integer as the length of a blob — the fuzzer keeps them coherent, and growing one past the other is the overflow trigger</span>`}
+      </div>
+    </div>` : null}
+    <div class="dim" style="font-size:12px">This is an analysis only: nothing is stored. A campaign picks a built-in model on its own when the format is detected.</div>
+  </section>`;
+}
+function fmtFieldVal(f) {
+  if (f.type === "magic") {
+    return html`<span class="mono">"${(f.value && f.value.ascii) || ""}"</span>${" "}<span class="dim mono">${(f.value && f.value.hex) || ""}</span>${" "}
+      <span class=${"chip" + (f.match ? " on" : " cx-amb")}>${f.match ? "magic ✓" : "magic ✕"}</span>`;
+  }
+  if (f.type === "group") return html`<span class="dim">group spanning ${Number(f.span) || 0} bytes</span>`;
+  if (f.type === "array") return html`<span class="dim">${plural(Number(f.records) || 0, "record")}, ${Number(f.span) || 0} bytes</span>`;
+  if (f.type === "shadow") return html`<span class="dim">not in the file · ${(f.value && f.value.ascii) || ""}</span>`;
+  if (f.type === "blob") {
+    return html`<span class="mono">${(f.value && f.value.ascii) || ""}${f.value && f.value.truncated ? "…" : ""}</span>${" "}<span class="dim mono">${(f.value && f.value.hex) || ""}</span>`;
+  }
+  return html`<span class="mono">= ${f.int}</span>${" "}<span class="dim">(${f.endian || ""})</span>
+    ${f.length_of != null ? html`${" "}<span class=${"chip" + (f.length_match ? " on" : " cx-amb")}>${f.length_match ? `length ✓ matches ${f.length_of}` : f.length_match === false ? `length ✕ ≠ ${f.length_of}` : `length of ${f.length_of}`}</span>` : null}`;
 }
 
 
