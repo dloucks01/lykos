@@ -36,6 +36,84 @@ def test_vclass_maps_every_primitive_cwe():
     assert chain._VCLASS["CWE-416"] == "uaf"
     assert chain._VCLASS["CWE-122"] == "heap_overflow"
     assert chain._VCLASS["CWE-129"] == "oob_write"
+    # TTP wiring: an integer overflow that undersizes an allocation is a heap overflow by its
+    # arithmetic, and an invalid / mismatched free seeds the same forward-pointer poison a
+    # double-free does -- both route into branches that already reach L3.
+    assert chain._VCLASS["CWE-190"] == "heap_overflow"
+    assert chain._VCLASS["CWE-590"] == "double_free"
+    assert chain._VCLASS["CWE-762"] == "double_free"
+    assert chain._VCLASS["CWE-761"] == "double_free"      # free of a non-start pointer
+    # an out-of-range pointer offset is a write-what-where -> route through the oob_write branch
+    assert chain._VCLASS["CWE-823"] == "oob_write"
+    assert "CWE-823" in chain._CHAINABLE_CWE
+    # a negative size parameter wraps to an undersized/over-long alloc -> the heap-overflow engine
+    assert chain._VCLASS["CWE-1284"] == "heap_overflow"
+    assert "CWE-1284" in chain._CHAINABLE_CWE
+
+
+# --- lead admission: a NAMED primitive is chained on its CWE, not only its detector ----------------
+import types as _types  # noqa: E402
+from collections import namedtuple as _nt  # noqa: E402
+
+_F = _nt("_F", "cwe detector confidence")
+
+
+def _patch_findings(monkeypatch, rows):
+    """Make chain_primitive's locally-imported FindingDAO return `rows` for any target."""
+    import lykos.db.dao as dao
+
+    class _FakeDAO:
+        def __init__(self, conn):
+            pass
+
+        def list_by_target(self, _tid):
+            return list(rows)
+
+    monkeypatch.setattr(dao, "FindingDAO", _FakeDAO)
+
+
+def test_lead_finding_admits_int_overflow_alloc_by_cwe(monkeypatch):
+    # int_overflow_alloc is NOT a dynamic lead detector, but a CWE-190 undersized-allocation finding
+    # names the heap overflow the wrap creates -- it must be admitted so the chain can finish it.
+    _patch_findings(monkeypatch, [_F("CWE-190", "int_overflow_alloc", 0.35)])
+    lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+    assert lead is not None and lead.cwe == "CWE-190"
+    # the source detector counts too
+    _patch_findings(monkeypatch, [_F("CWE-190", "int_overflow", 0.6)])
+    assert chain._lead_finding(object(), _types.SimpleNamespace(id=1)).cwe == "CWE-190"
+
+
+def test_lead_finding_admits_invalid_free_by_cwe(monkeypatch):
+    # CWE-590/762 come from heap_monitor / memoracle / the sanitizer root-cause -- none of them a
+    # dynamic lead detector -- yet each names a bad-free primitive the double_free branch can chain.
+    for det, cwe in (("heap_monitor", "CWE-590"), ("memoracle", "CWE-590"), ("rootcause", "CWE-762")):
+        _patch_findings(monkeypatch, [_F(cwe, det, 0.9)])
+        lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+        assert lead is not None and lead.cwe == cwe, (det, cwe)
+
+
+def test_lead_finding_dynamic_still_outranks_a_static_candidate(monkeypatch):
+    # A traced double-free (heap_trace, high confidence) is a fact about THIS run and must outrank a
+    # static CWE-190 candidate -- admitting the new classes never demotes the dynamic lead.
+    _patch_findings(monkeypatch, [_F("CWE-190", "int_overflow_alloc", 0.35),
+                                  _F("CWE-415", "heap_trace", 0.9)])
+    lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+    assert lead.cwe == "CWE-415" and lead.detector == "heap_trace"
+
+
+def test_lead_finding_admits_a_pointer_offset_overflow(monkeypatch):
+    # CWE-823 (UBSan pointer-overflow) names a write-what-where primitive; it must be admitted even
+    # though its only detector (rootcause) is not a dynamic lead detector.
+    _patch_findings(monkeypatch, [_F("CWE-823", "rootcause", 0.5)])
+    lead = chain._lead_finding(object(), _types.SimpleNamespace(id=1))
+    assert lead is not None and lead.cwe == "CWE-823"
+
+
+def test_lead_finding_excludes_recipe_rows_and_unknown_classes(monkeypatch):
+    # a recipe row this stage filed itself is never re-consumed; an unmapped class is not a lead.
+    _patch_findings(monkeypatch, [_F("CWE-190", "chain_primitive", 0.9),
+                                  _F("CWE-200", "leak", 0.9)])
+    assert chain._lead_finding(object(), _types.SimpleNamespace(id=1)) is None
 
 
 def test_recipe_control_flow_when_win_reachable():
@@ -159,6 +237,100 @@ def test_pie_leak_chain_declines_the_patched_target(pie_heapsafe_bin):
                                     opts=["1", "2", "3", "4", "5"], model={"2": ["str"]},
                                     width=None, workdir=wd)
         assert hit is None, f"patched target wrongly confirmed a hijack: {hit}"
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def _pie_steered_src(copy_len: str) -> str:
+    """A menu-driven PIE target with NO bare pointer-printing leak option -- the only disclosure is a
+    STEERED out-of-bounds read (option 3 prints arr[i] for any i; arr is adjacent to a global table
+    of function pointers, so an OOB index discloses an image pointer). So `_pie_leak_chain`'s bare
+    leak finds nothing and only the in-process steered-read relocate (`_pie_leak_write_chain`) can
+    reach the win. Parameterised by the edit's copy length for a byte-identical negative control."""
+    return (r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ puts("FLAG{pie-steered-chain}"); fflush(stdout); _exit(42); }
+void hello(void){ puts("hi"); }
+long arr[8] = {1,2,3,4,5,6,7,8};
+void (*cbs[3])(void) = {hello, hello, hello};   /* image pointers adjacent to arr: the OOB-read leak */
+struct obj { char buf[32]; void (*fn)(void); };
+static struct obj *o;
+/* LINE-based scalar read (one line per call) so the option and a following index do not collide in
+   one greedy read; the edit's overflow bytes are a separate raw read. */
+static long num(void){ char b[32]; int n=0; char ch;
+  while(n<31 && read(0,&ch,1)==1 && ch!='\n') b[n++]=ch; b[n]=0; return strtol(b,0,0); }
+int main(void){
+  setvbuf(stdout,0,_IONBF,0);
+  o=malloc(sizeof *o); o->fn=hello;
+  for(;;){
+    switch(num()){
+      case 1: o=malloc(sizeof *o); o->fn=hello; break;
+      case 2: { char b[64]; int k=read(0,b,64); if(k<0)k=0; memcpy(o->buf,b,""" + copy_len + r"""); } break;
+      case 3: { long i=num(); printf("%ld\n", arr[i]); } break;   /* STEERED OOB read -- no bare leak */
+      case 4: o->fn(); break;
+      case 5: return 0;
+    }
+  }
+}
+""")
+
+
+_PIE_STEERED = _pie_steered_src("k")
+_PIE_STEERED_SAFE = _pie_steered_src("k>(int)sizeof o->buf?(int)sizeof o->buf:k")
+
+
+@pytest.fixture
+def pie_steered_bin(tmp_path_factory):
+    return _build_pie_heap(tmp_path_factory, "piesteered", _PIE_STEERED)
+
+
+@pytest.fixture
+def pie_steered_safe_bin(tmp_path_factory):
+    return _build_pie_heap(tmp_path_factory, "piesteeredsafe", _PIE_STEERED_SAFE)
+
+
+def test_pie_leak_write_chain_steers_an_oob_read_and_hijacks(pie_steered_bin):
+    """Lever 2, the full in-process PIE relocate: with no bare-option leak, steer the out-of-bounds
+    READ (option 3) to disclose an image pointer, recover the base LIVE in the same process, and
+    relocate the win over the adjacent fn pointer -- confirmed by the flag under a negative control.
+    The bare-option `_pie_leak_chain` must find nothing here (there is no spontaneous pointer)."""
+    import types as _t
+    wd = Path(tempfile.mkdtemp(prefix="piesteer-"))
+    try:
+        tb = pie_steered_bin.read_bytes()
+        win_vaddr = elf_functions(tb)["win"]
+        opts, model = ["1", "2", "3", "4", "5"], {"2": ["str"], "3": ["idx"]}
+        # the bare-option leak chain finds no spontaneous pointer here
+        assert chain._pie_leak_chain(_FakeCtx(), tb, str(pie_steered_bin), ("win", win_vaddr),
+                                     opts=opts, model=model, width=None, workdir=wd) is None
+        hit = chain._pie_leak_write_chain(_FakeCtx(), _t.SimpleNamespace(), tb,
+                                          str(pie_steered_bin), ("win", win_vaddr),
+                                          opts=opts, model=model, width=None, workdir=wd)
+        assert hit is not None, "steered-OOB-read in-process relocate not confirmed"
+        read_opt, ridx, writer, off, trig, base = hit
+        assert read_opt == "3" and writer == "2" and off == 32
+        assert base and base % 0x1000 == 0
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def test_pie_leak_write_chain_declines_the_bounds_checked_target(pie_steered_safe_bin):
+    """Negative control: the SAME target with the edit bounded to the buffer cannot reach the
+    adjacent fn pointer, so the steered-read relocate must NOT confirm -- a None here is the missing
+    overflow alone (leak option, win and every path are still present)."""
+    import types as _t
+    wd = Path(tempfile.mkdtemp(prefix="piesteersafe-"))
+    try:
+        tb = pie_steered_safe_bin.read_bytes()
+        win_vaddr = elf_functions(tb)["win"]
+        hit = chain._pie_leak_write_chain(_FakeCtx(), _t.SimpleNamespace(), tb,
+                                          str(pie_steered_safe_bin), ("win", win_vaddr),
+                                          opts=["1", "2", "3", "4", "5"],
+                                          model={"2": ["str"], "3": ["idx"]}, width=None, workdir=wd)
+        assert hit is None, f"bounds-checked target wrongly confirmed a hijack: {hit}"
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 

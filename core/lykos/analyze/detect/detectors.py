@@ -119,6 +119,9 @@ def dangerous_api(ctx: DetectContext):
         n = normalize(e.dst_name)
         if n not in DANGEROUS:
             continue
+        if n in _SCANF_VARIANTS and _scanf_unbounded_at(
+                ctx, ctx.func_irs.get(e.src_addr), e.site_addr) is False:
+            continue                                  # this call's format is fully bounded (%d, %16s)
         cwe, sev, desc = DANGEROUS[n]
         cand = _cand(
             cwe, f"{desc}", sev, "dangerous_api",
@@ -240,6 +243,14 @@ _RUST_SOURCES = ("env::args", "env..args", "env::var", "env..var", "io::stdin", 
 _RUST_SIG = re.compile(r"::h[0-9a-f]{16}\b")
 
 
+def _go_canon(name) -> str:
+    """A Go method symbol in radare2's flag form, which the source/sink tables are written in:
+    rizin renders `bufio.(*Reader).ReadString` where radare2 renders `bufio._Reader_.ReadString`,
+    so with rizin present no Go input source matched and the os/exec.Command sink fed by stdin
+    stayed a candidate."""
+    return re.sub(r"\(\*?([\w.]+)\)", r"_\1_", name or "")
+
+
 @register_detector
 def lang_sinks(ctx: DetectContext):
     tc = (ctx.toolchain or "").lower()
@@ -257,7 +268,7 @@ def lang_sinks(ctx: DetectContext):
     sources = _GO_SOURCES if is_go else _RUST_SOURCES
 
     def _hit(name, needles):
-        n = name or ""
+        n = _go_canon(name)
         return any(k in n for k in needles)
     src_fns = {e.src_addr for e in ctx.call_edges if _hit(e.dst_name, sources)}
     callers = defaultdict(set)
@@ -268,7 +279,7 @@ def lang_sinks(ctx: DetectContext):
     out, seen = [], set()
     for e in ctx.call_edges:
         hit = next(((cwe, sev, desc) for pat, cwe, sev, desc in sinks
-                    if e.dst_name and pat in e.dst_name), None)
+                    if e.dst_name and pat in _go_canon(e.dst_name)), None)
         if not hit:
             continue
         cwe, sev, desc = hit
@@ -676,6 +687,9 @@ def stack_buffer_overflow(ctx: DetectContext):
         if n in _UNBOUNDED_COPY:
             if n in ("scanf", "sscanf") and not scanf_maybe_unbounded:
                 continue                          # only width-bounded %Ns present -> not a bug
+            if n in _SCANF_VARIANTS and _scanf_unbounded_at(
+                    ctx, ctx.func_irs.get(e.src_addr), e.site_addr) is False:
+                continue                          # THIS call's format has no unbounded %s/%[
             sinks_by_func[e.src_addr].append((n, e.site_addr))
     out = []
     for addr, frame in ctx.frames.items():
@@ -1178,6 +1192,34 @@ def _format_at(ctx, texts, reg: str):
     return None, _str_flag_for_reg(texts, reg)
 
 
+def _scanf_unbounded_at(ctx, ir, site):
+    """For a scanf-family call at `site`: True when ITS format (read at the call site) has an
+    unbounded %s / %[ conversion, False when the format is recovered and has none, None when the
+    format cannot be recovered (keep the finding -- never guess it away).
+
+    The binary-wide heuristic ("some string in the image has an unbounded %s") flagged EVERY
+    sscanf in a program that has one: gif2rgb's option parser calls sscanf(arg, "%d", &n) at
+    0x975f and was filed as both 'sscanf with unbounded %s' and a CWE-121 stack smash."""
+    if not ir or site is None:
+        return None
+    flat = [(i.get("addr"), (i.get("text") or "")) for b in _blocks_of(ir)
+            for i in (b.get("instructions") or [])]
+    sv = _naddr(site)
+    for idx, (a, t) in enumerate(flat):
+        if _naddr(a) != sv:
+            continue
+        variant = _norm_call(t)
+        if variant not in _SCANF_VARIANTS:
+            return None
+        fmt, sym = _format_at(ctx, [x for _, x in flat[:idx]], _SCANF_VARIANTS[variant][0])
+        convs = (_scanf_conversions(fmt) if fmt is not None
+                 else (_resolve_scanf_format(sym, ctx.strings) if sym else None))
+        if convs is None:
+            return None
+        return any(w is None and not alloc and conv in ("s", "[") for _k, w, conv, alloc in convs)
+    return None
+
+
 def _r2_flagify(v: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "_", v)
 
@@ -1188,14 +1230,19 @@ def _resolve_scanf_format(sym: str, strings):
     flagified form equals the (flagified) symbol is that format. Returns the conversion list when
     every matching string agrees on it, else None (ambiguous or not found -- never guessed)."""
     key = _r2_flagify(sym)
+    # rizin builds the same flag by DROPPING the punctuation (`%16s` -> `str.16s`, r2: `str._16s`),
+    # so compare with runs of non-alphanumerics collapsed and trimmed too -- without it every
+    # width-bounded scanf on a rizin host went unread and the off-by-one detector was silent
+    loose = re.sub(r"_+", "_", key).strip("_")
     convs = None
     for s in strings or []:
         v = getattr(s, "value", "") or ""
         if "%" not in v:
             continue
         fv = _r2_flagify(v)
+        fl = re.sub(r"_+", "_", fv).strip("_")
         # exact, or r2 truncated a long flag name (only trusted for a long, specific prefix)
-        if fv != key and not (len(key) >= 24 and fv.startswith(key)):
+        if fv != key and fl != loose and not (len(key) >= 24 and fv.startswith(key)):
             continue
         c = _scanf_conversions(v)
         if c is None:
@@ -1320,7 +1367,7 @@ def scanf_bounded_overflow(ctx: DetectContext):
                     if fmt is not None or w in real_widths:
                         checks.append((w, regs[k]))
             elif sym:
-                m0 = re.match(r"_(\d+)[hlLjztq]*s", sym)
+                m0 = re.match(r"_?(\d+)[hlLjztq]*s", sym)     # r2 `_16s`, rizin `16s`
                 if m0 and int(m0.group(1)) in real_widths:
                     checks.append((int(m0.group(1)), buf_reg))
             for n, dreg in checks:
@@ -2127,7 +2174,7 @@ def _length_unreadable_cmp(ins, length_regs):
         for pc in i.get("pcode") or []:
             try:
                 mnem, _insk, outk, toks = _parse(pc)
-            except Exception:
+            except Exception:  # a p-code line this parser does not model carries no taint; skip it
                 continue
             if mnem == "CBRANCH":
                 if j == n - 1 and len(toks) >= 3 and _key(toks[2]) in boundt:

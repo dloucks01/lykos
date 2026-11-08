@@ -6,8 +6,19 @@ Isolation reuses the Phase-4 sandbox (bwrap+netns when available, else rlimits-o
 for cross-arch). The PTY makes interactive programs line-buffer and see a tty. Protocol is JSON
 text frames both ways:
   server->client : {"t":"info",...} {"t":"out","b64":...} {"t":"exit","code"/"signal":...}
-                   {"t":"saved","sha":...}
+                   {"t":"saved","sha":...} {"t":"eof","closed":bool}
   client->server : {"t":"in","b64"|"s":...} {"t":"eof"} {"t":"signal","sig":"INT"} {"t":"save"}
+                   or a BINARY frame (opcode 0x2): its payload is input bytes, sent as-is.
+
+Two stdin channels, picked per session (`stdin=` on the /console URL):
+  "pty"  (default) stdin, stdout and stderr are the terminal: line editing, echo, Ctrl-C/Ctrl-D
+         keys. The line discipline interprets some bytes (^C ^D ^U DEL, CR->NL), so it is for
+         menus and text protocols. "eof" sends ^D (twice when a partial line is pending, so the
+         line is delivered and THEN the reader sees end-of-file).
+  "pipe" stdin is a pipe: every byte reaches the target exactly (a binary protocol), and "eof"
+         really closes it. stdout/stderr stay on the PTY (so stdio still line-buffers) in raw mode
+         -- no CR/LF rewriting -- so the output bytes are exact too.
+In both, "save as seed" stores exactly the bytes delivered as input, in order (no ^D, no echo).
 """
 from __future__ import annotations
 
@@ -19,7 +30,9 @@ import pty
 import select
 import signal as _signal
 import subprocess
+import termios
 import time
+import tty
 from pathlib import Path
 
 from .. import observe
@@ -30,6 +43,9 @@ _log = logging.getLogger(__name__)
 
 _HARD_CAP = 600.0        # overall wall-clock ceiling for one console session
 _SEED_CAP = 4 << 20      # bytes of operator input kept for "save as seed" (bounded memory)
+_SAVE_GRACE = 60.0       # seconds the socket stays open after the target exits, for "save as seed"
+_PENDING_CAP = 8 << 20   # input queued for a target that is not reading (never block the proxy)
+STDIN_MODES = ("pty", "pipe")
 
 
 def _build_cmd(exe, argv, arch, endianness, bits):
@@ -46,8 +62,10 @@ def _build_cmd(exe, argv, arch, endianness, bits):
 
 
 def serve(sock, exe, *, argv=(), arch=None, endianness=None, bits=None, cwd=None,
-          timeout=_HARD_CAP, put_seed=None):
-    """Run `exe` under a PTY and proxy it over the (already-upgraded) WebSocket `sock`."""
+          timeout=_HARD_CAP, put_seed=None, stdin_mode="pty"):
+    """Run `exe` under a PTY and proxy it over the (already-upgraded) WebSocket `sock`.
+    `stdin_mode` is "pty" (the terminal) or "pipe" (exact bytes + a real EOF); see the module doc."""
+    stdin_mode = stdin_mode if stdin_mode in STDIN_MODES else "pty"
     cmd, iso, emu = _build_cmd(exe, argv, arch, endianness, bits)
     rl = sandbox._rlimits(2048, int(min(timeout, _HARD_CAP)) + 5, set_as=(emu is None),
                           nproc=sandbox._nproc_cap(emu is not None))
@@ -57,28 +75,88 @@ def serve(sock, exe, *, argv=(), arch=None, endianness=None, bits=None, cwd=None
         rl()
 
     mfd, sfd = pty.openpty()
+    pin_r = pin_w = None
+    if stdin_mode == "pipe":
+        pin_r, pin_w = os.pipe()
+        try:
+            tty.setraw(sfd)                            # output bytes exact: no ONLCR, no echo
+        except termios.error:
+            observe.absorbed(_log, "pty raw mode unavailable; output may carry CR/LF rewriting")
     try:
-        proc = subprocess.Popen(cmd, stdin=sfd, stdout=sfd, stderr=sfd, close_fds=True,
-                                cwd=cwd, preexec_fn=_preexec)
+        proc = subprocess.Popen(cmd, stdin=(pin_r if pin_r is not None else sfd), stdout=sfd,
+                                stderr=sfd, close_fds=True, cwd=cwd, preexec_fn=_preexec)
     except OSError as e:
         _send(sock, {"t": "info", "msg": f"failed to start: {e}"})
-        os.close(mfd); os.close(sfd)
+        for fd in (mfd, sfd, pin_r, pin_w):
+            if fd is not None:
+                os.close(fd)
         return
     os.close(sfd)
-    _send(sock, {"t": "info", "msg": f"started [{iso}] pid {proc.pid} -- interactive"})
+    if pin_r is not None:
+        os.close(pin_r)
+    wfd = pin_w if pin_w is not None else mfd          # where operator input is written
+    os.set_blocking(wfd, False)
+    _send(sock, {"t": "info", "stdin": stdin_mode,
+                 "msg": f"started [{iso}] pid {proc.pid} -- interactive, stdin "
+                        + ("pipe (exact bytes, EOF closes it)" if pin_w is not None
+                           else "terminal")})
 
     sent = bytearray()
+    pending = bytearray()                              # input not yet accepted by the target
+    close_after = False                                # pipe EOF requested behind pending input
+    last_in = b"\n"                                    # last input byte: is a line pending?
     deadline = time.time() + min(timeout, _HARD_CAP)
     exited_at = None                                   # set on process exit -> short save grace
+
+    def _queue(b: bytes) -> bool:
+        nonlocal last_in
+        if wfd is None:
+            _send(sock, {"t": "info", "msg": "ignored input: stdin is closed"})
+            return False
+        if len(pending) + len(b) > _PENDING_CAP:
+            _send(sock, {"t": "info", "msg": "ignored input: the target is not reading stdin"})
+            return False
+        if len(sent) < _SEED_CAP:                      # the seed is bounded; the target is not
+            sent.extend(b[:_SEED_CAP - len(sent)])
+        pending.extend(b)
+        if b:
+            last_in = b[-1:]
+        return True
+
+    def _close_stdin():
+        nonlocal wfd, pin_w
+        if pin_w is not None:
+            try:
+                os.close(pin_w)
+            except OSError:
+                pass
+            pin_w = None
+        wfd = None
+        _send(sock, {"t": "eof", "closed": True})
+
     try:
         while True:
             if time.time() > deadline:
                 _send(sock, {"t": "info", "msg": "wall-clock cap reached; terminating"})
                 break
-            if exited_at is not None and time.time() - exited_at > 3.0:
+            if exited_at is not None and time.time() - exited_at > _SAVE_GRACE:
                 break                                  # grace elapsed after exit
             waitfds = [sock] if exited_at is not None else [mfd, sock]
-            r, _, _ = select.select(waitfds, [], [], 0.2)
+            wwait = [wfd] if (pending and wfd is not None and exited_at is None) else []
+            r, w, _ = select.select(waitfds, wwait, [], 0.2)
+            if w:
+                try:
+                    n = os.write(wfd, bytes(pending[:65536]))
+                    del pending[:n]
+                except BlockingIOError:
+                    pass
+                except OSError:                        # target closed its stdin (EPIPE)
+                    pending.clear()
+                    if pin_w is not None:
+                        _close_stdin()
+                if close_after and not pending and pin_w is not None:
+                    close_after = False
+                    _close_stdin()
             if mfd in r:
                 try:
                     chunk = os.read(mfd, 65536)
@@ -98,6 +176,10 @@ def serve(sock, exe, *, argv=(), arch=None, endianness=None, bits=None, cwd=None
                     except OSError:
                         break
                     continue
+                if op == 0x2:                          # binary frame: raw input bytes
+                    if data and exited_at is None:
+                        _queue(bytes(data))
+                    continue
                 msg = _parse(data)
                 if msg is None:
                     continue
@@ -112,17 +194,26 @@ def serve(sock, exe, *, argv=(), arch=None, endianness=None, bits=None, cwd=None
                         # the handler wrote an HTTP 500 into the upgraded socket)
                         _send(sock, {"t": "info", "msg": "ignored input: invalid base64"})
                         continue
-                    if len(sent) < _SEED_CAP:          # the seed is bounded; the target is not
-                        sent += b[:_SEED_CAP - len(sent)]
-                    try:
-                        os.write(mfd, b)
-                    except OSError:
-                        break
+                    if b and exited_at is None:
+                        _queue(b)
                 elif t == "eof":
-                    try:
-                        os.write(mfd, b"\x04")         # EOT -> EOF for a canonical-mode reader
-                    except OSError:
-                        pass
+                    if wfd is None:
+                        _send(sock, {"t": "eof", "closed": True})
+                    elif pin_w is not None:            # pipe: really close stdin (after pending)
+                        if pending:
+                            close_after = True
+                        else:
+                            _close_stdin()
+                    else:
+                        # terminal: ^D ends input for a canonical-mode reader -- but with a
+                        # partial line pending the first ^D only delivers that line, so send two.
+                        try:
+                            canon = bool(termios.tcgetattr(mfd)[3] & termios.ICANON)
+                        except termios.error:
+                            canon = True
+                        pending.extend(b"\x04\x04" if canon and last_in != b"\n" else b"\x04")
+                        last_in = b"\n"
+                        _send(sock, {"t": "eof", "closed": False})
                 elif t == "signal":
                     sig = {"INT": _signal.SIGINT, "TERM": _signal.SIGTERM,
                            "KILL": _signal.SIGKILL}.get(msg.get("sig"), _signal.SIGINT)
@@ -144,10 +235,13 @@ def serve(sock, exe, *, argv=(), arch=None, endianness=None, bits=None, cwd=None
         pass
     finally:
         _killpg(proc, _signal.SIGKILL)
-        try:
-            os.close(mfd)
-        except OSError:
-            pass
+        for fd in (mfd, pin_w):
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             sock.sendall(ws.close_frame())
         except OSError:

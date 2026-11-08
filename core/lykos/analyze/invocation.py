@@ -398,27 +398,27 @@ def from_help(lines) -> tuple:
     takes: dict = {}
     placeholders: dict = {}
     names: dict = {}
-    for raw in lines or []:
-        line = (raw or "").rstrip()
-        if not line.lstrip().startswith("-"):
-            continue
-        col = re.split(r"\s{2,}", line.strip(), maxsplit=1)[0]
+
+    def _absorb(col: str) -> None:
+        """Parse ONE option column (`-c, --config FILE`, `-t`, `--start-time <float>`) and fold
+        it into the result dicts. Factored out so a TWO-COLUMN help row can feed each of its
+        columns through the identical logic."""
         flags, rest = [], []
         for tok in re.split(r"[,\s]+", col):
             if not tok:
                 continue
             if tok.startswith("-") and "=" in tok:              # --config=FILE
-                f, _, mv = tok.partition("=")
+                f, _, mv2 = tok.partition("=")
                 if re.fullmatch(r"--?[A-Za-z][\w-]*", f):
                     flags.append(f)
-                    if mv:
-                        rest.append(mv)
+                    if mv2:
+                        rest.append(mv2)
             elif re.fullmatch(r"--?[A-Za-z][\w-]*", tok):       # -c / --config
                 flags.append(tok)
             else:
                 rest.append(tok)
         if not flags:
-            continue
+            return
         # a value exists only when exactly one trailing token remains and it is metavar-shaped;
         # several tokens means we captured a single-spaced description, not a value.
         mv = rest[0] if len(rest) == 1 and _HELP_METAVAR.match(rest[0]) else None
@@ -436,6 +436,23 @@ def from_help(lines) -> tuple:
         longest = max((f for f in flags), key=len)
         if longest.startswith("--") and canon not in names:
             names[canon] = longest.lstrip("-")
+
+    for raw in lines or []:
+        line = (raw or "").rstrip()
+        if not line.lstrip().startswith("-"):
+            continue
+        # The description is set off from the option column by a run of 2+ spaces. A TWO-COLUMN
+        # option table (unzip, busybox, many getopt tools) lists a SECOND option after another
+        # such run: splitting the whole row on 2+ spaces yields [opt, desc, opt, desc, ...], and
+        # each segment whose first token is a flag opens a new option column. Reading only the
+        # first segment (the old behaviour) silently dropped every right-hand flag -- for unzip
+        # that is -l/-t/-z/-T/-d, i.e. its list/test/zipinfo MODES, exactly where its bugs live.
+        for seg in re.split(r"\s{2,}", line.strip()):
+            # a segment OPENS an option column when it begins with a flag (`-c`, `-c,`,
+            # `--config=FILE`); _absorb does the real parsing. A prefix match, so the alias comma
+            # in `-c, --config` and an `=metavar` head both still count.
+            if re.match(r"--?[A-Za-z]", seg):
+                _absorb(seg)
     return takes, placeholders, names
 
 
@@ -941,6 +958,12 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     strings = [s for s in (strings or []) if s]
     if usage_hint:
         strings = list(strings) + [usage_hint]
+    if help_text:
+        # A usage line the program PRINTS is as authoritative as one in its strings -- more so: a
+        # program that builds it at runtime from an option spec (giflib's GAPrintHowTo) has no
+        # usage string at all, and the help output was ignored by the usage parser.
+        strings = list(strings) + [ln.strip() for ln in help_text.splitlines()
+                                   if "usage" in ln.lower() and len(ln) < 600]
     use, usage = from_usage(strings, prog=prog)
     opt = from_optstring(strings)
     cmp_ = from_argv_compares(strings)

@@ -1,0 +1,10 @@
+{
+  "id": "stb_vorbis",
+  "summary": "stb_vorbis.c single-file Ogg/Vorbis decoder; vuln.h = parent of the first 2015 fuzz-found crash fix (a3d62df~1, v0.99995), fixed.h = latest. Real historical invalid-file crash bugs; the differential (crashes vuln, survives fixed) is the ground truth.",
+  "upstream": "github.com/nothings/stb (stb_vorbis.c)",
+  "mode": "file",
+  "argv": ["@@"],
+  "extra_flags": ["-lm"],
+  "fuzz_seconds": 300,
+  "class": "memory-safety (audio decoder)"
+}

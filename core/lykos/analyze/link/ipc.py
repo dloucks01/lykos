@@ -44,9 +44,21 @@ _SYS_PREFIX = ("/lib", "/lib64", "/usr", "/proc", "/sys", "/bin", "/sbin", "/etc
                "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", "/dev/tty")
 
 
+#: A path ending in a source-code extension is a compiler-embedded `__FILE__` (assert / log
+#: strings), never a channel name.
+_SOURCE_EXT = (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".inl", ".m", ".mm",
+               ".rs", ".go", ".s", ".S", ".y", ".l")
+
+
 def _scan_keys(data: bytes) -> set[str]:
-    """Channel-name literals: leading-slash names that are not system library paths."""
-    out: set[str] = set()
+    """Channel-name literals: leading-slash names that are not system library paths.
+
+    Build-tree paths are dropped: a `__FILE__` (`.../winpr/include/winpr/stream.h`) and any
+    directory those sit under (the source root, `/tmp/build/freerdp-3.20.0`). Every component of
+    one source build carries the same ones, so they "matched" as a shared socket channel between
+    every pair of FreeRDP libraries -- 3 false IPC edges, and whole_system then tried to connect
+    to a header file as a TCP port."""
+    cand: set[str] = set()
     for m in _STR.finditer(data or b""):
         s = m.group().decode("ascii", "replace")
         if not _KEYISH.match(s):
@@ -55,8 +67,15 @@ def _scan_keys(data: bytes) -> set[str]:
             continue
         if s.endswith(".so") or ".so." in s or s.endswith("/"):
             continue
-        out.add(s)
-    return out
+        cand.add(s)
+    sources = {s for s in cand if s.endswith(_SOURCE_EXT)}
+    dirs = {d for f in sources for d in _parents(f)}
+    return {s for s in cand if s not in sources and s not in dirs}
+
+
+def _parents(path: str) -> set[str]:
+    parts = path.split("/")
+    return {"/".join(parts[:i]) for i in range(2, len(parts))}
 
 
 def component_ipc(content, target, triage_rec: dict) -> dict:

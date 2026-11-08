@@ -18,9 +18,9 @@ MARGIN = 54.0
 CONTENT_W = PAGE_W - 2 * MARGIN
 
 # base-14 fonts we reference
-_FONTS = {"H": "Helvetica", "HB": "Helvetica-Bold", "HO": "Helvetica-Oblique"}
+_FONTS = {"H": "Helvetica", "HB": "Helvetica-Bold", "HO": "Helvetica-Oblique", "C": "Courier"}
 # average glyph width as a fraction of font size (rough, for wrapping)
-_AVGW = {"H": 0.50, "HB": 0.53, "HO": 0.50}
+_AVGW = {"H": 0.50, "HB": 0.53, "HO": 0.50, "C": 0.60}
 
 _SEV_RGB = {
     "critical": (0.90, 0.28, 0.30), "high": (0.97, 0.41, 0.03),
@@ -32,11 +32,21 @@ _STATE_RGB = {
 }
 
 
+#: Characters the base-14 fonts' WinAnsi (cp1252) encoding cannot hold, spelled out. The page
+#: stream used to be encoded as LATIN-1 under a font declared WinAnsi, so every em dash, en dash,
+#: curly quote and arrow -- all of which the report text uses -- printed as "?".
+_TRANSLIT = str.maketrans({"\u2192": "->", "\u2190": "<-", "\u21d2": "=>", "\u2264": "<=",
+                           "\u2265": ">=", "\u2260": "!=", "\u2248": "~", "\u2713": "yes",
+                           "\u2717": "no", "\u2022": "\u00b7", "\u2009": " ", "\u00a0": " ",
+                           "\u2212": "-", "\u00d7": "x"})
+
+
 def _esc(s: str) -> str:
     out = []
-    for ch in s:
-        o = ord(ch)
-        if o > 255:
+    for ch in s.translate(_TRANSLIT):
+        try:
+            ch.encode("cp1252")
+        except UnicodeEncodeError:
             ch = "?"
         if ch in "\\()":
             out.append("\\" + ch)
@@ -246,11 +256,13 @@ def _arrowhead(ops, x1, y1, x2, y2, rgbstr):
 
 
 def _report_lines(report: dict[str, Any]) -> list[_Line]:
+    """The report a reader acts on first (report/dossier.py), then the full inventory as an
+    appendix. The inventory used to BE the report: the one demonstrated vulnerability of a jhead
+    run first appeared on page 5 of 14, after internal tool ids and 43 techniques that mostly ran
+    for 0 s."""
     L: list[_Line] = []
     case = report.get("case", {})
-    summ = report.get("summary", {})
-
-    L.append(_Line("VULNERABILITY ANALYSIS REPORT", "HB", 8, 0, 0, (0.6, 0.6, 0.65)))
+    L.append(_Line("VULNERABILITY ASSESSMENT REPORT", "HB", 8, 0, 0, (0.6, 0.6, 0.65)))
     L += _flow(case.get("name") or "Untitled case", "HB", 20, 0, 13)
     for k, v in (("Generated", report.get("generated_at")),
                  ("Tool", f'{report.get("tool", {}).get("name")} '
@@ -261,6 +273,208 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
             L += _flow(f"{k}: {v}", "H", 9, 0, 1, (0.4, 0.4, 0.45))
     if case.get("notes"):
         L += _flow(case["notes"], "HO", 9, 0, 4, (0.35, 0.35, 0.4))
+    nar = report.get("narrative")
+    if nar:
+        L += _narrative_lines(nar)
+        L.append(_Line("Appendix A - Technical inventory", "HB", 15, 0, 26))
+        L.append(_Line("", "H", 1, 0, 3, rule=True))
+        L += _flow("Everything the run recorded, for audit: the per-target detail, every engine's "
+                   "health, and every finding with its full evidence trail. The sections above "
+                   "are derived from this.", "HO", 8.5, 0, 4, (0.4, 0.4, 0.45))
+    return L + _inventory_lines(report)
+
+
+_MUTED = (0.4, 0.4, 0.45)
+_H2 = (0.12, 0.16, 0.22)
+
+
+def _h(L, text, size=14, gap=20):
+    L.append(_Line(text, "HB", size, 0, gap, _H2))
+    if size >= 13:
+        L.append(_Line("", "H", 1, 0, 3, rule=True))
+
+
+def _kvline(L, k, v, indent=0):
+    if v not in (None, "", [], {}):
+        L += _flow(f"{k}: {v}", "H", 9, indent, 1)
+
+
+def _mono(L, text, indent=10, size=7.5, gap=0.0):
+    # Courier, unwrapped below the page width: hexdumps and commands keep their spacing.
+    maxc = int((CONTENT_W - indent) / (size * 0.6))
+    while len(text) > maxc:
+        L.append(_Line(text[:maxc], "C", size, indent, gap))
+        text, gap = "  " + text[maxc:], 0.0
+    L.append(_Line(text, "C", size, indent, gap))
+
+
+def _narrative_lines(nar: dict) -> list[_Line]:
+    L: list[_Line] = []
+    ex = nar.get("executive") or {}
+    _h(L, "1. Executive summary", 15, 18)
+    risk = ex.get("risk") or "-"
+    L += _flow(f"Overall risk: {str(risk).upper()}", "HB", 11, 0, 4,
+               _SEV_RGB.get(risk) or (0.3, 0.3, 0.35))
+    for ptxt in ex.get("paragraphs") or []:
+        L += _flow(ptxt, "H", 10, 0, 5)
+    if ex.get("actions"):
+        L.append(_Line("Recommended actions", "HB", 10, 0, 8))
+        for i, a in enumerate(ex["actions"], 1):
+            L += _flow(f"{i}. {a}", "H", 9.5, 8, 2)
+
+    # findings at a glance
+    _h(L, "2. Findings at a glance", 15, 20)
+    n = 0
+    for t in nar.get("targets") or []:
+        for d in t.get("dossiers") or []:
+            n += 1
+            L += _flow(f'{n}.  [{(d.get("severity") or "-").upper()}]  {d.get("title")}  --  '
+                       f'{d.get("level") or "-"} ' + ("verified" if d.get("verified") else "")
+                       + f'  ({t.get("filename")})', "HB", 9.5, 0, 3,
+                       _SEV_RGB.get(d.get("severity")))
+    if not n:
+        L += _flow("No vulnerability was demonstrated by execution.", "HO", 9.5, 0, 3, _MUTED)
+    lk = sum(len(t.get("leads") or []) for t in nar.get("targets") or [])
+    if lk:
+        L += _flow(f"{lk} kind(s) of unproven lead are listed in section 4 -- detections, not "
+                   "vulnerabilities.", "HO", 9, 0, 4, _MUTED)
+
+    # dossiers
+    _h(L, "3. Demonstrated vulnerabilities", 15, 20)
+    n = 0
+    for t in nar.get("targets") or []:
+        for d in t.get("dossiers") or []:
+            n += 1
+            L += _dossier_lines(n, d, t.get("filename"))
+    if not n:
+        L += _flow("None in this run.", "HO", 9.5, 0, 3, _MUTED)
+
+    # leads
+    _h(L, "4. Unproven leads", 15, 20)
+    L += _flow("Each row is one KIND of detection (repeated call sites are folded together). None "
+               "has been reproduced by execution; the columns say why, and what would prove it.",
+               "HO", 8.5, 0, 4, _MUTED)
+    for t in nar.get("targets") or []:
+        leads = t.get("leads") or []
+        api = [g for g in leads if g.get("kind") == "API-use pattern"]
+        for g in [g for g in leads if g not in api]:
+            sites = f', {g["sites"]} site(s)' if g.get("sites", 1) > 1 else ""
+            L += _flow(f'{g.get("title")}  ({g.get("cwe") or "-"}{sites})', "HB", 9, 0, 6)
+            L += _flow(f'{g.get("kind")}  -  {g.get("state")}  -  detector grade '
+                       f'{g.get("severity")}', "H", 8, 8, 1, _MUTED)
+            L += _flow(f'Why unproven: {g.get("why")}', "H", 8.5, 8, 1)
+            if g.get("next"):
+                L += _flow(f'Would prove it: {g.get("next")}', "H", 8.5, 8, 1)
+        if api:
+            # One block, not one entry per function: these are where a reviewer looks, and saying
+            # why they are unproven nine times over buried the leads that are not.
+            L += _flow(f"Risky library calls ({sum(g['sites'] for g in api)} call sites, "
+                       f"{len(api)} functions)", "HB", 9, 0, 8)
+            L += _flow("Places to look, not vulnerabilities: the binary calls these, and no path "
+                       "from attacker input to their arguments was demonstrated. Each is proved by "
+                       "an input that reaches the call with attacker-controlled arguments and "
+                       "shows the effect.", "H", 8.5, 8, 1)
+            for g in api:
+                L += _flow(f'- {g.get("title")}  ({g.get("cwe") or "-"}, {g.get("sites")} '
+                           f'site(s))', "H", 8.5, 8, 1)
+
+    # scope / method / limitations
+    _h(L, "5. Scope and method", 15, 20)
+    for t in nar.get("targets") or []:
+        sc = t.get("scope") or {}
+        L.append(_Line(str(sc.get("target")), "HB", 11, 0, 8))
+        _kvline(L, "Engagement", sc.get("engagement"), 8)
+        _kvline(L, "Type", sc.get("type") + (" (stripped)" if sc.get("stripped") else ""), 8)
+        _kvline(L, "SHA-256", sc.get("sha256"), 8)
+        _kvline(L, "Invocation", f'{sc.get("invocation")}  (input via {sc.get("input_mode")}; '
+                                 '@@ marks where the input file goes)', 8)
+        _kvline(L, "Seeds supplied", ", ".join(sc.get("seeds") or []) or "none", 8)
+        _kvline(L, "Mitigations", sc.get("mitigations"), 8)
+        L.append(_Line("What was done", "HB", 9.5, 0, 8))
+        for m in t.get("methodology") or []:
+            L += _flow(f'{m["phase"]} ({_dur(m["seconds"])}): ' + "; ".join(m["techniques"]),
+                       "H", 8.5, 8, 2)
+        L.append(_Line("Limitations", "HB", 9.5, 0, 8))
+        for x in t.get("limitations") or []:
+            L += _flow("- " + x, "H", 8.5, 8, 1)
+    return L
+
+
+def _dur(secs) -> str:
+    secs = int(secs or 0)
+    return f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
+
+
+def _dossier_lines(n: int, d: dict, target: str) -> list[_Line]:
+    L: list[_Line] = []
+    sev = d.get("severity") or "medium"
+    L += _flow(f'3.{n}  {d.get("title")}', "HB", 12.5, 0, 14)
+    L += _flow(f'Severity: {sev.upper()}  -  Proof: {d.get("level") or "-"} '
+               + ("(verified reproducer)" if d.get("verified") else "(not verified)")
+               + f'  -  {d.get("cwe") or ""} {d.get("cwe_name") or ""}', "HB", 9, 0, 3,
+               _SEV_RGB.get(sev))
+    if d.get("severity_why"):
+        why = d["severity_why"]
+        if d.get("detector_severity") and d["detector_severity"] != sev:
+            why += f' (the detector filed it as {d["detector_severity"]})'
+        L += _flow("Why this severity: " + why, "HO", 8.5, 0, 2, _MUTED)
+    if d.get("summary"):
+        L.append(_Line("What it is", "HB", 9.5, 0, 7))
+        L += _flow(d["summary"], "H", 9, 0, 2)
+    loc = d.get("location") or {}
+    if loc:
+        L.append(_Line("Where", "HB", 9.5, 0, 7))
+        _kvline(L, "Target", target, 8)
+        _kvline(L, "Function", loc.get("function"), 8)
+        _kvline(L, "Faulting address", loc.get("site"), 8)
+        _kvline(L, "Faulting instruction", loc.get("instruction"), 8)
+        _kvline(L, "Source", loc.get("source"), 8)
+        if loc.get("stack"):
+            _kvline(L, "Stack", " <- ".join(loc["stack"][:5]), 8)
+    if d.get("trigger"):
+        L.append(_Line("How it is triggered", "HB", 9.5, 0, 7))
+        for x in d["trigger"]:
+            L += _flow("- " + x, "H", 9, 8, 1)
+    if d.get("reproduce"):
+        L.append(_Line("Reproduce", "HB", 9.5, 0, 7))
+        for x in d["reproduce"]:
+            if isinstance(x, dict):
+                L += _flow(x.get("note") or "", "HO", 8.5, 8, 3, _MUTED)
+                _mono(L, x.get("cmd") or "", 14, 7.5, 1)
+            else:
+                _mono(L, str(x), 8, 7.5, 2)
+    inp = d.get("input")
+    if inp:
+        L.append(_Line(f'Crash input ({inp.get("size")} bytes, sha256 {inp.get("sha256")})',
+                       "HB", 9.5, 0, 7))
+        for x in inp.get("hex") or []:
+            _mono(L, x, 8, 7.5)
+        if (inp.get("size") or 0) > 64:
+            L += _flow(f'... first 64 of {inp["size"]} bytes; the full input is in the PoC bundle.',
+                       "HO", 8, 8, 1, _MUTED)
+    if d.get("evidence"):
+        L.append(_Line("Evidence", "HB", 9.5, 0, 7))
+        for x in d["evidence"]:
+            L += _flow("- " + x, "H", 8.5, 8, 1)
+    L.append(_Line("Impact", "HB", 9.5, 0, 7))
+    L += _flow(d.get("impact") or "-", "H", 9, 0, 1)
+    if d.get("escalation"):
+        L.append(_Line("Why it stops at this level", "HB", 9.5, 0, 7))
+        for x in d["escalation"]:
+            L += _flow("- " + x, "H", 8.5, 8, 1)
+    if d.get("mitigations"):
+        L.append(_Line("Mitigations in the way of an exploit", "HB", 9.5, 0, 7))
+        for x in d["mitigations"]:
+            L += _flow("- " + x, "H", 8.5, 8, 1)
+    if d.get("remediation"):
+        L.append(_Line("Remediation", "HB", 9.5, 0, 7))
+        L += _flow(d["remediation"], "H", 9, 0, 1)
+    return L
+
+
+def _inventory_lines(report: dict[str, Any]) -> list[_Line]:
+    L: list[_Line] = []
+    summ = report.get("summary", {})
 
     # summary
     L.append(_Line("Summary", "HB", 13, 0, 16))
@@ -306,11 +520,12 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
     L.append(_Line("", "H", 1, 0, 3, rule=True))
     eng = report.get("engines", [])
     if eng:
-        for e in eng:
-            # An engine that aborted executed nothing; a bare tool/version line read the same
-            # as a campaign that ran and found no crash.
-            _note = "" if e.get("ran", True) else "  (did not complete)"
-            L += _flow(f'- {e["tool"]} {e.get("version") or ""}'.strip() + _note, "H", 9, 8, 1)
+        # One flowed line, not one line per tool: 35 lines of `aflpp aflpp-1` filled a page.
+        # An engine that aborted executed nothing, so it is still named apart.
+        L += _flow("Tools and versions: " + ", ".join(
+            f'{e["tool"]} {e.get("version") or ""}'.strip()
+            + ("" if e.get("ran", True) else " (did not complete)") for e in eng),
+            "H", 8.5, 0, 2, (0.35, 0.35, 0.4))
     else:
         L += _flow("No external analysis engines recorded for this case.", "HO", 9, 0, 2,
                    (0.4, 0.4, 0.45))
@@ -339,7 +554,12 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
             f'({ov.get("runs", 0)} runs; compute exceeds wall-clock because the worker pool runs '
             f'targets in parallel).', "H", 9, 0, 4)
         _compute = ov.get("compute_seconds") or 0
-        for tq in techs:
+        _idle = [tq for tq in techs if not (tq.get("seconds") or 0) and not tq.get("findings")
+                 and not tq.get("crashes")]
+        if _idle:
+            L += _flow(f"{len(_idle)} further technique(s) completed in under a second with no "
+                       "yield and are not listed.", "HO", 8.5, 0, 2, (0.4, 0.4, 0.45))
+        for tq in [x for x in techs if x not in _idle]:
             secs = tq.get("seconds") or 0
             pct = (100.0 * secs / _compute) if _compute else 0.0
             yld, cr = tq.get("findings") or 0, tq.get("crashes") or 0
@@ -504,7 +724,8 @@ def _finding_lines(f: dict) -> list[_Line]:
     _ff = f.get("figures") or {}
     L += _fig_block(_ff.get("provenance"))
     L += _fig_block(_ff.get("reachability"))
-    ev = f.get("evidence", [])
+    from .dossier import compact_evidence
+    ev = compact_evidence(f.get("evidence", []))
     if ev:
         L.append(_Line("Evidence trail", "HB", 8, 0, 6, (0.5, 0.5, 0.55)))
         for e in ev:
@@ -572,7 +793,7 @@ def _content_stream(page: list[tuple], page_no: int, total: int, report: dict) -
     foot = f'lykos {report.get("tool", {}).get("version")}  ·  page {page_no} of {total}'
     ops.append("0.6 0.6 0.65 rg")
     ops.append(f"BT /H 8 Tf {MARGIN:.1f} {MARGIN - 6:.1f} Td ({_esc(foot)}) Tj ET")
-    return "\n".join(ops).encode("latin-1", "replace")
+    return "\n".join(ops).encode("cp1252", "replace")
 
 
 def _emit(pages: list[list[tuple]], report: dict) -> bytes:

@@ -56,9 +56,27 @@ def fuzz(target: Target, seeds: List[bytes], *, seconds: int,
     argv_template = list(target.argv) if target.mode == "file" else \
         [a for a in target.argv if a != "@@"] or None
     cmplog = target.afl_cmplog if (target.afl_exe and target.afl_cmplog) else None
+    afl_path = ld_prefix = None
+    if qemu:
+        # The arch-matched afl-qemu-trace, staged as coverage_fuzz does. Without it afl-fuzz -Q
+        # picked whatever `afl-qemu-trace` was on its path (not the x86-64 tracer on this host):
+        # every binary-only campaign here died at "Fork server handshake failed" and the
+        # fallback returned no candidates -- seen only once the run console showed AFL's output.
+        from ..analyze.dynamic import sandbox as _sb
+        from ..analyze.fuzz.aflpp import locate_qemu_trace_for, stage_qemu_trace
+        arch = target.arch or _sb.host_arch()
+        trace = locate_qemu_trace_for(afl, arch)
+        if trace is None:
+            log(f"no afl-qemu-trace for {arch}: hybrid fuzz fallback skipped")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return []
+        afl_path = stage_qemu_trace(trace, tmp)
+        ld_prefix = _sb.qemu_ld_prefix(target.arch, target.endianness, target.bits,
+                                       exedir=str(Path(exe).resolve().parent))
     try:
         run_campaign(afl, str(exe), str(sd), str(od), seconds=int(seconds), mode=target.mode,
-                     qemu=qemu, argv_template=argv_template, cmplog=cmplog)
+                     qemu=qemu, argv_template=argv_template, cmplog=cmplog,
+                     afl_path=str(afl_path) if afl_path else None, qemu_ld_prefix=ld_prefix)
     except Exception as e:                       # noqa: BLE001 - a fuzz failure is "no candidates"
         log(f"fuzz campaign error: {e}")
         return []

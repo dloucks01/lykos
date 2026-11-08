@@ -1043,6 +1043,12 @@ _ERROR_LOOP_SAMPLE = 64
 _PLATEAU_MIN_EXECS = 1000
 _PLATEAU_MIN_S = 60.0
 _PLATEAU_FRAC = 0.5
+#: On an ordinary time-boxed run the plateau bail is still ON (a blind campaign must not spend its
+#: whole slice after coverage has flatlined -- the operator's "fuzz smart, never blind" rule), but
+#: TWICE as patient as a converge run: the idle tail must be at least TWICE the productive head
+#: (frac = k/(k+1) with k=2 => 2/3), so it only reclaims budget on an unmistakable, observed flatline
+#: and never cuts a campaign still finding things (fail-open: any new coverage/crash resets the head).
+_PLATEAU_FRAC_DEFAULT = 2.0 / 3.0
 
 #: STALL AUTO-SKIP. A campaign whose executions have stopped COMPLETING -- every one runs into the
 #: per-execution limit, reaches nothing new and crashes nothing -- is a wedged target (it waits on
@@ -1064,15 +1070,18 @@ _STALL_SHARE_CAP_S = 300.0       # ... capped, so a 6-hour ceiling waits 5 minut
 _TIMEOUT_BATCH = 8
 
 
-def _plateau_window(execs: int, elapsed: float) -> tuple:
-    """(idle executions, idle seconds) the campaign must go without a find to have converged."""
-    return (max(_PLATEAU_MIN_EXECS, int(_PLATEAU_FRAC * max(0, execs))),
-            max(_PLATEAU_MIN_S, _PLATEAU_FRAC * max(0.0, elapsed)))
+def _plateau_window(execs: int, elapsed: float, frac: float = _PLATEAU_FRAC) -> tuple:
+    """(idle executions, idle seconds) the campaign must go without a find to have converged. `frac`
+    is the share of the productive head the idle tail must match (0.5 for a converge run, 1.0 for an
+    ordinary run -- twice as patient)."""
+    return (max(_PLATEAU_MIN_EXECS, int(frac * max(0, execs))),
+            max(_PLATEAU_MIN_S, frac * max(0.0, elapsed)))
 
 
-def _plateaued(execs: int, elapsed: float, gain_exec: int, gain_s: float) -> bool:
+def _plateaued(execs: int, elapsed: float, gain_exec: int, gain_s: float,
+               frac: float = _PLATEAU_FRAC) -> bool:
     """Has the campaign found nothing new since (`gain_exec`, `gain_s`) for long enough?"""
-    need_e, need_s = _plateau_window(execs, elapsed)
+    need_e, need_s = _plateau_window(execs, elapsed, frac)
     return (execs - gain_exec) >= need_e and (elapsed - gain_s) >= need_s
 
 
@@ -1248,14 +1257,121 @@ def _file_hang(ctx, target, fd, *, mode, data, prefix, hang, control, exec_timeo
     return input_sha
 
 
+#: A program's OWN consistency check firing on attacker input. glibc's assert() aborts (SIGABRT, a
+#: crash every engine already sees), but many projects install their own handler that prints and
+#: exit()s -- md4c's MD_ASSERT prints "Assertion '1 == 0' failed" and exits 1, which every engine
+#: filed as an ordinary error exit while AFL hit it twice on md4c.c:5531.
+_ASSERT_RE = re.compile(rb"(Assertion [`'\"].{0,200}?[`'\"] failed|assertion failed[^\n]{0,160}|"
+                        rb"ASSERT(?:ION)? FAILED[^\n]{0,160}|failed assertion[^\n]{0,160})",
+                        re.I)
+
+
+def assertion_message(stderr) -> Optional[str]:
+    m = _ASSERT_RE.search(stderr or b"")
+    return m.group(0).decode("latin-1", "ignore").strip()[:200] if m else None
+
+
+def _verify_assertion(exe, mode, workfile, exec_timeout, target, cand, control):
+    """Re-run the asserting input ALONE and the benign control: the assertion must fire again with
+    the same message, and the control must run without it. Returns the candidate's result or None."""
+    kw = {"endianness": target.endianness, "bits": target.bits}
+    c_data, c_prefix, c_guard = control
+    h_data, h_prefix, h_guard, msg = cand
+    try:
+        _a, c = run_input(exe, mode, workfile, exec_timeout, target.arch, c_data,
+                          base_argv=c_prefix, guard_page=c_guard, **kw)
+        if assertion_message(c.stderr) or c.crashed or sandbox.did_not_run(c.isolation):
+            return None
+        _a, h = run_input(exe, mode, workfile, exec_timeout, target.arch, h_data,
+                          base_argv=h_prefix, guard_page=h_guard, **kw)
+    except Exception:                                    # noqa: BLE001 -- a check, never a finding
+        observe.absorbed(_log, "assertion not re-verified")
+        return None
+    if sandbox.did_not_run(h.isolation) or assertion_message(h.stderr) != msg:
+        return None
+    return h
+
+
+def _file_assertion(ctx, target, fd, *, mode, data, prefix, res, msg, detector) -> str:
+    """A re-verified reachable assertion: CWE-617, the program aborts its own consistency check on
+    attacker input -- a denial of service, and evidence of a state its authors held impossible."""
+    input_sha = ctx.put_artifact("fuzz-crash-input", data=data)
+    DynResultDAO(ctx.conn).insert(target.id, target.case_id, run_id=ctx.run_id,
+                                  input_sha=input_sha, input_mode=mode, argv=list(prefix),
+                                  exit_code=res.exit_code, crashed=False,
+                                  isolation=res.isolation, duration_ms=res.duration_ms,
+                                  note=f"reachable assertion: {msg}")
+    key = re.sub(r"0x[0-9a-f]+|\d+", "N", msg)[:120]
+    fd.upsert(target.id, target.case_id, {
+        "cwe": "CWE-617", "title": f"Reachable assertion: {msg[:80]}", "severity": "medium",
+        "detector": detector, "state": "confirmed", "confidence": 0.9,
+        "dedup_key": f"CWE-617:assert:{key}", "function_addr": None, "site_addr": None,
+        "evidence": [{"channel": "dynamic", "input_sha": input_sha, "input_mode": mode,
+                      "argv": list(prefix),
+                      "detail": (f"input {input_sha[:12]} ({len(data)}B via {mode}) makes the "
+                                 f"program fail its own consistency check ({msg}) and exit "
+                                 f"{res.exit_code}; re-run alone it fails the same way, while a "
+                                 f"benign input runs without it -- a reachable assertion "
+                                 f"(denial of service)")}]})
+    return input_sha
+
+
 #: The campaign's event prefix -> the autopilot stage (engine) it runs as.
 _ENGINE_OF_PREFIX = {"fuzz": "fuzz", "directed": "directed_fuzz", "harness": "boundary_fuzz"}
+
+
+#: kept (coverage-novel) inputs remembered per stage for the QASan sweep
+_QASAN_SINK_CAP = 400
+#: inputs the sweep replays: the most recently kept ones (deepest coverage) first
+_QASAN_SWEEP_RUNS = 24
+
+
+def qasan_sweep(ctx, target, sink, *, exec_timeout: float, origin: str,
+                max_runs: int = _QASAN_SWEEP_RUNS, deadline_s: float = 45.0) -> int:
+    """Replay a campaign's kept inputs under QASan (the binary memory oracle): this engine runs the
+    target natively, so a heap over-read / small over-write / UAF on any of them was invisible. The
+    most recently kept inputs go first -- coverage-novel inputs found late are the deepest. One
+    bounded pass per stage; files through coverage.qasan_pass (confirmed, forgery-checked).
+    Declines (0) when QASan does not apply to this target. Never raises."""
+    if not sink or ctx.should_cancel():
+        ctx.emit(f"{origin}.qasan_sweep", payload={"applied": False, "kept_inputs": len(sink or ()),
+                                                   "note": "no kept inputs to sweep"})
+        return 0
+    try:
+        from ..dynamic import qasan
+        first_exe = sink[0][3]
+        ok, why = qasan.applicable(Path(first_exe).read_bytes(), target.arch)
+        if not ok:
+            ctx.emit(f"{origin}.qasan_sweep", payload={"applied": False, "note": why})
+            return 0
+        from . import aflpp
+        if aflpp.is_sanitizer_build(Path(first_exe).read_bytes()):
+            return 0                                  # ASan already instruments this build
+        from .coverage import qasan_pass
+        groups: dict = {}
+        for data, mode, suffix, exe, argv in reversed(sink):          # newest first
+            groups.setdefault((mode, suffix, exe, argv), []).append(data)
+        filed, per = 0, max(4, max_runs // max(1, len(groups)))
+        for (mode, suffix, exe, argv), inputs in groups.items():
+            seen, uniq = set(), []
+            for d in inputs:
+                if d not in seen:
+                    seen.add(d); uniq.append(d)
+            filed += qasan_pass(ctx, target, exe, uniq[:per], mode=mode, argv=list(argv),
+                                suffix=suffix, exec_timeout=exec_timeout, origin=origin,
+                                max_runs=per, deadline_s=deadline_s / max(1, len(groups)))
+        return filed
+    except Exception as e:                               # noqa: BLE001 -- additive lane
+        observe.absorbed(_log, "qasan sweep skipped")
+        ctx.emit(f"{origin}.qasan_sweep", level="warn",
+                 payload={"applied": False, "error": f"{type(e).__name__}: {e}"[:200]})
+        return 0
 
 
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
                   mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None,
-                  exe_name: str = ""):
+                  exe_name: str = "", kept_sink: Optional[list] = None):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -1481,6 +1597,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # Hang capture (see `_HANG_MIN_EXECS`): a benign control, the first few timed-out inputs.
     hang_control = None
     hang_cands: list = []
+    assert_cands: list = []
+    assert_sha = None
     hang_timeouts = 0
     hang_checks = 0
     hang_sha = None
@@ -1491,6 +1609,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # to the case budget (it is wall-clock), and the stage's other channels.
     _p = ctx.params or {}
     converge = bool(_p.get("converge"))
+    # The plateau bail is ON by default even on a time-boxed run (the "fuzz smart, never blind" rule):
+    # a blind/directed campaign that has flatlined returns its slice instead of spending it. A
+    # converge run bails at FRAC=0.5; an ordinary run is twice as patient (FRAC_DEFAULT) so it only
+    # reclaims budget on an unmistakable flatline. Opt out with params {"plateau": False}.
+    plateau_on = converge or bool(_p.get("plateau", True))
+    plateau_frac = _PLATEAU_FRAC if converge else _PLATEAU_FRAC_DEFAULT
     stall_check = bool(_p.get("stall_check", True))
     if stall_check and _baseline_nonterm(ctx.conn, target.id):
         stall_check = False
@@ -1563,7 +1687,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
                                         bits=target.bits, blocks=arm, base_argv=run_argv,
-                                        guard_page=guard_eff)
+                                        guard_page=guard_eff,
+                                        # novelty is judged in batch order, so a block an earlier
+                                        # input reached need not trap again (see batch_runner)
+                                        share_breakpoints=block_dist is None)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
             else:
@@ -1610,8 +1737,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     hang_timeouts += 1
                     if hang_sha is None and len(hang_cands) < _HANG_CANDIDATES:
                         hang_cands.append((data, list(run_argv), guard_eff))
-                elif hang_control is None and not res.crashed and not res.timed_out:
+                elif hang_control is None and not res.crashed and not res.timed_out \
+                        and not assertion_message(res.stderr):
                     hang_control = (data, list(run_argv), guard_eff)
+                if (not res.crashed and not res.timed_out and assert_sha is None
+                        and len(assert_cands) < 4 and res.exit_code not in (0, None)):
+                    _am = assertion_message(res.stderr)
+                    if _am and all(c[3] != _am for c in assert_cands):
+                        assert_cands.append((data, list(run_argv), guard_eff, _am))
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
@@ -1665,6 +1798,9 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         corpus[rng.randrange(len(corpus))] = data
                     kept += 1
                     kept_this = True
+                    if kept_sink is not None and len(kept_sink) < _QASAN_SINK_CAP:
+                        # (input, how it was delivered) for the end-of-stage QASan sweep
+                        kept_sink.append((data, mode, _suffix, str(exe), tuple(base_argv or ())))
                     if closer and not novel:
                         directed_kept += 1
             if all_blocks and cover_reported:
@@ -1787,6 +1923,19 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     gain_exec, gain_t = execs, time.time() - t_start
                 except Exception:                    # noqa: BLE001 -- never break the campaign
                     observe.absorbed(_log, "hang not filed")
+        if assert_cands and assert_sha is None and hang_control is not None \
+                and deadline - time.time() > 2 * exec_timeout + 1.0:
+            _ac = assert_cands.pop(0)
+            _r = _verify_assertion(exe, mode, workfile, exec_timeout, target, _ac, hang_control)
+            execs += 2
+            if _r is not None:
+                try:
+                    assert_sha = _file_assertion(ctx, target, fd, mode=mode, data=_ac[0],
+                                                 prefix=_ac[1], res=_r, msg=_ac[3],
+                                                 detector=detector)
+                    gain_exec, gain_t = execs, time.time() - t_start
+                except Exception:                    # noqa: BLE001 -- never break the campaign
+                    observe.absorbed(_log, "assertion not filed")
         # An ERROR LOOP: the program "ran" as far as the sandbox is concerned, but the loader refused
         # it every time (missing .so, wrong interpreter -> exit 127). Without this the campaign spent
         # its whole budget re-proving it -- measured: 3,100 attempts across fuzz + directed on one
@@ -1828,8 +1977,9 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                             "streak_s": round(stall_s, 1),
                             "grace_s": round(_stall_grace_s(exec_timeout, max_seconds), 1),
                             "exec_timeout": exec_timeout}
-        elif converge and plateau_armed and _plateaued(execs, _now - t_start, gain_exec, gain_t):
-            _we, _ws = _plateau_window(execs, _now - t_start)
+        elif plateau_on and plateau_armed and _plateaued(execs, _now - t_start, gain_exec, gain_t,
+                                                          plateau_frac):
+            _we, _ws = _plateau_window(execs, _now - t_start, plateau_frac)
             _unit = "blocks" if (all_blocks and cover_reported) else "behaviours"
             _cov = len(seen_blocks) if _unit == "blocks" else len(seen_behaviour)
             stopped = "converged"
@@ -1905,6 +2055,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         (execs < 200 and rate < 20 and not did_work)
         or (execs >= 200 and not entered)
         or (coverage_dead and not did_work))
+    try:                                                  # for the finding resolver
+        from . import corpus_keep
+        corpus_keep.keep(ctx, target, corpus, source=event_prefix, mode=mode, argv=list(base_argv or ()))
+    except Exception:                                     # noqa: BLE001 -- a convenience
+        pass
     stats = {"execs": execs, "crashes": crashes, "flaky": flaky,
              # Timed-out executions, and the re-verified hang filed from them (if any) -- so a
              # campaign whose timeouts were never checked does not read as "no hang".
@@ -2443,6 +2598,42 @@ def fuzz_stage(ctx) -> dict:
             "sample": [t.decode("latin-1", "replace")[:32] for t in _rt_tokens[:8]],
             "why": "values the target COMPARED its input against at runtime, which a static "
                    "string scan cannot see when the value is computed"})
+    # INPUT-TO-STATE checksum/length repair (REDQUEEN): a parser that rejects any input whose
+    # embedded checksum/length field does not match the body stalls the fuzzer at the front door --
+    # no mutation reaching the code behind the gate is ever accepted. Learn the field layout from a
+    # seed and add the REPAIRED seed to the corpus FRONT, so the fuzzer explores behind the integrity
+    # gate. Best-effort, bounded, stdin-only; the 'got further' signal is a repaired seed producing a
+    # output token the raw seed did not AND the learned layout generalizes to a second body (see
+    # i2s.repaired_corpus_seeds); capped at 10s so the probe never eats the campaign.
+    try:
+        if corpus and not substrate.is_managed(target.file_type) and (not channels or channels[0] == "stdin"):
+            import re as _re2
+            from . import i2s as _i2s
+            _ie = ctx.scratch() / "i2s_target.bin"
+            if not _ie.exists():
+                ctx.content.stage_target(target, _ie.parent, _ie.name)
+                os.chmod(_ie, 0o755)
+
+            def _out_tokens(d, _exe=str(_ie), _argv=base_argv, _to=min(2.0, max(0.5, exec_timeout))):
+                # through the sandbox like every other target execution (bwrap, no network, mem cap)
+                try:
+                    r = sandbox.run(_exe, argv=[str(x) for x in _argv], stdin=d, timeout=_to,
+                                    arch=target.arch, endianness=target.endianness, bits=target.bits)
+                    return set(_re2.findall(rb"[\x20-\x7e]{3,}", (r.stdout or b"") + (r.stderr or b"")))
+                except Exception:                            # noqa: BLE001
+                    return set()
+
+            _rep = _i2s.repaired_corpus_seeds(str(_ie), corpus[:6], run=_out_tokens, max_seeds=4,
+                                                deadline_s=10.0)
+            if _rep:
+                corpus = _rep + list(corpus)
+                ctx.emit("fuzz.i2s", payload={
+                    "repaired_seeds": len(_rep),
+                    "why": "an embedded checksum/length field was repaired so the fuzzer explores "
+                           "behind the integrity gate instead of being rejected at it"})
+    except Exception:                                        # noqa: BLE001 -- advisory, never sink the campaign
+        pass
+
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
     fmt = p.get("format_name") or ("custom" if p.get("format") else None)
     if mutator is None and not p.get("format") and any(
@@ -2607,6 +2798,7 @@ def fuzz_stage(ctx) -> dict:
     blocks_known = 0
     stage_deadline = time.time() + max_seconds
     stopped_by: dict = {}
+    _kept_sink: list = []
     for i, ch in enumerate(channels):
         _kw = {"run_fn": _lin_run} if _lin_run is not None else {}
         # A channel that converged or stalled early hands its unused slice to the channels after
@@ -2622,7 +2814,7 @@ def fuzz_stage(ctx) -> dict:
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
                            cover_blocks=blocks, cover_flags=flags, base_argv=base_argv,
-                           exe_name=_exec_name, **_kw)
+                           exe_name=_exec_name, kept_sink=_kept_sink, **_kw)
         for k in totals:
             totals[k] += st.get(k, 0)
         blocks_hit = max(blocks_hit, st.get("blocks_hit", 0))
@@ -2633,6 +2825,8 @@ def fuzz_stage(ctx) -> dict:
             break
     ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals,
                                        "stopped": stopped_by or None})
+    if p.get("qasan", True) and not totals.get("crashes"):
+        qasan_sweep(ctx, target, _kept_sink, exec_timeout=exec_timeout, origin="fuzz")
     # Block coverage: how much of the recovered code the campaign actually reached. A parser
     # that fuzzed for a full budget but hit 3% of blocks never got past its length check.
     pct = round(100.0 * blocks_hit / blocks_known, 1) if blocks_known else None

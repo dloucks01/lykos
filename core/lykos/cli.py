@@ -121,8 +121,11 @@ def _cmd_analyze(args) -> int:
     from .jobs import JobConfig, JobQueue, WorkerPool
 
     path = Path(args.binary)
-    if not path.is_file():
-        print(f"not a file: {path}", file=sys.stderr)
+    # A DIRECTORY is a source project (or a challenge bundle): ingest builds it with sanitizers,
+    # exactly as a folder upload through the web GUI does. Refusing it here left the CLI unable to
+    # analyse a source tree at all -- a GUI/CLI parity gap.
+    if not (path.is_file() or path.is_dir()):
+        print(f"not a file or directory: {path}", file=sys.stderr)
         return 2
     case_dir = Path(args.case_store) if args.case_store else Path(
         tempfile.mkdtemp(prefix="lykos-case-"))
@@ -155,9 +158,16 @@ def _cmd_analyze(args) -> int:
         print(f"budget   {args.budget:g}s   case {case_dir}")
         status: dict = {"state": "starting"}
         stop = threading.Event()
+        # --no-fuzz: skip the sampling campaigns (blind + coverage-guided), leaving the non-fuzzing
+        # pipeline -- static detection, dedup, the potential-PoC floor, and the solve/construct
+        # prove-out rungs (concolic / template / driver synthesis / construction). Non-fuzzing is the
+        # primary deliverable; this makes a run exercise it without any campaign spending the clock.
+        from .analyze import budget as _budget_mod
+        _skip = _budget_mod.SAMPLER_STAGES if getattr(args, "no_fuzz", False) else None
         th = threading.Thread(target=run_case_autopilot,
                               args=(case_dir, case.id, [t.id], status, stop, args.budget,
                                     over),
+                              kwargs={"skip_stages": _skip},
                               daemon=True)
         th.start()
         # `--budget N` has to mean something to the person who typed it, so this is a hard
@@ -184,6 +194,7 @@ def _cmd_analyze(args) -> int:
         _print_scorecard(card)
         findings = [f for f in FindingDAO(store.conn).list_by_target(t.id)]
         _print_findings(findings)
+        _print_distinct(store, case.id)
         # THE DELIVERABLE. A verified PoC is a self-contained tarball with the target, the input
         # and a runner script -- and the run never said it existed, let alone where. Anyone who
         # wanted the thing the tool is for had to know that artifacts live in the case directory
@@ -242,27 +253,66 @@ def _tick_plan(status: dict, seen: dict) -> None:
 
 
 def _export_pocs(store, target, out_dir) -> None:
-    """Write every verified PoC bundle to disk and say how to run it."""
-    from .db.dao import PocDAO
+    """Write every PoC to disk and say how to run it. doc 58: a CONSTRUCTED/DETONATED PoC is the
+    lightweight deliverable -- the payload bytes + a few-line repro (no package); a legacy bundle PoC
+    is its tarball. Both are exported."""
+    from .db.dao import PocDAO, FindingDAO
     try:
         pocs = [p for p in PocDAO(store.conn).list_by_target(target.id)
-                if getattr(p, "verified", False) and getattr(p, "bundle_sha", None)]
+                if getattr(p, "level", None)
+                and (getattr(p, "bundle_sha", None) or getattr(p, "input_sha", None))]
     except Exception:                                    # noqa: BLE001 -- advisory
         return
     if not pocs:
         return
+    # the lightweight repro line(s) per finding, for payload PoCs that carry one
+    repro_by_fid = {}
+    try:
+        for f in FindingDAO(store.conn).list_by_target(target.id):
+            for e in (f.evidence or []):
+                if isinstance(e, dict) and e.get("channel") == "reproduce":
+                    repro_by_fid[f.id] = e.get("detail", "")
+    except Exception:                                    # noqa: BLE001
+        pass
     out_dir.mkdir(parents=True, exist_ok=True)
     print("\n-- proof of concept " + "-" * 57)
-    for p in sorted(pocs, key=lambda x: str(x.level), reverse=True)[:6]:
-        name = f"{target.filename}-{p.level}-{str(p.bundle_sha)[:8]}.tar.gz"
-        dest = out_dir / name
-        try:
-            dest.write_bytes(store.content.get_bytes(p.bundle_sha))
-        except Exception:                                # noqa: BLE001 -- one bad artifact
+    # highest level first; within a level, a detonated PoC outranks a merely-constructed one
+    _rank = {"detonated": 2, "constructed": 1}
+    seen_art = set()
+    for p in sorted(pocs, key=lambda x: (str(x.level), _rank.get(getattr(x, "provenance", None), 0)),
+                    reverse=True)[:8]:
+        art = getattr(p, "bundle_sha", None) or getattr(p, "input_sha", None)
+        if art in seen_art:                              # same artifact filed by two callers
             continue
-        print(f"  {p.level}  {dest}")
-        print(f"      tar xzf {name} && sh poc/runner.sh   # prints what it proves, exits "
-              f"non-zero on the fault")
+        seen_art.add(art)
+        if getattr(p, "bundle_sha", None):
+            name = f"{target.filename}-{p.level}-{str(p.bundle_sha)[:8]}.tar.gz"
+            dest = out_dir / name
+            try:
+                dest.write_bytes(store.content.get_bytes(p.bundle_sha))
+            except Exception:                            # noqa: BLE001 -- one bad artifact
+                continue
+            print(f"  {p.level}  {dest}")
+            print(f"      tar xzf {name} && sh poc/runner.sh   # prints what it proves, exits "
+                  f"non-zero on the fault")
+        elif getattr(p, "input_sha", None):
+            name = f"{target.filename}-{p.level}-{str(p.input_sha)[:8]}.bin"
+            dest = out_dir / name
+            try:
+                dest.write_bytes(store.content.get_bytes(p.input_sha))
+            except Exception:                            # noqa: BLE001 -- one bad artifact
+                continue
+            prov = getattr(p, "provenance", None)
+            mark = {"detonated": "[detonated: oracle fired]",
+                    "constructed": "[constructed: sound, not run here]"}.get(prov, "")
+            sig = f" {p.signal_name}" if getattr(p, "signal_name", None) else ""
+            print(f"  {p.level}  {dest}   {mark}{sig}")
+            repro = repro_by_fid.get(p.finding_id)
+            if repro:
+                for ln in repro.strip().splitlines():
+                    print(f"      {ln}")
+            else:
+                print(f"      {target.filename} < {dest.name}   # deliver the payload to the target")
     print("  RUN IN A SANDBOX OR VM: a PoC executes an untrusted binary. Authorized use only.")
 
 
@@ -622,6 +672,22 @@ def _print_findings(findings) -> None:
     print(f"\n  {len(demod)} demonstrated, {len(findings) - len(demod)} detected only.")
 
 
+def _print_distinct(store, case_id) -> None:
+    """The report's own count of distinct DEFECTS, beside the row count above. One defect is often
+    several rows -- the crash, root_cause's classification, a static detector that predicted the
+    same instruction, a PoC replay -- and the CLI said '2 demonstrated' for jhead's one bug while
+    the report said 1."""
+    try:
+        from .report.model import build_report
+        nar = (build_report(store, case_id) or {}).get("narrative") or {}
+    except Exception:                                    # noqa: BLE001 -- a summary line only
+        return
+    ds = [d for t in nar.get("targets") or [] for d in t.get("dossiers") or []]
+    if ds:
+        print(f"  = {len(ds)} distinct demonstrated vulnerabilit{'y' if len(ds) == 1 else 'ies'}: "
+              + "; ".join(f'{d.get("title")} [{d.get("severity")}]' for d in ds[:6]))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lykos", description="lykos core CLI")
     p.add_argument("--version", action="version", version=f"lykos {__version__}")
@@ -717,7 +783,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     an = sub.add_parser("analyze",
                         help="run the full pipeline on one binary and report what it did")
-    an.add_argument("binary", help="the file to analyse")
+    an.add_argument("binary", help="the file to analyse, or a source-project directory to build "
+                                    "with sanitizers and analyse")
     an.add_argument("--budget", type=float, default=900.0,
                     help="wall-clock seconds for this target (default 900); divided among the "
                          "recover/search/prove phases")
@@ -738,6 +805,10 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("--out", default=None,
                     help="where to write verified PoC bundles (default: the current directory)")
     an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
+    an.add_argument("--no-fuzz", action="store_true",
+                    help="skip the sampling campaigns (blind + coverage-guided fuzzing); run the "
+                         "non-fuzzing pipeline only -- static detection, dedup, the potential-PoC "
+                         "floor, and the solve/construct prove-out rungs")
     an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
     an.set_defaults(func=_cmd_analyze)
 
@@ -1330,7 +1401,11 @@ def _cmd_cwe_coverage(args: argparse.Namespace) -> int:
                       file=sys.stderr)
                 return 2
             findings = FindingDAO(store.conn).list_by_case(hit[0].id)
-            run = cc.run_matrix(findings)
+            # PoC rows carry the L0..L3 level; join them (by finding) so the scorecard reports the
+            # best LEVEL reached per class, not only the finding's confidence state.
+            pocs = [{"finding_id": r[0], "level": r[1]} for r in store.conn.execute(
+                "SELECT finding_id, level FROM poc WHERE case_id=?", (hit[0].id,)).fetchall()]
+            run = cc.run_matrix(findings, pocs)
         finally:
             store.close()
     if args.json:

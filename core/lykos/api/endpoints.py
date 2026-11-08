@@ -62,7 +62,7 @@ _MAX_BUNDLE_MEMBERS = 20_000
 
 #: Stage params that name a server-side path or tool binary: CLI-only (see `_create_run`).
 _CLI_ONLY_PARAMS = frozenset({"seed_files", "seed_dir", "afl_path", "gdb_path", "symqemu_path",
-                              "angr_python", "unicorn_python"})
+                              "angr_python", "unicorn_python", "sysroot"})
 #: Stages that take operator seeds (`seed_shas` from the browser, resolved to `seed_files`).
 _SEEDED_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "diff_test"})
 
@@ -162,6 +162,20 @@ def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
     return None
 
 
+def x_filename(headers):
+    """The upload's display name from `X-Filename`. A header value is Latin-1 only, so a browser
+    cannot send a name like `测试.bin` raw (fetch throws); the GUI percent-encodes it and says so
+    with `X-Filename-Encoding: uri`. Without that header the value is taken as-is (older clients)."""
+    v = headers.get("X-Filename")
+    if v and (headers.get("X-Filename-Encoding") or "").lower() == "uri":
+        from urllib.parse import unquote
+        try:
+            v = unquote(v, errors="strict")
+        except UnicodeDecodeError:
+            pass
+    return v
+
+
 def _extract_upload(ctype: str, raw: Path, td: Path, x_filename):
     """(filename, path) of the file to ingest from a body already streamed to `raw`.
 
@@ -202,6 +216,124 @@ def _hexdump(data: bytes, limit: int = 1024) -> str:
         ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         lines.append(f"{off:08x}  {hexpart}  |{ascii_}|")
     return "\n".join(lines)
+
+
+# ---- build-dependency pre-flight (`lykos deps`) for the GUI ----------------------------------
+# Deterministic for one source artifact on one host (it reads the tree and asks this host's
+# compiler / pkg-config / ldconfig), so it is computed once per (store, artifact, include-scan).
+_DEPS_CACHE: dict = {}
+_DEPS_LOCK = __import__("threading").Lock()
+#: Package names for the build TOOLS themselves (apt, dnf): a missing cmake is as stageable as a
+#: missing library, and the operator needs the install line for it too.
+_TOOL_PKG = {"cc": ("gcc", "gcc"), "c++": ("g++", "gcc-c++"), "make": ("make", "make"),
+             "pkg-config": ("pkg-config", "pkgconf-pkg-config"), "cmake": ("cmake", "cmake"),
+             "autoconf": ("autoconf", "autoconf"), "automake": ("automake", "automake")}
+
+
+def _deps_view(pf: dict, tree: Path, store_dir: Path) -> dict:
+    """The pre-flight dict made safe and useful for the browser: the project root reported
+    TREE-relative (never a server path, and every string scrubbed of the tree / store location as
+    a backstop), plus the aggregated stage-these install lines and the gaps no package maps."""
+    root = Path(pf.get("root") or tree)
+    try:
+        rel = root.resolve().relative_to(tree.resolve()).as_posix() or "."
+    except ValueError:
+        rel = "."
+    view = {k: v for k, v in pf.items() if k != "root"}
+    view["project_root"] = rel
+    apt: list = []
+    dnf: list = []
+    for tool in pf.get("toolchain_missing") or []:
+        a, d = _TOOL_PKG.get(tool, (None, None))
+        if a and a not in apt:
+            apt.append(a)
+        if d and d not in dnf:
+            dnf.append(d)
+    no_pkg: list = []
+    for r in pf.get("missing") or []:
+        h = r.get("hint")
+        if h:
+            if h.get("apt") and h["apt"] not in apt:
+                apt.append(h["apt"])
+            if h.get("dnf") and h["dnf"] not in dnf:
+                dnf.append(h["dnf"])
+        else:
+            no_pkg.append({"kind": r["kind"], "name": r["name"]})
+    view["stage"] = {
+        "apt": ("sudo apt-get install -y " + " ".join(apt)) if apt else None,
+        "dnf": ("sudo dnf install -y " + " ".join(dnf)) if dnf else None,
+        "apt_download": ("apt-get download " + " ".join(apt)) if apt else None,
+        "packages": {"apt": apt, "dnf": dnf},
+        "no_package_hint": no_pkg,
+    }
+    view["source"] = True
+    view["checked_on"] = "this lykos server host"
+    text = json.dumps(view)
+    for p in {str(tree), str(tree.resolve()), str(store_dir), str(Path(store_dir).resolve())}:
+        if p and p != "/":
+            text = text.replace(json.dumps(p)[1:-1], "<tree>")
+    return json.loads(text)
+
+
+# ---- weakness-class coverage (`lykos cwe-coverage`) for the GUI ------------------------------
+#: How a detection METHOD finds a class (cwe_catalog.method), in the operator's words.
+_CWE_METHOD = {
+    "pattern": "static pattern, run over every function",
+    "taint": "source-to-sink taint (the sink is located by pattern; a hit is a lead)",
+    "runtime": "sanitizer / execution oracle (ASan, UBSan, LSan, MSan, TSan)",
+    "binary": "recovered from the compiled image (imports, rodata, symbols)",
+    "na": "not applicable to C / native code (excluded explicitly)",
+}
+#: The furthest rung lykos can carry a SOUND exploit of a class today, and what that rung means.
+#: L3 is class-specific (code execution / validated disclosure / demonstrated DoS / the weakness
+#: reached). A lower rung, or none, is lykos's current reach -- the technique not yet built -- and
+#: never a property of any target.
+_CWE_RUNG = {
+    "rce": ("L3", "a working code / command-execution exploit is modelled for this class"),
+    "primitive": ("L2", "a corruption primitive; the technique that turns it into code execution "
+                  "is not yet built for this class"),
+    "leak": ("L3", "a validated disclosure (secret or pointer bytes exfiltrated under a control)"),
+    "dos": ("L3", "a demonstrated denial of service — the class gives availability, not control"),
+    "logic": ("L3", "the weakness demonstrated by reaching it (auth, traversal, crypto) — the "
+              "finding is the impact"),
+}
+_CWE_MATRIX: dict = {}
+
+
+def _cwe_matrix() -> dict:
+    """The static class matrix: cwe_coverage.capability_matrix() (the CLI's ~92 classes) joined
+    with the catalog's detection method, plus the catalog-only classes the sweep also covers."""
+    if _CWE_MATRIX:
+        return _CWE_MATRIX
+    from ..analyze import cwe_catalog
+    from ..analyze import cwe_coverage as cc
+    rows = []
+    seen = set()
+
+    def row(cwe, name, ceiling, catalog_only):
+        e = cwe_catalog.CATALOG.get(cwe)
+        method = e.method if e else None
+        lvl, why = _CWE_RUNG.get(ceiling, (None, "no exploit path modelled yet — not yet built"))
+        return {"cwe": cwe, "name": name, "family": e.family if e else None,
+                "severity": e.severity if e else None, "method": method,
+                "method_label": _CWE_METHOD.get(method) if method else None,
+                # the CLI's classes are all named by a detector; a catalog-only "na" class is not
+                "detected": (method != "na") if catalog_only else True,
+                "ceiling": ceiling, "ceiling_label": cc._CEILING_WORD.get(ceiling) if ceiling else None,
+                "ceiling_level": lvl, "ceiling_why": why, "rce_capable": ceiling == "rce",
+                "catalog_only": catalog_only}
+
+    for m in cc.capability_matrix():
+        rows.append(row(m["cwe"], m["name"], m["ceiling"], False))
+        seen.add(m["cwe"])
+    for cwe, e in cwe_catalog.CATALOG.items():
+        if cwe not in seen:
+            rows.append(row(cwe, e.name, cc.weaponizable(cwe), True))
+    rows.sort(key=lambda r: int(r["cwe"].split("-")[1]))
+    _CWE_MATRIX.update({"schema": "lykos.cwe-coverage/1", "classes": rows,
+                        "methods": _CWE_METHOD,
+                        "rungs": {k: {"level": v[0], "why": v[1]} for k, v in _CWE_RUNG.items()}})
+    return _CWE_MATRIX
 
 
 class EndpointsMixin:
@@ -549,6 +681,34 @@ class EndpointsMixin:
         finally:
             s.close()
 
+    def _get_backlog(self, cid):
+        """The WEAPONIZATION BACKLOG for a case: every finding lykos hasn't yet carried to a
+        validated PoC, the level its current techniques reach, and the SPECIFIC technique to build
+        next -- grouped so one build's leverage (advances N findings) is visible. The live mirror of
+        the report's backlog section, so the operator sees the research queue without opening a
+        report. Reuses the exact finding serialization the findings board uses (so `exploitability`
+        -- class primitive + the target's mitigations + the honest ceiling -- is already attached),
+        then runs the single `ceiling_ledger` source the report and GUI share. Returns an empty
+        shell (never 404-on-empty) so the panel can say 'nothing in the backlog' distinctly from a
+        missing case."""
+        from ..analyze.confirm_ladder import ceiling_ledger
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            tmap = {t.id: t for t in s.targets.list_by_case(cid)}
+            fd = FindingDAO(s.conn)
+            serialized = [_finding(f, mitigations=(tmap[f.target_id].mitigations
+                                                   if f.target_id in tmap else None))
+                          for f in fd.list_by_case(cid)]
+            led = ceiling_ledger(serialized)
+            if led is None:
+                from ..analyze.confirm_ladder import CEILING_FRAMING
+                led = {"framing": CEILING_FRAMING, "count": 0, "entries": [], "techniques": []}
+            return self._json(led)
+        finally:
+            s.close()
+
     def _get_case_findings(self, cid):
         """All findings in a case, enriched with target filename/arch and the target's best
         PoC level -- the data the case findings board aggregates."""
@@ -838,6 +998,112 @@ class EndpointsMixin:
         finally:
             s.close()
 
+    def _get_source_tree(self, tid):
+        """The files of the target's uploaded source tree (tree-relative), for the source view."""
+        from . import source_tree as ST
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            root = ST.tree_root(s, t)
+            if root is None:
+                return self._json({"files": [], "source": False})
+            return self._json({"source": True, **ST.list_files(root)})
+        finally:
+            s.close()
+
+    def _get_source_file(self, tid, qs):
+        """Lines of one file of the target's source tree: ?path=<tree-relative or basename>
+        &line=N&context=K. An ambiguous basename answers with its candidates."""
+        from . import source_tree as ST
+        path = (qs.get("path") or [""])[0]
+        try:
+            line = int((qs.get("line") or ["0"])[0]) or None
+            ctx = int((qs.get("context") or ["12"])[0])
+        except ValueError:
+            return self._json({"error": "line/context must be integers"}, 400)
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            root = ST.tree_root(s, t)
+            if root is None:
+                return self._json({"error": "this target has no source tree"}, 404)
+            fid = (qs.get("finding") or [""])[0]
+            if fid:
+                # the finding's own site, resolved exactly as dedup / the confirm stages do
+                from ..analyze.dedup import site_of
+                from ..db.dao import FindingDAO
+                f = next((x for x in FindingDAO(s.conn).list_by_target(tid) if x.id == fid), None)
+                if f is None:
+                    return self._json({"error": "no such finding on this target"}, 404)
+                fp, fl = site_of(f, root)
+                if not fp:
+                    return self._json({"error": "this finding names no source site"}, 404)
+                path, line = fp, (line or fl)
+            rel, cands = ST.resolve(root, path)
+            if rel is None:
+                return self._json({"error": "no such file in the source tree",
+                                   "candidates": cands}, 404)
+            out = ST.read_window(root, rel, line, ctx)
+            return self._json(out, 404 if out.get("error") else 200)
+        finally:
+            s.close()
+
+    def _get_target_deps(self, tid, qs):
+        """`lykos deps` for the target's uploaded source tree: what the project declares it needs
+        vs. what THIS server host has, the build toolchain, and the install lines to stage the
+        gaps before going offline. ?include_scan=0 is the CLI's --no-include-scan. A binary target
+        with no source tree answers {source: false}. Paths are tree-relative only."""
+        from . import source_tree as ST
+        scan = (qs.get("include_scan") or ["1"])[0] not in ("0", "false", "no")
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            art = ST.project_for(s, t)
+            root = ST.tree_root(s, t) if art is not None else None
+            if root is None:
+                return self._json({"source": False})
+            key = (str(s.dir), art.sha256, scan)
+            with _DEPS_LOCK:
+                hit = _DEPS_CACHE.get(key)
+            if hit is None:
+                from ..analyze import dep_preflight
+                hit = _deps_view(dep_preflight.scan_dependencies(root, scan_includes=scan),
+                                 Path(root), Path(s.dir))
+                with _DEPS_LOCK:
+                    _DEPS_CACHE[key] = hit
+            return self._json(hit)
+        finally:
+            s.close()
+
+    def _get_cwe_coverage(self, qs):
+        """`lykos cwe-coverage`: every weakness class -- how lykos detects it and the furthest
+        rung it can carry a sound exploit of it today -- plus, with ?case=<id>, how far each class
+        that actually appeared on that case was carried. Server-wide; the case overlay is optional."""
+        from ..analyze import cwe_coverage as cc
+        out = dict(_cwe_matrix())
+        out["summary"] = cc.summary()
+        out["case"] = None
+        cid = (qs.get("case") or [""])[0]
+        if cid:
+            s = self._store()
+            try:
+                c = s.cases.get(cid)
+                if not c:
+                    return self._json({"error": "no case"}, 404)
+                findings = FindingDAO(s.conn).list_by_case(cid)
+                pocs = [{"finding_id": r[0], "level": r[1]} for r in s.conn.execute(
+                    "SELECT finding_id, level FROM poc WHERE case_id=?", (cid,)).fetchall()]
+                out["case"] = {"id": c.id, "name": c.name, **cc.run_matrix(findings, pocs)}
+            finally:
+                s.close()
+        return self._json(out)
+
     def _get_run_output(self, rid):
         """The parsed JSON a stage produced -- what actually happened, for the run log.
 
@@ -1033,7 +1299,7 @@ class EndpointsMixin:
                                       413, close=True)
                 try:
                     filename, upload = _extract_upload(ctype, raw, tdp,
-                                                       self.headers.get("X-Filename"))
+                                                       x_filename(self.headers))
                 except ValueError as e:
                     return self._json({"error": str(e)}, 400, close=True)
                 # The client-supplied filename must never influence where we write: an absolute
@@ -1078,7 +1344,13 @@ class EndpointsMixin:
         sample = sample[:65536]                          # cap: previews stay fast
         spec = body.get("spec")
         if spec is not None:
-            return self._json({"preview": structure.describe(spec, sample)})
+            # a hand-written spec the model cannot build (wrong field type, bad length_of) is the
+            # operator's input error, not a server fault: say what was wrong, as a 400
+            try:
+                preview = structure.describe(spec, sample)
+            except Exception as e:                       # noqa: BLE001 -- reported to the UI
+                return self._json({"error": f"the spec could not be used: {e}"}, 400)
+            return self._json({"preview": preview})
         return self._json({"suggestion": structure.suggest_spec(sample)})
 
     @staticmethod
@@ -1100,6 +1372,16 @@ class EndpointsMixin:
         if paths:
             out["seed_files"] = paths
         return out, None
+
+    def _check_sysroot_param(self, cid, params):
+        """A single-stage run's target libraries arrive as `sysroot_sha` (an archive uploaded into
+        THIS case); the worker resolves it when the run starts (jobs/runenv). Checked here so a
+        foreign or unknown hash is a 400 at the edge, not a run that silently goes without."""
+        sha = (params or {}).get("sysroot_sha")
+        if not sha:
+            return None
+        _d, err = self._resolve_sysroot_sha(cid, sha)
+        return err
 
     def _create_run(self):
         from ..jobs.registry import reproject_cache_hit
@@ -1147,6 +1429,9 @@ class EndpointsMixin:
                 params, err = self._seed_params(cid, params)
                 if err:
                     return self._json({"error": err}, 400)
+                err = self._check_sysroot_param(cid, params)
+                if err:
+                    return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._CASE_STAGES[stage])
                 run = fn(q, cid) if stage in ("link_case", "ipc_model", "cross_taint") \
                     else fn(q, cid, params=params)
@@ -1159,8 +1444,16 @@ class EndpointsMixin:
                 params, err = self._seed_params(target.case_id, params)
                 if err:
                     return self._json({"error": err}, 400)
+                err = self._check_sysroot_param(target.case_id, params)
+                if err:
+                    return self._json({"error": err}, 400)
                 fn = self._enqueue_fn(self._TARGET_STAGES[stage])
-                run = fn(q, target) if stage in (_INGEST, "disassemble", "detect_cwe") \
+                # The no-params set is the stage table's own (StageSpec.no_params), the same one the
+                # autopilot uses. A hard-coded trio here made every newer no-params stage
+                # (guard_gap, triage, attack_path, ...) TypeError at dispatch: runnable from the
+                # CLI/autopilot, unreachable from the web GUI.
+                from ..analyze.orchestrate import _NO_PARAMS
+                run = fn(q, target) if (stage in _NO_PARAMS or stage == _INGEST) \
                     else fn(q, target, params=params)
             elif stage in self._TARGET_STAGES:
                 return self._json({"error": f"stage {stage!r} requires a target_id"}, 400)

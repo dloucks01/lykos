@@ -147,8 +147,10 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_AUTOPILOT_CANCEL,
     _CASE_AUTOPILOT_PAUSE,
     _CASE_AUTOPILOT_RESUME,
+    _CASE_BACKLOG,
     _CASE_COVERAGE,
     _CASE_CURATION,
+    _CASE_CONSOLE,
     _CASE_EVENTS,
     _CASE_EXPORT,
     _CASE_FIND,
@@ -156,6 +158,9 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_REPORT,
     _CASE_RUN_SIGNALS,
     _CASE_RUNS,
+    _CASE_RUNS_HISTORY,
+    _AUTOPILOT_RUN_COMPARE,
+    _AUTOPILOT_RUN_ID,
     _CASE_SCORECARD,
     _CASE_SEED_ID,
     _CASE_SEEDS,
@@ -174,6 +179,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _TARGET_CAPS,
     _TARGET_CG,
     _TARGET_CRASH_TRIAGE,
+    _TARGET_DEPS,
     _TARGET_DYN,
     _TARGET_FIND,
     _TARGET_FUNCS,
@@ -182,10 +188,13 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _TARGET_POC,
     _TARGET_REPLAY,
     _TARGET_SOURCE,
+    _TARGET_SRCFILE,
+    _TARGET_SRCTREE,
     _TARGET_STR,
     _read_static,
     _read_ui,
 )
+from .routes import _CASE_SYSROOT_ID, _CASE_SYSROOTS  # uploaded target libraries (api/sysroot.py)
 
 _log = logging.getLogger(__name__)
 
@@ -363,6 +372,7 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -414,6 +424,12 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._static()
             if path == "/classic.html":       # the preserved single-file UI, linked from the app
                 return self._static_asset("classic.html")
+            if path == "/rebuild.html":        # doc 59 ground-up GUI rebuild (dev entry; old app stays)
+                return self._static_asset("rebuild.html")
+            if path == "/next.html":           # the redesigned workbench, also the default at /
+                return self._static_asset("next.html")
+            if path == "/workbench-v1.html":   # the previous default workbench (index.html + app/)
+                return self._static_asset("index.html")
             m = _STATIC_ASSET.match(path)
             if m:
                 return self._static_asset(m.group(1))
@@ -431,6 +447,11 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                 return self._get_selftest()
             if path == "/selftest/history":
                 return self._get_selftest_history()
+            if path == "/cwe-coverage":         # `lykos cwe-coverage` parity (?case= overlay)
+                return self._get_cwe_coverage(qs)
+            m = _TARGET_DEPS.match(path)
+            if m:
+                return self._get_target_deps(m.group(1), qs)
             m = _CASE_RUN_SIGNALS.match(path)
             if m:
                 return self._get_run_signals(m.group(1))
@@ -440,6 +461,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_SEEDS.match(path)
             if m:
                 return self._get_seeds(m.group(1))
+            m = _CASE_SYSROOTS.match(path)
+            if m:
+                return self._get_sysroots(m.group(1))
             if path == "/cases":
                 s = self._store()
                 try:
@@ -458,6 +482,18 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
                     return self._json([_target(t) for t in s.targets.list_by_case(m.group(1))])
                 finally:
                     s.close()
+            # Durable autopilot run history + compare (api/run_history.py): read-only.
+            m = _CASE_RUNS_HISTORY.match(path)
+            if m:
+                from . import run_history as _rh
+                return _rh.get_runs_history(self, m.group(1))
+            if _AUTOPILOT_RUN_COMPARE.match(path):
+                from . import run_history as _rh
+                return _rh.compare_autopilot_runs(self, qs)
+            m = _AUTOPILOT_RUN_ID.match(path)
+            if m:
+                from . import run_history as _rh
+                return _rh.get_autopilot_run(self, m.group(1))
             m = _CASE_RUNS.match(path)
             if m:
                 s = self._store()
@@ -524,6 +560,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_COVERAGE.match(path)
             if m:
                 return self._get_coverage(m.group(1))
+            m = _CASE_BACKLOG.match(path)
+            if m:
+                return self._get_backlog(m.group(1))
             m = _CASE_TIMING.match(path)
             if m:
                 return self._get_timing(m.group(1))
@@ -594,6 +633,12 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _TARGET_SOURCE.match(path)
             if m:
                 return self._get_target_source(m.group(1))
+            m = _TARGET_SRCTREE.match(path)
+            if m:
+                return self._get_source_tree(m.group(1))
+            m = _TARGET_SRCFILE.match(path)
+            if m:
+                return self._get_source_file(m.group(1), qs)
             m = _TARGET_CAPS.match(path)
             if m:
                 return self._get_capabilities(m.group(1))
@@ -662,6 +707,12 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             if m:
                 after = _int_param(qs, "after", 0)
                 return self._get_events(m.group(1), after, max(0, _int_param(qs, "tail", 0)))
+            m = _CASE_CONSOLE.match(path)
+            if m:
+                if (qs.get("download") or [""])[0] == "1":
+                    return self._download_console(m.group(1))
+                return self._get_console(m.group(1), _int_param(qs, "after", 0),
+                                         _int_param(qs, "tail", 0))
             self._json({"error": "not found"}, 404)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)
@@ -682,6 +733,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_SEEDS.match(path)
             if m:
                 return self._upload_seed(m.group(1))
+            m = _CASE_SYSROOTS.match(path)
+            if m:
+                return self._upload_sysroot(m.group(1))
             if path == "/runs":
                 return self._create_run()
             if path == "/selftest":
@@ -739,6 +793,9 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
             m = _CASE_SEED_ID.match(path)
             if m:
                 return self._delete_seed(m.group(1), m.group(2).lower())
+            m = _CASE_SYSROOT_ID.match(path)
+            if m:
+                return self._delete_sysroot(m.group(1), m.group(2).lower())
             self._json({"error": "not found"}, 404, close=True)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)
@@ -812,20 +869,72 @@ class Handler(EndpointsMixin, AutopilotMixin, OpsMixin, SelftestMixin, BaseHTTPR
         exe = workdir / "target.bin"
         exe.write_bytes(blob)
         os.chmod(exe, 0o755)
-        argv = _csv(qs.get("argv")) or []
+        # `args` is a shell-quoted string ("-c @@", `--name "a b"`), split exactly like the
+        # autopilot's argv and the CLI's --argv. `argv` (comma-separated) is the older form.
+        args = (qs.get("args") or [None])[0]
+        if args is not None:
+            import shlex
+            try:
+                argv = shlex.split(args)
+            except ValueError:                           # unbalanced quotes: plain words
+                argv = args.split()
+        else:
+            argv = _csv(qs.get("argv")) or []
 
         def put_seed(data: bytes) -> str:
+            # A real case seed (artifact + operator.seed event): it shows in the seed list and
+            # the next run's seed picker. A bare artifact was never used by any analysis.
+            from .ops import register_seed
             st = CaseStore(self.server.case_dir)
             try:
-                return st.put_artifact(case_id, "console-seed", data=data).sha256
+                return register_seed(st, case_id, data, "console-session.bin")["sha256"]
             finally:
                 st.close()
 
+        # `stdin=pipe` = exact bytes + a real EOF (binary protocols); default = the terminal.
+        stdin_mode = (qs.get("stdin") or ["pty"])[0]
         try:
             console.serve(self.connection, exe, argv=argv, arch=arch, endianness=endianness,
-                          bits=bits, cwd=str(workdir), put_seed=put_seed)
+                          bits=bits, cwd=str(workdir), put_seed=put_seed,
+                          stdin_mode=stdin_mode if stdin_mode in console.STDIN_MODES else "pty")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _download_console(self, case_id: str):
+        """The WHOLE run console of a case as JSON lines (GET /cases/{id}/console?download=1).
+        The GUI only keeps a window of recent records in memory; this is the full log, streamed
+        from disk."""
+        from ..jobs import runlog
+        s = self._store()
+        try:
+            if not s.cases.get(case_id):
+                return self._json({"error": "no case"}, 404)
+        finally:
+            s.close()
+        p = runlog.console_path(self.server.case_dir, case_id)
+        if not p.is_file():
+            return self._bytes(b"", "application/x-ndjson",
+                               filename=f"lykos-console-{case_id}.jsonl")
+        return self._stream_file(p, "application/x-ndjson",
+                                 filename=f"lykos-console-{case_id}.jsonl")
+
+    def _get_console(self, case_id: str, after: int = 0, tail: int = 0):
+        """The live run console (jobs/runlog): records from byte offset `after`, plus `next` to
+        poll from. `tail=N` (with after=0) starts N bytes from the end instead -- a GUI opening a
+        long-running case does not replay the whole log."""
+        from ..jobs import runlog
+        if after <= 0 and tail > 0:
+            try:
+                size = runlog.console_path(self.server.case_dir, case_id).stat().st_size
+            except OSError:
+                size = 0
+            after = max(0, size - tail)
+            if after:
+                # land on a line boundary: skip the partial first line
+                with open(runlog.console_path(self.server.case_dir, case_id), "rb") as fh:
+                    fh.seek(after)
+                    after += len(fh.readline())
+        return self._json(runlog.read(self.server.case_dir, case_id, after=after))
 
     def _ws_events(self, case_id: Optional[str], after: int = 0):
         key = self.headers.get("Sec-WebSocket-Key")

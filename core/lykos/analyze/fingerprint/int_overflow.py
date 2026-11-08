@@ -38,9 +38,18 @@ _ALLOC = re.compile(r"\b(malloc|realloc|aligned_alloc|alloca|valloc|pvPortMalloc
                     r"kmalloc|kzalloc|vmalloc|OPENSSL_malloc)\s*\(")
 # risky arithmetic: a product / shift / sum where an operand is a NON-constant identifier.
 _IDENT = r"[A-Za-z_]\w*"
+_NUM = r"(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*"               # an integer literal, with any int suffix
 # `sizeof *p` is the canonical SAFE allocation size, not a product -- `sizeof` is never the left
-# operand of a risky multiply.
-_MUL = re.compile(rf"\b(?!sizeof\b){_IDENT}\s*[*]\s*{_IDENT}\b|\b{_IDENT}\s*<<\s*{_IDENT}\b")
+# operand of a risky multiply. A variable times (or shifted by) a LITERAL is the commonest
+# undersized-allocation shape (`malloc(n * 16)`, `malloc(count * 4)`, `malloc(len << 2)`): the
+# literal element size cannot be steered, but the variable CAN be driven large enough to wrap the
+# product, so these must be flagged -- matching only `var * var` missed the real bug. Precision is
+# preserved downstream: the HIGH finding still requires the variable operand to be attacker-
+# controlled (srctaint strong), so `x * 2` over an internal counter stays a low hygiene note.
+_MUL = re.compile(
+    rf"\b(?!sizeof\b){_IDENT}\s*[*]\s*(?:{_IDENT}|{_NUM})\b"    # var * (var | literal)
+    rf"|\b{_NUM}\s*[*]\s*(?!sizeof\b){_IDENT}\b"               # literal * var
+    rf"|\b(?!sizeof\b){_IDENT}\s*<<\s*(?:{_IDENT}|{_NUM})\b")  # var << (var | literal)
 _ADD = re.compile(rf"\b{_IDENT}\s*[+]\s*{_IDENT}\b")
 # tokens that mean "an overflow guard is present" in the window around the site. Each must be
 # distinctive enough not to appear in ordinary prose -- a bare "overflow" matched the comment

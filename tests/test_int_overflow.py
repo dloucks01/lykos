@@ -37,6 +37,48 @@ def test_unguarded_multiply_via_a_size_variable_is_flagged(tmp_path):
     assert len(_hits(root)) == 1
 
 
+def test_variable_times_a_literal_size_is_flagged(tmp_path):
+    """The commonest undersized-allocation shape is a variable times a LITERAL element size
+    (malloc(n * 16), malloc(count * 4), malloc(len << 2)) -- matching only var*var missed it. The
+    literal cannot be steered, but the variable can be driven large enough to wrap the product."""
+    for expr in ("n * 16", "16 * n", "n << 4", "n * 16u"):
+        root = _tree(tmp_path, {"v.c": f"void *f(unsigned n){{ return malloc({expr}); }}\n"})
+        hits = _hits(root)
+        assert len(hits) == 1 and hits[0]["cwe"] == "CWE-190", expr
+
+
+def test_a_scanf_sourced_count_is_a_high_attacker_controlled_finding(tmp_path):
+    """`scanf("%u",&n)` fills n from stdin, so malloc(n * 16) is an ATTACKER-CONTROLLED undersized
+    allocation (high), not a hygiene note -- the scanf family is a real input reader whose
+    destination is a `&var` argument, which srctaint previously missed (only read/fread/fgets)."""
+    root = _tree(tmp_path, {"v.c":
+                            'void *f(void){ unsigned n; if(scanf("%u",&n)!=1) return 0;\n'
+                            "  return malloc(n * 16); }\n"})
+    hits = _hits(root)
+    assert len(hits) == 1 and hits[0]["cwe"] == "CWE-190"
+    assert hits[0]["strong"] is True and hits[0]["severity"] == "high"
+    # a destination at a varying position in a multi-value scanf is still linked
+    root2 = _tree(tmp_path, {"w.c":
+                             'void *g(void){ int i; unsigned n; if(scanf("%d %u",&i,&n)!=2) return 0;\n'
+                             "  return malloc(n * 16); }\n"})
+    h2 = _hits(root2)
+    assert h2 and h2[0]["strong"] is True
+
+
+def test_a_literal_only_size_is_still_not_flagged(tmp_path):
+    """A product of pure constants cannot wrap from input -- precision must survive the literal
+    operand change."""
+    root = _tree(tmp_path, {"v.c": "void *f(void){ return malloc(4 * 8); }\n"})
+    assert _hits(root) == []
+
+
+def test_a_grow_by_one_is_not_a_wrappable_product(tmp_path):
+    """`mapSize + 1` is the safe dynamic-array grow idiom -- an additive step by a constant, not a
+    multiply/shift -- and must not be flagged (the additive path stays var+var only)."""
+    root = _tree(tmp_path, {"v.c": "void *f(unsigned mapSize){ return malloc(mapSize + 1); }\n"})
+    assert _hits(root) == []
+
+
 def test_a_size_max_guard_suppresses_the_finding(tmp_path):
     """The FreeRTOS fix idiom: `SIZE_MAX / a >= b` before the multiply."""
     root = _tree(tmp_path, {"v.c":

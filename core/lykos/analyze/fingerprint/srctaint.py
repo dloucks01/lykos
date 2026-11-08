@@ -87,6 +87,14 @@ def reader_source(body: str, base: str):
     for fn in ("fgets", "gets", "fread"):                  # destination = 1st argument
         if re.search(rf"\b{fn}\s*\(\s*(?:&)?{b}\b", body):
             return f"{fn}()"
+    # scanf family: the destinations are `&var` arguments at VARYING positions after the format
+    # string (`scanf("%d %u", &idx, &count)` fills both). These read from stdin / a FILE, so a
+    # matched destination is external input -- strong. (sscanf is NOT here: its source is a string
+    # that may be trusted, so it stays a transitive derive-from-source hop in _DERIVE_FNS.)
+    for fn in ("scanf", "fscanf", "vscanf", "vfscanf",
+               "__isoc99_scanf", "__isoc99_fscanf", "__isoc99_vscanf"):
+        if re.search(rf"\b{fn}\s*\([^;]*&\s*{b}\b", body):
+            return f"{fn}()"
     return None
 
 

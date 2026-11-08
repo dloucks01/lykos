@@ -1650,6 +1650,28 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
         cand = {"offset": off, "stride": stride, "span": abs(span), "points": pts}
         if best is None or cand["span"] > best["span"]:
             best = cand
+    # Did any byte WE varied move the fault off the original's address? Only sibling crashes
+    # (other whole inputs) moving it is far weaker evidence than a lever.
+    _orig_addrs = {s["addr"] for s in seen if s["label"] == "orig"}
+    _lever_moved = any(s["off"] is not None and s["addr"] not in _orig_addrs for s in seen)
+    if best is None and not _lever_moved and all(a & 0xFFF == 0 for a in addrs):
+        # EVERY fault is on a page boundary: the access ran off the END of its buffer onto the
+        # next unmapped page (under the guard-page allocator, the page it places after every
+        # allocation). Which page that is, is the ALLOCATOR's choice -- an input that allocates
+        # differently lands on a different guard page -- so different inputs faulting at
+        # different page boundaries is heap layout, not the attacker choosing an address. Measured
+        # on jhead 3.06.0.1's `-exifmap` dump (a 9-byte over-read of a malloc'd EXIF buffer): no
+        # varied byte moved the fault, sibling crashes landed on 3 different guard pages, and this
+        # branch filed it as an L2 "arbitrary read".
+        return dict(base, controlled=False, confirmed=False, max_level=1,
+                    effect_kind="denial-of-service", offset=None, stride=None,
+                    note=(f"every fault lands exactly on a page boundary (0x{addrs[0]:x} .. "
+                          f"0x{addrs[-1]:x}) and no varied input byte moved it: the {access} "
+                          f"runs off the end of its buffer onto the next unmapped page. The page "
+                          f"differs between inputs because the heap layout does, so the attacker "
+                          f"does not choose this address -- an out-of-bounds {access} past the "
+                          f"buffer end (a crash, and on an unguarded heap a small over-"
+                          f"{access} of adjacent memory), not an arbitrary-address primitive."))
     if best is None:
         # The address moved, but not traceably to one byte we varied -- control is still
         # demonstrated (two addresses from two inputs), the lever is just not identified.

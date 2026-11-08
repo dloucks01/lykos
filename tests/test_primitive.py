@@ -718,3 +718,77 @@ def test_ppc_names_its_branch_register_in_the_mnemonic():
     assert ibr("bctrl", {"ctr": 1}) == "ctr"
     assert ibr("bctr", {"ctr": 1}) == "ctr"
     assert ibr("bctrl", {"rdx": 1}) == "", "not a register this capture has"
+
+
+def test_a_read_off_the_buffer_end_onto_guard_pages_is_not_address_control():
+    """jhead 3.06.0.1 `-exifmap`: a 9-byte over-read of a malloc'd buffer. Under the guard-page
+    allocator every fault lands on a page boundary; no varied byte moves it, but sibling crashes
+    (other allocation layouts) land on other guard pages. That is heap layout, not the attacker
+    choosing the address -- it was filed as an L2 arbitrary read."""
+    def cap(addr, pc=0x55555555e3f0):
+        return {"ok": True, "signal_name": "SIGSEGV", "fault_addr": addr, "pc": pc}
+    obs = ([("orig", cap(0x7ffff7f96000)), ("orig", cap(0x7ffff7f96000))]
+           + [(f"byte@{o}=0xff", cap(0x7ffff7f96000)) for o in (25, 50, 75)]
+           + [("crash@aaaa", cap(0x7ffff7f8d000)), ("crash@bbbb", cap(0x7ffff7f99000))])
+    v = P.address_primitive(obs, disasm="movzx edx,BYTE PTR [rbx]")
+    assert not v["controlled"] and not v["confirmed"] and v["max_level"] == 1, v
+    assert "page boundary" in v["note"]
+    # an address that moves OFF page boundaries between inputs is still the attacker's
+    moved = [(lbl, cap(c["fault_addr"] + 0x18)) for lbl, c in obs]
+    m = P.address_primitive(moved, disasm="movzx edx,BYTE PTR [rbx]")
+    assert m["controlled"] and m["max_level"] == 2
+
+
+
+def test_a_lever_byte_between_the_sampled_offsets_is_still_found():
+    """`_address_verdict` with a 150-byte crashing input whose fault address depends ONLY on byte 4:
+    the evenly spaced sample steps by 3 (0, 3, 6, ...) and skips it. That read 'the faulting
+    address is FIXED' -- a DoS -- purely because of the input's length (giflib-5.1.4: L2 in one run,
+    L1 in the next, same defect). The skipped offsets are now tried when the sample finds none."""
+    from types import SimpleNamespace
+
+    from lykos.analyze.poc import primitive_stage as ps
+    orig = b"LZ\x00\x00\x40" + b"\x00" * 145
+    assert len(orig) // ps._ADDR_PROBE_OFFSETS == 3
+
+    def capture_for(_mode):
+        def cap(data):                                     # movzx edx, byte ptr [rdx]
+            return {"ok": True, "fault_addr": 0x7F0000000000 + data[4] * 0x100000,
+                    "pc": 0x401000, "pc_bytes": "0fb612", "signal_name": "SIGSEGV"}
+        return cap
+    ctx = SimpleNamespace(emit=lambda *a, **k: None)
+    verdict, _demo, _cap, _mode = ps._address_verdict(ctx, capture_for, ["stdin"], orig, "x86-64")
+    assert verdict and verdict.get("controlled"), verdict
+    assert verdict.get("offset") == 4, verdict
+    # the guard: the sample alone (fallback off) misses the lever
+    old = ps._ADDR_PROBE_FULL
+    try:
+        ps._ADDR_PROBE_FULL = 0
+        v0, *_ = ps._address_verdict(ctx, capture_for, ["stdin"], orig, "x86-64")
+    finally:
+        ps._ADDR_PROBE_FULL = old
+    assert not (v0 or {}).get("controlled"), v0
+
+
+def test_file_mode_detonation_can_open_its_input(gcc, tmp_path):
+    """`_detonate_capturing` writes a file-mode input to scratch under /tmp, which the sandbox
+    masks with an empty tmpfs. Without binding it back the target only ever said it could not
+    open its input -- seen on the live run console (gif2rgb: every OOB probe 'Failed to open
+    given file'), so those experiments tested nothing."""
+    from types import SimpleNamespace
+
+    from lykos.analyze.poc import primitive_stage as ps
+    src = tmp_path / "o.c"
+    src.write_text('#include <stdio.h>\nint main(int c,char**v){FILE*f=fopen(v[1],"rb");'
+                   'if(!f){puts("CANNOT-OPEN");return 2;}int n=fgetc(f);printf("OPENED %d\\n",n);'
+                   'return 0;}\n')
+    (tmp_path / "bin").mkdir()
+    exe = tmp_path / "bin" / "o"                       # NOT the scratch dir's parent: the sandbox
+    if subprocess.run([gcc, "-O0", "-w", str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")                    # binds the exe's own dir back in
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    ctx = SimpleNamespace(scratch=lambda: scratch)
+    target = SimpleNamespace(arch=None, endianness=None, bits=None)
+    _rep, out = ps._detonate_capturing(ctx, target, str(exe), "file", ["@@"], b"A", 5)
+    assert b"OPENED 65" in out, out

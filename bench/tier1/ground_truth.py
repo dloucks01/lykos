@@ -10,12 +10,29 @@ usage: ground_truth.py [--limit N] [challenge-dir ...]
 """
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from cgc_replay import replay  # noqa: E402
+
+
+def _benign_crashes(binpath):
+    """True if the binary takes a fatal signal on BENIGN input (empty stdin). cb-multios build64
+    ports some DECREE binaries that fault at startup under bare pipe/stdin invocation (verified:
+    Accel, CGC_Board SIGSEGV on empty input). Such a binary's crash under a POV is noise, not a
+    POV-driven bug -- the same baseline-differential guard the validator applies (doc 55 F1). A
+    challenge whose VULN binary crashes benignly is excluded from the crash-reproducible set."""
+    try:
+        r = subprocess.run([binpath], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=4)
+        return r.returncode < 0
+    except subprocess.TimeoutExpired:
+        return False  # blocked waiting for input == healthy (not a startup crash)
+    except OSError:
+        return False
 
 CB = HERE.parent.parent / "bench/external/cb-multios/build64/challenges"
 
@@ -37,7 +54,11 @@ def scan_challenge(name):
     if not vuln or not povs:
         return {"name": name, "skip": "no vuln binary / pov"}
     v, p = vuln[0], (patched[0] if patched else None)
-    best = {"name": name, "type": None, "vuln_crash": False, "patched_crash": False, "sig": None}
+    if _benign_crashes(v):
+        return {"name": name, "type": None, "vuln_crash": False, "patched_crash": False,
+                "sig": None, "broken": True}
+    best = {"name": name, "type": None, "vuln_crash": False, "patched_crash": False,
+            "sig": None, "broken": False}
     for pov in povs[:3]:
         try:
             cvc, svc, typ = replay(v, pov, timeout=10.0)
@@ -63,11 +84,15 @@ def main():
     ap.add_argument("dirs", nargs="*")
     a = ap.parse_args()
     names = a.dirs or sorted(d for d in os.listdir(CB) if (CB / d).is_dir())[:a.limit]
-    t1 = t2 = crashable = 0
+    t1 = t2 = crashable = broken = 0
     for name in names:
         r = scan_challenge(name)
         if r.get("skip"):
             print(f"SKIP {name:<40} {r['skip']}")
+            continue
+        if r.get("broken"):
+            broken += 1
+            print(f"{name:<40} BROKEN-STANDALONE (vuln SIGSEGVs on benign/empty input; excluded)")
             continue
         typ = r["type"]
         if typ == 2:
@@ -79,7 +104,8 @@ def main():
         tag = ("CRASHABLE" if diff else ("vuln-crash+patched-crash" if r["vuln_crash"] else "-"))
         print(f"{name:<40} type={typ} {tag} {r.get('sig') or ''}")
     print(f"\nTIER-1 GROUND TRUTH over {len(names)} challenges: type1(crash)={t1} type2(leak)={t2}; "
-          f"{crashable} crash-reproducible (POV crashes vuln, patched survives)")
+          f"{broken} broken-standalone (excluded); "
+          f"{crashable} crash-reproducible (POV crashes vuln, patched survives, vuln clean on benign)")
     return 0
 
 

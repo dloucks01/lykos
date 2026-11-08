@@ -89,6 +89,7 @@ class Replay:
     fault_pc: Optional[int] = None
     note: str = ""
     timed_out: bool = False
+    fault_addr: Optional[int] = None      # siginfo si_addr of the fatal signal, when traced
 
 
 def _program_frame(text: str, start: int, source_root: Optional[Path]):
@@ -190,7 +191,8 @@ def _native_runs(target: Target, data: bytes, n: int) -> list:
                             bits=target.bits, fault_pc=True)
     if res:
         return [Replay(bool(r.crashed), r.signal_name, r.stdout or b"", r.stderr or b"",
-                       r.fault_pc, r.note or "") for r in res]
+                       r.fault_pc, r.note or "", fault_addr=getattr(r, "fault_addr", None))
+                for r in res]
     return [replay(target, target.exe, data) for _ in range(n)]
 
 
@@ -322,6 +324,103 @@ def _traversal_opens(target: Target, data: bytes) -> list:
         if "../" in p and _TRAVERSAL_TAIL in p:
             hits.append(p)
     return hits
+
+
+#: hypothesis kinds whose fault happens AT the site instruction (native attribution = exact PC)
+_AT_SITE_KINDS = frozenset({"null-deref", "div-zero", "heap-read", "stack-read", "oob-read"})
+#: hypothesis kinds whose native fault, if any, happens elsewhere (no native attribution)
+_WRITE_KINDS = frozenset({"heap-write", "stack-write", "oob-write", "double-free"})
+#: a dereference faulting below this is a NULL (or NULL+small-offset) dereference
+_NULL_PAGE = 0x10000
+
+
+def _frame_relative(exe, va) -> bool:
+    """Does the instruction at link VA `va` address memory through the frame or stack pointer?
+    (x86-64 rbp/rsp, aarch64 x29/sp). False when it cannot be decoded -- never invents a reason."""
+    if va is None:
+        return False
+    try:
+        import struct
+        import capstone as cs
+        data = Path(exe).read_bytes()
+        if data[:4] != b"\x7fELF" or data[4] != 2:
+            return False
+        mach = struct.unpack_from("<H", data, 18)[0]
+        (phoff,) = struct.unpack_from("<Q", data, 32)
+        (phentsize,) = struct.unpack_from("<H", data, 54)
+        (phnum,) = struct.unpack_from("<H", data, 56)
+        off = None
+        for i in range(min(phnum, 256)):
+            b = phoff + i * phentsize
+            if struct.unpack_from("<I", data, b)[0] != 1:
+                continue
+            p_offset, p_vaddr = struct.unpack_from("<QQ", data, b + 8)
+            p_filesz = struct.unpack_from("<Q", data, b + 32)[0]
+            if p_vaddr <= va < p_vaddr + p_filesz:
+                off = p_offset + (va - p_vaddr)
+                break
+        if off is None:
+            return False
+        if mach == 0x3E:
+            md, frame = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64), {"rbp", "rsp", "ebp", "esp"}
+        elif mach == 0xB7:
+            md, frame = cs.Cs(cs.CS_ARCH_ARM64, cs.CS_MODE_ARM), {"x29", "sp", "fp"}
+        else:
+            return False
+        md.detail = True
+        ins = next(md.disasm(data[off:off + 16], va), None)
+        if ins is None:
+            return False
+        if mach == 0x3E and ins.mnemonic in ("leave", "pop", "push", "ret", "call", "enter"):
+            return True                                  # implicit stack access (Tier-0 r01: leave)
+        for op in ins.operands:
+            if op.type == getattr(cs, "CS_OP_MEM", 3) and op.mem.base:
+                if ins.reg_name(op.mem.base) in frame:
+                    return True
+        return False
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _qasan_verdict(target: Target, hyp: Hypothesis, data: bytes):
+    """QASan replays of the plain build, for a memory hypothesis that does not crash natively.
+    Confirms only when EVERY replay reports an error whose in-target site (for an alloc-size
+    overflow: whose allocation site) lies inside the hypothesis's own function -- the same
+    attribution bar the native-crash path uses. None when QASan does not apply or never fired
+    (the caller keeps its own verdict)."""
+    if target.mode not in ("file", "stdin") or hyp.func_addr is None or not hyp.func_size:
+        return None
+    try:
+        from ..analyze.dynamic import qasan
+        blob = Path(target.exe).read_bytes()
+        arch = target.arch or ("x86-64" if blob[18:20] == b"\x3e\x00" else None)
+        if not qasan.applicable(blob, arch)[0]:
+            return None
+        lo, hi = hyp.func_addr, hyp.func_addr + hyp.func_size
+        agree, last = 0, None
+        for _ in range(REPLAYS):
+            rep = qasan.run(target.exe, data, argv=list(target.argv), mode=target.mode,
+                            timeout=10.0)
+            if rep is None:
+                break
+            if hyp.kind == "int-overflow-alloc":
+                site = (rep.alloc_off + (qasan.site_va(rep, blob) - rep.site_off)
+                        if rep.alloc_off is not None and rep.site_off is not None else None)
+                ok = rep.kind == "heap-buffer-overflow" and site is not None and lo <= site < hi
+            else:
+                site = qasan.site_va(rep, blob)
+                ok = site is not None and lo <= site < hi
+            last = (f"{rep.summary()} -> site {site:#x}" if site is not None else rep.summary())
+            if not ok:
+                return Verdict(False, "qasan", f"{last}, outside {hyp.func or 'the site function'}",
+                               None, agree)
+            agree += 1
+        if agree == REPLAYS:
+            return Verdict(True, "qasan", f"{last} inside {hyp.func or 'the site function'} on "
+                           f"{REPLAYS}/{REPLAYS} QASan replays (no native crash)", hyp.line, agree)
+        return None if agree == 0 else Verdict(False, "qasan", last or "", None, agree)
+    except Exception:                                    # noqa: BLE001 -- an extra oracle, never fatal
+        return None
 
 
 def validate(target: Target, hyp: Hypothesis, data: bytes):
@@ -514,16 +613,63 @@ def validate(target: Target, hyp: Hypothesis, data: bytes):
     runs = _native_runs(target, data, REPLAYS)
     sigs = [r.signal for r in runs]
     if not all(r.crashed and r.signal in FATAL for r in runs):
+        # A binary with no sanitizer build: a heap over-read / small over-write / UAF does not
+        # crash natively, so a correctly SOLVED input looked like a failure. QASan (QEMU-ASan,
+        # forgery-checked) is the binary oracle for exactly that.
+        qv = _qasan_verdict(target, hyp, data)
+        if qv is not None:
+            return qv, None
         return Verdict(False, "native-crash",
                        f"did not crash on every replay ({', '.join(str(s) for s in sigs)})"), None
     pcs = {r.fault_pc for r in runs}
     lo = hyp.func_addr
     hi = lo + hyp.func_size if (lo is not None and hyp.func_size) else None
     inside = [p for p in pcs if p is not None and lo is not None and hi is not None and lo <= p < hi]
-    if inside and len(pcs) == 1:
+    # ATTRIBUTION. "The fault PC is somewhere in the site's function" confirmed EVERY hypothesis in
+    # that function off one crash: a stack overflow that kills main at its epilogue 'confirmed' five
+    # unrelated null-deref sites in main (Tier-0 --binary-only: 30 false confirmations, all here).
+    #  * a fault that happens AT the access (a NULL deref, a divide, an out-of-bounds read that
+    #    faults) must fault at the hypothesis's own site instruction;
+    #  * a WRITE (heap/stack/oob) usually faults later -- at a smashed return, in free() -- so a
+    #    native crash cannot attribute it; the QASan lane or a control-flow-hijack hypothesis does;
+    #  * a control-flow hijack faults at the hijacked return/indirect jump, anywhere in the
+    #    function (or outside code), so it keeps function-level attribution.
+    if hyp.kind in _AT_SITE_KINDS:
+        attributed = len(pcs) == 1 and hyp.site is not None and pcs == {hyp.site}
+        if attributed and hyp.kind == "null-deref" and _frame_relative(target.exe, hyp.site):
+            # A frame-/stack-pointer-relative access is never a NULL dereference in a valid
+            # program: it faulting proves the FRAME was corrupted (an overflow smashed the saved
+            # rbp), and the defect is that overflow (Tier-0 s01: `movzwl -0x24(%rbp)` in main after
+            # handle_name's memcpy overflowed into main's frame).
+            return Verdict(False, "native-crash", crashes=True, detail=
+                           f"{sigs[0]} at the site, a frame-relative access -- the stack frame was "
+                           f"corrupted (an overflow), not a NULL dereference"), None
+        if attributed and hyp.kind == "null-deref":
+            # the CLASS too: a NULL dereference faults near address 0. A pointer an overflow
+            # overwrote faults at the same instruction but at an attacker-shaped address
+            # (Tier-0 s01/s06/r01: 0x4141...), which is memory corruption, not CWE-476.
+            addrs = {r.fault_addr for r in runs}
+            if not (len(addrs) == 1 and None not in addrs and next(iter(addrs)) < _NULL_PAGE):
+                shown = ", ".join("?" if a is None else f"{a:#x}" for a in sorted(
+                    addrs, key=lambda a: -1 if a is None else a))
+                return Verdict(False, "native-crash", crashes=True, detail=
+                               f"{sigs[0]} at the site instruction, but on data address {shown} -- "
+                               f"not a NULL dereference (a corrupted pointer, or unknown)"), None
+    elif hyp.kind in _WRITE_KINDS:
+        attributed = False
+    else:
+        attributed = bool(inside) and len(pcs) == 1
+    if attributed:
         return Verdict(True, "native-crash",
-                       f"{sigs[0]} at {inside[0]:#x} inside {hyp.func or 'the site function'} on "
-                       f"{REPLAYS}/{REPLAYS} replays", hyp.line, REPLAYS), None
+                       f"{sigs[0]} at {next(iter(pcs)):#x} "
+                       + ("(the site instruction)" if hyp.kind in _AT_SITE_KINDS else
+                          f"inside {hyp.func or 'the site function'}")
+                       + f" on {REPLAYS}/{REPLAYS} replays", hyp.line, REPLAYS), None
+    if inside and len(pcs) == 1:
+        return Verdict(False, "native-crash", crashes=True, detail=
+                       f"{sigs[0]} at {next(iter(pcs)):#x} inside {hyp.func or 'the function'}, "
+                       f"but not attributable to this {hyp.kind} site"
+                       + (f" ({hyp.site:#x})" if hyp.site is not None else "")), None
     where = ", ".join(f"{p:#x}" for p in pcs if p is not None) or "an unknown address"
     return Verdict(False, "native-crash", crashes=True, detail=
                    f"{sigs[0]} on every replay, but at {where}, outside "

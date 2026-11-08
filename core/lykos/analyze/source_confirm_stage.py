@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from pathlib import Path
 
 from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
@@ -34,8 +35,19 @@ _CWE = {"stack-buffer-overflow": "CWE-121", "heap-buffer-overflow": "CWE-122",
 #: the STATIC source detectors whose candidates a ladder crash can confirm by co-location (and whose
 #: functions synth_confirm drives). Includes `cpg` (CWE-120/CWE-22 queries) and `source_sink`.
 _STATIC_SOURCE_DETECTORS = ("source_sink", "cpg", "int_overflow", "uaf", "cve_source",
-                            "embedded_config", "assert_guard", "oob_write")
+                            "embedded_config", "assert_guard", "oob_write",
+                            # the precise tree detectors (doc 60+): they were never handed to the
+                            # ladder / driver synthesis, so their candidates -- FreeRDP's ClearCodec
+                            # index sites among them -- could never be confirmed
+                            "wire_flow", "param_sink", "guard_gap", "alloc_overflow",
+                            "sibling_guard", "lifecycle", "intwidth", "double_fetch", "uninit_ptr")
 _SRC_LOC = re.compile(r"([\w./+\-]+):(\d+)")
+
+
+def _site(finding, root):
+    """(file, line) of a finding's site, from whichever channel its detector records it on."""
+    from .dedup import site_of
+    return site_of(finding, root)
 
 
 def _parse_loc(s):
@@ -53,7 +65,42 @@ def _suffix_match(a, b) -> bool:
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
-def _steer_sites(ctx, target) -> list:
+def _uc_sites(ctx, target, src) -> list:
+    """(basename, line) of the DEFINITION of every function an under-constrained symbolic lead names.
+
+    A UC lead says "this function, entered in isolation with attacker-shaped arguments, lets data
+    reach the instruction pointer". synth_confirm tries to prove that through a generated driver,
+    which assumes the arguments are attacker-controlled; steering the concolic rung to the function
+    from the harness's REAL entry is the other half -- if the program's own input reaches it and
+    faults, the assumption was never needed."""
+    if not src:
+        return []
+    from .libfuzzer import defs_index
+    idx = defs_index(src)
+    out: list = []
+    for f in FindingDAO(ctx.conn).list_by_target(target.id):
+        if f.detector != "uc_symbolic":
+            continue
+        fn = getattr(f, "site_detail", None) or ""
+        if not fn:
+            m = re.search(r"\bin (\w+)\(\)", f.title or "")
+            fn = m.group(1) if m else ""
+        hit = idx.get(fn)
+        if not hit:
+            continue
+        try:
+            lines = Path(hit[0]).read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        pat = re.compile(r"^\s*(?:[\w*\s]+\s+)?" + re.escape(fn) + r"\s*\(")
+        for i, ln in enumerate(lines):
+            if pat.match(ln) and not ln.rstrip().endswith(";"):
+                out.append((os.path.basename(str(hit[0])), i + 1))
+                break
+    return out[:32]
+
+
+def _steer_sites(ctx, target, src_root=None) -> list:
     """The (basename, line) SITES of the static source candidates, to steer the concolic rung toward
     the statically-suspected bug LINES (not the enclosing function entry -- that would stop before the
     guard the defect sits behind). Resolved per harness against its own DWARF line table. Returns a
@@ -63,12 +110,7 @@ def _steer_sites(ctx, target) -> list:
     for f in FindingDAO(ctx.conn).list_by_target(target.id):
         if f.detector not in _STATIC_SOURCE_DETECTORS or len(sites) >= 128:
             continue
-        fp = fline = None
-        for e in (f.evidence or []):
-            if e.get("channel") == "source":
-                fp, fline = _parse_loc(e.get("detail"))
-                if fp:
-                    break
+        fp, fline = _site(f, src_root)
         if not fp or not fline:
             continue
         key = (os.path.basename(fp), fline)
@@ -174,23 +216,98 @@ def _attack_surface(harness_bins, lib_dirs) -> set:
     return files
 
 
+#: Per memory-corruption class, the non-fuzzing recipe technique + the rung it would reach. These
+#: are the classes for which a REACHABILITY-GROUNDED recipe is meaningful: the finding sits in a
+#: file compiled into an in-tree fuzz harness, so the parser that reaches it processes attacker
+#: bytes -- grounding the recipe even when srctaint cannot trace the multi-layer flow to the operand
+#: (which is why FreeRDP's CWE-190/787 sinks are reachable but not taint-"strong", so the
+#: strong-only source-recipe floor emitted nothing for them).
+#: Per weaponizable class: (technique label, target ceiling). The potential-PoC floor fires for
+#: EVERY candidate in this map -- on OR off the fuzzed surface -- so no finding is left bare: the bar
+#: is "every finding has a potential PoC that is then proven out or honestly dead-ended". The memory
+#: classes (190/787/...) plus the DoS/logic classes a source scan flags (617 reachable assertion,
+#: 134 format string, 78 command injection, 22 path traversal).
+_SURFACE_REC = {
+    "CWE-190": ("integer-overflow allocation -> undersized buffer -> heap overflow", "L2"),
+    "CWE-787": ("out-of-bounds write (saved-pointer / adjacent-object overwrite)", "L2"),
+    "CWE-122": ("heap buffer overflow (adjacent chunk / allocator-metadata overwrite)", "L2"),
+    "CWE-121": ("stack buffer overflow (saved-return overwrite)", "L2"),
+    "CWE-120": ("unbounded copy -> buffer overflow", "L2"),
+    "CWE-129": ("unchecked array index -> out-of-bounds read/write", "L2"),
+    "CWE-125": ("out-of-bounds read -> information disclosure", "L1"),
+    "CWE-416": ("use-after-free -> controlled reclaimed object", "L2"),
+    "CWE-415": ("double free -> allocator-metadata corruption", "L2"),
+    "CWE-617": ("reachable assertion -> process abort (denial of service)", "L1"),
+    "CWE-134": ("format string -> %n write-what-where / %s,%p disclosure", "L2"),
+    "CWE-78": ("OS command injection via shell metacharacters", "L2"),
+    "CWE-22": ("path traversal -> read/write outside the intended directory", "L1"),
+}
+
+
+def _surface_recipe(ctx, target, cwe: str, file: str, line: int, *, on_surface: bool = True) -> bool:
+    """File a NON-FUZZING, reachability-grounded potential-PoC recipe for a candidate finding -- the
+    deliverable the operator carries so NO finding is bare. Corroborated, never a verified PoC, so it
+    inflates nothing; the confirmation ladder / class weaponizers prove out the ones they can and the
+    rest stay honest dead-ends naming the missing technique.
+
+    `on_surface` picks the grounding: in-surface means the sink's file is compiled into an in-tree
+    fuzz harness (the parser reaching it processes attacker bytes); OFF-surface means no shipped
+    harness drives it -- but that is no longer a dead end, because a driver can be SYNTHESIZED to the
+    sink's enclosing function (driver_synth), which is the reach step the missing_technique names.
+    Returns True when a recipe was filed."""
+    spec = _SURFACE_REC.get(cwe)
+    if not spec:
+        return False
+    tech, lvl = spec
+    from .poc import recipe
+    if on_surface:
+        ground = (f"{cwe} at {file}:{line} is in a file compiled into an in-tree fuzz harness, so the "
+                  f"parser reaching it processes attacker-controlled bytes: {tech}. Grounded by "
+                  "attack-surface reachability (not a proven srctaint flow).")
+        reach_step = f"drive the in-tree harness whose parser reaches {file}:{line} to an input that hits it"
+        missing = ("an input that reaches this sink through the harness (the ladder), then the class "
+                   "weaponizer on the confirmed crash")
+    else:
+        ground = (f"{cwe} at {file}:{line} is NOT on the fuzzed attack surface (no shipped harness "
+                  f"drives its file), so a driver is SYNTHESIZED to its enclosing function to reach "
+                  f"it (driver_synth): {tech}. Grounded by synthesizable reachability.")
+        reach_step = (f"synthesize a driver to the function enclosing {file}:{line} (driver_synth), "
+                      f"delivering the fuzz bytes through the project stream idiom")
+        missing = ("a synthesized driver that reaches this sink's enclosing function (driver_synth), "
+                   "then the ladder + the class weaponizer on the confirmed crash")
+    fid = recipe.file_recipe(
+        ctx, target, cwe=cwe, technique=tech, target_level=lvl, severity="high",
+        detector="surface_recipe", dedup_key=f"recipe:{cwe}:surface:{file}:{line}",
+        title=f"Potential PoC ({'attacker-reachable' if on_surface else 'synth-reachable'}): "
+              f"{tech} at {file}:{line}",
+        summary=ground,
+        why_not_executed=("static source + reachability; no crash reproduced in this slice -- the "
+                          "exact primitive/offset needs the confirmed crash the confirmation ladder "
+                          "produces when the sink is driven"),
+        steps=[reach_step,
+               "confirm the fault under ASan (the ladder: template / concolic / reach-gated fuzz)",
+               f"weaponize the confirmed primitive to its class impact ({tech})"],
+        grounded=True, missing_technique=missing)
+    return fid is not None
+
+
 def _rank_by_surface(ctx, target, surface) -> dict:
     """Annotate the static source findings + recipes by whether their file is on the fuzzed attack
     surface. IN-surface findings are boosted (more actionable: the fuzzer actually exercises that
     file) and annotated; OUT-of-surface ones are annotated only -- never hidden or penalised, so a
     real bug off the fuzzed path is still reported, just lower in the ranking. Returns counts."""
     fd = FindingDAO(ctx.conn)
-    inc = outc = 0
+    inc = outc = recs = 0
     for f in fd.list_by_target(target.id):
         if f.detector not in _RANKABLE_DETECTORS:
             continue
-        base = None
-        for e in (f.evidence or []):
-            if e.get("channel") in ("source", "recipe-source"):
-                fp, _ = _parse_loc(e.get("detail"))
-                if fp:
-                    base = os.path.basename(fp)
-                    break
+        # DEDUP respected: a `merged` duplicate is a non-representative site of a bug whose
+        # representative gets the recipe -- skip it (re-upserting it would also undo dedup, since
+        # upsert recomputes state back up from its verdicts).
+        if (f.state or "candidate") == "merged":
+            continue
+        fp, ln = _site(f, None)
+        base = os.path.basename(fp) if fp else None
         if not base:
             continue
         on = base in surface
@@ -204,15 +321,24 @@ def _rank_by_surface(ctx, target, surface) -> dict:
                       "harness -- e.g. a build tool, example, or platform-specific client); lower "
                       "remote-reachability priority, not dismissed")
             newconf = f.confidence or 0.0
+        # POTENTIAL-PoC FLOOR -- the operator's bar: EVERY distinct bug carries a potential PoC, so
+        # no finding is bare. On-surface is reached through the shipped harness; off-surface is
+        # reached by SYNTHESIZING a driver to the sink's enclosing function (driver_synth). Filed for
+        # a representative candidate in a weaponizable class that is not already proven. Non-fuzzing,
+        # corroborated -- the ladder / class weaponizers prove out the ones they can.
+        if (f.cwe in _SURFACE_REC and ln
+                and (f.state or "candidate") not in ("confirmed", "poc-backed")
+                and _surface_recipe(ctx, target, f.cwe, base, ln, on_surface=on)):
+            recs += 1
         fd.upsert(target.id, target.case_id, {
             "cwe": f.cwe, "title": f.title, "severity": f.severity or "medium",
             "detector": f.detector, "dedup_key": f.dedup_key, "state": f.state,
             "confidence": newconf, "channel": "attack-surface",
             "evidence": [{"channel": "attack-surface", "detail": detail}]})
-    return {"in_surface": inc, "off_surface": outc}
+    return {"in_surface": inc, "off_surface": outc, "surface_recipes": recs}
 
 
-def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> int:
+def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness, src_root=None) -> int:
     """Upgrade a co-located STATIC source candidate to `confirmed` when this ladder crash proves it:
     the crash's file:line matches the candidate's AND the CWE agrees. Sound -- an ASan fault at the
     exact site with a matching class confirms the statically-suspected defect there; a mismatched
@@ -228,12 +354,7 @@ def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> in
         if (f.detector not in _STATIC_SOURCE_DETECTORS or f.cwe != crash_cwe
                 or (f.state or "candidate") not in ("candidate", "corroborated")):
             continue
-        fp = fline = None
-        for e in (f.evidence or []):
-            if e.get("channel") == "source":
-                fp, fline = _parse_loc(e.get("detail"))
-                if fp:
-                    break
+        fp, fline = _site(f, src_root)
         if fline != aline or not _suffix_match(ap, fp):
             continue
         fd.upsert(target.id, target.case_id, {
@@ -248,7 +369,38 @@ def _crossref_static(ctx, target, src_line, crash_cwe, input_sha, harness) -> in
     return upgraded
 
 
-def _file_confirmed(ctx, target, r) -> int:
+def _replay_harness(ctx, target, r, static_by: dict) -> tuple:
+    """(isolation, lib_dirs) for replaying this confirmation: the binary that proved it, stored as a
+    `libfuzzer-harness` so `build_poc` replays THERE (`capture.replay_exe_for`). The proof ran on a
+    harness, not on the ingested program, and the input was tagged `source_confirm/<name>` -- which
+    no replay path reads -- so every PoC was replayed against the program and shipped unverified.
+
+    The STATIC ASan build of the same harness is preferred: it carries the project in-image, so the
+    bundle runs anywhere. A proof from the shared build is re-checked on it first."""
+    from .symbolic import directed_confirm as DC
+    binary, libs = r.get("binary"), list(r.get("lib_dirs") or [])
+    st = static_by.get(r.get("harness"))
+    if st and st != binary and r.get("input") is not None:
+        try:
+            if DC._asan_replay(st, r["input"], None, timeout=20.0).get("faulted"):
+                binary, libs = st, []
+        except Exception:                                # noqa: BLE001 -- keep the shared build
+            pass
+    elif st and st == binary:
+        libs = []
+    if not binary or not Path(binary).is_file():
+        return f"source_confirm/{r.get('harness', '?')}", libs
+    try:
+        sha = ctx.put_artifact("libfuzzer-harness", data=Path(binary).read_bytes(),
+                               meta={"harness": f"source_confirm {r.get('harness')}",
+                                     "target": target.sha256, "entry": r.get("harness"),
+                                     "lib_dirs": [str(d) for d in libs]})
+    except Exception:                                    # noqa: BLE001
+        return f"source_confirm/{r.get('harness', '?')}", libs
+    return f"libfuzzer/{sha[:12]}", libs
+
+
+def _file_confirmed(ctx, target, r, static_by=None) -> int:
     """File one ladder-confirmed bug: a CONFIRMED finding + a DynResult (so the exploit ladder can see
     it) + the reproducing input as an artifact, and CROSS-REFERENCE it against the static source
     candidates (a co-located, class-matching candidate is upgraded to confirmed). `r` is a
@@ -271,10 +423,11 @@ def _file_confirmed(ctx, target, r) -> int:
         "dedup_key": f"{cwe}:source_confirm:{key}", "function_addr": None, "site_addr": None,
         "site_detail": src_line,
         "evidence": [{"channel": "sanitizer", "detail": detail}]})
+    iso, _libs = _replay_harness(ctx, target, r, static_by or {})
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, input_sha=input_sha, input_mode="file", argv=["@@"],
         crashed=True, signal_name=(cls.get("class") or klass),
-        isolation=f"source_confirm/{harness}", defect_key=f"source_confirm:{key}",
+        isolation=iso, defect_key=f"source_confirm:{key}",
         note=f"{rung} confirmation: {klass}" + (f" at {src_line}" if src_line else "")
              + f" [{harness}]")
     # A static candidate at the SAME site with the SAME class is now dynamically proven -- link and
@@ -288,15 +441,32 @@ def source_confirm_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("source_confirm requires a target_id")
+    import time as _time
     p = ctx.params or {}
     budget = float(p.get("max_seconds") or p.get("seconds") or 600)
     input_size = int(p.get("input_size") or 1024)
+    # ONE wall-clock deadline for the whole stage. Without it the time accounting was additive by
+    # SLICE but unbounded in sum: each of up to four `cmake_build_harnesses` calls defaulted its own
+    # deadline to timeout*4 (libfuzzer.py), so the builds alone could run ~4x the budget, then the
+    # ladder added 0.6x more -- which is how this stage blew its worker hard deadline on a huge tree
+    # (FreeRDP). Now the builds SHARE one absolute deadline and the ladder gets only what remains.
+    _t0 = _time.monotonic()
+
+    def _remaining() -> float:
+        return budget - (_time.monotonic() - _t0)
 
     src = _materialize_source(ctx, target)
     if src is None:
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "no source tree for this target"})
         return {"metrics": {"supported": False}}
+    # DEDUP FIRST (the operator's pipeline: dedup -> build potential PoCs -> prove out). Collapse the
+    # raw per-SITE candidates into DISTINCT bugs (CWE + enclosing function) so the floor files ONE
+    # potential PoC per bug and the prover drives each function once instead of N times. Non-reps are
+    # set to `merged` (kept, pointed at their representative), so later steps skip the duplicates.
+    from . import dedup as _dedup
+    dd = _dedup.dedup_findings(ctx, target, src)
+    ctx.emit("dedup.done", payload=dd)
     if not LF.find_harnesses(src, limit=1):
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "no in-tree libFuzzer harness to drive the parser"})
@@ -307,13 +477,26 @@ def source_confirm_stage(ctx) -> dict:
     # static link needs unavailable deps (FreeRDP's static OpenSSL cascade), and that rung then simply
     # does not run. The SMART-FUZZ rung needs an ASan SHARED build, which succeeds where static does
     # not -- so it is always attempted, and is the floor that covers the projects concolic cannot.
-    bslice = max(60, int(budget * 0.25))
+    # The build PHASE shares one absolute deadline (~55% of the stage budget): per-build `timeout` is
+    # a soft per-build cap, but the shared `_build_deadline` is the hard bound, so four builds cannot
+    # sum past it -- once it passes, a later build gets ~0 time and bails fast rather than running its
+    # own timeout*4. The ladder gets the remaining ~40% (below).
+    # The build phase gets at most ~55% of the budget -- and NEVER more than the budget itself. A
+    # fixed floor here was the bug that wedged FreeRDP: max(120, 0.55*budget) handed four builds a
+    # 120s deadline on an 86s slice, so the stage ran ~180s on an 86s budget and the lease lapsed.
+    # With a small slice the builds now fail fast and the stage reports it could not build in time.
+    _build_budget = budget * 0.55
+    bslice = max(30, int(_build_budget))
+    _build_deadline = _time.time() + _build_budget
     ctx.progress(msg="building in-tree harnesses (static clean+ASan for concolic, shared ASan for fuzz)")
     # Config-keyed build dirs (the default): the shared-ASan fuzz build is shared with libfuzzer_stage
     # (built once, not twice); the static explore/replay builds are distinct configs with their own dirs.
-    explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice)
-    replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice)
-    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice)
+    explore = LF.cmake_build_harnesses(src, shared=False, sanitize=False, timeout=bslice,
+                                       deadline=_build_deadline)
+    replay = LF.cmake_build_harnesses(src, shared=False, sanitize=True, timeout=bslice,
+                                      deadline=_build_deadline)
+    fuzzb = LF.cmake_build_harnesses(src, shared=True, sanitize=True, timeout=bslice,
+                                     deadline=_build_deadline)
     # When the STATIC explore link fails (FreeRDP's -dev cascade) but the shared build works, build a
     # SHARED-CLEAN explore so concolic still runs: angr explores it with the project's own .so
     # force-loaded (auto_load_libs stays off, so system libs stay stubbed). This is the concolic
@@ -321,7 +504,8 @@ def source_confirm_stage(ctx) -> dict:
     explore_sh = None
     if not explore["ok"] and fuzzb["ok"]:
         ctx.progress(msg="static explore link failed; building shared-clean explore for concolic")
-        explore_sh = LF.cmake_build_harnesses(src, shared=True, sanitize=False, timeout=bslice)
+        explore_sh = LF.cmake_build_harnesses(src, shared=True, sanitize=False, timeout=bslice,
+                                              deadline=_build_deadline)
     if not (explore["ok"] or fuzzb["ok"]):
         ctx.emit("source_confirm.done", payload={"supported": False,
                  "note": "could not build harnesses for confirmation (neither static nor shared linked)",
@@ -337,7 +521,10 @@ def source_confirm_stage(ctx) -> dict:
     # rung at the statically-suspected bug lines (resolved per harness against its own DWARF line
     # table). Only computed when a concolic (explore) build exists -- the only rung that consumes it.
     # Steering only affects exploration efficiency, never soundness (replay + negative control gate it).
-    sites = _steer_sites(ctx, target) if (ex_by or exc_by) else []
+    sites = _steer_sites(ctx, target, src) if (ex_by or exc_by) else []
+    if ex_by or exc_by:
+        # the UC leads' functions first: reaching one from the real entry is the from-entry proof
+        sites = [s_ for s_ in _uc_sites(ctx, target, src) if s_ not in sites] + sites
     names = sorted(set(ex_by) | set(exc_by) | set(fz_by))
     harnesses = []
     for n in names:
@@ -392,12 +579,28 @@ def source_confirm_stage(ctx) -> dict:
     surface = _attack_surface(surf_bins, fuzzb.get("lib_dirs") if fuzzb["ok"] else None) if surf_bins else set()
     ranked = _rank_by_surface(ctx, target, surface) if surface else {"in_surface": 0, "off_surface": 0}
 
-    per = max(30, int((budget * 0.6) / max(1, len(harnesses))))
+    # The ladder gets what the build phase left (never the fixed 0.6*budget that, added to an
+    # overrunning build phase, blew the hard deadline). Each harness's rung is bounded by the share
+    # of the REMAINING wall-clock; if almost nothing is left, skip the ladder and say so rather than
+    # start a concolic/fuzz rung that cannot finish in time.
     attempts: list = []
-    proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts)
+    _left = _remaining()
+    if _left < 45:
+        proven = []
+        ctx.progress(msg=f"ladder skipped: {int(_left)}s of the {int(budget)}s budget left after "
+                         f"building {len(harnesses)} harness(es) -- not enough for a confirmation rung")
+    else:
+        # The ladder runs MULTIPLE rungs across ALL harnesses; without an overall deadline their
+        # sum (harnesses x rungs x per) blew the budget. Give it a hard absolute deadline so it
+        # stops once the remaining wall-clock is spent -- each rung is still bounded by `per`, and
+        # the ladder skips the rest once the deadline passes.
+        per = max(20, int((_left * 0.9) / max(1, len(harnesses))))
+        proven = DC.confirm_ladder(harnesses, timeout_per=per, ctx=ctx, attempts_out=attempts,
+                                   deadline=_time.monotonic() + _left * 0.95)
     upgraded = 0
     for r in proven:
-        upgraded += _file_confirmed(ctx, target, r)
+        upgraded += _file_confirmed(ctx, target, r,
+                                    {n: h["binary"] for n, h in rp_by.items() if h.get("binary")})
         ctx.progress(msg=f"CONFIRMED (non-fuzzing {r.get('rung')}): {r.get('class')} "
                          f"via {r.get('harness')}")
     # Surface the honest no-confirm account too: each rung that RAN and did not confirm, and each one

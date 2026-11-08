@@ -73,7 +73,9 @@ def validate_params(name: str, params: Optional[dict]) -> None:
 
 # Control keys the queue/harness may thread onto any run; never a stage-specific typo.
 _COMMON_PARAMS = frozenset({"force", "max_seconds", "max_execs", "exec_timeout", "timeout",
-                            "workers", "seed", "seeds"})
+                            "workers", "seed", "seeds",
+                            # a case-uploaded target-libraries archive, by hash (jobs/runenv)
+                            "sysroot_sha"})
 
 
 def cached_output_json(store: "CaseStore", run_id: str) -> Any:

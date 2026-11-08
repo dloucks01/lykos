@@ -52,7 +52,9 @@ def test_recovers_main_matches_symbol(tmp_path, flags):
     assert main_from_start(data) == real_main
 
 
-def test_none_on_non_aarch64(tmp_path):
+def test_x86_64_main_is_recovered_and_other_arches_are_none(tmp_path):
+    """x86-64 is handled too now (mov/lea rdi before __libc_start_main, doc 62); an arch with no
+    decoder still answers None -- never a wrong guess."""
     gcc = shutil.which("gcc")
     if not gcc:
         pytest.skip("no gcc")
@@ -61,11 +63,16 @@ def test_none_on_non_aarch64(tmp_path):
     exe = tmp_path / "x"
     if subprocess.run([gcc, str(src), "-o", str(exe)], capture_output=True).returncode != 0:
         pytest.skip("gcc build failed")
-    # x86-64 (or any non-aarch64 host) is not handled -> None, never a wrong guess
     from lykos.analyze.elf import parse
-    if parse(exe.read_bytes()).arch == "aarch64":
-        pytest.skip("host is aarch64")
-    assert main_from_start(exe.read_bytes()) is None
+    data = exe.read_bytes()
+    if parse(data).arch == "x86-64":
+        nm = subprocess.run(["nm", str(exe)], capture_output=True, text=True).stdout
+        real = next(int(ln.split()[0], 16) for ln in nm.splitlines() if ln.endswith(" main"))
+        assert main_from_start(data) == real
+    # the same image relabelled as riscv (EM 0xF3): no decoder -> None
+    fake = bytearray(data)
+    fake[18:20] = (0xF3).to_bytes(2, "little")
+    assert main_from_start(bytes(fake)) is None
 
 
 def test_never_raises_on_garbage():

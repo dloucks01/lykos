@@ -675,6 +675,129 @@ def _frame_and_vars(afvj: dict) -> tuple:
     return params, frame
 
 
+# x86 only: the ARM scanners read rizin's slot NAMES through the frame map (their raw operands are
+# `[sp, 0x1c]` / `[x29, 0x1c]`, a different coordinate), so ARM text is left as rizin renders it.
+_FRAME_REG = re.compile(r"\b(?:rbp|ebp|rsp|esp)\b", re.I)
+_KEEP_NAME = re.compile(r"^(?:obj|sym|str|reloc|section|fcn|loc|sub|imp|entry|main|case|switch)\.",
+                        re.I)
+
+
+def _split_operands(t: str) -> tuple:
+    """(mnemonic, [operands]) split on top-level commas (a `[a + b*4]` operand keeps its own)."""
+    t = (t or "").strip()
+    if " " not in t:
+        return t, []
+    mn, rest = t.split(" ", 1)
+    ops, depth, cur = [], 0, ""
+    for ch in rest:
+        depth += ch == "["
+        depth -= ch == "]"
+        if ch == "," and depth == 0:
+            ops.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        ops.append(cur.strip())
+    return mn, ops
+
+
+def _normalize_text(disasm, opcode) -> str:
+    """rizin's `disasm` with the substitutions the operand parsers cannot read put back to raw.
+
+    rizin renders a stack local or a spilled parameter by a NAME it made up (`[var_ch]`, and
+    `[str]` for a `char *` it typed as a string) and an unnamed data reference as `data.00402004`;
+    radare2 -- which the detectors were written against -- prints `[rbp - 4]` and keeps the
+    RIP-relative form. With rizin present the CWE-129 detector lost every -O0 stack-slot index and
+    read `atoi("3")` as input. Real names (a call target, `obj.table`, `str.*`) are kept: they are
+    what other detectors key on."""
+    d, o = (disasm or ""), (opcode or "")
+    if not d or not o:
+        return d or o
+    dm, dops = _split_operands(d)
+    om, oops = _split_operands(o)
+    if dm != om or len(dops) != len(oops):
+        return d
+    out = []
+    if dm.lower() in ("adrp", "adr") and len(dops) == 2 and re.fullmatch(r"(?:loc|data|section)\.\S+",
+                                                                       dops[1].strip()):
+        # `adrp x0, loc.data_start` is rizin pinning a page to whatever label sits there; the page
+        # ADDRESS (`adrp x0, 0x20000`) is what the aarch64 global-table resolver adds the low bits to
+        return dm + " " + ", ".join([dops[0], oops[1]])
+    for nd, rw in zip(dops, oops):
+        inner = re.search(r"\[([^\]]+)\]", nd)
+        if inner and _FRAME_REG.search(rw) and re.fullmatch(r"[A-Za-z_]\w*", inner.group(1).strip()) \
+                and not _KEEP_NAME.match(inner.group(1).strip()):
+            out.append(rw)                                   # [var_ch] -> [rbp-0x04]
+        elif re.search(r"\bdata\.([0-9a-f]+)\b", nd) and "rip" in rw.lower():
+            # data.00402004 -> qword [0x402004]: radare2's resolved form of a rip-relative operand,
+            # the one the constant-address readers parse (rizin's raw opcode is the unresolved
+            # [rip+0xebb], which reads as no constant at all)
+            da = re.search(r"\bdata\.([0-9a-f]+)\b", nd).group(1)
+            size = re.match(r"\s*((?:byte|word|dword|qword|xmmword|tbyte)\s+)", nd, re.I)
+            out.append(f"{size.group(1) if size else ''}[0x{int(da, 16):x}]")
+        else:
+            out.append(nd)
+    return dm + " " + ", ".join(out) if out else dm
+
+
+# x86 `[rbp-0x04]`, and the aarch64 base+displacement form `[sp, 0xc]` / `[x29, #0x2c]` -- the
+# coordinates the lifted P-Code uses for the same slot (`INT_ADD reg:sp const:0xc`), so a slot the
+# text names and a slot a guard reads in P-Code are the same key
+_FP_SLOT = re.compile(r"\[(?:rbp|ebp)\s*([+-])\s*(0x[0-9a-f]+|\d+)\]"
+                      r"|\[(?:sp|x29|fp)\s*,\s*#?(-?)\s*(0x[0-9a-f]+|\d+)\]", re.I)
+
+
+def _calibrate_frame(frame: dict, ops: list) -> int:
+    """Put rizin's stack-variable offsets into true FRAME-POINTER coordinates, measured from the
+    function's own instructions. Returns the delta applied (0 when none could be measured).
+
+    `FRAME_COORDS = "fp"` says the offsets are frame-pointer relative, and an older rizin made them
+    so. rizin 0.9 reports them from the stack pointer at function ENTRY instead -- 8 bytes lower on
+    x86-64 after `push rbp` (`buf` at rbp-0x90 reported as -152, `var_ch` at rbp-0x4 as -12) -- so
+    every name-to-offset mapping a detector made was off by a word: a CWE-129 index held at
+    `[var_ch]` resolved to a slot nothing wrote, and 17 x86 -O0 tests went red. Each instruction
+    carries both renderings (`disasm`: `[var_ch]`, `opcode`: `[rbp-0x04]`), so the true delta is
+    read off one pair, not assumed from a version number."""
+    vars_ = (frame or {}).get("vars") or []
+    by_name = {v.get("name"): v.get("offset") for v in vars_ if isinstance(v.get("offset"), int)}
+    if not by_name:
+        return 0
+    votes: dict = {}
+    for o in ops or []:
+        # any bracketed NAME the frame table knows: rizin names slots `var_ch` but also by their
+        # propagated type (`[n]`, `[ptr]`, `[str]`), and matching only var_/arg_ left those
+        # functions uncalibrated -- a size_t length at rbp-0x4 stayed mapped to -12
+        named = [t for t in re.findall(r"\[\s*([A-Za-z_]\w*)\s*\]", o.get("disasm") or "")
+                 if t in by_name]
+        raw = _FP_SLOT.findall(o.get("opcode") or "")
+        if len(named) != 1 or len(raw) != 1:
+            continue
+        sign, num = raw[0][0] or raw[0][2], raw[0][1] or raw[0][3]
+        fp_off = int(num, 0) * (-1 if sign == "-" else 1)
+        d = fp_off - by_name[named[0]]
+        votes[d] = votes.get(d, 0) + 1
+    if not votes:
+        return 0
+    delta, n = max(votes.items(), key=lambda kv: kv[1])
+    if delta == 0 or n * 2 <= sum(votes.values()):
+        return 0                                         # already fp-relative, or inconsistent
+    local = 0
+    for v in vars_:
+        if v.get("buffer_inferred"):
+            v.pop("is_buffer", None)
+            v.pop("buffer_inferred", None)
+        v.pop("size", None)                              # gap sizes were measured pre-shift
+        if isinstance(v.get("offset"), int):
+            v["offset"] += delta
+            if v["offset"] < 0:
+                local = max(local, -v["offset"])
+    frame["local_size"] = frame["frame_size"] = local
+    frame["fp_calibrated"] = delta
+    _infer_buffers(vars_)
+    return delta
+
+
 def _frame_vars_rizin(meta: dict) -> tuple:
     """rizin embeds variables in aflj: `stackvars` [{name, arg, type, storage:{stack:off}}] and
     `regvars`. Locals (arg=false) become frame.vars (is_buffer = array type); args become
@@ -789,7 +912,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
 
 def _analyze_in(cli: Path, binary: Path, T: Path, *, ctx, timeout: int) -> dict:
     """The body of `analyze`, writing its rizin output files under `T`."""
-    # Recover `main` on an aarch64 binary where the disassembler would miss it: main is passed to
+    # Recover `main` on a stripped aarch64/x86-64 binary where the disassembler would miss it: main is passed to
     # __libc_start_main only as a data pointer (never called), so a static/stripped aarch64 target
     # gets no function/name there. Decode _start (doc 04) and seed rizin with it so main is
     # analyzed + named for the function list, decompilation, xrefs and detectors alike.
@@ -1363,7 +1486,8 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
             if a is None or o.get("type") == "invalid":
                 continue
             hexb = o.get("bytes", "") or ""
-            ins = {"addr": hex(a), "text": o.get("disasm") or o.get("opcode") or "", "pcode": []}
+            ins = {"addr": hex(a), "text": _normalize_text(o.get("disasm"), o.get("opcode")),
+                   "pcode": []}
             ins_by_addr[a] = ins
             if hexb:
                 to_lift[a] = hexb
@@ -1383,6 +1507,7 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
         # vars + calls: from aflj-embedded fields on rizin, from afvj/afxj files on radare2.
         if embedded:
             params, frame = _frame_vars_rizin(meta)
+            _calibrate_frame(frame, ops)
             callrefs = meta.get("callrefs") or []
         else:
             params, frame = _frame_and_vars(afvj)

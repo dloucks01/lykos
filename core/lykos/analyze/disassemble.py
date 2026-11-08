@@ -71,6 +71,15 @@ def _persist_analysis(conn, target_id: str, result: dict, target_bytes: "bytes |
                 result["flirt_named"] = n
         except Exception:                                # noqa: BLE001 -- never break persistence
             pass
+        try:
+            # ...then by BEHAVIOUR, which survives a glibc version FLIRT's byte signatures do not:
+            # syscall-number wrappers + system's "exit 0"/"/bin/sh" shape (analyze/syswrap.py).
+            from . import syswrap
+            n = syswrap.relabel(target_bytes, funcs)
+            if n:
+                result["syswrap_named"] = n
+        except Exception:                                # noqa: BLE001 -- never break persistence
+            pass
     FunctionDAO(conn).replace_for_target(target_id, funcs)
     edges = _edges_from_funcs(funcs)
     CallEdgeDAO(conn).replace_for_target(target_id, edges)

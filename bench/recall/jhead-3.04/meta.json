@@ -1,0 +1,343 @@
+{
+  "id": "jhead-3.04",
+  "project": "jhead",
+  "version": "3.04",
+  "tree": "examples/vuln-targets/src/jhead-3.04",
+  "surface": "source",
+  "entry": {
+    "binary": "jhead",
+    "argv": [
+      "@@"
+    ]
+  },
+  "note": "Lines verified in the local tree (Debian orig 3.04 == GitHub commit afadc77 'Update version number to 3.04'). Many reporter ASAN traces were taken on exactly this tree (jpgfile.c:287 process_EXIF call, jhead.c:905/1756), which is how several lines are pinned. Read/write sites are pinned at the faulting statement in the named function; int-overflow entries are pinned at the overflowing check. A known bug with no CVE is also present: GitHub issue #24, an OOB read in show_IPTC's Photoshop-block loop (iptc.c:73-92, fault at iptc.c:82, default argv), fixed in 33e7a3f. It is not in this list because it has no CVE.",
+  "cves": [
+    {
+      "id": "CVE-2018-17088",
+      "class": "int-overflow",
+      "file": "gpsinfo.c",
+      "function": "ProcessGpsInfo",
+      "line": 104,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "GPS dir entry with ByteCount=Components*size huge (e.g. 0xff000002) and OffsetVal<=0x1000000 (e.g. 0x00ffffff): OffsetVal+ByteCount wraps in 32 bits, passes the check, and ValuePtr=OffsetBase+OffsetVal points ~16MB out",
+      "fixed_in": "upstream 56c108f (Oct 2020, Components>0x10000) + a50953a (OffsetVal>65536); in 3.06.0.1",
+      "ref": "https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=907925",
+      "confidence": "high",
+      "note": "Debian's 3.00-8 patch 32_crash_in_gpsinfo used the correct 'OffsetVal > UINT32_MAX - ByteCount' guard. Upstream commit 3963062 ('Equivalent to debian patch 32, but do not use UINT32_MAX') replaced it with 'OffsetVal > 0x1000000', which does not stop the wrap, so 3.04 is still vulnerable. Fault sites depend on the tag: 122 (LatRef, used by lykos's committed fixture inputs/jhead-crash.jpg), 126, 138, 148, 161, 166; with -v also the string loop at 187-199. This is the bug described in examples/vuln-targets/README.md."
+    },
+    {
+      "id": "CVE-2020-6625",
+      "class": "heap-overflow-read",
+      "file": "gpsinfo.c",
+      "function": "ProcessGpsInfo",
+      "line": 138,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "GPS Lat/Long tag with wrong format or too few components (e.g. Format=ULONG, 'Inappropriate format (4)'): loop reads Get32s(ValuePtr+4+a*ComponentSize) for a<3 regardless of ByteCount, past the end of the APP1 heap section",
+      "fixed_in": "effectively 3.06.0.1 (5186ddc gives sections 20 bytes of slack; the read itself is still not bounds-checked); Debian still lists it as unfixed",
+      "ref": "https://bugs.launchpad.net/ubuntu/+source/jhead/+bug/1858746",
+      "confidence": "high",
+      "note": "Reporter's ASAN trace is on jhead-3.04: Get32s exif.c:336 <- ProcessGpsInfo gpsinfo.c:138, matching this tree. CVE-2026-90682 (WebP, 3.3) is the same defect and is not listed again."
+    },
+    {
+      "id": "CVE-2020-6624",
+      "class": "heap-overflow-read",
+      "file": "jpgqguess.c",
+      "function": "process_DQT",
+      "line": 109,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "DQT segment with a 16-bit-precision table (Pq=1) and fewer than 128 table bytes: the check 'a+64 > length' only covers 8-bit tables, so the 16-bit reads run past the section",
+      "fixed_in": "upstream b711024 (3.06); in 3.06.0.1",
+      "ref": "https://bugs.launchpad.net/ubuntu/+source/jhead/+bug/1858744",
+      "confidence": "high",
+      "note": "Reporter's ASAN trace is on jhead-3.04: jpgqguess.c:109 <- ReadJpegSections jpgfile.c:223, matching this tree."
+    },
+    {
+      "id": "CVE-2020-26208",
+      "class": "heap-overflow-read",
+      "file": "jpgfile.c",
+      "function": "ReadJpegSections",
+      "line": 286,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "APP1 (0xE1) marker with section length 2: Data is a 2-byte malloc and memcmp(Data+2, \"Exif\", 4) reads past it (also memcmp(Data+2,\"http:\",5) at 289)",
+      "fixed_in": "upstream 5186ddc (allocate 20 extra bytes per section); in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/7",
+      "confidence": "high",
+      "note": "Issue trace says jpgfile.c:285 on the Oct-2020 master, which is one line shorter in process_COM. That is line 286 here."
+    },
+    {
+      "id": "CVE-2020-28840",
+      "class": "heap-overflow-read",
+      "file": "jpgfile.c",
+      "function": "process_COM",
+      "line": 51,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "COM section whose last byte is '\\r': Data[a+1] is read one byte past the section",
+      "fixed_in": "upstream 4827ed3; in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/8",
+      "confidence": "high"
+    },
+    {
+      "id": "CVE-2021-28275",
+      "class": "heap-overflow-read",
+      "file": "makernote.c",
+      "function": "ProcessCanonMakerNoteDir",
+      "line": 117,
+      "argv": [
+        "-v",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Canon makernote (CameraMake contains 'Canon') entry with OffsetVal near 0xffffffff: 'OffsetVal+ByteCount > ExifLength' at line 67 wraps, ValuePtr = OffsetBase+~4GB, and -v's PrintFormatNumber reads it (Get16u/Get32s wild read, SEGV)",
+      "fixed_in": "upstream a50953a (OffsetVal > 65536); in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/17",
+      "confidence": "high",
+      "note": "The CVE names Get16u in exif.c (leaf frame exif.c:320 via PrintFormatNumber exif.c:378). Issue #17 trace is makernote.c:123 on master, which has 6 more lines (56c108f), so line 117 here. The same issue's string-format variant faults at makernote.c:99 (master 105). Root-cause check is makernote.c:67."
+    },
+    {
+      "id": "CVE-2021-28276",
+      "class": "heap-overflow-read",
+      "file": "makernote.c",
+      "function": "ProcessCanonMakerNoteDir",
+      "line": 122,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Canon makernote tag 1 with Components>16 and an OffsetVal that wraps the 32-bit check at line 67: Get16u(ValuePtr+32) on a pointer ~4GB past the section (wild read, SEGV)",
+      "fixed_in": "upstream a50953a; in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/26",
+      "confidence": "high",
+      "note": "Issue #26 trace was taken on 3.04 (Get16u exif.c:320 <- makernote.c:122 <- makernote.c:183), matching this tree. The fault address is heap+4GB, which is the wrap. This shares line 122 with CVE-2021-3496 but has a different root cause."
+    },
+    {
+      "id": "CVE-2021-28277",
+      "class": "heap-overflow-read",
+      "file": "jpgfile.c",
+      "function": "RemoveUnknownSections",
+      "line": 714,
+      "argv": [
+        "-purejpg",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Deleting an unknown section when the Sections array is full: memmove copies SectionsRead-a entries starting at a+1, reading one Section_t past the array",
+      "fixed_in": "upstream b8d78e5 (3.06); in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/16",
+      "confidence": "high",
+      "note": "Also reachable with -du."
+    },
+    {
+      "id": "CVE-2021-28278",
+      "class": "heap-overflow-read",
+      "file": "jpgfile.c",
+      "function": "RemoveSectionType",
+      "line": 665,
+      "argv": [
+        "-purejpg",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Removing a COM/EXIF/IPTC/XMP section when the Sections array is full: memmove(Sections+a, Sections+a+1, sizeof(Section_t)*(SectionsRead-a)) reads one element past the array",
+      "fixed_in": "upstream 556a0c5 (memmove size; Debian cites a50953a from the same day); in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/15",
+      "confidence": "high",
+      "note": "Also reachable with -dc, -de, -di or -dx."
+    },
+    {
+      "id": "CVE-2021-3496",
+      "class": "heap-overflow-read",
+      "file": "makernote.c",
+      "function": "ProcessCanonMakerNoteDir",
+      "line": 122,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Canon makernote tag 1 with Components>16 but a small format (e.g. BYTE, ByteCount 17..33): Get16u(ValuePtr + 16*sizeof(short)) reads past the value and the section. The white-balance read at line 130 (tag 4) has the same flaw",
+      "fixed_in": "upstream ca2973f (ByteCount < 17*sizeof(short) guard); in 3.06.0.1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/33",
+      "confidence": "high",
+      "note": "Issue #33 trace is makernote.c:128:27 at 871e319. That tree has the 6 lines from 56c108f, which puts the call at line 122 here. The column matches 'Get16u('. The CVE names the leaf Get16u in exif.c."
+    },
+    {
+      "id": "CVE-2021-34055",
+      "class": "uaf",
+      "file": "exif.c",
+      "function": "ClearOrientation",
+      "line": 1229,
+      "argv": [
+        "-autorot",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Two APP1 Exif sections, the second carrying Orientation!=1: OrientationPtr points into the 2nd section, DiscardAllButExif (jhead.c:867) frees it (keeps only the first M_EXIF), then ClearOrientation does Put16u(OrientationPtr,1) on freed memory. A malformed first 'Exif' section also works",
+      "fixed_in": "upstream f0a8842 (Sep 2021, 3.08); Debian 3.04-6+deb11u1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/36",
+      "confidence": "high",
+      "note": "This is a write after free. The CVE text says 'heap overflow in Put16u', but ASAN reports heap-use-after-free. BYTE/ULONG orientation formats write at lines 1225 and 1234."
+    },
+    {
+      "id": "CVE-2022-41751",
+      "class": "cmd-injection",
+      "file": "jhead.c",
+      "function": "RegenerateThumbnail",
+      "line": 776,
+      "argv": [
+        "-rgt50",
+        "@@"
+      ],
+      "input": "filename",
+      "trigger": "JPEG with an Exif thumbnail at the end of the header, named e.g. 'x$(touch PWNED).jpg' or containing '\"': the filename is put inside \"...\" unescaped in the mogrify command and passed to system() at line 779",
+      "fixed_in": "upstream ec67262 (Oct 2022, 3.08; earlier PR #57 attempts were insufficient); Debian 3.04-6+deb11u1",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/60",
+      "confidence": "high",
+      "note": "Needs a crafted FILENAME, not crafted file content (the file only needs a valid end-of-exif thumbnail). The same unescaped-filename pattern is in DoAutoRotate's thumbnail jpegtran sprintf at jhead.c:748 (-autorot) and in the -ce editor command at jhead.c:167. Both were reported in the same issue thread."
+    },
+    {
+      "id": "CVE-2022-28550",
+      "class": "stack-overflow",
+      "file": "jhead.c",
+      "function": "shellescape",
+      "line": 344,
+      "argv": [
+        "-cmd",
+        "&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i&i",
+        "@@"
+      ],
+      "input": "argv",
+      "trigger": "-cmd string with many &i/&o tokens: each shellescape() bounds only its own output (j<PATH_MAX), so many expansions of a long filename overrun DoCommand's ExecString[PATH_MAX*3] on the stack",
+      "fixed_in": "upstream 64894db / 9688daa (3.08)",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/51",
+      "confidence": "high",
+      "note": "The trigger is argv. The total must exceed 3*PATH_MAX (12288) bytes, so use a long input filename (~200+ chars) with 70 &i (shown), or more tokens. The call site is DoCommand jhead.c:392. shellescape is already in 3.04 (from a Debian patch). Debian marks bullseye 3.04 no-dsa, i.e. affected."
+    },
+    {
+      "id": "CVE-2024-2824",
+      "class": "heap-overflow-read",
+      "file": "gpsinfo.c",
+      "function": "ProcessGpsInfo",
+      "line": 208,
+      "argv": [
+        "-v",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "GPS tag of numeric format with Components>=2 near the end of the Exif section under -v: the loop calls PrintFormatNumber(ValuePtr+a*ComponentSize, Format, ByteCount) for every component, and each call prints up to ByteCount bytes, so the last calls read up to (Components-1)*ComponentSize past the value",
+      "fixed_in": "upstream d3cb0a7 (2026; single PrintFormatNumber call)",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/84",
+      "confidence": "medium",
+      "note": "The CVE was filed against 3.08. I confirmed the identical defective loop at gpsinfo.c:207-211 in this tree. The leaf frame is PrintFormatNumber in exif.c (370-405)."
+    },
+    {
+      "id": "CVE-2018-6612",
+      "class": "heap-overflow-read",
+      "file": "exif.c",
+      "function": "process_EXIF",
+      "line": 1027,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "APP1 'Exif\\0\\0' section shorter than 16 bytes (e.g. itemlen 15): Get32u(ExifSection+12) reads past the allocation before any length check",
+      "fixed_in": "Debian 3.00-6 patch 0008 (adds 'length < 16', which is at line 1029 here); the header read is only masked in 3.05+/3.06.0.1 by 5186ddc's 20-byte slack",
+      "ref": "https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=889272",
+      "confidence": "medium",
+      "note": "The CVE text calls this an integer underflow (length-16), and that part is patched in 3.04 (line 1029). But the reporter's ASAN fault is Get32s <- Get32u <- process_EXIF on a 15-byte region, at the 'FirstOffset = Get32u(ExifSection+12)' statement. That statement is unguarded at line 1027 here, so the original PoC should still trip ASAN on 3.04. NVD/Debian count it as fixed."
+    },
+    {
+      "id": "CVE-2025-44906",
+      "class": "heap-overflow-write",
+      "file": "jhead.c",
+      "function": "ProcessFile",
+      "line": 1156,
+      "argv": [
+        "-dsft",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Exif date-rewrite: memcpy(ExifSection->Data + DateTimeOffsets[a] + 8, TempBuf, 19) with no bound against the section size. Offsets come from DateTime tags parsed in any Exif section (a later, larger one, or a tag value within 19 bytes of the end), but are written into FindSection(M_EXIF)'s data",
+      "fixed_in": "unfixed upstream as of 3.08",
+      "ref": "https://github.com/madao123123/crash_report/blob/main/jhead/jhead.md",
+      "confidence": "low",
+      "note": "Filed against 3.08 as heap-use-after-free (CWE-416). The ASAN write landed in a freed realloc'd Sections array, i.e. an OOB write into a neighbouring chunk. The report shows no flags, but this memcpy (jhead.c:1156 here, identical code in 3.08) is reachable only under -ts/-ta/-ds/-dsft. I matched it by the 19-byte memcpy in ProcessFile and did not reproduce it."
+    },
+    {
+      "id": "CVE-2026-90681",
+      "class": "heap-overflow-read",
+      "file": "exif.c",
+      "function": "ProcessExifDir",
+      "line": 476,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "Exif/Interop sub-IFD link pointing exactly at OffsetBase+ExifLength (check at exif.c:849 uses '>' not '>='): NumDirEntries = Get16u(DirStart) reads 2 bytes past the section",
+      "fixed_in": "unfixed upstream",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/98",
+      "confidence": "low",
+      "note": "The CVE was filed against the WebP path in jhead 3.3 ('up to 3.3'). The same unguarded Get16u(DirStart) is in this tree's format-independent ProcessExifDir, and JPEG reaches it with no slack in 3.04. The same pattern exists for the GPS sub-IFD: ProcessGpsInfo gpsinfo.c:62 via the check at exif.c:863. I did not reproduce it."
+    },
+    {
+      "id": "jhead-issue-24",
+      "class": "heap-overflow-read",
+      "file": "iptc.c",
+      "function": "show_IPTC",
+      "line": 82,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "IPTC record whose dataLen bytes run past the APP13 section end",
+      "fixed_in": "upstream 33e7a3f",
+      "ref": "https://github.com/Matthias-Wandel/jhead/issues/24",
+      "confidence": "medium",
+      "note": "No CVE assigned; listed so a lykos hit here scores. Present in the 3.04 tree."
+    }
+  ],
+  "excluded": [
+    {
+      "id": "CVE-2016-3822",
+      "reason": "fixed in this tree: components capped at 0x10000 and offset at 65536 (exif.c:519/530)."
+    },
+    {
+      "id": "CVE-2018-16554",
+      "reason": "fixed in this tree: snprintf with a double at gpsinfo.c:165."
+    },
+    {
+      "id": "CVE-2019-1010301",
+      "reason": "fixed in this tree: snprintf at gpsinfo.c:151."
+    },
+    {
+      "id": "CVE-2019-1010302",
+      "reason": "fixed in this tree: bounds check at iptc.c:120."
+    },
+    {
+      "id": "CVE-2019-19035",
+      "reason": "fixed in this tree: length check at jpgfile.c:329."
+    },
+    {
+      "id": "CVE-2026-90682",
+      "reason": "WebP filing of the same defect as CVE-2020-6625; not counted twice."
+    },
+    {
+      "id": "CVE-2008-*",
+      "reason": "fixed around 2.8x."
+    }
+  ],
+  "binary_path": "examples/vuln-targets/bin/jhead_x86-64"
+}

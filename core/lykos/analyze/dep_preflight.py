@@ -27,7 +27,36 @@ from pathlib import Path
 # Directories under a source tree that are not the project's own build inputs -- vendored copies,
 # examples and tests often #include third-party headers the project itself does not depend on.
 _SKIP_SEG = {"examples", "example", "demo", "demos", "test", "tests", "third_party", "3rdparty",
-             "vendor", "node_modules", ".git", "_lykos_build", "build"}
+             "vendor", "node_modules", ".git", "_lykos_build", "build", "CMakeFiles"}
+#: lykos's OWN build directories written into an extracted tree (`_lykos_cmake_sh_asan`, `_plain`,
+#: `_qlbuild`): their generated .pc files name the project's own outputs (freerdp3, winpr3), which
+#: are not dependencies to stage.
+_SKIP_PREFIX = ("_lykos", "_plain", "_qlbuild", "_asan")
+
+
+def _skipped(p: Path, root: Path) -> bool:
+    """Is `p` under a skipped directory OF THE TREE? Only the tree-relative segments count: the
+    absolute path of a case store under e.g. /home/x/tests/ must not skip the whole project. A
+    directory holding a CMakeCache.txt is a configured BUILD tree (any name), so it is skipped too."""
+    try:
+        parts = p.relative_to(root).parts[:-1]
+    except ValueError:
+        return any(seg in _SKIP_SEG for seg in p.parts[:-1])
+    if any(seg in _SKIP_SEG or seg.startswith(_SKIP_PREFIX) for seg in parts):
+        return True
+    d = root
+    for seg in parts:
+        d = d / seg
+        if _is_build_dir(str(d)):
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=4096)
+def _is_build_dir(d: str) -> bool:
+    return os.path.isfile(os.path.join(d, "CMakeCache.txt"))
+
+
 _SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hpp", ".hh", ".hxx"}
 _MAX_SCAN_FILES = 4000
 
@@ -288,10 +317,13 @@ def _strip_cmake_comments(txt: str) -> str:
 def _parse_cmake(text: str) -> list:
     """(kind, name, token-or-None) deps declared in a CMakeLists.txt / *.cmake body."""
     out: list = []
-    t = _strip_cmake_comments(text)
+    # a `${var}` reference is not a dependency name: `pkg_check_modules(${name} ${module})` (a
+    # helper macro's body) used to declare a pkg-config module literally called "module"
+    # (kept as a placeholder glued to its neighbours, so `${p}_LIBRARY` stays ONE variable name)
+    t = re.sub(r"\$\{[^}]*\}", "__VAR__", _strip_cmake_comments(text))
     for m in re.finditer(r"\bfind_package\s*\(\s*([A-Za-z0-9_+.\-]+)", t, re.I):
         name = m.group(1)
-        if name.upper() in ("PKGCONFIG", "PKG_CONFIG"):
+        if name.upper() in ("PKGCONFIG", "PKG_CONFIG") or "__VAR__" in name:
             continue
         out.append(("cmake-package", name, None))
     for m in re.finditer(r"\b(?:pkg_check_modules|pkg_search_module)\s*\(([^)]*)\)", t, re.I):
@@ -303,12 +335,16 @@ def _parse_cmake(text: str) -> list:
             if tok in kw or ">=" in tok or "<=" in tok:
                 continue
             mod = re.split(r"[<>=]", tok)[0]
+            if "__VAR__" in mod:                          # a variable: not knowable
+                continue
             if mod and mod[:1].isalpha() and not mod.isupper():   # a module name, not a version
                 out.append(("pkg-config", mod, mod))
     for m in re.finditer(r"\bfind_library\s*\(\s*[A-Za-z0-9_]+\s+(?:NAMES\s+)?([^)]*)\)", t, re.I):
         for lib in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", m.group(1)):
             if lib in ("NAMES", "PATHS", "REQUIRED", "HINTS", "PATH_SUFFIXES", "DOC", "NO_DEFAULT_PATH"):
                 continue
+            if "__VAR__" in lib:                          # a variable name list: not knowable
+                break
             out.append(("library", re.sub(r"^lib", "", lib), re.sub(r"^lib", "", lib)))
             break
     for m in re.finditer(r"\bcheck_include_files?\s*\(\s*\"?([A-Za-z0-9_./+\-]+\.h[a-z]*)", t, re.I):
@@ -334,7 +370,9 @@ def _parse_autotools(text: str) -> list:
 
 def _parse_pc(text: str) -> list:
     out: list = []
-    for m in re.finditer(r"^\s*Requires(?:\.private)?\s*:\s*(.+)$", text, re.M):
+    # [ \t]*, not \s*: an EMPTY `Requires.private:` line let \s* run over the newline and read the
+    # next line (`Libs: -L${libdir} ...`) as module names "Libs", "L", "libdir".
+    for m in re.finditer(r"^[ \t]*Requires(?:\.private)?[ \t]*:[ \t]*([^\n]+)$", text, re.M):
         for tok in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", m.group(1)):
             mod = re.split(r"[<>=]", tok)[0]
             out.append(("pkg-config", mod, mod))
@@ -355,7 +393,7 @@ def _scan_includes(root: Path) -> list:
             break
         if not p.is_file() or p.suffix not in _SRC_EXT:
             continue
-        if any(seg in _SKIP_SEG for seg in p.parts):
+        if _skipped(p, root):
             continue
         n += 1
         for inc in _INC_RE.findall(_read(p, 128 * 1024)):
@@ -417,6 +455,7 @@ def scan_dependencies(root, *, scan_includes: bool = True) -> dict:
     """
     root = _project_root(Path(root).resolve())
     system = _detect_build_system(root)
+    _is_build_dir.cache_clear()                           # a build may have configured since
 
     raw: list = []                                        # (kind, name, token)
     if system == "cmake":
@@ -424,7 +463,7 @@ def scan_dependencies(root, *, scan_includes: bool = True) -> dict:
             raw += _parse_cmake(_read(root / name))
         cnt = 0
         for cm in root.rglob("*.cmake"):
-            if cnt >= 200 or any(seg in _SKIP_SEG for seg in cm.parts):
+            if cnt >= 200 or _skipped(cm, root):
                 continue
             cnt += 1
             raw += _parse_cmake(_read(cm))
@@ -433,9 +472,11 @@ def scan_dependencies(root, *, scan_includes: bool = True) -> dict:
             if (root / name).exists():
                 raw += _parse_autotools(_read(root / name, 2 * 1024 * 1024))
                 break
-    for cnt, pc in enumerate(root.rglob("*.pc")):
-        if cnt >= 100 or any(seg in _SKIP_SEG for seg in pc.parts):
+    cnt = 0
+    for pc in root.rglob("*.pc"):
+        if cnt >= 100 or _skipped(pc, root):
             continue
+        cnt += 1
         raw += _parse_pc(_read(pc))
     if scan_includes:
         raw += _scan_includes(root)

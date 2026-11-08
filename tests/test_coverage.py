@@ -291,3 +291,42 @@ def test_qemu_campaign_enables_compcov_input_to_state(monkeypatch, tmp_path):
     aflpp.run_campaign(Path("/usr/bin/afl-fuzz"), exe, sd, od, seconds=1, mode="file",
                        qemu=False, cmplog=cl)
     assert "-c" in seen["cmd"] and str(cl) in seen["cmd"], "native build must run a CmpLog copy"
+
+
+def test_afl_queue_assertions_are_verified_and_filed(store, case, gcc, tmp_path):
+    """md4c's MD_ASSERT prints and exit(1)s; AFL never saves that as a crash, so the queue replay
+    is the only place it shows. A candidate is filed only with the differential: it asserts again
+    alone, and a benign seed does not."""
+    import subprocess
+    from types import SimpleNamespace as NS
+    from lykos.analyze.fuzz.coverage import _file_afl_assertions
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    src = tmp_path / "a.c"
+    src.write_text('#include <stdio.h>\n#include <stdlib.h>\nint main(void){char b[8];'
+                   'size_t n=fread(b,1,8,stdin); if(n>1&&b[0]==\'Z\'){fprintf(stderr,'
+                   '"X: a.c:1: Assertion \'0\' failed.\\n"); exit(1);} return 0;}\n')
+    exe = tmp_path / "a"
+    if subprocess.run([gcc, str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+    t = ingest(store, case.id, exe, filename="a")
+    stored = {}
+
+    class Ctx:
+        conn, run_id = store.conn, None
+
+        def put_artifact(self, kind, data=b"", meta=None):
+            sha = store.content.put_bytes(data)[0]
+            stored[sha] = data
+            return sha
+    fd = FindingDAO(store.conn)
+    n = _file_afl_assertions(Ctx(), t, fd, exe=str(exe), mode="stdin", workfile=tmp_path / "w",
+                             exec_timeout=2, replay_argv=(), seeds=[b"ok"],
+                             cands=[(b"Zq", "Assertion '0' failed")], plain=False)
+    assert n == 1
+    assert any(f.cwe == "CWE-617" and f.state == "confirmed" for f in fd.list_by_target(t.id))
+    # no benign control -> no differential -> nothing filed
+    assert _file_afl_assertions(Ctx(), t, fd, exe=str(exe), mode="stdin",
+                                workfile=tmp_path / "w2", exec_timeout=2, replay_argv=(),
+                                seeds=[b"Zz"], cands=[(b"Zq", "Assertion '0' failed")],
+                                plain=False) == 0

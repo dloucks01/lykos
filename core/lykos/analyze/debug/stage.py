@@ -339,7 +339,16 @@ def root_cause_stage(ctx) -> dict:
         except Exception:                                # noqa: BLE001 -- the guard is best-effort
             observe.absorbed(_log, "capturing unguarded")
 
+    _sock_proto = "udp" if "udp" in (_dyn_iso or "") else "tcp"
+
     def _capture_with(m):
+        if m == "socket":
+            # The input only exists once the server listens: run it under gdb and deliver the
+            # recorded session over loopback (net_fuzz's channel), following a forked handler.
+            if gpath is None or emulated:
+                return {"ok": False, "reason": "socket capture needs a native gdb"}
+            return gdb.run_gdb_session(gpath, exe, list(base_argv), input_bytes, _sock_proto,
+                                       timeout=int(max(30, timeout * 3)))
         if emulated:
             return make_qemu_capture(exe, target.arch, m, base_argv, timeout,
                                      endianness=target.endianness,
@@ -362,18 +371,23 @@ def root_cause_stage(ctx) -> dict:
                     argv = place(argv, sandbox.argv_arg(input_bytes, truncate=True))
                 except sandbox.ArgvNulError as e:
                     return {"ok": False, "reason": f"argv cannot carry this input: {e}"}
-            elif m == "file":
-                (ctx.scratch() / "input.bin").write_bytes(input_bytes)
-                argv = place(argv, str(ctx.scratch() / "input.bin"))
+            rw = ()
+            if m == "file":
+                # writable, as the campaign had it (fuzz.runner.writable_slot)
+                from ..fuzz.runner import writable_slot
+                wf = writable_slot(ctx.scratch() / "input.bin")
+                wf.write_bytes(input_bytes)
+                argv = place(argv, str(wf))
+                rw = (str(wf.parent),)
             return gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout),
-                               preload=_guard_preload)
+                               preload=_guard_preload, rw_dirs=rw)
         return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable,
                             guard_page=_guard)(input_bytes)
 
     # Try the mode we believe in, then the others. A crashing input fed the wrong way looks
     # exactly like an input that does not crash, and reporting that as "no fault reproduced"
     # turns a wrong setup into what reads as a clean negative result.
-    order = sweep_modes(mode, input_bytes)
+    order = ["socket"] if mode == "socket" else sweep_modes(mode, input_bytes)
     tried = []
     for m in order:
         ctx.progress(msg=f"capturing fault under {backend} ({m})")
@@ -418,8 +432,14 @@ def root_cause_stage(ctx) -> dict:
         from ..fuzz.aflpp import is_sanitizer_build
         if is_sanitizer_build(target_bytes):
             try:
-                asan_text = _sanitizer_report(exe, mode, base_argv, input_bytes,
-                                              ctx.scratch(), timeout, target)
+                if mode == "socket":
+                    from ..fuzz import session as _session
+                    asan_text = (_session.replay_session(exe, _sock_proto, input_bytes,
+                                                         argv=list(base_argv)).stderr or b""
+                                 ).decode("latin-1", "ignore")
+                else:
+                    asan_text = _sanitizer_report(exe, mode, base_argv, input_bytes,
+                                                  ctx.scratch(), timeout, target)
                 parsed = rootcause.parse_asan_report(asan_text)
             except Exception:
                 observe.absorbed(_log, "keeping the default")
@@ -437,7 +457,7 @@ def root_cause_stage(ctx) -> dict:
                 # sanitizer-confirmed use-after-free reads as RCE-capable, not just "a crash".
                 from . import exploitability as _expl
                 report["exploitability"]["effects"] = _expl.effects(parsed, cap)
-        elif not emulated:
+        elif not emulated and mode != "socket":
             # Stripped / non-sanitizer NATIVE binary: the generic classification is signal-based
             # ("a SIGSEGV somewhere"). Valgrind memcheck names the exact heap defect -- OOB
             # read/write, use-after-free, double-free -- on a binary with no source ASan, so re-run

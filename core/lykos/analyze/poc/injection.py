@@ -15,9 +15,20 @@ import re
 
 def cmdi_payloads(marker: str):
     m = marker
-    # shell metacharacters that break out of system()/popen() argument construction
-    return [f"; echo {m}", f"$(echo {m})", f"`echo {m}`", f"| echo {m}", f"&& echo {m}",
-            f"' ; echo {m} ; '", f'" ; echo {m} ; "', f"\n echo {m}\n"]
+    # shell metacharacters that break out of system()/popen() argument construction (a C/shell
+    # sink that concatenates the user string into a command line). Tried FIRST, so a classic shell
+    # injection confirms exactly as before.
+    shell = [f"; echo {m}", f"$(echo {m})", f"`echo {m}`", f"| echo {m}", f"&& echo {m}",
+             f"' ; echo {m} ; '", f'" ; echo {m} ; "', f"\n echo {m}\n"]
+    # ARGV-DIRECT forms: a managed exec sink (Go `exec.Command`, Rust `std::process::Command`,
+    # or a C `execvp` of a tokenized string) runs the program WITHOUT a shell, so no metacharacter
+    # breaks out -- but if the whole user string IS the command (split into argv on spaces, or
+    # handed to `sh -c`), then `echo <marker>` itself executes and prints the marker. The oracle is
+    # unchanged (`cmdi_confirm`): the bare marker appears only because echo RAN, and a verbatim
+    # echo of the payload still carries the literal "echo <marker>" and is rejected. Tried after
+    # the shell forms, so nothing regresses for a classic shell sink.
+    argv_direct = [f"echo {m}", f"/bin/echo {m}"]
+    return shell + argv_direct
 
 
 def cmdi_confirm(out: bytes, payload: str, marker: str) -> bool:
@@ -232,7 +243,14 @@ def sqli_returned_data(out: bytes, payload, marker: str) -> bool:
 PROBES = {
     "command-injection": {
         "cwe": "CWE-78", "severity": "critical",
-        "sinks": {"system", "popen", "execl", "execlp", "execv", "execve", "execvp"},
+        # C libc exec family + posix_spawn (the process-spawn path a stripped Rust/C binary bottoms
+        # out in when the higher-level wrapper's symbol is gone) + the unambiguous Go managed exec
+        # names (so the set-match and the objdump sink-reach see a Go binary directly; the Rust
+        # `Command::spawn/output/status` names are admitted by CWE through the `lang_sinks` fold-in
+        # in inject_stage, since their `::`-suffixed form cannot be matched by a `<name` prefix).
+        "sinks": {"system", "popen", "execl", "execlp", "execv", "execve", "execvp",
+                  "posix_spawn", "posix_spawnp",
+                  "os_exec.Command", "os_exec.CommandContext", "os.StartProcess", "syscall.Exec"},
         "payloads": lambda m: cmdi_payloads(m), "confirm": cmdi_confirm,
         "proves": _PROVES_EFFECT,
         "title": "OS command injection", "binary": False},

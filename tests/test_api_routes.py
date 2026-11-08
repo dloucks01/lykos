@@ -331,3 +331,155 @@ def test_orchestrate_prove_stages_receive_params():
     assert not (needs_input & orchestrate._NO_PARAMS), \
         ("stages that raise on a missing params.input_sha but are marked no-param, so the "
          f"autopilot will drop it: {sorted(needs_input & orchestrate._NO_PARAMS)}")
+
+
+def _put_tree(tmp_path, cid, tid, files: dict):
+    import io
+    import tarfile
+
+    from lykos.casestore import CaseStore
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, text in files.items():
+            data = text.encode()
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    st = CaseStore.open(tmp_path / "cs")
+    try:
+        sha = st.targets.get(tid).sha256
+        st.put_artifact(cid, "source-project", data=buf.getvalue(), meta={"binary_sha": sha})
+    finally:
+        st.close()
+
+
+def test_source_tree_files_and_line_windows(triaged, tmp_path):
+    """A source-tree finding names `dc.c:221`; the GUI reads the lines around it. Paths in and
+    out are tree-relative, a basename resolves, an ambiguous one returns candidates, and a path
+    that climbs out of the tree is refused."""
+    sock, cid, tid = triaged
+    src = "\n".join(f"line {i}" for i in range(1, 301))
+    _put_tree(tmp_path, cid, tid, {"lib/dc.c": src, "a/util.h": "x", "b/util.h": "y",
+                                   "README.md": "readme"})
+    st, body = _json(sock, "GET", f"/targets/{tid}/source-tree")
+    assert st == 200 and body["source"] is True
+    assert set(body["files"]) >= {"lib/dc.c", "a/util.h", "b/util.h"}
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=dc.c&line=221&context=2")
+    assert st == 200 and w["path"] == "lib/dc.c" and w["start"] == 219
+    assert w["lines"] == ["line 219", "line 220", "line 221", "line 222", "line 223"]
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=/tmp/build/proj/lib/dc.c&line=1&context=0")
+    assert st == 200 and w["lines"] == ["line 1"]
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=util.h")
+    assert st == 404 and sorted(w["candidates"]) == ["a/util.h", "b/util.h"]
+    st, w = _json(sock, "GET", f"/targets/{tid}/source-file?path=../../../etc/passwd")
+    assert st == 404
+
+
+def test_source_tree_for_a_binary_only_case(triaged):
+    sock, _cid, tid = triaged
+    st, body = _json(sock, "GET", f"/targets/{tid}/source-tree")
+    assert st == 200 and body == {"files": [], "source": False}
+
+
+def test_source_file_resolves_a_findings_own_site(triaged, tmp_path):
+    from lykos.casestore import CaseStore
+    sock, cid, tid = triaged
+    body = "static int f(int numBits)\n{\n\tint t = 0;\n\tstop = t & MASKS[numBits];\n\treturn 0;\n}\n"
+    _put_tree(tmp_path, cid, tid, {"codec/clear.c": body})
+    st = CaseStore.open(tmp_path / "cs")
+    try:
+        from lykos.db.dao import FindingDAO
+        FindingDAO(st.conn).upsert(tid, cid, {
+            "cwe": "CWE-129", "title": "Wire value -> index", "severity": "high",
+            "detector": "wire_flow", "state": "candidate", "dedup_key": "wf:t",
+            "evidence": [{"channel": "source", "detail": "codec/clear.c: f() uses wire-read "
+                          "'numBits' as a index -- stop = t & MASKS[numBits];"}]})
+        fid = next(x.id for x in FindingDAO(st.conn).list_by_target(tid) if x.dedup_key == "wf:t")
+    finally:
+        st.close()
+    code, w = _json(sock, "GET", f"/targets/{tid}/source-file?finding={fid}&context=1")
+    assert code == 200 and w["path"] == "codec/clear.c" and w["line"] == 4
+    assert w["lines"][1].strip() == "stop = t & MASKS[numBits];"
+
+
+# ---- CLI parity: `lykos deps`, `lykos cwe-coverage`, the format analyzer --------------------
+
+def test_deps_preflights_the_targets_source_tree_with_tree_relative_paths(triaged, tmp_path):
+    """GET /targets/{id}/deps is `lykos deps` on the uploaded tree: declared vs present, the
+    toolchain, and the stage-these install lines. The browser never sees a server path."""
+    sock, cid, tid = triaged
+    _put_tree(tmp_path, cid, tid, {
+        "proj/CMakeLists.txt": "cmake_minimum_required(VERSION 3.10)\nfind_package(ZLIB)\n"
+                               "find_package(SomeExoticLib)\n"
+                               "pkg_check_modules(X REQUIRED lykos-no-such-module-1.0)\n",
+        "proj/main.c": "#include <zlib.h>\nint main(void){return 0;}\n"})
+    st, d = _json(sock, "GET", f"/targets/{tid}/deps")
+    assert st == 200 and d["source"] is True
+    assert d["build_system"] == "cmake" and "cmake" in d["toolchain"]
+    assert d["project_root"] in ("proj", ".") and "root" not in d
+    names = {r["name"]: r for r in d["requirements"]}
+    assert names["SomeExoticLib"]["present"] is None                 # unknown, never "missing"
+    assert names["lykos-no-such-module-1.0"]["present"] is False
+    assert {r["name"] for r in d["missing"]} >= {"lykos-no-such-module-1.0"}
+    assert set(d["summary"]) >= {"declared", "present", "missing", "unknown", "toolchain_missing"}
+    assert set(d["stage"]) >= {"apt", "dnf", "packages", "no_package_hint"}
+    assert {"kind": "pkg-config", "name": "lykos-no-such-module-1.0"} in d["stage"]["no_package_hint"]
+    raw = json.dumps(d)
+    assert str(tmp_path) not in raw and "/src-cache/" not in raw   # no server path leaks
+    st2, d2 = _json(sock, "GET", f"/targets/{tid}/deps")             # cached: same answer
+    assert st2 == 200 and d2 == d
+    st3, d3 = _json(sock, "GET", f"/targets/{tid}/deps?include_scan=0")
+    assert st3 == 200 and "zlib.h" not in {r["name"] for r in d3["requirements"]}
+
+
+def test_deps_for_a_binary_target_and_an_unknown_one(triaged):
+    sock, _cid, tid = triaged
+    st, d = _json(sock, "GET", f"/targets/{tid}/deps")
+    assert st == 200 and d == {"source": False}
+    st, _ = _json(sock, "GET", "/targets/nope/deps")
+    assert st == 404
+
+
+def test_cwe_coverage_matrix_and_case_overlay(triaged, tmp_path):
+    """GET /cwe-coverage is `lykos cwe-coverage`: every class with how it is detected and the
+    furthest rung lykos carries it today; ?case= overlays what this case actually has."""
+    from lykos.analyze import cwe_coverage as cc
+    from lykos.casestore import CaseStore
+    sock, cid, tid = triaged
+    st, m = _json(sock, "GET", "/cwe-coverage")
+    assert st == 200 and m["case"] is None and m["summary"] == cc.summary()
+    rows = {r["cwe"]: r for r in m["classes"]}
+    assert set(rows) >= {e["cwe"] for e in cc.capability_matrix()}
+    r = rows["CWE-787"]
+    assert r["method"] == "runtime" and r["ceiling"] == "rce" and r["ceiling_level"] == "L3"
+    assert rows["CWE-119"]["ceiling_level"] == "L2"
+    for row in m["classes"]:
+        assert set(row) >= {"cwe", "name", "method", "method_label", "ceiling", "ceiling_level",
+                            "ceiling_why", "detected", "catalog_only"}
+        assert "blocked" not in (row["ceiling_why"] or "").lower()   # a ceiling is lykos's reach
+    s = CaseStore.open(tmp_path / "cs")
+    try:
+        from lykos.db.dao import FindingDAO
+        FindingDAO(s.conn).upsert(tid, cid, {"cwe": "CWE-787", "title": "oob write",
+                                             "severity": "high", "detector": "t",
+                                             "state": "candidate", "dedup_key": "cc:1"})
+    finally:
+        s.close()
+    st, m = _json(sock, "GET", f"/cwe-coverage?case={cid}")
+    assert st == 200 and m["case"]["id"] == cid
+    assert any(r["cwe"] == "CWE-787" and r["count"] == 1 for r in m["case"]["rows"])
+    st, _ = _json(sock, "GET", "/cwe-coverage?case=nope")
+    assert st == 404
+
+
+def test_format_analyze_suggests_then_previews_and_refuses_a_bad_spec(api):
+    import base64
+    sample = base64.b64encode(b"ABCD\x05\x00\x00\x00hello").decode()
+    st, r = _json(api, "POST", "/format/analyze", {"sample_b64": sample})
+    assert st == 200 and r["suggestion"]["spec"]
+    st, p = _json(api, "POST", "/format/analyze", {"sample_b64": sample,
+                                                   "spec": r["suggestion"]["spec"]})
+    assert st == 200 and p["preview"]["ok"] and p["preview"]["roundtrip"]
+    st, e = _json(api, "POST", "/format/analyze", {"sample_b64": sample,
+                                                   "spec": "not a spec"})
+    assert st == 400 and "spec" in e["error"]

@@ -43,7 +43,8 @@ def locate_gdb(config: Optional[str] = None) -> Optional[Path]:
     return Path(w) if w else None
 
 
-def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int) -> str:
+def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int,
+               rw_dirs=()) -> str:
     """Write `cmds` to a script and run `gdb -batch` on the (hostile) target INSIDE the sandbox
     -- bwrap read-only root with /home,/root masked (net unshared; ptrace needs no loopback) and
     rlimits, so a runaway/forking inferior cannot exhaust or write to the host. Returns gdb's
@@ -64,7 +65,10 @@ def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int) -> 
             ro.append(str(Path(stdin_file).resolve().parent))
         inner = ([str(gdb), "-q", "-batch", "-nx", "-x", str(script), "--args", exe_abs]
                  + [sandbox.argv_bytes(a) for a in argv])
-        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=ro) + inner
+        # `rw_dirs`: the writable slot a file input sits in -- the target may edit its input in
+        # place (jhead -mkexif), and read-only it refuses before reaching the fault.
+        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=ro,
+                                     rw_binds=[str(x) for x in rw_dirs]) + inner
         preexec = sandbox._rlimits(2048, int(timeout) + 15, set_as=False)
         if ctx is not None:
             proc = ctx.run_subprocess(cmd, timeout=timeout + 15, preexec_fn=preexec)
@@ -112,11 +116,11 @@ def _capture_cmds(stdin_file, preload: str | None = None):
 
 
 def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30,
-            preload: str | None = None) -> dict:
+            preload: str | None = None, rw_dirs=()) -> dict:
     if stdin_file:                                     # absolute: the `run < file` redirect is
         stdin_file = str(Path(stdin_file).resolve())   # resolved before bwrap chdirs to /tmp
     return _parse(_drive_gdb(gdb, exe, argv, stdin_file, _capture_cmds(stdin_file, preload),
-                             ctx=ctx, timeout=timeout))
+                             ctx=ctx, timeout=timeout, rw_dirs=rw_dirs))
 
 
 _FORK = re.compile(r"fork to child process (\d+)")
@@ -163,6 +167,91 @@ def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int =
     cap["execed"] = execed.group(1) if execed else None
     cap["multiproc"] = bool(fork or execed)
     return cap
+
+
+def run_gdb_session(gdb: Path, exe, argv, blob: bytes, proto: str = "tcp", *,
+                    timeout: int = 30) -> dict:
+    """Fault capture for a crash delivered over a SOCKET: start the server under gdb (following a
+    forked connection handler into the child), wait for it to listen, deliver the stored session
+    message by message, and let gdb report the fault. Contained like `_drive_gdb`, except the
+    network namespace is kept (we connect over loopback)."""
+    import subprocess
+    import time
+    from ..fuzz import netfuzz
+    from ..fuzz import session as _session
+    d = Path(tempfile.mkdtemp(prefix="lykos-gdbsock-"))
+    proc = None
+    try:
+        cmds = [
+            "set pagination off", "set confirm off", "set height 0", "set width 0",
+            "set debuginfod enabled off", "set follow-fork-mode child", "set detach-on-fork on",
+            _HANDLE, "run",
+            'printf "LYKOS_PC %#lx\\n", $pc', "print $_siginfo",
+            "python", "try:", '    gdb.execute("x/16xb $pc")', "except gdb.error as _e:",
+            '    gdb.write("x/16xb $pc -> %s (pc unmapped -- control flow redirected to an '
+            'invalid address)\\n" % _e)', "end",
+            "info proc mappings", "bt", "quit"]
+        script = d / "cmd.gdb"
+        script.write_text("\n".join(cmds) + "\n")
+        exe_abs = str(Path(exe).resolve())
+        inner = ([str(gdb), "-q", "-batch", "-nx", "-x", str(script), "--args", exe_abs]
+                 + [sandbox.argv_bytes(a) for a in argv])
+        env = dict(os.environ)
+        if sandbox._is_sanitizer_exe(exe_abs):
+            env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0:symbolize=1"
+        cmd = sandbox.isolate_prefix(str(Path(exe_abs).parent), net=True, ro_binds=[str(d)]) + inner
+        out_f = d / "out.txt"
+        with open(out_f, "wb") as fo:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fo,
+                                    stderr=subprocess.STDOUT, start_new_session=True, env=env,
+                                    preexec_fn=sandbox._rlimits(4096, int(timeout) + 30,
+                                                                set_as=False))
+            port = None
+            end = time.time() + max(10.0, timeout / 2)
+            while time.time() < end and proc.poll() is None:
+                ports = netfuzz._listening_ports(proc.pid, proto)
+                if ports:
+                    port = ports[0]
+                    break
+                time.sleep(0.1)
+            if port is None:
+                return {"ok": False, "reason": "server did not listen under the debugger"}
+            msgs = _session.decode_session(blob)
+            try:
+                import socket as _s
+                if proto == "tcp":
+                    s = _s.create_connection(("127.0.0.1", port), timeout=3)
+                    s.settimeout(1.0)
+                    try:
+                        s.recv(65536)
+                    except OSError:
+                        pass
+                    for m in msgs:
+                        s.sendall(m)
+                        s.settimeout(1.0)
+                        try:
+                            s.recv(65536)
+                        except OSError:
+                            pass
+                    s.close()
+                else:
+                    s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+                    for m in msgs:
+                        s.sendto(m, ("127.0.0.1", port))
+                        time.sleep(0.1)
+                    s.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+        text = out_f.read_bytes().decode("latin-1", "ignore")
+        return _parse(text)
+    finally:
+        if proc is not None and proc.poll() is None:
+            netfuzz._killtree(proc)
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _parse(out: str) -> dict:

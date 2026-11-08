@@ -445,25 +445,23 @@ def _is_generic(name) -> bool:
     return (not n) or n.startswith(_GENERIC)
 
 
-def relabel(target_bytes: bytes, funcs: list) -> int:
-    """Name the security-relevant libc functions in a STRIPPED STATIC target (x86-64 or aarch64) by
-    matching its code against that arch's libc.a signatures, and propagate the names onto the call
-    EDGES so the call-graph detectors (dangerous_api keys on dst_name) see `system`/`strcpy`/...
-    instead of `fcn.XXXX`.
+def identified(target_bytes: bytes) -> dict:
+    """{hex_va: canonical name} of every libc body FLIRT recognises in the target (x86-64 or
+    aarch64), plus -- on x86-64 -- the IFUNC thunks/GOT slots that resolve to one. Empty when the
+    arch has no signature rule or no reference archive, or nothing matches.
 
-    Mutates `funcs` in place (each is a dict with `addr`, `name`, and `calls`=[{dst_addr, dst_name,
-    ...}]); returns how many names were applied. A no-op -- so a dynamic/named target is untouched --
-    when there is no reference archive for the arch, the target is not a supported ELF64 arch, or
-    nothing matches. Only a generic/blank name is ever overwritten."""
+    This is the LIBRARY set for a stripped static binary: `relabel` names these, and the detect
+    stage's static-binary scoping (detect/libscope.py) treats their bodies as the linked-in library
+    -- analysed as named imports, not walked."""
     machine = _target_machine(target_bytes)
     if machine not in (_EM_X86_64, _EM_AARCH64):         # the arches with a signature/mask rule
-        return 0
+        return {}
     sigs = _signatures(machine)
     if not sigs:
-        return 0
-    named = identify(target_bytes, None, sigs)           # {hex_va: canonical name}
+        return {}
+    named = identify(target_bytes, None, sigs)
     if not named:
-        return 0
+        return {}
     # Extend with the IFUNC thunks/GOT slots: a str*/mem* CALL lands on a resolver thunk, not the
     # named variant body, so without this the overflow-sink edges (strcpy/strcat/memcpy) stay
     # unnamed even though the body is identified. x86-64 only -- the thunk/resolver decoding
@@ -474,6 +472,22 @@ def relabel(target_bytes: bytes, funcs: list) -> int:
             named.update(ifunc_stub_names(target_bytes, named))
         except Exception:                                # noqa: BLE001 -- the direct names still stand
             pass
+    return named
+
+
+def relabel(target_bytes: bytes, funcs: list) -> int:
+    """Name the security-relevant libc functions in a STRIPPED STATIC target (x86-64 or aarch64) by
+    matching its code against that arch's libc.a signatures, and propagate the names onto the call
+    EDGES so the call-graph detectors (dangerous_api keys on dst_name) see `system`/`strcpy`/...
+    instead of `fcn.XXXX`.
+
+    Mutates `funcs` in place (each is a dict with `addr`, `name`, and `calls`=[{dst_addr, dst_name,
+    ...}]); returns how many names were applied. A no-op -- so a dynamic/named target is untouched --
+    when there is no reference archive for the arch, the target is not a supported ELF64 arch, or
+    nothing matches. Only a generic/blank name is ever overwritten."""
+    named = identified(target_bytes)                     # {hex_va: canonical name}
+    if not named:
+        return 0
 
     def _hx(a):
         try:

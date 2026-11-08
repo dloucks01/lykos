@@ -76,3 +76,46 @@ def test_candidates_from_disasm_recovers_pie_lea_rip_tables():
     by_addr = {c["addr"]: c for c in cands}
     assert 0x4040 in by_addr and by_addr[0x4040]["stride"] == 8   # ptr-table default stride
     assert 0x12ad not in by_addr                          # a .text lea-rip is not a data array
+
+
+def test_sanitizer_runtime_tables_are_not_probed():
+    """An ASan/libFuzzer harness's largest global tables are the runtime's. FreeRDP's harnesses
+    got a CWE-129 filed on __sanitizer::internal_alloc_placeholder (index 0 -- in bounds)."""
+    from lykos.analyze.dynamic.oob_index import _array_candidates
+    objs = {"_ZN11__sanitizerL26internal_alloc_placeholderE": (0x1000, 0x400),
+            "_ZN6fuzzer12_GLOBAL__N_19MallocHooksE": (0x2000, 0x80),
+            "__asan_option_detect_stack_use_after_return_tbl": (0x3000, 0x40),
+            "menu_handlers": (0x4000, 0x40)}
+    assert [a["name"] for a in _array_candidates(objs)] == ["menu_handlers"]
+
+
+def test_runtime_file_locals_and_compiler_objects_are_not_probed():
+    """`_ZL11ioctl_table` (asan_interceptors.cpp) and `_ZL17kSuppressionTypes` (ubsan_diag.cpp)
+    carry no namespace; the symbol table's STT_FILE attribution is what marks them runtime."""
+    from lykos.analyze.dynamic.oob_index import _array_candidates
+    objs = {"_ZL11ioctl_table": (0x1000, 8000), "_ZL17kSuppressionTypes": (0x3000, 304),
+            "_ZTVN11__sanitizer2DDE": (0x4000, 0x80), ".str.1": (0x5000, 0x20),
+            "__abi_tag": (0x6000, 0x20), "__func__.test_client": (0x7000, 0x10),
+            "VIRTUAL_KEY_CODE_TABLE": (0x8000, 0x800)}
+    got = _array_candidates(objs, frozenset({"_ZL11ioctl_table", "_ZL17kSuppressionTypes"}))
+    assert [a["name"] for a in got] == ["VIRTUAL_KEY_CODE_TABLE"]
+
+
+def test_runtime_symbols_reads_stt_file_attribution(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    from lykos.analyze.toolchain_runtime import runtime_symbols
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        pytest.skip("no C compiler")
+    (tmp_path / "asan_fake.c").write_text("static void *tbl[8]; void *rt(int i){return tbl[i];}\n")
+    (tmp_path / "prog.c").write_text("static void *mine[8]; void *rt(int);\n"
+                                    "int main(int c,char**v){(void)v;return !!rt(c)+!!mine[c];}\n")
+    exe = tmp_path / "a.out"
+    subprocess.run([cc, "-O0", "-o", str(exe), str(tmp_path / "asan_fake.c"),
+                    str(tmp_path / "prog.c")], check=True, capture_output=True)
+    rs = runtime_symbols(exe.read_bytes())
+    assert "tbl" in rs and "mine" not in rs

@@ -20,6 +20,22 @@ fetch() { # name url sha256
                             echo "     got  $got"; rm -f "$out"; return 1; }
 }
 
+# Debug twins + stripped copies, for the recall bench (bench/recall/README.md "Binary ground truth").
+# Each x86-64 recall binary gets `<bin>.dbg`: the SAME build with -g added and nothing else changed,
+# so the bench can map a no-debug binary's crash VA to (function, file, line) with addr2line. A twin
+# is kept only when its .text is byte-identical to the shipped binary's (-g must not move code; a
+# different compiler/libc would), otherwise it is deleted -- a twin that maps addresses wrongly is
+# worse than none. `<bin>.stripped` is a `strip -s` copy: the binary-stripped bench surface.
+text_of() { objcopy -O binary --only-section=.text "$1" "$2" 2>/dev/null; }
+twin_check() { # shipped twin
+  local a b; a=$(mktemp); b=$(mktemp)
+  if [ -s "$2" ] && text_of "$1" "$a" && text_of "$2" "$b" && cmp -s "$a" "$b"; then
+    echo "  + $(basename "$2") (.text identical to $(basename "$1"))"
+  else echo "  x $(basename "$2") (.text differs from $(basename "$1") -- removed)"; rm -f "$2"; fi
+  rm -f "$a" "$b"
+}
+strip_copy() { strip -s -o "$1.stripped" "$1" && echo "  + $(basename "$1").stripped"; }
+
 # ---------------------------------------------------------------- jhead 3.04 (EXIF/JPEG)
 # CWE-125 out-of-bounds read in ProcessGpsInfo. The bounds check adds a GPS entry's value
 # offset to its byte count in 32 bits, so a pair that WRAPS passes the check while the offset
@@ -41,7 +57,11 @@ if fetch jhead.tar.gz https://deb.debian.org/debian/pool/main/j/jhead/jhead_3.04
     command -v "$cc" >/dev/null || { echo "  - $a (no $cc)"; continue; }
     # static so qemu-user needs no sysroot; -O0 keeps the frames recoverable
     if (cd src/jhead-3.04 && $cc -O0 -static -w $fl -o "$W/bin/jhead_$a" $SRC -lm) 2>/dev/null
-    then echo "  + jhead_$a"; else echo "  x jhead_$a (toolchain present, build failed)"; fi
+    then echo "  + jhead_$a"; else echo "  x jhead_$a (toolchain present, build failed)"; continue; fi
+    if [ "$a" = x86-64 ]; then   # the recall bench's jhead-3.04 binary: debug twin + stripped copy
+      (cd src/jhead-3.04 && $cc -O0 -static -w $fl -g -o "$W/bin/jhead_$a.dbg" $SRC -lm) 2>/dev/null
+      twin_check "bin/jhead_$a" "bin/jhead_$a.dbg"; strip_copy "bin/jhead_$a"
+    fi
   done
 fi
 
@@ -58,6 +78,11 @@ if fetch giflib.tar.bz2 http://archive.ubuntu.com/ubuntu/pool/main/g/giflib/gifl
      lib/gif_hash.c lib/openbsd-reallocarray.c lib/quantize.c \
      util/gif2rgb.c util/getarg.c util/qprintf.c) 2>/dev/null \
     && echo "  + gif2rgb_x86-64" || echo "  x gif2rgb_x86-64"
+  (cd src/giflib-5.1.4 && gcc -O0 -w -g -Ilib -Iutil -o "$W/bin/gif2rgb_x86-64.dbg" \
+     lib/dgif_lib.c lib/egif_lib.c lib/gifalloc.c lib/gif_err.c lib/gif_font.c \
+     lib/gif_hash.c lib/openbsd-reallocarray.c lib/quantize.c \
+     util/gif2rgb.c util/getarg.c util/qprintf.c) 2>/dev/null
+  twin_check bin/gif2rgb_x86-64 bin/gif2rgb_x86-64.dbg; strip_copy bin/gif2rgb_x86-64
 fi
 
 # ---------------------------------------------------------------- unzip 6.0 (ZIP)
@@ -67,9 +92,18 @@ UZ_SHA=036d96991646d0449ed0aa952e4fbe21b476ce994abc276e49d30e686708bd37
 if fetch unzip.tar.gz https://deb.debian.org/debian/pool/main/u/unzip/unzip_6.0.orig.tar.gz $UZ_SHA; then
   rm -rf src/unzip60; tar xzf src/unzip.tar.gz -C src
   echo "== unzip 6.0 =="
+  # NB: linux_noasm re-invokes make with CFLAGS="-O -Wall", which overrides CFLAGS="-O0" here, so
+  # this binary is really -O (-O1), and its link line passes -s (LF2), so it ships stripped.
   (cd src/unzip60 && make -f unix/Makefile linux_noasm CC=gcc CFLAGS="-O0" \
       CF_NOOPT="-I. -DUNIX -std=gnu89 -w -DNO_LCHMOD" >/dev/null 2>&1 \
    && cp unzip "$W/bin/unzip_x86-64") && echo "  + unzip_x86-64" || echo "  x unzip_x86-64"
+  # Twin: -g goes in CF_NOOPT (the one variable the sub-make does not override); LF2= drops the
+  # link-time -s, which would otherwise strip the debug info straight back out.
+  (cd src/unzip60 && rm -f ./*.o unzip funzip unzipsfx zipinfo && \
+   make -f unix/Makefile linux_noasm CC=gcc CFLAGS="-O0" \
+      CF_NOOPT="-I. -DUNIX -std=gnu89 -w -DNO_LCHMOD -g" LF2= >/dev/null 2>&1 \
+   && cp unzip "$W/bin/unzip_x86-64.dbg")
+  twin_check bin/unzip_x86-64 bin/unzip_x86-64.dbg; strip_copy bin/unzip_x86-64
 fi
 
 # ---------------------------------------------------------------- ncompress (CVE-2001-1413)
@@ -96,9 +130,34 @@ if fetch ncompress.tar.gz http://archive.ubuntu.com/ubuntu/pool/universe/n/ncomp
         -DCOMPILE_DATE='"cve-revert"' -fno-stack-protector -no-pie \
         -o "$W/bin/ncompress_x86-64_cve" compress42.c) 2>/dev/null \
       && echo "  + ncompress_x86-64_cve" || echo "  x ncompress_x86-64_cve (build failed)"
+    (cd src/ncompress-4.2.4.4 && gcc -O0 -w -g -std=gnu89 -DNOFUNCDEF -DUTIME_H \
+        -DCOMPILE_DATE='"cve-revert"' -fno-stack-protector -no-pie \
+        -o "$W/bin/ncompress_x86-64_cve.dbg" compress42.c) 2>/dev/null
+    twin_check bin/ncompress_x86-64_cve bin/ncompress_x86-64_cve.dbg
+    strip_copy bin/ncompress_x86-64_cve
   else
     echo "  x length check not found -- upstream changed, not reverting"
   fi
+fi
+
+# ---------------------------------------------------------------- jhead 3.06.0.1 (EXIF/JPEG)
+# The recall bench's "downloaded, hardened, stripped" jhead (bench/recall/jhead-3.06.0.1): GitHub
+# tag 3.06.0.1 (commit 78057ab), built the way a distro would -- -O2, SSP, FORTIFY, PIE, full RELRO
+# -- WITH -g, then stripped. So the -g build itself is the debug twin, and the shipped binary is
+# `strip` of it; twin_check still verifies the pair. myglob.c is the Win32 path, left out.
+J6_SHA=5c5258c3d7a840bf831e22174e4a24cb1de3baf442f7cb73d5ab31b4ae0b0058
+if fetch jhead-3.06.0.1.tar.gz https://github.com/Matthias-Wandel/jhead/archive/refs/tags/3.06.0.1.tar.gz $J6_SHA; then
+  rm -rf src/jhead-3.06.0.1; tar xzf src/jhead-3.06.0.1.tar.gz -C src
+  echo "== jhead 3.06.0.1 (hardened, stripped) =="
+  J6=$W/src/jhead-3.06.0.1
+  if gcc -g -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -pie -Wl,-z,relro,-z,now \
+       -o "$W/bin/jhead-3.06.0.1_x86-64.dbg" $J6/jhead.c $J6/jpgfile.c $J6/jpgqguess.c $J6/paths.c \
+       $J6/exif.c $J6/iptc.c $J6/gpsinfo.c $J6/makernote.c -lm 2>/dev/null \
+     && strip -o "$W/bin/jhead-3.06.0.1_x86-64" "$W/bin/jhead-3.06.0.1_x86-64.dbg"; then
+    echo "  + jhead-3.06.0.1_x86-64"
+    twin_check bin/jhead-3.06.0.1_x86-64 bin/jhead-3.06.0.1_x86-64.dbg
+    strip_copy bin/jhead-3.06.0.1_x86-64
+  else echo "  x jhead-3.06.0.1_x86-64 (build failed)"; fi
 fi
 
 # ---------------------------------------------------------------- libtiff 4.0.3 tiffcp (TIFF)
@@ -124,6 +183,7 @@ fi
 echo
 echo "== self-check: the crasher must fault, the seed must parse =="
 for f in bin/jhead_*; do
+  case $f in *.dbg|*.stripped) continue;; esac   # bench twins/copies, not extra architectures
   a=${f#bin/jhead_}
   case $a in x86-64) q="";; x86) q="";; s390x) q=qemu-s390x;; powerpc) q=qemu-ppc;;
              ppc) q=qemu-ppc;; riscv64) q=qemu-riscv64;; *) q=qemu-$a;; esac

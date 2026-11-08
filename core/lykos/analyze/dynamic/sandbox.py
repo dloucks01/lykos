@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+from ...jobs import runenv as _runenv     # per-run target libraries (not os.environ)
 import platform
 import re
 import resource
@@ -196,6 +197,9 @@ class RunResult:
     # Image-relative address of the faulting instruction, when the target was traced. Two
     # crashes at different addresses are different defects, however alike their signals look.
     fault_pc: Optional[int] = None
+    # The data address a fatal signal faulted on (siginfo si_addr), when traced: a NULL deref
+    # faults near 0, a corrupted pointer at an attacker-shaped address.
+    fault_addr: Optional[int] = None
     # Which of the requested coverage blocks this run reached, or None when coverage was not
     # asked for. This used to travel in `note`, parsed back out of a comma-joined string --
     # which worked only because nothing else ever put anything in `note`. The channel runner
@@ -272,7 +276,8 @@ def _batch_runner_path() -> str:
 
 def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
               arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048,
-              blocks=(), guard_page: bool = False, fault_pc: bool = False):
+              blocks=(), guard_page: bool = False, fault_pc: bool = False,
+              share_breakpoints: bool = False):
     """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
 
     `blocks` are image-relative basic-block addresses to watch; each result then carries the
@@ -338,6 +343,12 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
         if guarded:
             env = dict(env if env is not None else os.environ)
             env["LYKOS_PRELOAD"] = _genv.get("LD_PRELOAD", "").split(":")[0]
+    if share_breakpoints and blocks:
+        # one-shot across the BATCH (see batch_runner): only for a caller that judges each input
+        # by "did it reach anything new", which batch order already answers -- never for one that
+        # needs every input's full coverage (distillation, directed distance)
+        env = dict(env if env is not None else os.environ)
+        env["LYKOS_SHARED_ARM"] = "1"
     if fault_pc:
         # ask the runner to ptrace and report the faulting PC even with no coverage blocks -- the
         # crash attribution the native-crash validator needs. Added last so no env setup clobbers it.
@@ -351,11 +362,11 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
     results, off = [], 0
     for _ in payloads:
-        if off + 25 > len(out):
+        if off + 33 > len(out):
             return None                               # truncated reply: fall back rather than
-        code, nso, nse, flags, nnew, fault_pc = struct.unpack(   # invent one
-            "<iIIBIQ", out[off:off + 25])
-        off += 25
+        code, nso, nse, flags, nnew, fault_pc, fault_addr = struct.unpack(   # invent one
+            "<iIIBIQQ", out[off:off + 33])
+        off += 33
         so, se = out[off:off + nso], out[off + nso:off + nso + nse]
         off += nso + nse
         reached = ()
@@ -389,11 +400,31 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
                                  timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
                                  duration_ms=per_ms, fault_pc=(fault_pc or None),
+                                 fault_addr=(fault_addr if crashed and fault_pc
+                                             and fault_addr != 0xFFFFFFFFFFFFFFFF else None),
                                  # both channels, like run(): `blocks_hit` is the explicit
                                  # one, `note` stays for a reader that has not been moved over
                                  blocks_hit=tuple(reached) if blocks else None,
                                  note=(",".join(str(x) for x in reached) or None)))
+    _console_batch(exe, base_argv, mode, payloads, results)
     return results
+
+
+def _console_batch(exe, base_argv, mode, payloads, results) -> None:
+    """Record a batch's executions on the live run console (sampled there; crashes in full)."""
+    try:
+        from ...jobs import runlog
+        if runlog.current() is None:
+            return
+        name = Path(str(exe)).name
+        for data, rr in zip(payloads or (), results or ()):
+            runlog.target_run([name] + [str(a) for a in (base_argv or ())], mode=mode,
+                              in_len=len(data or b""), rc=rr.exit_code, signal=rr.signal_name,
+                              crashed=bool(rr.crashed), timed_out=bool(rr.timed_out),
+                              ms=rr.duration_ms, isolation=rr.isolation, out=rr.stdout,
+                              err=rr.stderr, fault_pc=rr.fault_pc, fault_addr=rr.fault_addr)
+    except Exception:                                    # noqa: BLE001 -- console telemetry only
+        pass
 
 
 def kill_quietly(proc, *, reap: float = 2.0) -> None:
@@ -714,7 +745,7 @@ def qemu_ld_prefix(arch, endianness=None, bits=None, exedir=None) -> Optional[st
          a relocated bundle that stages the guest libs next to the target.
       3. The host cross-arch sysroot /usr/<triple> (present on a box with the cross toolchains).
     """
-    env_ovr = os.environ.get("LYKOS_QEMU_SYSROOT")
+    env_ovr = _runenv.get("LYKOS_QEMU_SYSROOT")
     if env_ovr and Path(env_ovr).is_dir():
         return env_ovr
     if exedir and _dir_has_guest_loader(exedir):
@@ -2400,12 +2431,35 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix,
               (None if crashed or not timed else "timed out")))
 
 
-def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
+def run(exe, *, argv=(), stdin: bytes = b"", **kw) -> RunResult:
+    """Run the target once in the sandbox (see `_run` for every option) and record the execution
+    on the live run console (jobs/runlog: a no-op outside a stage)."""
+    import time as _time
+    t0 = _time.time()
+    rr = _run(exe, argv=argv, stdin=stdin, **kw)
+    try:
+        from ...jobs import runlog
+        if runlog.current() is not None:
+            runlog.target_run([Path(str(exe)).name] + [str(a) for a in (argv or ())],
+                              mode="stdin" if stdin else None, in_len=len(stdin or b"") or None,
+                              rc=rr.exit_code, signal=rr.signal_name, crashed=bool(rr.crashed),
+                              timed_out=bool(getattr(rr, "timed_out", False)),
+                              ms=getattr(rr, "duration_ms", None) or int((_time.time() - t0) * 1000),
+                              isolation=rr.isolation, out=rr.stdout, err=rr.stderr,
+                              fault_pc=getattr(rr, "fault_pc", None),
+                              fault_addr=getattr(rr, "fault_addr", None))
+    except Exception:                                    # noqa: BLE001 -- console telemetry only
+        pass
+    return rr
+
+
+def _run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),
         env_overrides: Optional[dict] = None, aslr: bool = False,
-        guard_page: bool = False, ro_binds=(), winedebug: Optional[str] = None) -> RunResult:
+        guard_page: bool = False, ro_binds=(), rw_binds=(),
+        winedebug: Optional[str] = None) -> RunResult:
     """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
     ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
     was running blind on output shape alone -- eleven of the twelve architectures the platform
@@ -2415,7 +2469,14 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     input staged outside the exe's own directory). The sandbox masks /tmp with an empty tmpfs, so
     an input file under /tmp that is not bound back in reaches the target as a name it cannot
     open -- every input then "runs" as the same usage error and a campaign reads clean. Native
-    (bwrap) path only; the managed runtimes bind their own argv paths."""
+    (bwrap) path only; the managed runtimes bind their own argv paths.
+
+    `rw_binds` are directories bound WRITABLE (after `ro_binds`, so they win): the throwaway slot a
+    `file`-mode input sits in. The batch runner hands the target its input in its own writable
+    tmpfs, so a target that edits its input in place (jhead -mkexif renames the file to a backup
+    and rewrites it) runs the same code under both runners; read-only here, the same target only
+    printed "Skipping readonly file" -- every crash the campaign found failed its re-run and was
+    dropped as flaky."""
     host = host or host_arch()
     if _is_elf_shared_object(exe):
         # Not a crash and not a clean run: this image has no entry point, so nothing of the
@@ -2520,7 +2581,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         if _sysroot:
             env = dict(env if env is not None else os.environ)
             env.setdefault("QEMU_LD_PREFIX", _sysroot)
-    elif os.environ.get("LYKOS_QEMU_SYSROOT"):
+    elif _runenv.get("LYKOS_QEMU_SYSROOT"):
         # NATIVE dynamically-linked target off its own system: the operator supplies its libraries
         # via LYKOS_QEMU_SYSROOT (a rootfs or a flat lib dir). Prepend its lib dirs to
         # LD_LIBRARY_PATH so the host loader finds the deps and the program reaches main() --
@@ -2531,14 +2592,14 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # are already present is unaffected; it can turn a not-runnable into a run, never the
         # reverse. Mirrors the native dep wiring aflpp.run_campaign already does for the afl path.
         try:
-            _libdirs = [str(d) for d in _sysroot_lib_dirs(os.environ["LYKOS_QEMU_SYSROOT"])]
+            _libdirs = [str(d) for d in _sysroot_lib_dirs(_runenv.get("LYKOS_QEMU_SYSROOT"))]
         except Exception:                                # noqa: BLE001 -- best-effort
             _libdirs = []
         if _libdirs:
             env = dict(env if env is not None else os.environ)
             _ld = env.get("LD_LIBRARY_PATH")
             env["LD_LIBRARY_PATH"] = ":".join(_libdirs + ([_ld] if _ld else []))
-            native_sysroot = os.environ["LYKOS_QEMU_SYSROOT"]
+            native_sysroot = _runenv.get("LYKOS_QEMU_SYSROOT")
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
@@ -2575,6 +2636,10 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             _d = str(_d)
             if _d and os.path.isdir(_d) and os.path.realpath(_d) != os.path.realpath(exedir):
                 extra += ["--ro-bind", _d, _d]
+        for _d in rw_binds or ():
+            _d = str(_d)
+            if _d and os.path.isdir(_d) and os.path.realpath(_d) != os.path.realpath(exedir):
+                extra += ["--bind", _d, _d]
         if native_sysroot and os.path.isdir(native_sysroot):
             # The native sysroot's lib dirs are on LD_LIBRARY_PATH (above), but a sysroot under
             # /tmp is MASKED by the sandbox's tmpfs, so the loader would still not find the deps.

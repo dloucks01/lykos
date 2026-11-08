@@ -67,6 +67,29 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("dynamic_run", "Baseline execution", "target", "..analyze.dynamic", "enqueue_dynamic"),
     StageSpec("disassemble", "Disassemble", "target", "..analyze.disassemble", "enqueue_disassemble", no_params=True),
     StageSpec("detect_cwe", "Static detectors", "target", "..analyze.detect", "enqueue_detect", no_params=True),
+    StageSpec("wire_flow", "Wire-value -> dangerous-use flow (div/index/seek/size)", "target",
+              "..analyze.wire_flow_stage", "enqueue_wire_flow", no_params=True),
+    StageSpec("param_sink", "Interprocedural wire -> param-sink flow", "target",
+              "..analyze.param_sink_stage", "enqueue_param_sink", no_params=True),
+    StageSpec("lifecycle_scan", "Use-after-free / double-free (type-state)", "target",
+              "..analyze.lifecycle_stage", "enqueue_lifecycle_scan", no_params=True),
+    StageSpec("intwidth_scan", "Integer signedness/width misuse", "target",
+              "..analyze.intwidth_stage", "enqueue_intwidth_scan", no_params=True),
+    StageSpec("dop_scan", "Data-only (DOP) hijack surface: security-decision variables", "target",
+              "..analyze.dop_scan_stage", "enqueue_dop_scan", no_params=True),
+    StageSpec("race_scan", "Double-fetch (TOCTOU) + uninitialized-pointer deref", "target",
+              "..analyze.race_scan_stage", "enqueue_race_scan", no_params=True),
+    StageSpec("guard_gap", "Missing stream-length guard (attacker length -> seek/copy, OOB r/w)",
+              "target", "..analyze.guard_gap_stage", "enqueue_guard_gap", no_params=True),
+    StageSpec("alloc_overflow", "Integer overflow in allocation size (wire product/sum, no guard)",
+              "target", "..analyze.alloc_overflow_stage", "enqueue_alloc_overflow", no_params=True),
+    StageSpec("sibling_guard", "Missing sibling validation (a guard most dispatch-family siblings "
+              "make, one omits)", "target", "..analyze.sibling_guard_stage",
+              "enqueue_sibling_guard", no_params=True),
+    StageSpec("codeql", "CodeQL CPG/dataflow (interprocedural taint)", "target",
+              "..analyze.codeql_stage", "enqueue_codeql", no_params=True, in_plan=False,
+              on_demand="heavy one-time DB build (10-20 min); dispatch explicitly for the deep pass "
+                        "-- auto-scheduling it in a bounded run starves the core sequence"),
     # --- Case-scoped linking (interleaved in the plan where it runs) --------------------------
     StageSpec("whole_system", "Whole-system emulation", "case", "..analyze.link", "enqueue_whole_system"),
     StageSpec("ipc_model", "IPC model", "case", "..analyze.link", "enqueue_ipc", no_params=True),
@@ -83,8 +106,18 @@ STAGES: tuple[StageSpec, ...] = (
               "enqueue_oob_write_scan", no_params=True),
     StageSpec("grounding", "Ground findings (precision + peer reachability)", "target",
               "..analyze.grounding_stage", "enqueue_grounding", no_params=True),
+    StageSpec("coverage_sweep", "Coverage ledger (every function x every CWE)", "target",
+              "..analyze.coverage_sweep_stage", "enqueue_coverage_sweep", no_params=True),
     StageSpec("confirm", "Confirm real+reachable findings, then weaponize", "target",
               "..analyze.verify_stage", "enqueue_verify", no_params=True),
+    StageSpec("drivable_confirm", "Confirm drivable findings (non-fuzzing first; constructed PoCs)",
+              "target", "..analyze.drivable_confirm", "enqueue_drivable_confirm", no_params=True),
+    StageSpec("weaponize_plan", "Compose confirmed primitives into TTP chains (heap-groom/leak->write/RCE)",
+              "target", "..analyze.weaponize_plan_stage", "enqueue_weaponize_plan", no_params=True),
+    StageSpec("attack_path", "Chain findings into a full attacker path (capability graph -> objective)",
+              "target", "..analyze.attack_path_stage", "enqueue_attack_path", no_params=True),
+    StageSpec("triage", "Resolve every finding to a disposition (PoC / ceiling / dead-end)", "target",
+              "..analyze.triage_stage", "enqueue_triage", no_params=True),
     StageSpec("source_sink_scan", "Tainted-sink scan", "target", "..analyze.fingerprint", "enqueue_source_sink_scan", no_params=True),
     StageSpec("cpg_scan", "Per-CWE source/sink queries", "target", "..analyze.fingerprint", "enqueue_cpg_scan", no_params=True),
     # extract_secrets feeds itself a probe input when given none; synthesize_secret reads static
@@ -99,6 +132,13 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("libfuzzer", "libFuzzer harness", "target", "..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
     StageSpec("source_confirm", "Directed source confirmation", "target",
               "..analyze.source_confirm_stage", "enqueue_source_confirm"),
+    # the binary counterpart: propose -> solve (angr) -> validate (native crash / QASan at the site)
+    StageSpec("hypo_hunt", "Hypothesis loop (propose -> solve -> validate)", "target",
+              "..analyze.hypo_stage", "enqueue_hypo_hunt"),
+    # drive the binary's own parsers directly under the emulator (redzone heap), for code no
+    # whole-program path reaches; function-level until a program replay (native / QASan) agrees
+    StageSpec("harness", "Emulated function harness (binary)", "target", "..analyze.harness",
+              "enqueue_harness"),
     StageSpec("uc_symbolic", "Under-constrained symbolic exec (undriven code)", "target",
               "..analyze.symbolic.uc_stage", "enqueue_uc_symbolic"),
     StageSpec("synth_confirm", "Synthesized-driver confirmation", "target",
@@ -107,13 +147,22 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec("cve_poc", "CVE weaponization", "target", "..analyze.poc", "enqueue_cve_poc", no_params=True),
     StageSpec("cve_corroborate", "CVE corroboration", "target", "..analyze.fingerprint", "enqueue_cve_corroborate", no_params=True),
     StageSpec("synthesize_injection", "Injection probes", "target", "..analyze.poc", "enqueue_inject"),
+    StageSpec("palette_overread", "Palette over-read (directed)", "target", "..analyze.poc", "enqueue_palette_overread", no_params=True),
+    StageSpec("png_overread", "PNG palette over-read (directed)", "target", "..analyze.poc", "enqueue_png_overread", no_params=True),
+    StageSpec("bmp_overread", "BMP palette over-read (directed)", "target", "..analyze.poc", "enqueue_bmp_overread", no_params=True),
+    StageSpec("zip_overflow", "ZIP field overflow (directed)", "target", "..analyze.poc", "enqueue_zip_overflow", no_params=True),
+    StageSpec("jpeg_overread", "JPEG EXIF over-read (directed)", "target", "..analyze.poc", "enqueue_jpeg_overread", no_params=True),
     StageSpec("fuzz", "Black-box fuzzing", "target", "..analyze.fuzz", "enqueue_fuzz"),
     StageSpec("coverage_fuzz", "Coverage fuzzing", "target", "..analyze.fuzz", "enqueue_coverage_fuzz"),
     StageSpec("directed_fuzz", "Directed fuzzing", "target", "..analyze.fuzz", "enqueue_directed_fuzz"),
     # --- Memory-safety probes -----------------------------------------------------------------
     StageSpec("heap_check", "Heap checks", "target", "..analyze.dynamic", "enqueue_heap_check"),
-    StageSpec("heap_trace", "Heap primitives", "target", "..analyze.dynamic", "enqueue_heap_trace", no_params=True),
-    StageSpec("oob_index", "Array-index probes", "target", "..analyze.dynamic", "enqueue_oob_index", no_params=True),
+    # NOT no_params: both read `baseline_nonterm` and the budget slice's `max_seconds`. Listed as
+    # no_params they got neither, so on a libFuzzer harness (whose bare run never exits)
+    # heap_trace drove 12 sequences to its own ~100 s ceiling on every FreeRDP harness, past the
+    # phase slice the batch had computed for it.
+    StageSpec("heap_trace", "Heap primitives", "target", "..analyze.dynamic", "enqueue_heap_trace"),
+    StageSpec("oob_index", "Array-index probes", "target", "..analyze.dynamic", "enqueue_oob_index"),
     # mem_oracle picks its own probe inputs (a recorded crash if there is one, else an empty probe).
     StageSpec("mem_oracle", "Uninitialised-memory oracle", "target", "..analyze.dynamic", "enqueue_mem_oracle", no_params=True),
     StageSpec("chain_primitive", "Primitive chaining", "target", "..analyze.poc", "enqueue_chain", no_params=True),
@@ -122,6 +171,10 @@ STAGES: tuple[StageSpec, ...] = (
     # --- Prove: root-cause and the exploit ladder ---------------------------------------------
     # root_cause/build_poc/poc_primitive require params["input_sha"] (the crashing input), so they
     # are NOT no_params -- listing them would drop that input and every one would fail.
+    # every unresolved finding: replay the kept inputs to decide reach, fire the site-reaching ones
+    # under the memory oracles, and give each finding a measured verdict (or a crash to prove)
+    StageSpec("finding_resolve", "Resolve every finding (reached? fires? verdict)", "target",
+              "..analyze.resolve_stage", "enqueue_finding_resolve"),
     StageSpec("root_cause", "Root-cause", "target", "..analyze.debug", "enqueue_root_cause"),
     StageSpec("build_poc", "Build PoC", "target", "..analyze.poc", "enqueue_build_poc"),
     StageSpec("poc_primitive", "PoC primitive", "target", "..analyze.poc", "enqueue_primitive"),
@@ -140,8 +193,6 @@ STAGES: tuple[StageSpec, ...] = (
     # --- On demand: dispatchable via the API/CLI, deliberately NOT autopilot-scheduled --------
     # Each needs an operator decision a run does not have. Listed (out of the plan) so they are
     # dispatchable and so a stage cannot fall out of the catalogue unseen.
-    StageSpec("harness", "", "target", "..analyze.harness", "enqueue_harness", in_plan=False,
-              on_demand="started from the Code tab's function view on the functions the operator picks"),
     StageSpec("patch_diff", "", "target", "..analyze.patch_diff_stage", "enqueue_patch_diff", in_plan=False,
               on_demand="needs a second build chosen as the baseline to diff against"),
     StageSpec("variant_scan", "", "target", "..analyze.scan_stages", "enqueue_variant_scan", in_plan=False,

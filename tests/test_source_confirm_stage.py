@@ -5,6 +5,7 @@ materializes the tree, builds the clean + ASan static harnesses, runs the ladder
 the gate), and files a CONFIRMED finding + a DynResult the exploit ladder can see -- a proven,
 non-fuzzing PoC with a reproducing input."""
 import shutil
+import time
 
 import pytest
 
@@ -82,5 +83,164 @@ def test_source_confirm_stage_files_confirmed_poc(store, tmp_path):
     assert any("overflow" in (f.title or "") for f in finds), f"titles={[f.title for f in finds]}"
     # a DynResult the exploit ladder can see, carrying the reproducing input
     drs = [d for d in DynResultDAO(store.conn).list_by_target(t.id)
-           if (d.isolation or "").startswith("source_confirm")]
+           if (d.defect_key or "").startswith("source_confirm")]
     assert drs and drs[0].crashed and drs[0].input_sha
+    # ...tagged with the HARNESS that proved it, stored, so build_poc replays there and not
+    # against the ingested program
+    assert (drs[0].isolation or "").startswith("libfuzzer/"), drs[0].isolation
+    prefix = drs[0].isolation.split("/", 1)[1]
+    assert any(a.kind == "libfuzzer-harness" and a.sha256.startswith(prefix)
+               for a in store.artifacts.list_by_case(t.case_id))
+
+
+def test_the_build_phase_shares_one_deadline_and_the_ladder_takes_what_remains(store, tmp_path,
+                                                                               monkeypatch):
+    """Regression for the wedge on a huge tree (FreeRDP): the stage must bound its TOTAL wall-clock,
+    not give each of four builds its own timeout*4 deadline. Pin that every build gets the SAME
+    absolute `deadline`, and that when the build phase spends the budget the ladder is SKIPPED
+    rather than started with time it cannot finish in."""
+    from lykos.analyze import libfuzzer as LF
+    from lykos.analyze.symbolic import directed_confirm as DC
+    from lykos.analyze import source_confirm_stage as SC
+    from lykos.analyze.ingest import ingest
+
+    proj = tmp_path / "proj"
+    _mk(proj)
+    t = ingest(store, store.cases.create("scbudget").id, proj, filename="proj")
+
+    from types import SimpleNamespace
+    deadlines, ladder_kw = [], []
+    monkeypatch.setattr(SC, "_materialize_source", lambda ctx, target: proj)
+    monkeypatch.setattr(LF, "find_harnesses", lambda root, limit=1: [proj / "h.c"])
+
+    def fake_build(sleep, root, *, shared, sanitize, timeout, deadline=None, **kw):
+        deadlines.append(deadline)
+        time.sleep(sleep)
+        return {"ok": True, "log": "", "lib_dirs": [],
+                "harnesses": [{"name": "h", "source": str(proj / "h.c"), "binary": str(proj / "h")}]}
+    monkeypatch.setattr(DC, "confirm_ladder", lambda *a, **k: ladder_kw.append(dict(k)) or [])
+
+    # (1) tiny budget spent by the builds -> the ladder is SKIPPED, and the builds SHARE one deadline
+    monkeypatch.setattr(LF, "cmake_build_harnesses", lambda *a, **k: fake_build(0.4, *a, **k))
+    SC.source_confirm_stage(SimpleNamespace(conn=store.conn, target_id=t.id, params={"max_seconds": 1},
+                                            emit=lambda *a, **k: None, progress=lambda **k: None))
+    built = [d for d in deadlines if d is not None]
+    assert built and len(set(built)) == 1, f"builds must share ONE deadline, got {deadlines}"
+    assert not ladder_kw, "ladder ran despite the budget being spent on builds"
+
+    # (2) ample budget, instant builds -> the ladder RUNS and is handed a hard overall deadline
+    deadlines.clear()
+    monkeypatch.setattr(LF, "cmake_build_harnesses", lambda *a, **k: fake_build(0.0, *a, **k))
+    SC.source_confirm_stage(SimpleNamespace(conn=store.conn, target_id=t.id, params={"max_seconds": 120},
+                                            emit=lambda *a, **k: None, progress=lambda **k: None))
+    assert ladder_kw, "ladder did not run on an ample budget"
+    assert ladder_kw[-1].get("deadline") is not None, "ladder must get a hard overall deadline"
+
+
+def test_every_weaponizable_candidate_gets_a_potential_poc_recipe(store):
+    """The operator's bar -- no finding is bare. EVERY candidate in a weaponizable class earns a
+    reachability-grounded potential-PoC recipe, on OR off the fuzzed surface: in-surface is reached
+    through the shipped harness, off-surface by synthesizing a driver to its enclosing function. The
+    surface still ranks them (in-surface boosted), it just no longer gates the deliverable."""
+    from types import SimpleNamespace
+    from lykos.analyze import source_confirm_stage as SC
+    from lykos.db.dao import FindingDAO, TargetDAO
+    c = store.cases.create("surf")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "d" * 64)
+    fd = FindingDAO(store.conn)
+    # a CWE-190 in a file ON the fuzzed surface, and a CWE-787 OFF it -- both merely `candidate`
+    fd.upsert(t.id, c.id, {"cwe": "CWE-190", "title": "int-overflow alloc", "severity": "medium",
+              "detector": "int_overflow", "state": "candidate", "confidence": 0.45,
+              "dedup_key": "io:on", "evidence": [{"channel": "source", "detail": "geometry.c:120: realloc()"}]})
+    fd.upsert(t.id, c.id, {"cwe": "CWE-787", "title": "oob write", "severity": "medium",
+              "detector": "oob_write", "state": "candidate", "confidence": 0.45,
+              "dedup_key": "ow:off", "evidence": [{"channel": "source", "detail": "buildtool.c:9: arr[i]="}]})
+    ctx = SimpleNamespace(conn=store.conn, put_artifact=lambda *a, **k: "x" * 64)
+    ranked = SC._rank_by_surface(ctx, t, {"geometry.c"})     # only geometry.c is on the surface
+    assert ranked["in_surface"] == 1 and ranked["off_surface"] == 1
+    assert ranked["surface_recipes"] == 2                    # BOTH get a potential PoC now
+    recs = sorted((f for f in fd.list_by_target(t.id) if f.detector == "surface_recipe"),
+                  key=lambda f: f.cwe)
+    assert [r.cwe for r in recs] == ["CWE-190", "CWE-787"]
+    assert all(r.state == "corroborated" for r in recs)
+    # the off-surface one names the synthesized-driver reach step as its missing technique
+    off = [f for f in fd.list_by_target(t.id)
+           if f.detector == "surface_recipe" and f.cwe == "CWE-787"][0]
+    blob = " ".join(e.get("detail", "") for e in (off.evidence or []))
+    assert "synth" in blob.lower()
+
+
+def test_merged_duplicates_are_skipped_by_the_floor(store):
+    """A `merged` duplicate (a non-representative dedup site) must NOT get its own recipe, and must
+    not be re-upserted back to candidate -- the representative carries the potential PoC."""
+    from types import SimpleNamespace
+    from lykos.analyze import source_confirm_stage as SC
+    from lykos.db.dao import FindingDAO, TargetDAO
+    c = store.cases.create("merged")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "e" * 64)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, c.id, {"cwe": "CWE-190", "title": "dup site", "severity": "medium",
+              "detector": "int_overflow", "state": "candidate", "confidence": 0.4,
+              "dedup_key": "io:dup", "evidence": [{"channel": "source", "detail": "x.c:9: n*w"}]})
+    # force it to the merged state the dedup stage would set
+    import json
+    import time
+    store.conn.execute("UPDATE finding SET state='merged', evidence_json=? WHERE dedup_key=?",
+                       (json.dumps([{"channel": "source", "detail": "x.c:9: n*w"}]), "io:dup"))
+    store.conn.commit()
+    ctx = SimpleNamespace(conn=store.conn, put_artifact=lambda *a, **k: "x" * 64)
+    ranked = SC._rank_by_surface(ctx, t, {"x.c"})
+    assert ranked["surface_recipes"] == 0                    # no recipe for a merged duplicate
+    still = fd.list_by_target(t.id)
+    assert [f.state for f in still if f.dedup_key == "io:dup"] == ["merged"]   # stays merged
+
+
+# ---- a confirmation is replayed against the binary that proved it ------------------------------
+def test_the_ladder_names_the_binary_each_rung_proved_on():
+    from lykos.analyze.symbolic.directed_confirm import _rung_binary
+    h = {"explore_binary": "/e", "replay_binary": "/r", "fuzz_binary": "/f"}
+    assert _rung_binary(h, "concolic") == "/r"
+    assert _rung_binary(h, "template") == "/r"
+    assert _rung_binary(h, "smart-fuzz") == "/f"
+    assert _rung_binary({"fuzz_binary": "/f"}, "template") == "/f"
+
+
+def test_a_confirmation_is_stored_as_its_own_replay_harness(tmp_path):
+    """source_confirm tagged its proofs `source_confirm/<name>`, which no replay path reads, so the
+    PoC was replayed against the ingested PROGRAM and every bundle shipped unverified."""
+    from types import SimpleNamespace as NS
+    from lykos.analyze.source_confirm_stage import _replay_harness
+    b = tmp_path / "h_static"
+    b.write_bytes(b"\x7fELF-static-asan-harness")
+    stored = {}
+
+    class Ctx:
+        def put_artifact(self, kind, data=b"", meta=None):
+            stored[kind] = (data, meta)
+            return "ab" * 32
+    iso, libs = _replay_harness(Ctx(), NS(sha256="t" * 64),
+                                {"harness": "fuzz_x", "binary": str(b), "lib_dirs": ["/lib/x"],
+                                 "input": b"A"}, {"fuzz_x": str(b)})
+    assert iso == "libfuzzer/" + ("ab" * 6)
+    assert libs == []                                    # the static build needs no .so dirs
+    assert stored["libfuzzer-harness"][0] == b.read_bytes()
+    assert stored["libfuzzer-harness"][1]["lib_dirs"] == []
+
+
+def test_uc_leads_steer_the_concolic_rung_to_their_function(store, tmp_path):
+    """The from-entry half of a UC lead: steer concolic from the harness's real entry to the
+    function UC flagged, so a proof need not assume its arguments are attacker-controlled."""
+    from types import SimpleNamespace as NS
+    from lykos.analyze.source_confirm_stage import _uc_sites
+    from lykos.db.dao import FindingDAO, TargetDAO
+    (tmp_path / "lib.c").write_text("#include <string.h>\n\nstatic int x;\n"
+                                    "void dispatch_record(const unsigned char *d,\n"
+                                    "                     unsigned long n)\n{\n  (void)d; (void)n;\n}\n")
+    c = store.cases.create("u")
+    t = TargetDAO(store.conn).upsert(c.id, "t", "e" * 64)
+    FindingDAO(store.conn).upsert(t.id, c.id, {
+        "cwe": "CWE-94", "title": "Control flow reaches data-derived pointer in dispatch_record() "
+        "(under-constrained)", "severity": "medium", "detector": "uc_symbolic",
+        "state": "candidate", "confidence": 0.4, "dedup_key": "uc:x", "evidence": []})
+    assert _uc_sites(NS(conn=store.conn), t, tmp_path) == [("lib.c", 4)]
+    assert _uc_sites(NS(conn=store.conn), t, None) == []

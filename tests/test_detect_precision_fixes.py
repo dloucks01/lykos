@@ -416,3 +416,29 @@ def test_a_ghidra_plt_stub_is_not_a_call_site():
              N(src_addr="0x1300", dst_name="walk", external=False)]          # recursion
     kept = drop_import_stub_edges(fns, edges)
     assert [e.src_addr for e in kept] == ["0x1200", "0x1300"]
+
+
+# ------------------------------------------- scanf-family: judged by THIS call's own format ----
+def _sscanf_ir(flag):
+    # sscanf(arg, <flag>, dest) -- the -O0 shape gif2rgb's option parser uses
+    return _ir([(0x10, "lea rdx, [rbp - 0x10]"), (0x14, f"lea rcx, str.{flag}"),
+                (0x18, "mov rsi, rcx"), (0x1c, "mov rdi, rax"),
+                (0x20, "call sym.imp.__isoc23_sscanf")])
+
+
+def test_a_bounded_sscanf_format_is_not_an_unbounded_copy():
+    """gif2rgb's sscanf(arg, "%d", &n) was filed as 'sscanf with unbounded %s' AND a CWE-121
+    stack smash, because SOME string in the image had an unbounded %s."""
+    from lykos.analyze.detect.detectors import _scanf_unbounded_at, dangerous_api
+    strings = ["%d", "%s"]                                 # another format elsewhere is unbounded
+    ctx = _sctx(_sscanf_ir("_d"), strings)
+    assert _scanf_unbounded_at(ctx, ctx.func_irs[0x1000], "0x20") is False
+    ctx.call_edges = [types.SimpleNamespace(dst_name="sscanf", src_addr=0x1000, site_addr="0x20")]
+    assert not [c for c in dangerous_api(ctx) if c.get("api") == "sscanf"]
+    ctx2 = _sctx(_sscanf_ir("_s"), strings)
+    assert _scanf_unbounded_at(ctx2, ctx2.func_irs[0x1000], "0x20") is True
+    ctx2.call_edges = [types.SimpleNamespace(dst_name="sscanf", src_addr=0x1000, site_addr="0x20")]
+    assert [c for c in dangerous_api(ctx2) if c.get("api") == "sscanf"]
+    # an unrecoverable format keeps the finding (never guessed away)
+    ctx3 = _sctx(_ir([(0x1c, "mov rsi, rbx"), (0x20, "call sym.imp.__isoc23_sscanf")]), strings)
+    assert _scanf_unbounded_at(ctx3, ctx3.func_irs[0x1000], "0x20") is None

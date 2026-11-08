@@ -24,8 +24,13 @@ _ARTIFACT_BUNDLE = re.compile(r"^/artifacts/([0-9a-fA-F]+)/bundle$")
 _ARTIFACT_ATTEMPTS = re.compile(r"^/artifacts/([0-9a-fA-F]+)/attempts$")
 _CASE_ATTEMPT_LOGS = re.compile(r"^/cases/([^/]+)/attempt-logs$")
 _CASE_EVENTS = re.compile(r"^/cases/([^/]+)/events$")
+_CASE_CONSOLE = re.compile(r"^/cases/([^/]+)/console$")
 _CASE_TARGETS = re.compile(r"^/cases/([^/]+)/targets$")
 _CASE_RUNS = re.compile(r"^/cases/([^/]+)/runs$")
+# Durable AUTOPILOT run history + comparison (api/run_history.py) -- not the stage runs above.
+_CASE_RUNS_HISTORY = re.compile(r"^/cases/([^/]+)/runs-history$")
+_AUTOPILOT_RUN_COMPARE = re.compile(r"^/autopilot-runs/compare$")
+_AUTOPILOT_RUN_ID = re.compile(r"^/autopilot-runs/([^/]+)$")
 _TARGET_FUNCS = re.compile(r"^/targets/([^/]+)/functions$")
 _FUNC_ID = re.compile(r"^/functions/([^/]+)$")
 _TARGET_CG = re.compile(r"^/targets/([^/]+)/callgraph$")
@@ -33,6 +38,9 @@ _TARGET_STR = re.compile(r"^/targets/([^/]+)/strings$")
 _TARGET_FIND = re.compile(r"^/targets/([^/]+)/findings$")
 _CASE_FIND = re.compile(r"^/cases/([^/]+)/findings$")
 _CASE_COVERAGE = re.compile(r"^/cases/([^/]+)/coverage$")
+# The weaponization backlog: the research queue of findings not yet at a validated PoC + the
+# technique to build next for each (doc 58). The live mirror of the report's backlog section.
+_CASE_BACKLOG = re.compile(r"^/cases/([^/]+)/backlog$")
 _CASE_TIMING = re.compile(r"^/cases/([^/]+)/timing$")
 _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 # Operator curation (doc 47 P3): the per-finding verdict + note, and the case-wide map.
@@ -42,6 +50,10 @@ _TARGET_DYN = re.compile(r"^/targets/([^/]+)/dynresults$")
 _TARGET_POC = re.compile(r"^/targets/([^/]+)/pocs$")
 _TARGET_ADVICE = re.compile(r"^/targets/([^/]+)/advice$")
 _TARGET_SOURCE = re.compile(r"^/targets/([^/]+)/source$")
+_TARGET_SRCFILE = re.compile(r"^/targets/([^/]+)/source-file$")
+_TARGET_SRCTREE = re.compile(r"^/targets/([^/]+)/source-tree$")
+# `lykos deps` parity: the build-dependency pre-flight of the target's uploaded source tree.
+_TARGET_DEPS = re.compile(r"^/targets/([^/]+)/deps$")
 _CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
 _CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
 _CASE_SYSMAP = re.compile(r"^/cases/([^/]+)/systemmap$")
@@ -56,12 +68,15 @@ _CASE_RUN_SIGNALS = re.compile(r"^/cases/([^/]+)/run-signals$")
 _TARGET_CRASH_TRIAGE = re.compile(r"^/targets/([^/]+)/crash-triage$")
 _CASE_SEEDS = re.compile(r"^/cases/([^/]+)/seeds$")
 _CASE_SEED_ID = re.compile(r"^/cases/([^/]+)/seeds/([0-9a-fA-F]{64})$")
+# Uploaded target-library archives (the GUI's LYKOS_QEMU_SYSROOT) -- see api/sysroot.py.
+_CASE_SYSROOTS = re.compile(r"^/cases/([^/]+)/sysroots$")
+_CASE_SYSROOT_ID = re.compile(r"^/cases/([^/]+)/sysroots/([0-9a-fA-F]{64})$")
 
 # Assets the SPA loads after index.html: the vendored ESM runtime and the app modules. Only these
 # subtrees are served, and only plain web asset types -- nothing else under the package is
 # reachable, and a name with `..` or a leading slash never resolves.
 _STATIC_ASSET = re.compile(
-    r"^/((?:app|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
+    r"^/((?:app|app2|app3|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
 _ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".mjs": "text/javascript; charset=utf-8",
@@ -76,8 +91,11 @@ _ASSET_TYPES = {
 
 
 def _read_ui() -> bytes:
-    """Load the UI page — works from a filesystem checkout AND from a zipapp (.pyz)."""
-    return _read_static("index.html")
+    """Load the UI page — works from a filesystem checkout AND from a zipapp (.pyz).
+
+    The default is the redesigned workbench (next.html + app3/). The previous workbench stays
+    reachable at /workbench-v1.html (index.html + app/) and the single-file one at /classic.html."""
+    return _read_static("next.html")
 
 
 def _read_static(relpath: str) -> bytes:

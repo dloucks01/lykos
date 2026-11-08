@@ -69,6 +69,19 @@ def test_classify_sigabrt_detected_corruption():
 
 
 # ------------------------------------------------------------------- slice
+def test_ubsan_index_out_of_bounds_is_the_precise_array_index_class():
+    """UBSan 'index N out of bounds' is an array-index violation -> CWE-129 (the read/write-neutral
+    array-index class the chain engine can drive to L3), not the vague CWE-119 bounds parent."""
+    bug, cwe, sev = rootcause._classify_ubsan(
+        "v.c:10:5: runtime error: index 200 out of bounds for type 'char [2]'")
+    assert cwe == "CWE-129" and bug == "array-index-out-of-bounds"
+    # a pointer-offset overflow stays its own write-what-where class
+    assert rootcause._classify_ubsan("runtime error: pointer index expression with base ... "
+                                     "overflowed to ...")[1] == "CWE-823"
+    # an unrecognised UB still falls back to CWE-758
+    assert rootcause._classify_ubsan("runtime error: something new")[1] == "CWE-758"
+
+
 def _fn(addr, name, size=0x40):
     return Function(id=f"f{addr}", target_id="t", addr=addr, created_at=0, name=name,
                     size=size)

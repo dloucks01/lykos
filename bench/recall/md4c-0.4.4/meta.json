@@ -1,0 +1,177 @@
+{
+  "id": "md4c-0.4.4",
+  "project": "md4c",
+  "version": "0.4.4",
+  "tree": "examples/vuln-targets/src/md4c-release-0.4.4",
+  "surface": "source",
+  "note": "tree not on disk; lines from upstream tag release-0.4.4 on GitHub. Line numbers are 0.4.4 coordinates derived from the old side of GitHub compare diffs (release-0.4.4...<fix>), cross-checked against published sanitizer traces (0.4.5 md4c.c has identical line numbering to 0.4.4: every 0.4.4->0.4.5 hunk is same-size; 0.4.7 = 0.4.4 + 37 after line 5814). ENTRY CAVEAT: md2html reads input into a malloc'd 32KiB-growing membuf that is NOT NUL-terminated and always has >=1 byte of spare capacity, so the 1-byte past-the-end reads below are uninitialized-memory reads under md2html (MSan-visible, ASan-invisible); under an exact-size harness (e.g. OSS-Fuzz fuzz-mdhtml / libFuzzer md_html(data,size)) they are ASan heap-buffer-overflow READ 1. Excluded (fixed before 0.4.4): CVE-2018-11536/11545/11546/11547 (0.2.5), CVE-2018-12102/12112 (0.2.6). Excluded (introduced after 0.4.4): md4c #173/#174/#212/#213, OSV-2022-40/42/126, ARVO 42507295/42507297/42508248/42507371 (all regressed by Jan-2022 commits db9ab41/62b6097/f7c8db7), all OSV-2026-* (introduced 2026), #167's md_is_container_mark hunk (introduced by the 0.4.7 #139 fix).",
+  "entry": {
+    "binary": "md2html",
+    "argv": [
+      "@@"
+    ]
+  },
+  "cves": [
+    {
+      "id": "CVE-2020-26148",
+      "class": "other",
+      "file": "src/md4c.c",
+      "function": "md_push_block_bytes",
+      "line": 4848,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "NUL byte at line start (printf '\\0x\\n'): ISANYOF_() treats '\\0' as a palette member (md_strchr finds the terminator), corrupting parser block state; MSan use-of-uninitialized-value in md_push_block_bytes via md_start_new_block <- md_process_line(6147) <- md_process_doc(6218)",
+      "fixed_in": "0.4.6 (22ca89a3008966c4316d6b0a158b1a49f9038df0)",
+      "ref": "https://github.com/mity/md4c/issues/130",
+      "confidence": "high",
+      "note": "Uninitialized-memory use (MSan); class 'other'. Root cause is the macro #define ISANYOF_ at src/md4c.c:279 (identical text present at 0.4.4). Trace lines are from the 0.4.5 report, and 0.4.5 md4c.c line numbering equals 0.4.4. Under ASan alone may not crash (CVE says DoS e.g. assertion failure in DEBUG builds)."
+    },
+    {
+      "id": "CVE-2021-30027",
+      "class": "heap-overflow-read",
+      "file": "src/md4c.c",
+      "function": "md_analyze_line",
+      "line": 5948,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "line analysis advances off to ctx->size, then reads CH(off) without an off<size guard (ATX '#' check); reporter's input01.md (gzip attachment on issue #155)",
+      "fixed_in": "0.4.8 (4fc808d8fe8d8904f8525bb4231d854f45e23a19)",
+      "ref": "https://github.com/mity/md4c/issues/155",
+      "confidence": "high",
+      "note": "1-byte read past input end; reported as MSan uninit at 0.4.7 md4c.c:5985 (= 0.4.4 line 5948, ATX header check). The same fix also guards unguarded CH(off) reads in md_analyze_line at 0.4.4 lines 5831 (setext), 5843 (thematic break), 5959 (code fence), 5968 (HTML block '<'), 5990 (table underline, --ftables)."
+    },
+    {
+      "id": "md4c-issue-167",
+      "class": "heap-overflow-read",
+      "file": "src/md4c.c",
+      "function": "md_is_inline_link_spec",
+      "line": 2272,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "inline link whose destination whitespace runs to EOF, ISNEWLINE(off) read at off==ctx->size; fuzzer input \"\\xA9##r[](r[](\"",
+      "fixed_in": "0.5.0 (PR #167, 933388a / merge eeb32ec)",
+      "ref": "https://github.com/mity/md4c/pull/167",
+      "confidence": "medium",
+      "note": "0.4.4 line taken from old side of compare release-0.4.4...f436c30 (hunk -2269,7). Corroborated by OSS-Fuzz/ARVO 42493685/42493686 (heap-buffer-overflow READ 1, present since md4c's first OSS-Fuzz build 2021-02-24, verified fixed in range 202201060601:202201070605 which contains eeb32ec and f436c30); which ARVO id maps to which hunk is unknown. Not ASan-visible through md2html (spare buffer capacity)."
+    },
+    {
+      "id": "md4c-issue-168",
+      "class": "heap-overflow-read",
+      "file": "src/md4c.c",
+      "function": "md_is_html_block_end_condition",
+      "line": 5410,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "HTML block type 1 (<script>/<style>/<pre>) whose last line ends with a partial end tag prefix (e.g. '</scrip') at EOF: md_ascii_case_eq(STR(off), \"</script>\", 9) compares past ctx->size",
+      "fixed_in": "0.5.0 (PR #168, f436c30; FIND_TAG_END bounds check, kept after the 2024 partial revert ebbb12e)",
+      "ref": "https://github.com/mity/md4c/pull/168",
+      "confidence": "medium",
+      "note": "Same pattern at 0.4.4 lines 5415 (</style>, 8) and 5420 (</pre>, 6). Up to 8 bytes over-read. Lines from old side of compare release-0.4.4...f436c30 (hunk -5407,20)."
+    },
+    {
+      "id": "md4c-issue-168-b",
+      "class": "heap-overflow-read",
+      "file": "src/md4c.c",
+      "function": "md_is_inline_link_spec",
+      "line": 2315,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "inline link '[x](dest' with whitespace before the final ')' running to EOF: ISNEWLINE(off) read at off==ctx->size",
+      "fixed_in": "0.5.0 (PR #168, f436c30)",
+      "ref": "https://github.com/mity/md4c/pull/168",
+      "confidence": "low",
+      "note": "Upstream reverted this check in ebbb12e (2024, 'Revert most of PR #168') arguing the condition implies already-broken parser state, so it may not be independently reachable at 0.4.4. Kept as low-confidence ground truth."
+    },
+    {
+      "id": "md4c-issue-168-c",
+      "class": "heap-overflow-read",
+      "file": "src/md4c.c",
+      "function": "md_is_html_block_end_condition",
+      "line": 5447,
+      "argv": [
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "HTML block type 6/7 open at EOF: return (ISNEWLINE(beg) ? ...) evaluated with beg==ctx->size",
+      "fixed_in": "0.5.0 (PR #168, f436c30)",
+      "ref": "https://github.com/mity/md4c/pull/168",
+      "confidence": "low",
+      "note": "Reverted upstream in ebbb12e (claimed unreachable without prior state corruption); reachability at 0.4.4 unconfirmed."
+    },
+    {
+      "id": "md4c-issue-168-d",
+      "class": "heap-overflow-read",
+      "file": "src/md4c.c",
+      "function": "md_analyze_line",
+      "line": 6027,
+      "argv": [
+        "--ftasklists",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "task-list item '- [x] ' ending at EOF: while(ISWHITESPACE(off)) off++ has no off<ctx->size bound",
+      "fixed_in": "0.5.0 (PR #168, f436c30)",
+      "ref": "https://github.com/mity/md4c/pull/168",
+      "confidence": "low",
+      "note": "Needs MD_FLAG_TASKLISTS (md2html --ftasklists, or --github). Reverted upstream in ebbb12e (claimed unreachable without prior state corruption); reachability at 0.4.4 unconfirmed."
+    },
+    {
+      "id": "md4c-issue-168-e",
+      "class": "assertion",
+      "file": "src/md4c.c",
+      "function": "md_analyze_permissive_email_autolink",
+      "line": 3881,
+      "argv": [
+        "--fpermissive-email-autolinks",
+        "--fwiki-links",
+        "@@"
+      ],
+      "input": "file",
+      "trigger": "\"[[<4@w>]]\" fails MD_ASSERT(CH(beg) == _T('@')) (commit c3c900b in PR #168)",
+      "fixed_in": "0.5.0 (PR #168, f436c30)",
+      "ref": "https://github.com/mity/md4c/pull/168",
+      "confidence": "low",
+      "note": "MD_ASSERT only aborts in DEBUG builds (-DDEBUG); release builds compile it to __builtin_unreachable, so no observable crash in a normal md2html build. Required flags guessed from the input (fuzzer enabled all flags; --github alone may not suffice). Upstream later restored this exact assertion (ebbb12e), so presence at 0.4.4 is unconfirmed."
+    }
+  ],
+  "excluded": [
+    {
+      "id": "CVE-2018-11536/11545/11546/11547, CVE-2018-12102/12112",
+      "reason": "fixed in 0.2.5/0.2.6 (2018), before 0.4.4."
+    },
+    {
+      "id": "md4c #173, #174, #212, #213, OSV-2022-40/42/126, ARVO 42507295/42507297/42508248/42507371",
+      "reason": "introduced by Jan 2022 commits (db9ab41, 62b6097, f7c8db7), after 0.4.4."
+    },
+    {
+      "id": "OSV-2026-717/718/726/727/760/777/816/1274/1281/1293",
+      "reason": "introduced by 2026 commits."
+    },
+    {
+      "id": "md_is_container_mark part of #167",
+      "reason": "introduced by the 0.4.7 fix for #139; 0.4.4 has an off+1 < ctx->size guard."
+    },
+    {
+      "id": "0.5.1 OSS-Fuzz memory-corruption fixes",
+      "reason": "no issue/regression range found; refactored 0.5.x code; status at 0.4.4 unknown."
+    },
+    {
+      "id": "#330",
+      "reason": "md2html output buffer overflow needs size_t wrap; not realistic on 64-bit."
+    },
+    {
+      "id": "#236, #238",
+      "reason": "quadratic slowdowns, not infinite loops."
+    }
+  ]
+}

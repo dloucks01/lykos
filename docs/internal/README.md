@@ -10,10 +10,24 @@ build.
 
 ## Current docs
 
+- **[`63-binary-finding-resolution-2026-11-06.md`](63-binary-finding-resolution-2026-11-06.md) — start here.** Every binary finding driven to a measured verdict (finding_resolve: reached? fires at its site? verdict), the precision bugs it exposed, and the remaining foundation (one address model, an execution-evidence index).
+- **[`62-binary-capability-2026-11-04.md`](62-binary-capability-2026-11-04.md)** The
+  2026-11-04 audit (review findings + fixes) and the binary-only capability program: the broken
+  reach spine, the QASan memory oracle that made silent heap bugs in shipped binaries visible, and
+  the prioritized binary build list.
+- [`61`](61-advanced-ttp-research-2026-11-03.md) advanced-TTP research (DOP, input-to-state, House
+  of Water, race/uninit detectors) · [`60`](60-foundation-first-analysis-engine-2026-11-03.md)
+  foundation-first engine (reach + taint + CodeQL wired into stages) ·
+  [`59`](59-gui-rebuild-2026-10-30.md) GUI rebuild · [`58`](58-poc-engine-redesign-2026-10-30.md)
+  PoC engine redesign (constructed vs detonated PoCs) · [`57`](57-measurement-gap-2026-10-30.md)
+  measurement gap · [`56`](56-where-we-stand-2026-10-30.md) where we stand ·
+  [`55`](55-phase-audit-2026-10-30.md) phase audit · [`54`](54-tier1-weaponize-2026-10-30.md)
+  Tier-1 weaponize · [`53`](53-tools-and-issues-2026-10-30.md) tools and issues ·
+  [`52`](52-ground-up-rethink-2026-10-29.md) ground-up rethink (the hypothesis loop).
 - **[`51-full-audit-2026-10-24.md`](51-full-audit-2026-10-24.md)** — the 2026-10-24 full audit +
   improvement pass: highest-impact defects fixed (AFL ran ~1 s; large binaries strings-only;
   reports calling unexecuted targets clean), new capabilities, and the prioritized open list.
-- **[`50-current-state-2026-10-22.md`](50-current-state-2026-10-22.md) — start here.** What lykos
+- **[`50-current-state-2026-10-22.md`](50-current-state-2026-10-22.md)** — What lykos
   actually does today: the L0→L3 capability matrix across architectures, the Windows/PE depth and its
   L2/L3 wall, the large-binary (100 MB+) ceiling, and the honest-degradation posture. Supersedes the
   archived series as the "what is true now" reference.

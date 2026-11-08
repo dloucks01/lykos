@@ -140,14 +140,45 @@ def reachable_names_for_target(functions: list, call_edges: list, *, entry_subst
     return seen
 
 
-def unified_name_graph(conn, case_id: str):
+#: A PROGRAM's own entry: for a binary-only target the attacker supplies the program's input (file,
+#: stdin, argv, socket), so everything main reaches runs on attacker input. `main` is named even on a
+#: stripped binary (elf.main_from_start seeds the disassembler with it).
+_PROGRAM_ENTRIES = frozenset({"main", "sym.main", "dbg.main", "wmain", "winmain", "wwinmain"})
+
+#: Input sources whose CALLER is where attacker bytes enter program code: data a function reads
+#: flows into the callees it hands the buffer to. Matched against the callee's bare name.
+_INPUT_SOURCES = frozenset({
+    "read", "pread", "pread64", "readv", "fread", "fread_unlocked", "fgets", "fgets_unlocked",
+    "getline", "getdelim", "fgetc", "getc", "getc_unlocked", "getchar", "fscanf", "scanf",
+    "__isoc99_fscanf", "__isoc99_scanf", "__isoc23_fscanf", "__isoc23_scanf", "recv", "recvfrom",
+    "recvmsg", "mmap", "mmap64", "bio_read", "ssl_read", "gnutls_record_recv", "wsarecv",
+    "readfile", "internetreadfile"})
+
+
+def _bare(name: str) -> str:
+    """'sym.imp.fread' / 'reloc.fread' / '_IO_fread' / 'fread@plt' -> 'fread'."""
+    n = (name or "").lower().split("@")[0]
+    n = re.split(r"[.:]", n)[-1]
+    return n[4:] if n.startswith("_io_") else n
+
+
+def is_input_source(name: Optional[str]) -> bool:
+    return _bare(name or "") in _INPUT_SOURCES
+
+
+def unified_name_graph(conn, case_id: str, *, program_entries: bool = True):
     """One name-keyed call graph UNIONED across every target in the case: (adjacency, entries).
 
     A harness binary holds `entry -> parse_X`; the deep chain `parse_X -> parse_X_int -> ...` is
     best recovered in the LIBRARY binary that defines it (which has no entry of its own). BFS per
     target and union-of-results severs that cross-binary path -- so instead we union all EDGES by
     function name into one graph and BFS once. The same name in two binaries is the same function
-    (static link), so this reconnects the harness entry to the library's deep call chains."""
+    (static link), so this reconnects the harness entry to the library's deep call chains.
+
+    With `program_entries` (default) the entries also include each program's `main` and every
+    function that CALLS an input source (read/fread/recv/...): the callee-ward BFS must start where
+    attacker bytes enter PROGRAM code. Seeding only from the read import itself reaches nothing (an
+    import has no callees), which left every binary-only finding undecided."""
     from ..db.dao import CallEdgeDAO, FunctionDAO, TargetDAO
     adj: dict = {}
     entries: set = set()
@@ -160,7 +191,7 @@ def unified_name_graph(conn, case_id: str):
             n = getattr(f, "name", None)
             if a is not None and n:
                 addr2name[a] = n
-                if _is_entry(n):
+                if _is_entry(n) or (program_entries and n.lower() in _PROGRAM_ENTRIES):
                     entries.add(n)
         for e in edges:
             src = addr2name.get(_norm(getattr(e, "src_addr", None)))
@@ -169,6 +200,8 @@ def unified_name_graph(conn, case_id: str):
                 adj.setdefault(src, set()).add(dst)
                 if _is_entry(dst):
                     entries.add(dst)
+                if program_entries and is_input_source(dst) and not is_input_source(src):
+                    entries.add(src)                    # the reader: attacker bytes enter here
     return adj, entries
 
 
@@ -188,7 +221,7 @@ def harness_reachable_names(conn, case_id: str) -> set:
     """Function names reachable from a FUZZ-HARNESS / network-read entry over the unified
     cross-binary name graph. The harnessed slice -- kept for back-compat and for distinguishing the
     harnessed surface from the full peer surface."""
-    adj, entries = unified_name_graph(conn, case_id)
+    adj, entries = unified_name_graph(conn, case_id, program_entries=False)
     return _bfs(adj, entries) if entries else set()
 
 
@@ -279,8 +312,9 @@ def ground_reach(finding: dict, reachable: set, *, conn=None, source_lookup=None
         or any(r == name or r.endswith("." + name) or r.split("::")[-1] == tail for r in reachable)
     if hit:
         return {"reachable": True, "name": name, "basis": "reached",
-                "reason": f"'{name}' is reachable from an attacker entry (peer parser / network "
-                          "read / fuzz harness) in the recovered call graph -- attacker input reaches it"}
+                "reason": f"'{name}' is reachable from an attacker entry (program main / an input "
+                          "reader / peer parser / fuzz harness) in the recovered call graph -- "
+                          "attacker input reaches it"}
     return {"reachable": False, "name": name, "basis": "unreached",
             "reason": f"'{name}' was not reached from any attacker entry in the recovered call graph "
                       "(indirect/plugin dispatch may hide a path) -- deprioritised, not dismissed"}

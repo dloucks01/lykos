@@ -17,7 +17,8 @@ concrete steps/inputs, titled "Exploitation recipe: ...", explicitly marked "not
 Honesty contract (this module must never violate it -- precision is paramount):
   * A recipe is NEVER filed as `poc-backed` / `demonstrated` and NEVER carries `verified=True`.
     Those states are reserved for an artifact an execution actually confirmed. A recipe is
-    `corroborated` at most -- "derived from the recovered program, not demonstrated here".
+    `corroborated` at most -- "derived from the recovered program, not demonstrated here" -- and
+    never more than its LEAD (`recipe_state`): `candidate` without a reachable lead.
   * `target_level` is the rung the recipe TARGETS if finished (L1/L2/L3). It is recorded as a
     candidate CEILING ("reaches L2 and stops"), never asserted as achieved.
   * Everything in the recipe is computed from the binary; the row says plainly what was and was not
@@ -41,13 +42,56 @@ RECIPE_STATE = "corroborated"
 RECIPE_CONFIDENCE = 0.5
 
 
-def annotate_lead_ceiling(ctx, target, lead, *, target_level: str, why: str) -> None:
+def _lead_unreached(lead) -> bool:
+    """Did grounding find NO path from attacker input to this lead's site?"""
+    import json as _json
+    for e in getattr(lead, "evidence", None) or []:
+        if not isinstance(e, dict) or e.get("channel") != "grounding-map":
+            continue
+        try:
+            g = _json.loads(e.get("detail") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if g.get("reachable") is False or g.get("verdict") == "unreached":
+            return True
+    return False
+
+
+def recipe_state(lead, grounded: bool = False) -> str:
+    """The state a recipe may claim: never more than its lead's, and `candidate` when there is no
+    lead or grounding found no path from attacker input to it.
+
+    A payload computed for a sink is only as real as the evidence that the sink is reachable: on
+    jhead, a command-injection recipe was filed `corroborated` beside a lead whose own grounding
+    said "unreached -- the 'untrusted input' is an assumed source", because every recipe was
+    `corroborated` by fiat. That is corroboration with nothing behind it."""
+    if lead is not None and _lead_unreached(lead):
+        return "candidate"
+    if grounded:
+        # The CALLER proved a strong source->sink link (argv / an input reader / a wire parser
+        # reaching this sink) -- evidence of its own, independent of any lead row.
+        return RECIPE_STATE
+    if lead is None:
+        return "candidate"
+    if getattr(lead, "state", None) in ("corroborated", "confirmed", "poc-backed"):
+        return RECIPE_STATE
+    return "candidate"
+
+
+def annotate_lead_ceiling(ctx, target, lead, *, target_level: str, why: str,
+                          missing_technique: Optional[str] = None) -> None:
     """Record ON THE LEAD (the L0 detection) how far its weaponization got and why it stopped, in
     the lead's own evidence channel so the detected defect and its recipe are linked and the
     account survives a re-run of whichever detector owns the lead row. Generalised from
-    `chain_primitive._annotate_lead_ceiling`. Best-effort: never fails the caller."""
+    `chain_primitive._annotate_lead_ceiling`. Best-effort: never fails the caller.
+
+    `missing_technique`, when a stage knows the SPECIFIC technique to build next to carry
+    weaponization further (more precise than the per-class default), is recorded inline as
+    "[needs: ...]" -- the confirm ladder parses it back out and the weaponization backlog ranks by
+    it, so a finding is never a bare stop but an itemized 'this is what lykos builds next'."""
     if lead is None:
         return
+    needs = f" [needs: {missing_technique}]" if missing_technique else ""
     try:
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
             "cwe": getattr(lead, "cwe", None), "title": getattr(lead, "title", None),
@@ -56,7 +100,11 @@ def annotate_lead_ceiling(ctx, target, lead, *, target_level: str, why: str) -> 
             "confidence": getattr(lead, "confidence", None),
             "dedup_key": getattr(lead, "dedup_key", None),
             "evidence": [{"channel": "recipe-ceiling",
-                          "detail": f"weaponization reached {target_level} and stopped here: {why}"}]})
+                          # NOT "reached": the level is what the recipe TARGETS. Saying lykos
+                          # "reached L3 here" over a payload nobody ran is the over-claim the
+                          # report then repeated on jhead's import-only system() lead.
+                          "detail": f"a recipe targeting {target_level} was computed but not "
+                                    f"executed; to carry it further: {why}{needs}"}]})
     except Exception:                                    # noqa: BLE001 -- never fail the filing
         observe.absorbed(_log, "leaving the lead alone")
 
@@ -67,7 +115,9 @@ def file_recipe(ctx, target, *, cwe: str, technique: str, target_level: str, sum
                 title: Optional[str] = None, confidence: float = RECIPE_CONFIDENCE,
                 lead=None, extra_evidence: Optional[list] = None,
                 input_bytes: Optional[bytes] = None, input_mode: Optional[str] = None,
-                argv: Optional[list] = None) -> Optional[int]:
+                argv: Optional[list] = None,
+                missing_technique: Optional[str] = None,
+                grounded: bool = False) -> Optional[int]:
     """File a NON-EXECUTED exploitation recipe as a `corroborated` candidate finding, and annotate
     its originating lead with the ceiling. Returns the recipe finding's id, or None on failure.
 
@@ -86,9 +136,15 @@ def file_recipe(ctx, target, *, cwe: str, technique: str, target_level: str, sum
                      and never collides with the lead or a verified PoC.
       lead           the originating L0 finding row, annotated with the ceiling when given.
       extra_evidence optional additional evidence dicts (e.g. a stored unverified-input artifact ref).
+      missing_technique  the SPECIFIC technique to build next to carry weaponization further, when
+                     the stage knows it (overrides the per-class default); recorded inline for the
+                     weaponization backlog.
+      grounded       the caller PROVED a strong source->sink link for this recipe (see
+                     `recipe_state`); without it a recipe is never stronger than its lead.
     """
     if target_level not in ("L1", "L2", "L3"):
         target_level = "L2"
+    state = recipe_state(lead, grounded)
     key = dedup_key or f"recipe:{cwe}:{technique}:{target.id}"
     detail = summary.strip()
     if steps:
@@ -116,12 +172,13 @@ def file_recipe(ctx, target, *, cwe: str, technique: str, target_level: str, sum
         fd = FindingDAO(ctx.conn)
         fd.upsert(target.id, target.case_id, {
             "cwe": cwe, "title": title or f"Exploitation recipe: {technique} (targets {target_level})",
-            "severity": severity, "detector": detector, "state": RECIPE_STATE,
+            "severity": severity, "detector": detector, "state": state,
             "confidence": confidence, "dedup_key": key, "site_detail": technique,
             "evidence": ev})
         fid = fd.id_for_dedup(target.id, key)
     except Exception:                                    # noqa: BLE001 -- advisory, never fatal
         observe.absorbed(_log, "recipe not filed")
         return None
-    annotate_lead_ceiling(ctx, target, lead, target_level=target_level, why=why_not_executed)
+    annotate_lead_ceiling(ctx, target, lead, target_level=target_level, why=why_not_executed,
+                          missing_technique=missing_technique)
     return fid

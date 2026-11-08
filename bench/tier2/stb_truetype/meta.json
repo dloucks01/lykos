@@ -1,0 +1,10 @@
+{
+  "id": "stb_truetype",
+  "summary": "stb_truetype.h single-header font parser/rasterizer; vuln.h = parent of the 2018 stbtt_hheap 'severe badness' fix (87352fd~1), fixed.h = latest. Real historical malformed-font bugs; the differential (crashes vuln, survives fixed) is the ground truth.",
+  "upstream": "github.com/nothings/stb (stb_truetype.h)",
+  "mode": "file",
+  "argv": ["@@"],
+  "extra_flags": ["-lm"],
+  "fuzz_seconds": 300,
+  "class": "memory-safety (font parser)"
+}

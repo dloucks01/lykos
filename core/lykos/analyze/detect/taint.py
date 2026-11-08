@@ -130,6 +130,10 @@ for _grp in _X86_SUBREGS:
         _REG_FAMILY.setdefault(_r, set()).update(_grp)
 
 _MAX_BLOCKS = 3000
+#: instruction transfers one function's fixpoint may spend before it stops with a partial result
+_MAX_FN_WORK = 400_000
+#: re-walks of one block allowed in the (non-monotone) origin-chain fixpoint before it is frozen
+_VIA_VISITS = 12
 # The inter-procedural fixpoint's function budget (a runtime ceiling). ABOVE it the analysis is no
 # longer dropped whole (the old behaviour returned an empty set: a 13,529-function libcrypto got NO
 # data flow at all); it runs on a RANKED top-N instead -- see `rank_functions`.
@@ -628,7 +632,8 @@ def build_callmap(call_edges):
 
 
 def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, oversized=None,
-         seed_sources=True, extmap=None, ext_out=None, mem_out=None, heap_regions=None):
+         seed_sources=True, extmap=None, ext_out=None, mem_out=None, heap_regions=None,
+         capped_out=None):
     """Analyze one function. Returns (flagged_sink_sites, return_is_tainted, callee_contribs).
 
     Cross-binary hooks (Phase 8, doc 17.2):
@@ -746,42 +751,77 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
     interblock = _os3.environ.get("LYKOS_INTERBLOCK_ORIGINS", "1") != "0"
     need_via = interblock and (mem_out is not None or heap_regions)
     VIA_OUT = {a: {} for a in order}
+    succ_of = {a: [s for s in by_addr[a].get("succ", []) if s in by_addr] for a in order}
+    budget = _MAX_FN_WORK
     if need_via:
-        for _ in range(len(blocks) * 4 + 10):
-            vchanged = False
-            for a in order:
-                vvia = dict(_merge_origins([VIA_OUT[p] for p in preds[a]]))
-                valias, tdummy = {}, set()
-                for instr in by_addr[a]["instructions"]:
-                    _apply(tdummy, instr.get("pcode", []), abi.get("frame", ()),
-                           valias, None, vvia)
-                vout = _carry_origins(vvia)
-                if vout != VIA_OUT[a]:
-                    VIA_OUT[a] = vout
-                    vchanged = True
-            if not vchanged:
+        # Origin-chain fixpoint, as a WORKLIST (see the taint fixpoint below for why): a block is
+        # re-walked only when a predecessor's VIA_OUT changed. The origin map is NOT monotone
+        # (an origin is replaced, not only added), so around a loop it can cycle forever -- a
+        # 6-block function exhausted a 400k budget (measured). Each block is re-walked at most
+        # _VIA_VISITS times and then frozen (widening); the old round-robin only stopped at its
+        # pass limit. The taint SETS below are monotone and still run to their fixpoint.
+        vwl = deque(order)
+        vin = set(order)
+        visits: dict = defaultdict(int)
+        while vwl:
+            a = vwl.popleft()
+            vin.discard(a)
+            visits[a] += 1
+            vvia = dict(_merge_origins([VIA_OUT[p] for p in preds[a]]))
+            valias, tdummy = {}, set()
+            ins = by_addr[a]["instructions"]
+            for instr in ins:
+                _apply(tdummy, instr.get("pcode", []), abi.get("frame", ()),
+                       valias, None, vvia)
+            budget -= max(1, len(ins))
+            vout = _carry_origins(vvia)
+            if vout != VIA_OUT[a]:
+                VIA_OUT[a] = vout
+                for s2 in succ_of[a]:
+                    if s2 not in vin and visits[s2] < _VIA_VISITS:
+                        vwl.append(s2)
+                        vin.add(s2)
+            if budget <= 0:
+                if capped_out is not None:
+                    capped_out.append({"blocks": len(blocks), "phase": "origins"})
                 break
 
     def _seed_via(a):
         return dict(_merge_origins([VIA_OUT[p] for p in preds[a]])) if need_via else {}
 
+    # WORKLIST fixpoint: a block is re-transferred only when one of its predecessors' OUT changed.
+    # It reaches the same fixpoint as the old round-robin (every block, every pass, up to
+    # blocks*4+10 passes), which on a 1,950-block glibc function in a static binary ran ~426 s in
+    # ONE call -- out of reach of the stage's cancel check (measured, jhead-3.04). `_MAX_FN_WORK`
+    # bounds the instruction transfers per function; a function that hits it keeps its partial
+    # OUT (an UNDER-approximation of taint: flows can be missed, never invented) and is reported.
     OUT = {a: set() for a in order}
-    for _ in range(len(blocks) * 4 + 10):
-        changed = False
-        for a in order:
-            cur = set()
-            for p in preds[a]:
-                cur |= OUT[p]
-            if a == entry:
-                cur |= pre
-            f, c, pushes, aliases = set(), {}, [], {}
-            via = _seed_via(a)              # seed origins so region taint resolves heap pointers
-            for instr in by_addr[a]["instructions"]:
-                transfer(cur, instr, f, c, pushes, aliases, None, via)
-            if cur != OUT[a]:
-                OUT[a] = cur
-                changed = True
-        if not changed:
+    wl = deque(order)
+    inwl = set(order)
+    budget = max(budget, _MAX_FN_WORK // 4)     # the taint pass always gets a share
+    while wl:
+        a = wl.popleft()
+        inwl.discard(a)
+        cur = set()
+        for p in preds[a]:
+            cur |= OUT[p]
+        if a == entry:
+            cur |= pre
+        f, c, pushes, aliases = set(), {}, [], {}
+        via = _seed_via(a)                  # seed origins so region taint resolves heap pointers
+        ins = by_addr[a]["instructions"]
+        for instr in ins:
+            transfer(cur, instr, f, c, pushes, aliases, None, via)
+        budget -= max(1, len(ins))
+        if cur != OUT[a]:
+            OUT[a] = cur
+            for s in succ_of[a]:
+                if s not in inwl:
+                    wl.append(s)
+                    inwl.add(s)
+        if budget <= 0:
+            if capped_out is not None:
+                capped_out.append({"blocks": len(blocks), "pending": len(wl)})
             break
 
     flagged, contribs = set(), {}
@@ -805,8 +845,32 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
     return flagged, ret_bool, contribs
 
 
+def _stopper(should_stop, every: float = 1.0):
+    """A cheap poll of `should_stop` (a stage's cancel check, which reads the database): at most
+    once per `every` seconds. Returns a no-arg callable -> bool."""
+    if should_stop is None:
+        return lambda: False
+    import time as _t
+    last = [0.0]
+    hit = [False]
+
+    def poll() -> bool:
+        if hit[0]:
+            return True
+        now = _t.monotonic()
+        if now - last[0] >= every:
+            last[0] = now
+            try:
+                hit[0] = bool(should_stop())
+            except Exception:                                # noqa: BLE001 -- never sink the analysis
+                hit[0] = False
+        return hit[0]
+    return poll
+
+
 def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,
-                    max_funcs=None, skipped_out=None, heap_regions=None, ranked_out=None):
+                    max_funcs=None, skipped_out=None, heap_regions=None, ranked_out=None,
+                    should_stop=None, capped_out=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -829,8 +893,15 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     (`rank_functions`) instead of returning nothing; `ranked_out`, when given, is filled with that
     selection's report (total / analyzed / skipped / unreachable / skipped_reachable / exact /
     note) so the caller can state exactly how much was not looked at. Untouched at or below it.
+
+    `should_stop` (the stage's cancel/deadline check) is polled about once a second; when it fires
+    the fixpoint stops and the sites flagged SO FAR are returned, with `ranked_out["cut_short"]`
+    set. Without it a cancelled detect stage kept its worker for ~2 more minutes on a static
+    binary (measured, jhead-3.04), starving every stage after it.
     """
+    stop = _stopper(should_stop)
     heap_regions = heap_regions or {}
+    _cap: list = []                        # functions whose fixpoint hit _MAX_FN_WORK
     ak = _arch_key(arch)
     if not ak or not _has_abi(ARCH_ABI[ak]):
         return set()
@@ -863,12 +934,17 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     inq = set(func_addrs)
     cap = len(func_addrs) * 8 + 200
     while wl and cap > 0:
+        if stop():
+            break
         cap -= 1
         f = wl.popleft()
         inq.discard(f)
+        _cap.clear()
         _, retf, contribs = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
                                  entry_params[f], ret_tainted,
-                                 heap_regions=heap_regions.get(f))
+                                 heap_regions=heap_regions.get(f), capped_out=_cap)
+        if _cap and capped_out is not None:
+            capped_out.add(f)
         if retf and not ret_tainted[f]:
             ret_tainted[f] = True
             for c in callers.get(f, ()):
@@ -883,15 +959,24 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     flagged = set()
     big: list = []
     for f in func_addrs:
+        if stop():
+            break
         acc = [] if mem_out is not None else None
+        _cap.clear()
         ff, _, _ = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
                         entry_params[f], ret_tainted, mem_out=acc, oversized=big,
-                        heap_regions=heap_regions.get(f))
+                        heap_regions=heap_regions.get(f), capped_out=_cap)
+        if _cap and capped_out is not None:
+            capped_out.add(f)
         flagged |= ff
         for x in (acc or ()):
             mem_out.append({**x, "function_addr": f})
     if big and skipped_out is not None:
         skipped_out.extend(big)
+    if stop() and ranked_out is not None:
+        ranked_out["cut_short"] = True
+        ranked_out["note"] = ((ranked_out.get("note") or "") +
+                              " -- cut short by the stage's budget/cancel; partial result").strip(" -")
     return flagged
 
 

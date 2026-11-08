@@ -91,12 +91,13 @@ def _validate_all(target, hyps, incidental, log):
 
 
 def hunt_target(target, budget: float, *, input_size: int, mem_mb: int,
-                log: Callable[[str], None]) -> dict:
+                log: Callable[[str], None], extra: Optional[dict] = None) -> dict:
     t_end = time.time() + budget
     log(f"solving {target.exe.name} ({target.mode} input, argv {target.argv}) for {int(budget)} s")
     # uninitialised-memory proposing only earns its cost (extra directing targets) when there is
     # an MSan build to confirm against; otherwise it can never reach `confirmed`.
     base_extra = {"uninit": True} if target.msan_exe else {}
+    base_extra.update(extra or {})           # e.g. focus_funcs from the autopilot stage
     if _is_large_static(target.exe):
         base_extra["cb_scope"] = True
         log(f"large static binary: scoping proposers to the target's own code")

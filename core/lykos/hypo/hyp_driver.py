@@ -34,6 +34,8 @@ validator is the precision filter, and failures come back as exclusions).
 
 spec.json: binary, argv (list, "@@" = input carrier), input_mode (file|stdin|arg), input_size,
            max_seconds, max_states, width, exclude {hyp_id: [b64,...]}, only [hyp_id,...],
+           focus_funcs [link VA,...] (propose only inside these functions),
+           seed_b64 / seed_pin (pin the input's first seed_pin bytes to a format specimen),
            max_rss_mb (default 8192: past it the driver writes partial results and exits 3),
            solver_timeout_ms (default 10000), solver_max_mb (z3 heap cap, default max_rss_mb)
 out.json : ok, angr_version, stats, hypotheses:[{id, kind, cwe, site, func, func_addr, callee,
@@ -169,8 +171,56 @@ class Driver:
         self.main_obj = self.p.loader.main_object
         self.x86 = self.p.arch.name in ("AMD64", "X86")
         self._install_models()
+        self._install_ifuncs()
         self.dlocals = self._dwarf_locals()
         self._globals_table()
+
+    def _install_ifuncs(self):
+        """Keep by-name models OFF a static binary's IFUNC resolvers.
+
+        In a static glibc binary the symbol `strlen` IS the IFUNC resolver; the startup calls it
+        once (IRELATIVE) and stores what it returns in the `.plt` GOT slot. `hook_symbol("strlen",
+        LeanStrlen)` therefore hooked the RESOLVER: the startup's call returned strlen(<garbage>)
+        = 0, the slot became 0, and every later strlen call jumped to 0x0 -- measured: 9,698
+        errored states from the strlen stub at 0x4010f0 on static jhead-3.04 (113,738 in a longer
+        run), the hypothesis loop's reach collapse on static binaries.
+
+        The parent resolved each slot offline (spec["ifunc"] = [[slot, impl, name, resolver]],
+        link-time VAs). A hooked resolver is unhooked and its model moved to the implementation
+        the resolver selects, so the startup's IRELATIVE pass writes the real implementation and
+        every call through the slot still reaches the model. A routine angr models but the driver
+        does not hook gets angr's libc SimProcedure on the implementation (no symbolic stepping
+        through SSE2 string code). The slot is also written directly, for a run that does not
+        start at the image's entry."""
+        slots = self.spec.get("ifunc") or []
+        if not slots:
+            return
+        obj = self.main_obj
+        shift = obj.mapped_base - getattr(obj, "linked_base", 0)
+        libc = self.angr.SIM_PROCEDURES.get("libc", {})
+        moved = hooked = written = 0
+        for row in slots:
+            slot, impl, name = row[0], row[1], row[2]
+            resolver = row[3] if len(row) > 3 else None
+            r_impl = impl + shift
+            r_res = resolver + shift if resolver is not None else None
+            if r_res is not None and self.p.is_hooked(r_res):
+                model = self.p.hooked_by(r_res)
+                self.p.unhook(r_res)
+                if not self.p.is_hooked(r_impl) and model is not None:
+                    self.p.hook(r_impl, model)
+                    moved += 1
+            elif name and name in libc and not self.p.is_hooked(r_impl):
+                self.p.hook(r_impl, libc[name]())
+                hooked += 1
+            try:
+                self.p.loader.memory.pack_word(slot + shift, r_impl)
+                written += 1
+            except Exception:  # a slot outside the loaded image: leave it
+                pass
+        self.stats["ifunc_slots"] = written
+        self.stats["ifunc_moved"] = moved
+        self.stats["ifunc_hooked"] = hooked
 
     def _globals_table(self):
         """Data objects with known extent: ELF symbols with a size (best effort; stripped -> sections)."""
@@ -183,6 +233,7 @@ class Driver:
                     continue
                 objs.append((s.rebased_addr, s.rebased_addr + s.size, s.name))
         except Exception:
+            # cle symbol tables can be malformed on stripped/odd ELFs; the .data/.bss fallback below covers it
             pass
         if not objs:
             try:
@@ -190,6 +241,7 @@ class Driver:
                     if sec.name in (".data", ".bss") and sec.memsize:
                         objs.append((sec.vaddr, sec.vaddr + sec.memsize, sec.name))
             except Exception:
+                # no usable section table either: the object map stays empty, frame-level checks still run
                 pass
         objs.sort()
         self.gobjs = objs
@@ -206,6 +258,7 @@ class Driver:
             if f is not None and f.addr <= addr < f.addr + max(1, f.size or 1) + 0x1000:
                 return f
         except Exception:
+            # no CFG function covers addr (or the kb lookup raised): None is the 'unknown function' answer
             pass
         return None
 
@@ -312,6 +365,7 @@ class Driver:
                     concrete = all(x is not None for x in (pos, fsize)) and not any(
                         st.solver.symbolic(x) for x in (size, pos, fsize) if not isinstance(x, int))
                 except Exception:
+                    # position/size not resolvable on this fd: treated as non-concrete, generic model below
                     concrete = False
                 if simfd is None or not concrete:
                     return self.inline_call(angr.SIM_PROCEDURES["libc"]["fgets"], dst, size,
@@ -349,12 +403,32 @@ class Driver:
             def run(self, src, fmt):   # noqa: D401
                 return drv._sscanf(self, src, fmt, va_start=2)
 
+        class PreciseScanf(angr.SimProcedure):
+            """scanf / __isoc99_scanf reading from STDIN. angr's own scanf CRASHES on a symbolic
+            stream position (format_parser does `BVV(position + max_str_len)` with a symbolic
+            position -> TypeError), so a value guard on a `scanf("%u", &key)` was never solved --
+            the state errored out before the sink. This stages a chunk of stdin into scratch, runs
+            the precise sscanf model on it (which ties %d/%u/%s to the input bytes, so key==MAGIC
+            constrains the input digits), then advances the stream by exactly what was consumed --
+            leaving the delimiter for the next read, as scanf does."""
+            def run(self, fmt):   # noqa: D401
+                return drv._scanf_stream(self, fmt, va_start=1)
+
+        class PreciseFscanf(angr.SimProcedure):
+            """fscanf(stream, fmt, ...): same stream model as PreciseScanf, arg 0 is the FILE*."""
+            def run(self, stream, fmt):   # noqa: D401
+                return drv._scanf_stream(self, fmt, va_start=2, stream=stream)
+
         for name, cls in (("snprintf", BoundedSnprintf), ("sprintf", BoundedSprintf),
                           ("memset", BoundedMemset), ("__memset_chk", BoundedMemsetChk),
                           ("strlen", LeanStrlen), ("strcpy", LeanStrcpy), ("strdup", LeanStrdup),
                           ("__strdup", LeanStrdup),
                           ("sscanf", PreciseSscanf), ("__isoc99_sscanf", PreciseSscanf),
-                          ("__isoc23_sscanf", PreciseSscanf)):
+                          ("__isoc23_sscanf", PreciseSscanf),
+                          ("scanf", PreciseScanf), ("__isoc99_scanf", PreciseScanf),
+                          ("__isoc23_scanf", PreciseScanf),
+                          ("fscanf", PreciseFscanf), ("__isoc99_fscanf", PreciseFscanf),
+                          ("__isoc23_fscanf", PreciseFscanf)):
             sym = self.p.loader.find_symbol(name)
             if sym is not None:
                 self.p.hook_symbol(name, cls(), replace=True)
@@ -384,7 +458,7 @@ class Driver:
         try:
             from angr.state_plugins.heap.heap_brk import SimHeapBrk
             heap_cls = SimHeapBrk
-        except Exception:
+        except Exception:  # this angr build has no SimHeapBrk: run on angr's default heap, unpatched
             pass
         if heap_cls is not None and not getattr(heap_cls, "_lyk_patched", False):
             o_malloc, o_free, o_calloc, o_realloc = (heap_cls._malloc, heap_cls._free,
@@ -393,7 +467,7 @@ class Driver:
             def _rec(state, addr, size):
                 try:
                     a = state.solver.eval_one(addr)
-                except Exception:
+                except Exception:  # a symbolic allocation address cannot be keyed: this chunk simply goes untracked
                     return
                 ch = dict(state.globals.get("chunks", {}))
                 ch[a] = (size, False)
@@ -413,6 +487,7 @@ class Driver:
                     a = addr if not isinstance(addr, int) else claripy.BVV(addr, state.arch.bits)
                     return claripy.If(big, claripy.BVV(0, state.arch.bits), a)
                 except Exception:
+                    # failure-size check not buildable for this size: allocate normally, no forced-NULL branch
                     return addr
 
             def _malloc(self, sim_size):
@@ -435,6 +510,7 @@ class Driver:
                 try:
                     a = st.solver.eval_one(ptr)
                 except Exception:
+                    # a symbolic pointer cannot be matched to a tracked chunk: the free proceeds untracked
                     a = None
                 ch = st.globals.get("chunks", {})
                 if a is not None and a in ch:
@@ -459,7 +535,7 @@ class Driver:
             f = st.solver.eval(st.memory.load(fmt, 512, inspect=False), cast_to=bytes).split(b"\0")[0]
             if st.solver.symbolic(st.memory.load(fmt, len(f) + 1, inspect=False)):
                 raise ValueError("symbolic format")
-        except Exception:
+        except Exception:  # format not concrete/readable: angr's FormatParser model handles it instead
             return self._fallback_fmt(proc, dst, size, fmt, va_start)
         cc = proc.cc
         argi = [va_start]
@@ -472,7 +548,7 @@ class Driver:
         def _arg(i):
             try:
                 return cc.get_args(st, [proc.angr_proto_ptr if False else None] * 0) and None
-            except Exception:
+            except Exception:  # this accessor always yields None anyway; a calling-convention error changes nothing
                 return None
 
         regs = list(getattr(cc, "ARG_REGS", []) or [])
@@ -571,7 +647,7 @@ class Driver:
         if size is not None:
             try:
                 nlim = st.solver.eval_one(size)
-            except Exception:
+            except Exception:  # size is not single-valued: bound the write by its maximum instead
                 nlim = st.solver.max(size)
             if nlim == 0:
                 return total.zero_extend(st.arch.bits - 32)
@@ -639,7 +715,7 @@ class Driver:
         claripy = self.claripy
         try:
             cs = st.solver.eval(st.memory.load(chars, 64, inspect=False), cast_to=bytes).split(b"\0")[0]
-        except Exception:
+        except Exception:  # reject set unreadable/symbolic: unconstrained length, exactly what angr's stub returns
             return st.solver.Unconstrained("strspn", self.arch_bits)
         M = max(16, st.libc.max_str_len)
         blob = st.memory.load(src, M, inspect=False)
@@ -675,17 +751,21 @@ class Driver:
     SCANF_INT = {b"d": (10, True), b"i": (10, True), b"u": (10, False), b"x": (16, False),
                  b"X": (16, False), b"o": (8, False)}
 
-    def _sscanf(self, proc, src, fmt, va_start):
+    def _sscanf(self, proc, src, fmt, va_start, out=None):
         """Solver-encoded sscanf. No forking: the return value is a sum of If(ok_k, 1, 0) over the
         conversions and every store is conditional on ok_k, so the caller's `!= N` branch splits
         the paths. Token lengths are symbolic; positions after a variable-length token are
-        resolved over their feasible values (at most POS_FANOUT, else a sound subset)."""
+        resolved over their feasible values (at most POS_FANOUT, else a sound subset).
+
+        `out` (optional dict) receives `out["consumed"]` = the final parse position relative to
+        `src` -- how many bytes were read -- so a STREAM caller (`PreciseScanf`) can advance the
+        file position by exactly that, leaving the delimiter for the next read (scanf semantics)."""
         claripy, st = self.claripy, proc.state
         try:
             f = st.solver.eval(st.memory.load(fmt, 256, inspect=False), cast_to=bytes).split(b"\0")[0]
             if st.solver.symbolic(st.memory.load(fmt, len(f) + 1, inspect=False)):
                 raise ValueError("symbolic format")
-        except Exception:
+        except Exception:  # format not concrete: defer to angr's own sscanf model
             from angr.procedures.libc.sscanf import sscanf as _ss
             return proc.inline_call(_ss, src, fmt).ret_expr
         cc = proc.cc
@@ -908,7 +988,133 @@ class Driver:
             from angr.procedures.libc.sscanf import sscanf as _ss
             return proc.inline_call(_ss, src, fmt).ret_expr
         del consumed_any
+        if out is not None:
+            out["consumed"] = pos.ast
         return count.zero_extend(self.arch_bits - W32) if self.arch_bits > W32 else count
+
+    def _scanf_stream(self, proc, fmt, va_start, stream=None):
+        """scanf/fscanf from a STREAM: stage a chunk of the stream into scratch, run the precise
+        sscanf model on it, then advance the stream by exactly the bytes consumed (leaving the
+        delimiter for the next read). Replaces angr's scanf, which crashes on a symbolic stream
+        position. Returns the matched-conversion count.
+
+        Two advance modes. DEFAULT: set `_read_pos = p0 + consumed` (symbolic consumed -> symbolic
+        position; reaches guards, but a later read starts at a symbolic offset so the solve does not
+        reliably RUN-reproduce). `fork_scanf`: fork one successor per feasible concrete consumed-
+        length with `_read_pos` concrete, so the next read is at a fixed offset and the solved stdin
+        replays byte-for-byte -- the run-reproducible PoC path (used by the inject_stage concolic
+        fallback)."""
+        claripy, st = self.claripy, proc.state
+        if stream is None:
+            fd = 0
+        else:
+            try:
+                from cle.backends.externs.simdata.io_file import io_file_data_for_arch
+                fd = st.solver.eval(st.mem[stream + io_file_data_for_arch(st.arch)["fd"]:].int.resolved)
+            except Exception:  # FILE* fd not resolvable: assume stdin, the common case for the scanf family
+                fd = 0
+        simfd = st.posix.get_fd(fd)
+        if simfd is None:
+            return claripy.BVV(0xFFFFFFFF & ((1 << self.arch_bits) - 1), self.arch_bits)   # EOF
+        # Peek only a SMALL chunk: scanf consumes one token, and reading the whole input would
+        # leave nothing for the program's later reads (the sink's own read()) even after we rewind.
+        M = max(16, min(48, int(self.spec.get("scanf_peek", 48))))
+        try:
+            p0 = simfd._read_pos
+        except Exception:  # this descriptor has no _read_pos: p0=None disables the precise rewind below
+            p0 = None
+        try:
+            data, _real = simfd.read_data(M)               # symbolic bytes; advances _read_pos
+        except Exception:
+            # not a readable duplex stream: let angr's model try (rare; may still work on a file)
+            from angr.procedures.libc.scanf import scanf as _sc
+            return proc.inline_call(_sc, fmt).ret_expr
+        try:
+            scratch = st.heap.allocate(M + 1)
+        except Exception:  # heap plugin cannot allocate here: a fixed scratch region is used instead
+            scratch = (self.spec.get("scratch_base") or 0x5f000000) & ~0xF
+        st.memory.store(scratch, data, inspect=False)
+        st.memory.store(scratch + M, claripy.BVV(0, 8), inspect=False)
+        out = {}
+        ret = self._sscanf(proc, scratch, fmt, va_start, out=out)
+        consumed = out.get("consumed")
+        if consumed is None or p0 is None:                 # couldn't track -> leave the M-advance
+            return ret
+        cons64 = consumed if consumed.size() >= 64 else consumed.zero_extend(64 - consumed.size())
+        # p0 must be CONCRETE for a concrete rewind / fork to mean anything.
+        if isinstance(p0, int):
+            p0c = p0
+        elif not st.solver.symbolic(p0):
+            p0c = st.solver.eval(p0)
+        else:
+            p0c = None
+
+        def set_read_pos(sfd, newpos):
+            """Rewind the read stream to `newpos`. The duplex's `_read_pos` is only a mirror --
+            SimFileStream.read() IGNORES the position it is handed and advances its OWN `self.pos`
+            (stream semantics), so the stream object (read_storage()) is what the NEXT read actually
+            uses. Setting only `_read_pos` (as the first cut did) left the stream at p0+M, so the
+            sink's read started M bytes too far and the solve never run-reproduced."""
+            try:
+                rf = sfd.read_storage()
+            except Exception:  # older angr descriptors lack read_storage(): fall back to the private attribute
+                rf = getattr(sfd, "_read_file", None)
+            if rf is not None and hasattr(rf, "pos"):
+                rf.pos = newpos
+            try:
+                sfd._read_pos = newpos
+            except Exception:  # descriptor without _read_pos: the stream .pos set above is what the next read uses
+                pass
+
+        # DEFAULT (non-forking): set the mirror `_read_pos` only, exactly as shipped -- the stream
+        # itself stays at p0+M (SimFileStream.read uses its own pos), so a later read over-reads by
+        # the peek amount. This REACHES a value guard (confirmed by effect for Tier-0) but does not
+        # reliably RUN-reproduce. Left untouched so the Tier-0 corpus cannot regress; the run-
+        # reproducible rewind is the opt-in forking path below, used by the concolic PoC fallback.
+        if not self.spec.get("fork_scanf") or p0c is None or not st.solver.symbolic(cons64):
+            try:
+                base = claripy.BVV(p0c, 64) if p0c is not None else \
+                    (p0 if not isinstance(p0, int) else claripy.BVV(p0, 64))
+                simfd._read_pos = base + cons64
+            except Exception:  # rewind not expressible on this fd: keep the M-byte advance
+                pass                                       # leave the M-byte advance (over-read)
+            return ret
+
+        # FORKING (opt-in `fork_scanf`, the run-reproducible path): one successor per feasible
+        # concrete consumed-length, each with the stream position CONCRETE (= p0 + c). The program's
+        # later read then starts at a concrete offset, so the digits scanf ate stay a fixed-length
+        # prefix of the solved stdin and the bytes after them land in the next read verbatim -- the
+        # PoC replays. Mirrors LineFgets' KLEE-style length forking (an under-approximation: every
+        # forked path is a real execution; we only enumerate a bounded, small set of lengths).
+        cap = max(1, int(self.spec.get("scanf_fork_cap", 12)))
+        cands, c = [], 0
+        while c <= M and len(cands) < cap:
+            if st.solver.satisfiable(extra_constraints=[cons64 == c]):
+                cands.append(c)
+            c += 1
+        if not cands:                                      # nothing feasible -> leave the M-advance
+            return ret
+        # `self` is the Driver; the callsite-teardown / successor machinery lives on the SimProcedure
+        # (`proc`), as it does for LineFgets where the SimProcedure is `self`.
+        proc.inhibit_autoret = True
+        added = 0
+        for c in cands:
+            s2 = st.copy()
+            s2.add_constraints(cons64 == c)
+            if not s2.satisfiable():
+                continue
+            try:
+                set_read_pos(s2.posix.get_fd(fd), claripy.BVV(p0c + c, 64))
+                ret_addr = proc.cc.teardown_callsite(s2, return_val=ret, prototype=proc.prototype)
+                proc.successors.add_successor(s2, ret_addr, claripy.true(), "Ijk_Ret")
+                added += 1
+            except Exception:
+                # this fork branch could not be set up: skip it; zero branches falls back to the M-advance
+                continue
+        if not added:                                      # forking failed -> fall back to M-advance
+            proc.inhibit_autoret = False
+            return ret
+        return None
 
     def _fallback_fmt(self, proc, dst, size, fmt, va_start):
         from angr.procedures.libc.snprintf import snprintf as _sn
@@ -954,14 +1160,28 @@ class Driver:
         has_check = False                 # TOCTOU: the program performs a filename check somewhere
         open_sites = []                   # (ins, cs, func, callee) of input-openable sinks
         own = self._own_functions() if self.spec.get("cb_scope") else None
+        if self.spec.get("own_funcs"):
+            # the core's library attribution (libscope) for a static binary: link-time VAs
+            _d = self.main_obj.mapped_base - self.main_obj.linked_base
+            spec_own = {int(a) + _d for a in self.spec["own_funcs"]}
+            own = spec_own if own is None else (own & spec_own) or spec_own
         if own is not None:
             self.stats["own_functions"] = len(own)
+        # FOCUS: propose only inside the functions other evidence names (link-time VAs from the
+        # core: static detector / QASan / directed-fuzz sites). On a real parser an unfocused
+        # proposer emits thousands of generic stores and solves none of them in budget.
+        focus = {int(a) for a in (self.spec.get("focus_funcs") or [])}
+        fdelta = self.main_obj.mapped_base - self.main_obj.linked_base
+        if focus:
+            self.stats["focus_funcs"] = len(focus)
         for f in list(kb.functions.values()):
             if f.is_plt or f.is_simprocedure or f.name in BORING_FUNCS or f.is_syscall:
                 continue
             if not self.main_obj.contains_addr(f.addr):
                 continue
             if own is not None and f.addr not in own:
+                continue
+            if focus and (f.addr - fdelta) not in focus:
                 continue
             for cs in f.get_call_sites():
                 tgt = f.get_call_target(cs)
@@ -971,7 +1191,7 @@ class Driver:
                 try:
                     blk = self.p.factory.block(cs)
                     ins = blk.instruction_addrs[-1]
-                except Exception:
+                except Exception:  # no block decodable at this call site: it cannot be scanned as a sink site
                     continue
                 if base in CHECK_SINKS:
                     has_check = True
@@ -1019,7 +1239,7 @@ class Driver:
         for blk_node in f.blocks:
             try:
                 insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
-            except Exception:
+            except Exception:  # undecodable block (data in .text / bad bytes): nothing to scan for divisions
                 continue
             for i in insns:
                 if i.mnemonic not in ("div", "idiv"):
@@ -1071,7 +1291,7 @@ class Driver:
         if not hasattr(self, "_auth_addr"):
             try:
                 hits = list(self.p.loader.memory.find(marker))
-            except Exception:
+            except Exception:  # loader memory search failed: no auth marker found, so no auth sites are proposed
                 hits = []
             self._auth_addr = hits[0] if hits else -1
         if self._auth_addr < 0:
@@ -1080,7 +1300,7 @@ class Driver:
         for blk_node in f.blocks:
             try:
                 insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
-            except Exception:
+            except Exception:  # undecodable block (data in .text / bad bytes): nothing to scan for marker refs
                 continue
             for i in insns:
                 hit = False
@@ -1107,7 +1327,7 @@ class Driver:
         for blk_node in f.blocks:
             try:
                 insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
-            except Exception:
+            except Exception:  # undecodable block (data in .text / bad bytes): nothing to scan for indirect calls
                 continue
             for i in insns:
                 if i.mnemonic != "call" or not i.insn.operands:
@@ -1137,7 +1357,7 @@ class Driver:
                     n = next(iter(comp))
                     if f.graph.has_edge(n, n):
                         loop_blocks.add(n.addr)
-        except Exception:
+        except Exception:  # loop analysis failed on this function's graph: no loop-bound sites proposed for it
             return
         self.loop_cmps = getattr(self, "loop_cmps", {})
         for blk_node in f.blocks:
@@ -1145,7 +1365,7 @@ class Driver:
                 continue
             try:
                 insns = self.p.factory.block(blk_node.addr, size=blk_node.size).capstone.insns
-            except Exception:
+            except Exception:  # undecodable block (data in .text / bad bytes): nothing to scan for loop compares
                 continue
             for i in insns:
                 if i.mnemonic not in ("cmp", "test") or len(i.insn.operands) != 2:
@@ -1180,7 +1400,7 @@ class Driver:
         for blk_node in f.blocks:
             try:
                 vex = self.p.factory.block(blk_node.addr, size=blk_node.size).vex
-            except Exception:
+            except Exception:  # block will not lift to VEX: skipped, no frame accesses recorded for it
                 continue
             frame, cur = {}, blk_node.addr    # tmp -> frame offset (relative to bp)
             for stmt in vex.statements:
@@ -1224,13 +1444,13 @@ class Driver:
                     n = next(iter(comp))
                     if f.graph.has_edge(n, n):
                         loop_blocks.add(n.addr)
-        except Exception:
+        except Exception:  # SCC pass failed: proceed with no loop blocks known (only the in-loop refinement is lost)
             loop_blocks = set()
         sp_off = {self.p.arch.registers.get("sp", (None,))[0], self.p.arch.registers.get("bp", (None,))[0]}
         for blk_node in f.blocks:
             try:
                 vex = self.p.factory.block(blk_node.addr, size=blk_node.size).vex
-            except Exception:
+            except Exception:  # block will not lift to VEX: skipped, no store targets recorded for it
                 continue
             prov = {}   # tmp -> ("frame"|"index"|"ptr"|"const")
             cur_ins = blk_node.addr
@@ -1324,7 +1544,7 @@ class Driver:
                     v = dm.get(ra, INF)
                     if v + 1 < d:
                         d = v + 1
-        except Exception:
+        except Exception:  # callstack walk failed: distance stays what the current block alone gives
             pass
         vis = self.visits.get(s.addr, 0)
         return (d if d < INF else INF) + vis // 4
@@ -1357,6 +1577,17 @@ class Driver:
         st = self.p.factory.full_init_state(args=args, add_options=opts,
                                             remove_options={angr.options.LAZY_SOLVES}, **kw)
         self._configure_state(st, n)
+        # SEEDED reach: pin the first `seed_pin` bytes of the input to a format specimen, so the
+        # parser's front gates (magic, header lengths, segment markers) hold by construction and the
+        # solver spends its budget past them. The rest stays symbolic. Without it a real parser's
+        # sites are out of reach from the entry in budget (measured: 0-2 of 43-3,230 solved).
+        seed = base64.b64decode(self.spec["seed_b64"]) if self.spec.get("seed_b64") else b""
+        if seed:
+            pin = int(self.spec.get("seed_pin") or max(16, len(seed) // 2))
+            pin = min(pin, len(seed), n)
+            for i in range(pin):
+                st.solver.add(self.inp.get_byte(i) == seed[i])
+            self.stats["seed_pinned"] = pin
         return st
 
     def _func_state(self, func_addr):
@@ -1430,7 +1661,7 @@ class Driver:
             return out
         try:
             from elftools.elf.elffile import ELFFile
-        except Exception:
+        except Exception:  # pyelftools absent in this interpreter: no DWARF object map, frame-level oracle only
             return out
         delta = self.main_obj.mapped_base - self.main_obj.linked_base
 
@@ -1507,7 +1738,7 @@ class Driver:
                                 objs.append((nm, off, sz))
                         if objs:
                             out[die.attributes["DW_AT_low_pc"].value + delta] = objs
-        except Exception:
+        except Exception:  # malformed/unsupported DWARF: drop the map rather than trust a partial one
             return {}
         self.stats["dwarf_funcs"] = len(out)
         return out
@@ -1548,9 +1779,9 @@ class Driver:
                     # call_site_addr is the calling BLOCK; the call is its last instruction
                     try:
                         return self.p.factory.block(cs).instruction_addrs[-1]
-                    except Exception:
+                    except Exception:  # call-site block will not decode: report the block address itself
                         return cs
-        except Exception:
+        except Exception:  # callstack unavailable on this state: fall back to the current instruction
             pass
         return ins
 
@@ -1572,7 +1803,7 @@ class Driver:
                 sp = fr.stack_ptr
                 if isinstance(sp, int) and sp and fr.func_addr is not None:
                     out.append((sp, fr.ret_addr, fr.func_addr))
-        except Exception:
+        except Exception:  # callstack unavailable: return the frames gathered so far
             pass
         return out
 
@@ -1595,7 +1826,7 @@ class Driver:
             raise
         except self.claripy.errors.ClaripyError:
             self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
-        except Exception:
+        except Exception:  # angr raises arbitrary errors on odd address ASTs: this write goes unchecked, path continues
             pass
 
     def _note_store_reach(self, s, addr):
@@ -1640,7 +1871,7 @@ class Driver:
             raise
         except self.claripy.errors.ClaripyError:
             self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
-        except Exception:
+        except Exception:  # angr raises arbitrary errors on odd address ASTs: this read goes unchecked, path continues
             pass
 
     def _chunk_for(self, chunks, a):
@@ -1722,7 +1953,7 @@ class Driver:
                 # ~90% of oracle calls, so they take a single eval. Writes keep min(): it picks the
                 # innermost frame above the write for the saved-return-address check.
                 a_lo = s.solver.min(addr) if write else s.solver.eval(addr)
-            except Exception:
+            except Exception:  # address not solvable (unsat/timeout): no region to classify, access unchecked
                 return
             end = addr + ln_ast
             if write and self.x86:
@@ -1880,14 +2111,14 @@ class Driver:
                         return r
             if ast.op == "__sub__":
                 return self._const_base(ast.args[0])
-        except Exception:
+        except Exception:  # unexpected AST shape: no constant base to report
             return None
         return None
 
     def _fname(self, fa):
         try:
             return self.cfg.kb.functions.function(addr=fa).name
-        except Exception:
+        except Exception:  # no kb function at fa: its hex address serves as the name
             return hex(fa)
 
     def violation(self, s, kind, site, why, extra=()):
@@ -1916,7 +2147,7 @@ class Driver:
                     h["status"] = "potential"
                     h["potential_note"] = why
                     self.stats["potentials"] = self.stats.get("potentials", 0) + 1
-            except Exception:
+            except Exception:  # satisfiability query failed: the hypothesis is simply not marked potential
                 pass
             return
         if len(h["solutions"]) >= 3:
@@ -1963,7 +2194,7 @@ class Driver:
     def _ccbse_one(self, func_addr, hs, per):
         try:
             st = self._func_state(func_addr)
-        except Exception:
+        except Exception:  # no entry state constructible for this function: CCBSE skips it
             return
         targets = {h["block"] for h in hs}
         sm = self.p.factory.simulation_manager(st, resilience=(Exception,))
@@ -1998,7 +2229,7 @@ class Driver:
             if not s.solver.satisfiable(extra_constraints=cons):
                 return None
             data = s.solver.eval(self.inp, cast_to=bytes, extra_constraints=cons)
-        except Exception:
+        except Exception:  # solve failed/timed out: this state yields no input
             return None
         if self.spec.get("input_mode") == "arg":
             data = data.split(b"\0")[0]
@@ -2013,7 +2244,7 @@ class Driver:
             if s.history.jumpkind != "Ijk_Call":
                 return
             src = s.history.jump_source
-        except Exception:
+        except Exception:  # state has no usable history: it is not a sink-call entry
             return
         if src is None:
             return
@@ -2075,7 +2306,7 @@ class Driver:
         try:
             dst = self._arg(s, spec[0])
             n = spec[1](lambda i: self._arg(s, i))
-        except Exception:
+        except Exception:  # copy arguments unreadable for this callee: no size check at this call
             return
         if s.solver.symbolic(dst):
             return
@@ -2100,7 +2331,7 @@ class Driver:
             if pick is None:
                 try:
                     pick = s.solver.min(n)
-                except Exception:
+                except Exception:  # n has no minimum (unsat): skip the check, leave this copy unconstrained
                     return
             s.add_constraints(n == pick)
 
@@ -2137,7 +2368,7 @@ class Driver:
         fmt = self._arg(s, FMT_SINKS[h["callee"]])
         try:
             bs, first = self._input_bytes_at(s, fmt)
-        except Exception:
+        except Exception:  # format argument not resolvable to memory: input reach at this sink cannot be judged
             return
         if first is None:
             return
@@ -2166,7 +2397,7 @@ class Driver:
             try:
                 p0 = self._input_bytes_at(s, self._arg(s, path_i))[0]
                 path0 = bytes(s.solver.eval(b) for b in p0 if not b.symbolic).split(b"\0")[0]
-            except Exception:
+            except Exception:  # path argument not readable: treated as a non-shell (empty) path
                 path0 = b""
             if path0.endswith(b"/sh") or path0.endswith(b"/bash") or path0 == b"sh":
                 self._check_shell_arg(s, h, self._arg(s, shell_i))
@@ -2178,7 +2409,7 @@ class Driver:
     def _check_shell_arg(self, s, h, cmd):
         try:
             bs, first = self._input_bytes_at(s, cmd)
-        except Exception:
+        except Exception:  # command argument not resolvable to memory: input reach at this sink cannot be judged
             return
         if first is None:
             return
@@ -2198,7 +2429,7 @@ class Driver:
     def _check_exec_path(self, s, h, pathptr):
         try:
             bs, first = self._input_bytes_at(s, pathptr)
-        except Exception:
+        except Exception:  # path argument not resolvable to memory: input reach at this sink cannot be judged
             return
         if first is None:
             return
@@ -2223,7 +2454,7 @@ class Driver:
         traversal, so it is skipped -- the base prefix is what the attacker is escaping."""
         try:
             bs, first = self._input_bytes_at(s, self._arg(s, OPEN_SINKS[h["callee"]]))
-        except Exception:
+        except Exception:  # path argument not resolvable to memory: input reach at this sink cannot be judged
             return
         if first is None or first == 0:
             return
@@ -2372,6 +2603,16 @@ class Driver:
                 key = f"{type(e.error).__name__}@{e.state.addr:#x}"
                 errs = self.stats.setdefault("errored", {})
                 errs[key] = errs.get(key, 0) + 1
+                # WHERE the path came from (guest blocks, not the Python stack): the evidence that
+                # names the unmodelled pointer behind a jump to 0 (static libc init skipped, ...)
+                try:
+                    _src = list(e.state.history.bbl_addrs)[-3:]
+                    _fk = f"{key}<-{_src[-1]:#x}" if _src else key
+                    _fr = self.stats.setdefault("errored_from", {})
+                    if len(_fr) < 24 or _fk in _fr:
+                        _fr[_fk] = _fr.get(_fk, 0) + 1
+                except Exception:  # noqa: BLE001 -- a state with no history: diagnostics only
+                    pass
                 tr = self.stats.setdefault("errored_trace", {})
                 if key not in tr:       # first traceback per kind: the evidence to fix a model
                     import traceback as _tb
@@ -2382,7 +2623,7 @@ class Driver:
             for e in sm.deadended:
                 try:
                     src = e.history.jump_source or e.history.addr
-                except Exception:
+                except Exception:  # errored state has no history: key it by its own address
                     src = None
                 key = self._fname(self.func_of(src).addr) if src and self.func_of(src) else hex(e.addr)
                 dd = self.stats.setdefault("deadended", {})
@@ -2465,7 +2706,7 @@ class Driver:
             raise
         except self.claripy.errors.ClaripyError:
             self.stats["solver_giveups"] = self.stats.get("solver_giveups", 0) + 1
-        except Exception:
+        except Exception:  # angr raises arbitrary errors on odd divisor ASTs: this division goes unchecked
             pass
 
     def _on_uninit(self, s):
@@ -2486,7 +2727,7 @@ class Driver:
                            f"reaches it on this path", extra=[])
         except Deadline:
             raise
-        except Exception:
+        except Exception:  # violation() failed on this state (solver/memory error): not filed from this path
             pass
 
     def _on_auth(self, s):
@@ -2514,14 +2755,14 @@ class Driver:
                     if s.solver.satisfiable(extra_constraints=[b0 == term]):
                         self.violation(s, "auth-bypass", ins, why, extra=[b0 == term])
                         return
-            except Exception:
+            except Exception:  # degenerate-credential probe failed: fall through to the plain auth-bypass solve below
                 pass
             self.violation(s, "auth-bypass", ins,
                            "the authenticated path is reached; the validator re-runs with a "
                            "randomised secret to confirm the grant does not depend on it", extra=[])
         except Deadline:
             raise
-        except Exception:
+        except Exception:  # violation() failed on this state (solver/memory error): not filed from this path
             pass
 
     def _on_icall(self, s):
@@ -2541,7 +2782,7 @@ class Driver:
                            "object's dynamic type is confused (UBSan vptr)", extra=[])
         except Deadline:
             raise
-        except Exception:
+        except Exception:  # violation() failed on this state (solver/memory error): not filed from this path
             pass
 
     def _on_loop(self, s):
@@ -2572,20 +2813,20 @@ class Driver:
                     return
         except Deadline:
             raise
-        except Exception:
+        except Exception:  # operand/solver error on this loop compare: no resource-exhaustion filed from this path
             pass
 
     def _jump_site(self, s):
         """The program instruction that transferred control here (the indirect call/jump)."""
         try:
             src = s.history.jump_source
-        except Exception:
+        except Exception:  # no jump_source on this state's history: the site is unknown
             return None
         if src is None:
             return None
         try:
             return self.p.factory.block(src).instruction_addrs[-1]
-        except Exception:
+        except Exception:  # source block will not decode: report the block address itself
             return src
 
     def _hijack(self, s):
@@ -2594,7 +2835,7 @@ class Driver:
         site = None
         try:
             site = s.history.jump_source
-        except Exception:
+        except Exception:  # no history on this state: the hijack site is unknown (None)
             pass
         # weaponization re-solve: pin the hijacked instruction pointer to a chosen address (a win
         # function) instead of the marker, so the solved input is a framing-aware ret2win payload.

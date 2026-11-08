@@ -296,21 +296,54 @@ def coverage_stage(ctx) -> dict:
     # allocate without bound and OOM the host -- observed here. So AFL does not fuzz sanitizer
     # builds at all: the sandbox `fuzz`/`directed_fuzz` stages run them under rlimits (memory
     # bounded, crashes still caught as the sanitizer's SIGABRT), which is safe and effective.
+    _plain = None
     if aflpp.is_sanitizer_build(_blob):
+        # The UNINSTRUMENTED build of the same source, when ingest made one: AFL fuzzes THAT, and
+        # every crash it finds is replayed by root_cause/build_poc against the sanitizer build,
+        # which is what classifies and verifies it -- so nothing is believed on the plain build's
+        # word alone.
+        from ..poc.capture import plain_build_bytes
+        _plain = plain_build_bytes(ctx, target)
+        # The "plain" build must ACTUALLY be uninstrumented. A source project is built in place, so a
+        # prior sanitizer build can leave objects/binaries the plain build relinks -- handing us a
+        # sanitizer ELF mislabelled as plain. Fuzzing THAT under AFL/qemu reserves the ~20 TB ASan
+        # shadow and OOM-kills the host (measured on unzip: a 24 GB scope OOM in coverage_fuzz).
+        # Verify, and refuse it if it is sanitizer-instrumented -- the sandbox path covers the
+        # sanitizer build under rlimits, so nothing is lost but the host OOM.
+        if _plain is not None and aflpp.is_sanitizer_build(_plain):
+            ctx.emit("coverage.build_choice", payload={
+                "build": "rejected", "note": "the 'plain' build was sanitizer-instrumented (a "
+                "shared-tree in-place rebuild inherited the sanitizer objects); not fuzzed under "
+                "AFL/qemu (its ~20 TB shadow OOM-kills the host). The sandbox fuzzers cover it."})
+            _plain = None
+    if aflpp.is_sanitizer_build(_blob) and _plain is None:
         note = ("sanitizer build: not fuzzed under AFL (its shadow memory is incompatible with "
-                "AFL's memory model). The sandbox fuzzers cover it under rlimits.")
+                "AFL's memory model) and no uninstrumented build of the source was available. "
+                "The sandbox fuzzers cover it under rlimits.")
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
                                            "sanitizer": True, "note": note})
         ctx.progress(pct=100, msg="sanitizer build — fuzzed by the sandbox path instead")
         return {}
     ctx.content.stage_target(target, exe.parent, exe.name)   # + bundled loader/libc, if any
+    if _plain is not None:
+        exe.write_bytes(_plain)
+        exe.chmod(0o755)
+        ctx.emit("coverage.build_choice", payload={
+            "build": "uninstrumented", "note": "AFL fuzzes the plain build of the same source; "
+            "crashes are replayed on the sanitizer build to be classified and verified"})
 
     # seed corpus for AFL's input dir. A coverage-guided campaign is only as good as the seed it
     # starts from: format-aware seeds (a valid jpeg/gif/config sample built from the binary's own
     # strings) get AFL INSIDE the parser instead of bouncing off its front door, which is the whole
     # difference between the 0.7% edge coverage a blind seed reaches and a campaign that climbs.
     seeds = [base64.b64decode(x) for x in p.get("seeds", [])]
+    # The operator's --seed files and the seeds mined from a source tree arrive as `seed_files`,
+    # which this stage never read: the autopilot scoped them to coverage_fuzz and AFL started from
+    # format guesses anyway -- on jhead, without the three real camera JPEGs the operator supplied.
+    from .stage import _load_external_seeds
+    seeds += [s for s in _load_external_seeds({"seed_files": p.get("seed_files"),
+                                               "seed_dir": p.get("seed_dir")}) if s]
     seeds += format_aware_seeds(ctx, target)
     seeds += list(_DEFAULT_SEEDS)
     seen, uniq = set(), []                       # dedupe, keep order (format seeds first)
@@ -402,10 +435,28 @@ def coverage_stage(ctx) -> dict:
     if not _dep_ok:
         ctx.emit("coverage.deps", payload={"resolved": False, "note": _dep_why})
         ctx.progress(msg="missing shared libraries — the handshake will fail until they are supplied")
+    # QASan lane (binary-only memory oracle): on an x86-64 dynamically linked, non-sanitizer
+    # target, run the campaign under QEMU-ASan so heap errors that do not crash natively stop the
+    # target. Measured on the shipped gif2rgb: 2 min under QASan surfaced the DumpScreen2RGB
+    # colormap over-read (CVE-2016-3977 group) that native fuzzing can never see.
+    _qasan_on = False
+    if afl_path and use_qemu and p.get("qasan", True) and _plain is None:
+        try:
+            from ..dynamic import qasan as _qasan
+            _ok, _why = _qasan.applicable(exe.read_bytes(), target.arch)
+            if _ok:
+                _lib = _qasan._locate()[1] / "libqasan.so"
+                _dst = Path(afl_path) / "libqasan.so"
+                if not _dst.exists():
+                    _dst.symlink_to(_lib)
+                _qasan_on = True
+            ctx.emit("coverage.qasan", payload={"enabled": _qasan_on, "note": _why or None})
+        except Exception:                                    # noqa: BLE001 -- the lane is additive
+            observe.absorbed(_log, "qasan lane unavailable")
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
                               mode=mode, qemu=use_qemu, argv_template=argv_template,
                               input_file=input_file, qemu_ld_prefix=_ld_prefix,
-                              converge=bool(p.get("converge")))
+                              converge=bool(p.get("converge")), qasan=_qasan_on)
     # How contained the campaign was. A degraded (unsandboxed) run is reported at warn level --
     # coverage fuzzing still happened, but the operator must be able to see it ran unconfined.
     _iso = getattr(proc, "isolation", None)
@@ -516,6 +567,7 @@ def coverage_stage(ctx) -> dict:
                          base_argv=replay_argv, blocks=cover_blocks,
                          endianness=target.endianness, bits=target.bits)[1]
 
+    _qasan_cands: list = []
     for data in raw:
         if ctx.should_cancel():
             break
@@ -523,6 +575,7 @@ def coverage_stage(ctx) -> dict:
         alog.record_result(data, res, phase="afl-crash",
                            note=None if res.crashed else "AFL saved it as a crash; did not reproduce here")
         if not res.crashed:
+            _qasan_cands.append(data)                 # maybe a QASan-only memory error
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
         defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
@@ -570,14 +623,33 @@ def coverage_stage(ctx) -> dict:
             fault_pc=res.fault_pc, discriminator=defect_key, hijack=hj))
         confirmed += 1
 
+    if _qasan_on:
+        try:
+            _qasan_cands += [f.read_bytes() for f, _m in aflpp.saved_entries(out_dir, "hangs")][:40]
+            confirmed += qasan_pass(ctx, target, exe, _qasan_cands, mode=mode, argv=replay_argv,
+                                    suffix=suffix, exec_timeout=exec_timeout, origin="coverage_fuzz")
+        except Exception:                                    # noqa: BLE001 -- additive lane
+            observe.absorbed(_log, "qasan replay pass failed")
     # Uninitialized-read pass (CWE-457): detonate the corpus against the MSan build if one exists.
     try:
         _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
     except Exception:
         observe.absorbed(_log, "continuing")
+    # keep the queue AFL built (the inputs that reached new code) for the finding resolver
+    try:
+        from . import corpus_keep
+        corpus_keep.keep(ctx, target, (pth.read_bytes() for pth, _m in aflpp.saved_entries(out_dir, "queue")),
+                         source="coverage_fuzz", mode=mode, argv=list(replay_argv or ()))
+    except Exception:                                        # noqa: BLE001 -- a convenience
+        observe.absorbed(_log, "could not keep the AFL corpus")
+    _asserts: list = []
     _att = _log_afl_campaign(ctx, alog, out_dir, stats, exe=exe, mode=mode, target=target,
                              replay_argv=replay_argv, exec_timeout=exec_timeout,
-                             seconds=seconds, workfile=workfile)
+                             seconds=seconds, workfile=workfile, assert_cands=_asserts)
+    if _asserts:
+        _file_afl_assertions(ctx, target, fd, exe=exe, mode=mode, workfile=workfile,
+                             exec_timeout=exec_timeout, replay_argv=replay_argv, seeds=seeds,
+                             cands=_asserts, plain=_plain is not None)
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
                                        "unique": len(seen_crashes), "confirmed": confirmed,
                                        "attempts": _brief(_att), "isolation": _iso})
@@ -601,6 +673,80 @@ def coverage_stage(ctx) -> dict:
     return {"output_shas": [sha], "output_kind": "fuzz-summary"}
 
 
+_QASAN_TITLES = {"heap-buffer-overflow": "Heap buffer {acc}", "heap-use-after-free": "Use after free",
+                 "double-free": "Double free", "invalid-free": "Invalid free",
+                 "stack-buffer-overflow": "Stack buffer overflow",
+                 "global-buffer-overflow": "Global buffer overflow"}
+
+
+def qasan_pass(ctx, target, exe, inputs, *, mode, argv, suffix, exec_timeout, origin,
+               max_runs: int = 40, deadline_s: float = 120.0) -> int:
+    """Replay candidate inputs under QASan and file every DISTINCT memory error it demonstrates.
+
+    `inputs` are what a native replay could not show: AFL crashes that did not reproduce natively and
+    AFL hangs (QASan's report path can spin, so AFL files many detections as hangs). Each accepted
+    report is execution-demonstrated by a shadow-memory oracle with forgery checks (dynamic.qasan),
+    so the finding is `confirmed`; it is not poc-backed (no reproducer bundle is built here).
+    Distinct = (class, access, in-target site). Bounded by max_runs / deadline_s. Returns #filed."""
+    import time as _t
+    from ...db.dao import FunctionDAO
+    from ..dynamic import qasan
+    fd, dd = FindingDAO(ctx.conn), DynResultDAO(ctx.conn)
+    blob = Path(exe).read_bytes()
+    funcs = sorted(((int(f.addr, 16) if str(f.addr).startswith("0x") else int(f.addr)), f)
+                   for f in FunctionDAO(ctx.conn).list_by_target(target.id) if f.addr)
+    t_end = _t.monotonic() + deadline_s
+    seen, filed, runs = set(), 0, 0
+    for data in inputs:
+        if runs >= max_runs or _t.monotonic() > t_end or ctx.should_cancel():
+            break
+        runs += 1
+        rep = qasan.run(exe, data, argv=list(argv or ()), mode=mode,
+                        timeout=max(6.0, 3 * exec_timeout), input_suffix=suffix or "")
+        if rep is None:
+            continue
+        key = (rep.kind, rep.access, rep.site_off)
+        if key in seen:
+            continue
+        seen.add(key)
+        va = qasan.site_va(rep, blob)
+        fn = None
+        if va is not None:
+            for a, f in funcs:
+                if a <= va < a + max(int(f.size or 0), 1):
+                    fn = f
+                    break
+        acc = (rep.access or "").lower()
+        title = _QASAN_TITLES.get(rep.kind, f"Memory error ({rep.kind})").format(
+            acc="over-read" if acc == "read" else "over-write" if acc == "write" else "overflow")
+        # name: the recovered function, else the symbol QASan printed for the in-target frame
+        sym = next((n for n, mod, off in rep.frames if n and off == rep.site_off), None)
+        name = (fn.name if fn and fn.name else None) or sym
+        where = f" in {name}" if name else ""
+        input_sha = ctx.put_artifact("afl-crash-input", data=data)
+        dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
+                  input_mode=mode, argv=list(argv or []), signal=None, signal_name="QASAN",
+                  crashed=True, isolation="qasan", duration_ms=None,
+                  note=rep.summary(), fault_pc=va,
+                  defect_key=f"qasan:{rep.kind}:{rep.access}:{rep.site_off}")
+        fd.upsert(target.id, target.case_id, {
+            "cwe": rep.cwe, "title": f"{title}{where} (QASan-demonstrated)",
+            "severity": "high" if rep.access == "WRITE" or rep.kind != "heap-buffer-overflow" else "medium",
+            "state": "confirmed", "confidence": 0.9, "detector": "qasan",
+            "dedup_key": f"{rep.cwe}:qasan:{rep.kind}:{rep.access}:{rep.site_off}",
+            "function_addr": fn.addr if fn else None,
+            "site_addr": hex(va) if va is not None else None,
+            "evidence": [{"channel": "qasan", "detail": f"{rep.summary()} -- found by {origin}; the "
+                                                         f"native binary does not crash on it"},
+                         {"channel": "qasan-input", "detail": f"input {input_sha[:12]} via {mode}"},
+                         {"channel": "qasan-report", "detail": rep.raw[:1500]}]})
+        filed += 1
+    ctx.emit("coverage.qasan_replay", payload={"candidates": len(inputs), "runs": runs,
+                                               "filed": filed,
+                                               "kinds": sorted({k[0] for k in seen})})
+    return filed
+
+
 def _brief(att: dict) -> dict:
     return {k: (att or {}).get(k) for k in ("counts", "verdict", "verdict_note", "value", "log")}
 
@@ -608,8 +754,43 @@ def _brief(att: dict) -> dict:
 _QUEUE_REPLAY_CAP = 300           # saved inputs replayed through our runner, at most
 
 
+def _file_afl_assertions(ctx, target, fd, *, exe, mode, workfile, exec_timeout, replay_argv,
+                         seeds, cands, plain: bool) -> int:
+    """Verify reachable assertions AFL's queue tripped and file them (CWE-617), with the same
+    differential the black-box campaign uses: the input asserts again ALONE with the same message,
+    and a benign seed runs without it. Returns how many were filed."""
+    from .stage import _file_assertion, _verify_assertion, assertion_message
+    control = None
+    for sd in seeds[:16]:
+        try:
+            _a, r = run_input(exe, mode, workfile, exec_timeout, target.arch, sd,
+                              base_argv=list(replay_argv), endianness=target.endianness,
+                              bits=target.bits)
+        except Exception:                                # noqa: BLE001 -- try the next seed
+            continue
+        if not r.crashed and not r.timed_out and not assertion_message(r.stderr):
+            control = (sd, list(replay_argv), False)
+            break
+    if control is None:
+        return 0                                         # no differential possible: file nothing
+    filed = 0
+    for data, msg in cands[:2]:
+        res = _verify_assertion(exe, mode, workfile, exec_timeout, target,
+                                (data, list(replay_argv), False, msg), control)
+        if res is None:
+            continue
+        try:
+            _file_assertion(ctx, target, fd, mode=mode, data=data, prefix=list(replay_argv),
+                            res=res, msg=msg + (" [uninstrumented build]" if plain else ""),
+                            detector="coverage_fuzz")
+            filed += 1
+        except Exception:                                # noqa: BLE001 -- advisory
+            observe.absorbed(_log, "AFL assertion not filed")
+    return filed
+
+
 def _log_afl_campaign(ctx, alog, out_dir, stats, *, exe, mode, target, replay_argv, exec_timeout,
-                      seconds, workfile) -> dict:
+                      seconds, workfile, assert_cands: list | None = None) -> dict:
     """Fold what AFL kept into the attempt log and finish it. Never raises (advisory).
 
     * every queue entry (the corpus: imported seeds + inputs AFL kept for new coverage), with
@@ -644,6 +825,15 @@ def _log_afl_campaign(ctx, alog, out_dir, stats, *, exe, mode, target, replay_ar
                 alog.record_result(d, r, phase="afl-queue", note=m.get("op") or
                                    ("seed" if "orig" in m else None))
                 replayed += 1
+                # A queue entry that trips the program's own consistency check: md4c's MD_ASSERT
+                # prints and exit(1)s, which AFL does not save as a crash at all -- this replay is
+                # the only place the campaign ever sees it (see fuzz.stage.assertion_message).
+                if assert_cands is not None and len(assert_cands) < 4 and not r.crashed \
+                        and not r.timed_out and r.exit_code not in (0, None):
+                    from .stage import assertion_message
+                    _am = assertion_message(r.stderr)
+                    if _am and all(c[1] != _am for c in assert_cands):
+                        assert_cands.append((d, _am))
             batch.clear()
 
         for f, meta in queue:

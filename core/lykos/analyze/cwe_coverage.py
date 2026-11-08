@@ -35,18 +35,26 @@ CEILING: dict[str, str] = {
     "CWE-123": "rce", "CWE-134": "rce", "CWE-416": "rce", "CWE-415": "rce", "CWE-843": "rce",
     "CWE-190": "rce", "CWE-191": "rce", "CWE-680": "rce", "CWE-131": "rce", "CWE-193": "rce",
     "CWE-824": "rce", "CWE-763": "rce", "CWE-562": "rce", "CWE-825": "rce",
+    # invalid / mismatched / non-start free -> tcache-poison / fastbin-dup -> control (chain double_free)
+    "CWE-590": "rce", "CWE-762": "rce", "CWE-761": "rce",
+    # a negative size parameter wraps to an undersized/over-long allocation or copy -> heap overflow
+    # -> control (chain_primitive heap_overflow); detonation-gated, so a DoS-only case stays honest.
+    "CWE-1284": "rce",
     # hard-coded / recoverable secrets -> authentication (a usable credential)
     "CWE-798": "logic", "CWE-321": "logic", "CWE-259": "logic",
     # reads / disclosure -> leak
     "CWE-125": "leak", "CWE-126": "leak", "CWE-127": "leak", "CWE-200": "leak", "CWE-209": "leak",
     "CWE-201": "leak", "CWE-212": "leak", "CWE-457": "leak", "CWE-908": "leak", "CWE-522": "leak",
     "CWE-203": "leak", "CWE-643": "leak", "CWE-786": "leak", "CWE-788": "leak",
-    "CWE-129": "primitive", "CWE-823": "primitive", "CWE-822": "primitive", "CWE-119": "primitive",
+    # array-index / pointer-offset / indirect-call-through-field write primitives that the chain
+    # engine drives to a detonation-confirmed control-flow hijack (oob_construct / _oob_write_hijack /
+    # the heap_overflow branch). CWE-119 stays the honest generic-bounds primitive (read-or-write
+    # unknown, no specific write primitive).
+    "CWE-129": "rce", "CWE-823": "rce", "CWE-822": "rce", "CWE-119": "primitive",
     # availability -> dos
     "CWE-476": "dos", "CWE-617": "dos", "CWE-835": "dos", "CWE-400": "dos", "CWE-770": "dos",
     "CWE-369": "dos", "CWE-674": "dos", "CWE-401": "dos", "CWE-789": "dos", "CWE-248": "dos",
     "CWE-252": "dos", "CWE-690": "dos", "CWE-833": "dos", "CWE-409": "dos", "CWE-776": "dos",
-    "CWE-590": "dos", "CWE-761": "dos", "CWE-762": "dos",
     # logic / auth / crypto / traversal -> the finding is the impact
     "CWE-22": "logic", "CWE-23": "logic", "CWE-59": "logic", "CWE-79": "logic", "CWE-20": "logic",
     "CWE-287": "logic", "CWE-306": "logic", "CWE-862": "logic", "CWE-863": "logic",
@@ -61,6 +69,9 @@ CEILING: dict[str, str] = {
 
 #: The confidence ladder, ordered, so a run's "best state reached" for a class is comparable.
 _STATE_ORDER = {"candidate": 0, "corroborated": 1, "confirmed": 2, "poc-backed": 3}
+#: The PoC LEVEL ladder (L0 recipe .. L3 validated impact), so "best level reached" per class is
+#: comparable -- the per-CWE scorecard that makes "every class to L3" a tracked number, not a claim.
+_LEVEL_ORDER = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
 _CEILING_WORD = {"rce": "code/command execution", "primitive": "corruption primitive",
                  "leak": "information disclosure", "dos": "denial of service",
                  "logic": "logic / auth / crypto impact"}
@@ -90,31 +101,58 @@ def capability_matrix() -> list:
     return out
 
 
-def run_matrix(findings) -> dict:
-    """How far each CWE class that APPEARED in this run was carried: per class, the count and the
-    best confidence state reached, plus its ceiling. `findings` are serialized dicts or rows with
-    `.cwe`/`.state` (or ["cwe"]/["state"]). Deduplicated by (cwe, dedup_key)."""
+def _get(o, k):
+    return (o.get(k) if isinstance(o, dict) else getattr(o, k, None))
+
+
+def run_matrix(findings, pocs=None) -> dict:
+    """How far each CWE class that APPEARED in this run was carried: per class, the count, the best
+    confidence state reached, its ceiling, and -- when `pocs` is given -- the best PoC LEVEL
+    (L0..L3) reached for the class. `findings` are serialized dicts or rows with `.cwe`/`.state`
+    (and, for the level join, `.id`); `pocs` are PoC rows/dicts with `.level` and `.finding_id`.
+    Deduplicated by (cwe, dedup_key).
+
+    The per-class best_level is the scorecard that makes 'every class to L3' a tracked number: a
+    PoC's rung is a FACT (a verified reproduction at L1, a primitive at L2, a demonstrated impact at
+    L3), joined to its finding's class, so `l3_classes` counts the classes actually driven to a
+    validated impact this run -- distinct from best_state (the confidence rung of the finding)."""
     seen: set = set()
     by_cwe: dict = {}
+    fid2cwe: dict = {}
     for f in findings:
-        cwe = (f.get("cwe") if isinstance(f, dict) else getattr(f, "cwe", None)) or "(none)"
-        state = (f.get("state") if isinstance(f, dict) else getattr(f, "state", None)) or "candidate"
-        key = (f.get("dedup_key") if isinstance(f, dict) else getattr(f, "dedup_key", None))
+        cwe = _get(f, "cwe") or "(none)"
+        state = _get(f, "state") or "candidate"
+        key = _get(f, "dedup_key")
+        fid = _get(f, "id")
+        if fid is not None:
+            fid2cwe[fid] = cwe
         k = (cwe, key)
         if key and k in seen:
             continue
         seen.add(k)
         e = by_cwe.setdefault(cwe, {"cwe": cwe, "name": CWE_NAMES.get(cwe, (cwe, ""))[0],
                                     "count": 0, "best_state": "candidate",
-                                    "ceiling": weaponizable(cwe)})
+                                    "best_level": None, "ceiling": weaponizable(cwe)})
         e["count"] += 1
         if _STATE_ORDER.get(state, 0) > _STATE_ORDER.get(e["best_state"], 0):
             e["best_state"] = state
+    # LEVEL join: a PoC's level counts for the class of the finding it backs. A PoC with no
+    # finding_id (an orphan) or an unknown level is ignored rather than guessed.
+    for p in (pocs or []):
+        cwe = fid2cwe.get(_get(p, "finding_id"))
+        lvl = _get(p, "level")
+        if cwe is None or lvl not in _LEVEL_ORDER or cwe not in by_cwe:
+            continue
+        e = by_cwe[cwe]
+        if e["best_level"] is None or _LEVEL_ORDER[lvl] > _LEVEL_ORDER[e["best_level"]]:
+            e["best_level"] = lvl
     rows = sorted(by_cwe.values(), key=lambda e: (-e["count"], e["cwe"]))
     demonstrated = [e for e in rows if _STATE_ORDER.get(e["best_state"], 0) >= 2]
+    l3 = [e["cwe"] for e in rows if e["best_level"] == "L3"]
     return {"schema": "lykos.cwe-coverage/1", "classes_present": len(rows), "rows": rows,
             "demonstrated_classes": len(demonstrated),
-            "rce_capable_present": [e["cwe"] for e in rows if e["ceiling"] == "rce"]}
+            "rce_capable_present": [e["cwe"] for e in rows if e["ceiling"] == "rce"],
+            "l3_classes": l3, "l3_class_count": len(l3)}
 
 
 def summary() -> dict:
@@ -159,13 +197,18 @@ def format_report(run: dict | None = None) -> str:
         if not run["rows"]:
             out.append("  (no findings)")
         else:
-            out.append(f"  {'CWE':<10} {'best state':<13} {'ceiling':<10} count  name")
+            out.append(f"  {'CWE':<10} {'best state':<13} {'level':<6} {'ceiling':<10} count  name")
             for e in run["rows"]:
                 ceil = e["ceiling"] or "-"
-                out.append(f"  {e['cwe']:<10} {e['best_state']:<13} {ceil:<10} "
+                lvl = e.get("best_level") or "-"
+                out.append(f"  {e['cwe']:<10} {e['best_state']:<13} {lvl:<6} {ceil:<10} "
                            f"{e['count']:>5}  {e['name']}")
             out.append("")
             out.append(f"  classes present: {run['classes_present']}   "
                        f"carried to confirmed/poc: {run['demonstrated_classes']}   "
                        f"RCE-capable classes present: {len(run['rce_capable_present'])}")
+            if "l3_class_count" in run:
+                l3 = run["l3_classes"]
+                out.append(f"  classes driven to a validated L3 impact: {run['l3_class_count']}"
+                           + (f"  ({', '.join(l3)})" if l3 else ""))
     return "\n".join(out)

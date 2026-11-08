@@ -246,7 +246,8 @@ def input_suffix(seeds) -> str:
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None,
                  cmplog: Optional[Path] = None, argv_template=None, input_file=None,
-                 qemu_ld_prefix: Optional[str] = None, converge: bool = False):
+                 qemu_ld_prefix: Optional[str] = None, converge: bool = False,
+                 qasan: bool = False):
     # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
     # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
     # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
@@ -269,7 +270,10 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
     # several times slower than native, and AFL's default calibration timeout marks it "too slow"
     # and can abort the whole run. `<ms>+` keeps going and skips the slow entries instead of
     # failing. Native (instrumented) runs keep AFL's own auto-calibration.
-    tmout = ["-t", "5000+"] if qemu else []
+    # Under QASan a detection often SPINS until the per-exec timeout (its report path does not
+    # exit), so every hit costs a full timeout: measured on gif2rgb, 23 timeouts x 5 s ate 115 s of
+    # a 120 s campaign. 2 s keeps detections cheap; `+` still skips genuinely slow entries.
+    tmout = (["-t", "2000+"] if qasan else ["-t", "5000+"]) if qemu else []
     cmd = [str(afl)] + (["-Q"] if qemu else []) + tmout + ffile + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
     env = dict(os.environ)
@@ -295,6 +299,12 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         # target (per-exec timeout -> the input is marked a hang and skipped), so "stuck" is covered
         # natively. setdefault keeps an operator's explicit env.
         env.setdefault("AFL_EXIT_WHEN_DONE", "1")
+    if qemu and qasan:
+        # QEMU-AddressSanitizer: libqasan.so (staged into AFL_PATH by the caller) shadows the
+        # guest heap, so a silent over-read / small over-write / UAF -- invisible to a native run --
+        # stops the target. NOTE: QASan's report path can spin instead of dying, so AFL files many
+        # detections as HANGS, not crashes; the caller replays hangs through dynamic.qasan.
+        env["AFL_USE_QASAN"] = "1"
     if qemu:
         # Input-to-state (COMPCOV): the qemu tracer instruments comparisons and splits multi-byte
         # ones, so AFL learns the magic value / checksum / length a branch demands and reaches code a
@@ -358,7 +368,8 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
             proc = subprocess.Popen(cmd, env=env, stdout=_o, stderr=_e,
                                     start_new_session=True)
             try:
-                rc = proc.wait(timeout=int(seconds) + 90)
+                rc = _wait_reporting(proc, out_dir, o_path, int(seconds) + 90,
+                                     qasan=qasan, qemu=qemu)
                 overran = False
             except subprocess.TimeoutExpired:
                 _sandbox.kill_quietly(proc)
@@ -557,6 +568,55 @@ def campaign_failed(proc) -> Optional[str]:
     if proc.returncode not in (0, None):
         return f"afl-fuzz exited {proc.returncode}"
     return None
+
+
+def _wait_reporting(proc, out_dir, out_path, timeout: int, *, qasan=False, qemu=True) -> int:
+    """`proc.wait(timeout)` that, once a second while the campaign runs, feeds the live run
+    console (jobs/runlog) this campaign's window: AFL's own fuzzer_stats + its last output lines.
+    Raises subprocess.TimeoutExpired exactly as proc.wait would."""
+    import time as _time
+
+    from ...jobs import runlog
+    engine = "AFL++" + (" QEMU" if qemu else "") + (" + QASan" if qasan else "")
+    t_end = _time.time() + timeout
+    while True:
+        try:
+            rc = proc.wait(timeout=1.0)
+            break
+        except subprocess.TimeoutExpired:
+            if _time.time() >= t_end:
+                raise
+            if runlog.current() is not None:
+                runlog.fuzz(engine, **_live_stats(out_dir, out_path, "running"))
+    if runlog.current() is not None:
+        runlog.fuzz(engine, final=True, **_live_stats(out_dir, out_path, f"exited {rc}"))
+    return rc
+
+
+def _live_stats(out_dir, out_path, status: str) -> dict:
+    st = campaign_stats(out_dir)
+    lines = []
+    try:
+        raw = Path(out_path).read_bytes()[-4096:].decode("utf-8", "replace")
+        import re as _re
+        raw = _re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw)       # strip ANSI
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()][-6:]
+    except OSError:
+        pass
+
+    def _num(k):
+        v = st.get(k)
+        try:
+            return float(v) if v is not None and "." in str(v) else (int(v) if v is not None else None)
+        except ValueError:
+            return None
+    return {"status": status, "execs": _num("execs_done"), "eps": _num("execs_per_sec"),
+            "cov": _num("edges_found"), "cov_label": "edges",
+            "crashes": _num("saved_crashes") if st.get("saved_crashes") is not None
+            else _num("unique_crashes"),
+            "hangs": _num("saved_hangs") if st.get("saved_hangs") is not None
+            else _num("unique_hangs"),
+            "corpus": _num("corpus_count"), "out": lines}
 
 
 def campaign_stats(out_dir) -> dict:

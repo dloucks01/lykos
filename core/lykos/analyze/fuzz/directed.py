@@ -431,12 +431,17 @@ def directed_stage(ctx) -> dict:
     # Staged under the name the image dispatches on, when it has one: a directed campaign
     # against a busybox called `target.bin` reaches "applet not found" and nothing else.
     from ..invocation import exec_name_for
+    _kept: list = []
     st = fuzz_campaign(ctx, target, corpus=corpus, dictionary=plan["dictionary"], mode=mode,
                        max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
                        rng=rng, detector="directed_fuzz", event_prefix="directed",
                        note_prefix=note_prefix, mutator=mutator, cover_blocks=blocks,
-                       block_dist=bdist,
+                       block_dist=bdist, kept_sink=_kept,
                        exe_name=exec_name_for(ctx.content.path(target.sha256).read_bytes()))
+    if (ctx.params or {}).get("qasan", True) and not st.get("crashes"):
+        # directed inputs are aimed at the static sinks: exactly where a silent heap error sits
+        from .stage import qasan_sweep
+        qasan_sweep(ctx, target, _kept, exec_timeout=exec_timeout, origin="directed")
     hit, known = st.get("blocks_hit", 0), st.get("blocks_known", 0)
     summary = {"backend": "directed", "execs": st.get("execs", 0), "crashes": st.get("crashes", 0),
                "directed": bool(plan["directed"]),

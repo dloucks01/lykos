@@ -36,12 +36,23 @@ class AutopilotMixin:
         # the web path is `seed_shas` (seeds uploaded into THIS case, resolved in _start_autopilot).
         out.pop("seed_files", None)
         out.pop("seed_dir", None)
+        # `sysroot` is a server directory too (it becomes QEMU_LD_PREFIX, set process-wide): the
+        # same CLI-only rule. On the server it comes from LYKOS_QEMU_SYSROOT / the CLI; from the
+        # browser it is `sysroot_sha` (an archive uploaded into the case, api/sysroot.py).
+        out.pop("sysroot", None)
         av = out.get("argv")
         if isinstance(av, str):
             try:
                 out["argv"] = shlex.split(av)
             except ValueError:
                 out.pop("argv", None)                    # unbalanced quotes: ignore rather than 500
+        # a format spec is a JSON list of fields (POST /format/analyze's shape); anything else,
+        # or an oversized one, is dropped rather than handed to the fuzzer
+        fmt = out.get("format")
+        if fmt is not None:
+            import json as _json
+            if not isinstance(fmt, list) or not fmt or len(_json.dumps(fmt)) > 65536:
+                out.pop("format", None)
         im = out.get("input_mode")
         if im not in ("stdin", "arg", "file", "env", "none"):
             out.pop("input_mode", None)                  # "auto"/blank/garbage -> let discovery decide
@@ -71,6 +82,14 @@ class AutopilotMixin:
             seed_paths, err = self._resolve_seed_shas(cid, _over.get("seed_shas"))
             if err:
                 return self._json({"error": err}, 400)
+        # Target libraries (the GUI's LYKOS_QEMU_SYSROOT): the hash of an archive uploaded into
+        # THIS case, resolved to its extracted directory here. A raw `sysroot` path from the
+        # browser is still dropped by _normalize_overrides; an unknown hash is refused.
+        sysroot_path = None
+        if _over.get("sysroot_sha"):
+            sysroot_path, err = self._resolve_sysroot_sha(cid, _over.get("sysroot_sha"))
+            if err:
+                return self._json({"error": err}, 400)
         target_ids = body.get("target_ids")
         if target_ids:
             # A string here was iterated per CHARACTER into "target ids", and an id from ANOTHER
@@ -84,6 +103,8 @@ class AutopilotMixin:
             target_ids = list(dict.fromkeys(target_ids))           # de-dupe, keep order
         else:
             target_ids = in_case
+        # a strict subset is a CHOICE (the GUI's target checkboxes): run exactly those
+        only_handed = bool(body.get("target_ids")) and set(target_ids) != set(in_case)
         if not target_ids:
             return self._json({"error": "no targets to analyse"}, 400)
         with AutopilotMixin._AUTOPILOTS_LOCK:
@@ -107,6 +128,11 @@ class AutopilotMixin:
             if over:
                 over = self._normalize_overrides(over)
                 over.pop("seed_shas", None)
+                over.pop("sysroot_sha", None)
+            if sysroot_path:
+                over = dict(over or {})
+                over["sysroot"] = sysroot_path
+                status["sysroot_sha"] = str(_over.get("sysroot_sha")).lower()
             if seed_paths:
                 over = dict(over or {})
                 over["seed_files"] = seed_paths
@@ -116,7 +142,10 @@ class AutopilotMixin:
             # allowlist so a malformed request cannot skip triage/disassembly and hollow out the run;
             # the search/prove stages can be dropped without breaking the rest (the ladder just has
             # fewer crash sources). `skip_stages: ["fuzz"]` is "uncheck black-box fuzzing".
-            _skippable = {"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer", "concolic"}
+            # The search stages: every sampler (what the CLI's --no-fuzz drops -- incl. the
+            # network / environment / IPC-boundary campaigns) plus the concolic solver.
+            from ..analyze.budget import SAMPLER_STAGES
+            _skippable = set(SAMPLER_STAGES) | {"concolic"}
             raw_skip = body.get("skip_stages")
             skip_stages = (sorted(_skippable & {str(s) for s in raw_skip})
                            if isinstance(raw_skip, list) else [])
@@ -128,6 +157,7 @@ class AutopilotMixin:
                 target=orchestrate.run_case_autopilot,
                 args=(self.server.case_dir, cid, target_ids, status, stop, secs, over, converge,
                       skip_stages, pause),
+                kwargs={"only_handed": only_handed},
                 name=f"autopilot-{cid[:8]}", daemon=True)
             AutopilotMixin._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop,
                                                "pause": pause}
@@ -145,7 +175,12 @@ class AutopilotMixin:
             # json.dumps iterate them mid-mutation -> "dictionary changed size during iteration" 500.
             st = copy.deepcopy(rec["status"])
             st["running"] = rec["thread"].is_alive()
+            # `paused` = a pause was REQUESTED (the run finishes the stage in flight first);
+            # `pause_waiting` = the run is actually parked between stages (orchestrate sets it).
+            st["pause_waiting"] = bool(st.get("paused")) and st["running"]
             st["paused"] = bool(rec.get("pause") and rec["pause"].is_set())
+            # Stop was asked for and the run is still finishing its current stage.
+            st["stopping"] = bool(rec["stop"].is_set()) and st["running"]
         # Server clock, so the UI can show each stage's elapsed time (now - plan[i].started) in the
         # server's own time base -- no client/server clock skew. The elapsed on a running stage is
         # the signal that tells slow-but-working apart from a hang.

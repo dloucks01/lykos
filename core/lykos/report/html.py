@@ -90,6 +90,11 @@ _REMEDIATION = {
                "scrub buffers before they cross the boundary.",
     "CWE-362": "Protect shared state with appropriate locking/atomics; run a thread sanitizer in CI.",
     "CWE-369": "Reject a zero (or INT_MIN/-1) divisor from untrusted input before dividing.",
+    "CWE-758": "Fix the code path the sanitizer reports: an input reaches behaviour the language "
+               "leaves undefined (here, code the authors marked unreachable), which an optimising "
+               "compiler may turn into an arbitrary jump. Handle that input explicitly.",
+    "CWE-617": "Replace the assertion on this path with input validation that rejects the input; an "
+               "assertion reachable from attacker input is a denial of service.",
     "CWE-798": "Remove embedded credentials/keys; load secrets from a managed store or environment "
                "at runtime and rotate the exposed ones.",
     "CWE-295": "Verify the full certificate chain and hostname; never disable validation.",
@@ -188,6 +193,42 @@ _STATE_LEGEND = [
 ]
 #: state order for the summary chips (weakest -> strongest).
 _STATE_ORDER = [k for k, _ in _STATE_LEGEND]
+
+
+def _ceiling_ledger_html(led: dict[str, Any]) -> str:
+    """The weaponization backlog: findings lykos hasn't yet carried to a validated PoC, each with
+    the technique to build next. The mirror of the PoC list -- so a 'clean' area is never read as a
+    clearance, and every such finding stays a named build task, never a wall."""
+    entries = led.get("entries") or []
+    techs = led.get("techniques") or []
+    p = ['<section class="card ledger ceiling-ledger"><h2>Weaponization backlog '
+         '<span class="muted">— techniques to build next</span></h2>',
+         f'<p class="headline tone-medium">{esc(led.get("framing") or "")}</p>',
+         '<p class="muted">The mirror of the demonstrated-PoC list: these defects are real and '
+         'stand. lykos hasn\'t implemented the technique to carry them further yet — each row names '
+         'what to build next. Shipping one technique advances every finding in its group toward a '
+         'PoC. This backlog IS the roadmap; a finding here is not a finding that is safe, and not '
+         'one that is walled off — just one whose technique isn\'t built yet.</p>']
+    if techs:
+        p.append('<div class="evlabel">Techniques to build, by how many findings each advances</div>'
+                 '<ul class="ev">')
+        for c in techs:
+            p.append(f'<li><b>+{c.get("advances")} findings</b> — {esc(c.get("missing_technique") or "")}</li>')
+        p.append('</ul>')
+    p.append('<table class="verdicts ceiling-tab"><thead><tr><th>CWE</th><th>Reach today</th>'
+             '<th>Target</th>'
+             '<th>Finding</th><th>Technique to build next</th></tr></thead><tbody>')
+    for e in entries:
+        p.append('<tr>'
+                 f'<td class="mono">{esc(e.get("cwe") or "")}</td>'
+                 f'<td>{esc(e.get("reached") or "")}</td>'
+                 f'<td>{esc(e.get("would_reach") or "")}</td>'
+                 f'<td>{esc((e.get("title") or "")[:90])}'
+                 f'{" <span class=mono>" + esc(str(e["site"])) + "</span>" if e.get("site") else ""}</td>'
+                 f'<td>{esc(e.get("missing_technique") or "—")}</td>'
+                 '</tr>')
+    p.append('</tbody></table></section>')
+    return "".join(p)
 
 
 def _coverage_ledger_html(led: dict[str, Any]) -> str:
@@ -421,7 +462,15 @@ def to_html(report: dict[str, Any]) -> str:
         parts.append(f'<p class="notes">{esc(case["notes"])}</p>')
     parts.append('</header>')
 
-    # ---- executive summary ----
+    # ---- the engagement narrative (report/dossier.py): what the reader acts on, first ----
+    nar = report.get("narrative")
+    if nar:
+        parts.append(_narrative_html(nar))
+        parts.append('<h2 class="appendix-h">Appendix A &mdash; Technical inventory</h2>'
+                     '<p class="muted">Everything the run recorded, for audit. The sections above '
+                     'are derived from it.</p>')
+
+    # ---- inventory summary ----
     targets = report.get("targets", [])
     verdicts = [(t, _target_verdict(t)) for t in targets]
     # Impact FIRST: the strongest outcome across the whole case, in one sentence, before any count.
@@ -459,7 +508,8 @@ def to_html(report: dict[str, Any]) -> str:
             htone = "medium"
     elif not top_level and any(v.get("engine_health") == "degraded" for _t, v in verdicts):
         headline += " Dynamic analysis was degraded on at least one target (an engine failed)."
-    parts.append('<section class="card"><h2>Executive summary</h2>')
+    parts.append('<section class="card"><h2>' + ("Inventory summary" if nar else
+                                                 "Executive summary") + '</h2>')
     parts.append(f'<p class="headline tone-{htone}">{esc(headline)}</p>')
     # The engagement map (doc 49 Theme 2a) leads the summary: the path from target to proof, with
     # each phase showing what it produced and how far this run got. Trusted, internally-escaped SVG.
@@ -538,6 +588,11 @@ def to_html(report: dict[str, Any]) -> str:
     if led:
         parts.append(_coverage_ledger_html(led))
 
+    # ---- ceiling ledger (the research queue: what we could not yet weaponize) ----
+    cled = report.get("ceiling_ledger")
+    if cled and cled.get("entries"):
+        parts.append(_ceiling_ledger_html(cled))
+
     # ---- time & yield per technique ----
     tm = report.get("timing")
     if tm and (tm.get("techniques") or tm.get("overall")):
@@ -582,6 +637,141 @@ def to_html(report: dict[str, Any]) -> str:
                  f' · {esc(report.get("generated_at"))} · authorized use only</footer>')
     parts.append('</div></body></html>')
     return "".join(parts)
+
+
+def _narrative_html(nar: dict) -> str:
+    """Executive summary, findings at a glance, one dossier per demonstrated vulnerability, the
+    unproven leads (grouped), and scope/method/limitations -- see report/dossier.py."""
+    ex = nar.get("executive") or {}
+    risk = ex.get("risk") or "-"
+    p = ['<section class="card narrative"><h2>1. Executive summary</h2>',
+         f'<p class="headline tone-{esc(risk if risk in _SEV_COLOR else "info")}">Overall risk: '
+         f'{esc(str(risk).upper())}</p>']
+    p += [f"<p>{esc(x)}</p>" for x in ex.get("paragraphs") or []]
+    if ex.get("actions"):
+        p.append('<h3>Recommended actions</h3><ol>'
+                 + "".join(f"<li>{esc(a)}</li>" for a in ex["actions"]) + "</ol>")
+    p.append("</section>")
+
+    dos = [(t, d) for t in nar.get("targets") or [] for d in t.get("dossiers") or []]
+    p.append('<section class="card"><h2>2. Findings at a glance</h2>')
+    if dos:
+        p.append('<table class="htab"><thead><tr><th>#</th><th>Severity</th><th>Vulnerability</th>'
+                 '<th>Proof</th><th>Target</th></tr></thead><tbody>')
+        for i, (t, d) in enumerate(dos, 1):
+            sev = d.get("severity") or "medium"
+            p.append(f'<tr><td>{i}</td><td>{_badge(sev, _SEV_COLOR.get(sev, "#8b8d98"))}</td>'
+                     f'<td><a href="#dossier-{i}">{esc(d.get("title"))}</a></td>'
+                     f'<td>{esc(d.get("level") or "-")} '
+                     f'{"verified" if d.get("verified") else "not verified"}</td>'
+                     f'<td class="mono">{esc(t.get("filename"))}</td></tr>')
+        p.append("</tbody></table>")
+    else:
+        p.append('<p class="muted">No vulnerability was demonstrated by execution.</p>')
+    p.append("</section>")
+
+    p.append('<section class="card"><h2>3. Demonstrated vulnerabilities</h2>')
+    if not dos:
+        p.append('<p class="muted">None in this run.</p>')
+    for i, (t, d) in enumerate(dos, 1):
+        p.append(_dossier_html(i, d, t.get("filename")))
+    p.append("</section>")
+
+    p.append('<section class="card"><h2>4. Unproven leads</h2><p class="muted">Each row is one kind '
+             'of detection, with repeated call sites folded together. None was reproduced by '
+             'execution.</p>')
+    for t in nar.get("targets") or []:
+        leads = t.get("leads") or []
+        api = [g for g in leads if g.get("kind") == "API-use pattern"]
+        rest = [g for g in leads if g not in api]
+        if rest:
+            p.append('<table class="htab"><thead><tr><th>Lead</th><th>Kind</th><th>Why unproven</th>'
+                     '<th>Would prove it</th></tr></thead><tbody>')
+            for g in rest:
+                p.append(f'<tr><td><b>{esc(g.get("title"))}</b><br><span class="muted">'
+                         f'{esc(g.get("cwe") or "")} &middot; {esc(g.get("state"))} &middot; '
+                         f'detector grade {esc(g.get("severity"))}</span></td>'
+                         f'<td>{esc(g.get("kind"))}</td><td>{esc(g.get("why"))}</td>'
+                         f'<td>{esc(g.get("next"))}</td></tr>')
+            p.append("</tbody></table>")
+        if api:
+            p.append(f'<h3>Risky library calls ({sum(g["sites"] for g in api)} call sites)</h3>'
+                     '<p class="muted">Places to look, not vulnerabilities: no path from attacker '
+                     'input to these calls\' arguments was demonstrated.</p><ul>'
+                     + "".join(f'<li>{esc(g.get("title"))} <span class="muted">({esc(g.get("cwe"))}'
+                               f', {g.get("sites")} site(s))</span></li>' for g in api) + "</ul>")
+    p.append("</section>")
+
+    p.append('<section class="card"><h2>5. Scope and method</h2>')
+    for t in nar.get("targets") or []:
+        sc = t.get("scope") or {}
+        p.append(f'<h3 class="mono">{esc(sc.get("target"))}</h3>')
+        p.append(_kv([("Engagement", sc.get("engagement")),
+                      ("Type", (sc.get("type") or "") + (" (stripped)" if sc.get("stripped") else "")),
+                      ("SHA-256", sc.get("sha256")),
+                      ("Invocation", f'{sc.get("invocation")} (input via {sc.get("input_mode")})'),
+                      ("Seeds supplied", ", ".join(sc.get("seeds") or []) or "none"),
+                      ("Mitigations", sc.get("mitigations"))]))
+        if t.get("methodology"):
+            p.append("<h3>What was done</h3><ul>" + "".join(
+                f'<li><b>{esc(m["phase"])}</b> ({m["seconds"]}s): '
+                f'{esc("; ".join(m["techniques"]))}</li>' for m in t["methodology"]) + "</ul>")
+        if t.get("limitations"):
+            p.append("<h3>Limitations</h3><ul>" + "".join(
+                f"<li>{esc(x)}</li>" for x in t["limitations"]) + "</ul>")
+    p.append("</section>")
+    return "".join(p)
+
+
+def _dossier_html(i: int, d: dict, target: str) -> str:
+    sev = d.get("severity") or "medium"
+    why = d.get("severity_why") or ""
+    if d.get("detector_severity") and d["detector_severity"] != sev:
+        why += f' (the detector filed it as {d["detector_severity"]})'
+    p = [f'<div class="finding sev-{esc(sev)}" id="dossier-{i}">',
+         f'<h3>3.{i} {esc(d.get("title"))}</h3>',
+         f'<div class="chips">{_badge(sev, _SEV_COLOR.get(sev, "#8b8d98"))} '
+         f'{_badge((d.get("level") or "-") + (" verified" if d.get("verified") else ""), "#8e4fc7")} '
+         f'{_badge((d.get("cwe") or "") + " " + (d.get("cwe_name") or ""), "#5b6b7d")}</div>',
+         f'<p class="muted">Why this severity: {esc(why)}</p>']
+    if d.get("summary"):
+        p.append(f'<h4>What it is</h4><p>{esc(d["summary"])}</p>')
+    loc = d.get("location") or {}
+    p.append("<h4>Where</h4>" + _kv([("Target", target), ("Function", loc.get("function")),
+                                     ("Faulting address", loc.get("site")),
+                                     ("Faulting instruction", loc.get("instruction")),
+                                     ("Source", loc.get("source")),
+                                     ("Stack", " &larr; ".join(loc.get("stack") or []) or None)]))
+    if d.get("trigger"):
+        p.append("<h4>How it is triggered</h4><ul>"
+                 + "".join(f"<li>{esc(x)}</li>" for x in d["trigger"]) + "</ul>")
+    if d.get("reproduce"):
+        p.append("<h4>Reproduce</h4>")
+        for x in d["reproduce"]:
+            if isinstance(x, dict):
+                p.append(f'<p class="muted">{esc(x.get("note"))}</p>'
+                         f'<pre class="code">{esc(x.get("cmd"))}</pre>')
+            else:
+                p.append(f'<pre class="code">{esc(x)}</pre>')
+    inp = d.get("input")
+    if inp:
+        p.append(f'<h4>Crash input <span class="muted">({inp.get("size")} bytes, sha256 '
+                 f'<span class="mono">{esc(inp.get("sha256"))}</span>)</span></h4>'
+                 f'<pre class="code">{esc(chr(10).join(inp.get("hex") or []))}</pre>')
+    if d.get("evidence"):
+        p.append("<h4>Evidence</h4><ul>" + "".join(f"<li>{esc(x)}</li>" for x in d["evidence"])
+                 + "</ul>")
+    p.append(f'<h4>Impact</h4><p>{esc(d.get("impact"))}</p>')
+    if d.get("escalation"):
+        p.append("<h4>Why it stops at this level</h4><ul>"
+                 + "".join(f"<li>{esc(x)}</li>" for x in d["escalation"]) + "</ul>")
+    if d.get("mitigations"):
+        p.append("<h4>Mitigations in the way of an exploit</h4><ul>"
+                 + "".join(f"<li>{esc(x)}</li>" for x in d["mitigations"]) + "</ul>")
+    if d.get("remediation"):
+        p.append(f'<h4>Remediation</h4><p class="remed">{esc(d["remediation"])}</p>')
+    p.append("</div>")
+    return "".join(p)
 
 
 def _stat(n: Any, label: str) -> str:
@@ -886,8 +1076,12 @@ def _finding_html(f: dict) -> str:
             p.append(f'<li><b>Demonstrated:</b> a verified PoC reached {esc(dl)}</li>')
         if ex.get("ceiling"):
             rr = f' — {esc(ex.get("ceiling_reason"))}' if ex.get("ceiling_reason") else ""
-            p.append(f'<li><b>Ceiling:</b> weaponization reached {esc(ex["ceiling"])} and stopped'
-                     f'{rr}</li>')
+            p.append(f'<li><b>Reach today (lykos\'s tooling, not the target):</b> weaponized to '
+                     f'{esc(ex["ceiling"])} so far{rr}</li>')
+            if ex.get("missing_technique"):
+                p.append(f'<li><b>Technique to build next:</b> {esc(ex["missing_technique"])}</li>')
+            if ex.get("ceiling_framing"):
+                p.append(f'<li class="muted"><b>Note:</b> {esc(ex["ceiling_framing"])}</li>')
         if ex.get("targets_live"):
             p.append(f'<li><b>Against the live target:</b> this recipe targets '
                      f'{esc(ex["targets_live"])}</li>')
@@ -966,7 +1160,8 @@ def _finding_html(f: dict) -> str:
         p.append('<div class="figure reach"><div class="fig-h">Reachable from an input source '
                  '<span class="muted">— control-flow reachability, not verified dataflow</span>'
                  '</div>' + figs["reachability"] + '</div>')
-    ev = f.get("evidence", [])
+    from .dossier import compact_evidence
+    ev = compact_evidence(f.get("evidence", []))
     if ev:
         p.append('<div class="evlabel">Evidence trail</div><ul class="ev">')
         for e in ev:
@@ -987,7 +1182,12 @@ def _finding_html(f: dict) -> str:
         p.append('<div class="evlabel">Proof-of-Concept</div><div class="pocs">')
         for pc in pocs:
             lvl = pc.get("level") or "?"
-            ok = "verified" if pc.get("verified") else "unverified"
+            # doc 58: a PoC's provenance is the honest signal -- a detonation fired the oracle; a
+            # sound construction stands on its reach+trigger argument (no execution needed).
+            prov = pc.get("provenance")
+            ok = ({"detonated": "detonated — oracle fired",
+                   "constructed": "constructed — sound, not run here"}.get(prov)
+                  or ("verified" if pc.get("verified") else "unverified"))
             dl = ""
             if pc.get("bundle_b64"):
                 fn = f'poc-{(pc.get("bundle_sha") or lvl)[:12]}.tar.gz'
@@ -1006,21 +1206,33 @@ def _finding_html(f: dict) -> str:
                     dl += (f' <span class="muted">not embedded — fetch from '
                            f'<span class="mono">{esc(where)}</span> on the analysis server'
                            f'</span>')
+            elif pc.get("input_sha"):
+                # doc 58 lightweight PoC: the payload bytes are the deliverable (no package).
+                dl = (f' <span class="muted mono">payload {esc(pc["input_sha"][:16])}…</span>'
+                      ' <span class="muted">— the few-line repro is below</span>')
             p.append(f'<div class="poc">{_badge(lvl, "#8e4ec6")} '
                      f'<span class="mono">{esc(pc.get("signal") or "")}</span> '
                      f'<span class="muted">{ok}</span>{dl}</div>')
         p.append('</div>')
     # How to reproduce: the concrete recipe a reader re-runs -- the channel, the crashing input
     # hash, and the PoC bundle. Anchored to hashes so it is deterministic.
-    crashes = f.get("crashes", [])
-    repro = crashes[0] if crashes else None
-    if repro:
-        chan = esc(repro.get("input_mode") or "stdin")
-        ish = esc((repro.get("input_sha") or "")[:16])
+    # doc 58: prefer the constructed PoC's own few-line repro (payload + one command) when present.
+    repro_ev = next((e.get("detail") for e in (f.get("evidence") or [])
+                     if isinstance(e, dict) and e.get("channel") == "reproduce"), None)
+    if repro_ev:
+        body = "<br>".join(esc(ln) for ln in repro_ev.strip().splitlines())
         p.append('<div class="evlabel">Reproduction</div>'
-                 f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
-                 f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
-                 'carries the exact bytes and the invocation.</div>')
+                 f'<div class="repro mono">{body}</div>')
+    else:
+        crashes = f.get("crashes", [])
+        repro = crashes[0] if crashes else None
+        if repro:
+            chan = esc(repro.get("input_mode") or "stdin")
+            ish = esc((repro.get("input_sha") or "")[:16])
+            p.append('<div class="evlabel">Reproduction</div>'
+                     f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
+                     f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
+                     'carries the exact bytes and the invocation.</div>')
     # Remediation: every finding ends with what to DO about it -- the report is a fix list, not
     # just an inventory.
     p.append('<div class="evlabel">Remediation</div>'
@@ -1178,4 +1390,7 @@ a.dl:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
   .finding{break-inside:avoid;page-break-inside:avoid}
   a.dl{display:none}
 }
+.narrative p{margin:.35em 0}.appendix-h{margin:2.2em 0 .3em;font-size:1.25em}
+h4{margin:1em 0 .3em;font-size:.95em}pre.code{white-space:pre-wrap;word-break:break-all;
+font-size:.8em;padding:.5em .7em;border-radius:6px;background:rgba(127,127,127,.08)}
 </style></head><body>"""

@@ -1,0 +1,50 @@
+{
+  "id": "ncompress-4.2.4.4-cve",
+  "project": "ncompress",
+  "version": "4.2.4.4 (CVE-2001-1413 length check reverted by examples/vuln-targets/fetch_build.sh)",
+  "tree": "examples/vuln-targets/src/ncompress-4.2.4.4",
+  "surface": "source",
+  "entry": {
+    "binary": "compress",
+    "argv": [
+      "-c",
+      "@@"
+    ]
+  },
+  "note": "Upstream 4.2.4.4 carries the CVE-2001-1413 fix; the local tree has that one `if (strlen(*fileptr) > sizeof(tempname) - 3)` block deleted (see fetch_build.sh), so the only scoreable defect is CVE-2001-1413. Built as bin/ncompress_x86-64_cve (-fno-stack-protector -no-pie).",
+  "cves": [
+    {
+      "id": "CVE-2001-1413",
+      "class": "stack-overflow",
+      "file": "compress42.c",
+      "function": "comprexx",
+      "line": 895,
+      "argv": [
+        "-c",
+        "@@"
+      ],
+      "input": "argv",
+      "trigger": "a pathname argument longer than 1024 bytes is strcpy'd into the 1024-byte stack buffer tempname[MAXPATHLEN] before any stat; the file need not exist. Here @@ stands for the crafted argv string, not a file path.",
+      "fixed_in": "upstream check `strlen(*fileptr) > sizeof(tempname) - 3` (present in 4.2.4.4 tarball, reverted locally); distro: RHSA-2004:536 ncompress-4.2.4-37; 4.2.4.5 made pathnames dynamic",
+      "ref": "https://nvd.nist.gov/vuln/detail/CVE-2001-1413",
+      "confidence": "high",
+      "note": "Any mode reaches it (compress, -d, -c); the flag is irrelevant. With -r, compdir() bounds names it builds (line 1314), so recursion is not a second path. IP control: README records L2 at offset 1048."
+    }
+  ],
+  "excluded": [
+    {
+      "id": "CVE-2006-1168",
+      "reason": ".bss de_stack underflow in decompress(); fixed in 4.2.4.1 (Changes) by the `code > free_ent` corrupt-input abort at compress42.c:1745, so 4.2.4.4 is not affected."
+    },
+    {
+      "id": "CVE-2010-0001",
+      "reason": "integer underflow (gzip unlzw-derived); Changes says fixed in 4.2.4.3."
+    },
+    {
+      "id": "no-CVE maxmaxcode integer overflow (fixed 4.2.4.5, Jakub Wilk)",
+      "reason": "MAXCODE(maxbits) at compress42.c:1644 is computed before the maxbits>BITS check; maxbits<=31 and long is 64-bit on LP64, and the check then aborts. Not a crash on x86-64."
+    }
+  ],
+  "binary_path": "examples/vuln-targets/bin/ncompress_x86-64_cve",
+  "debug_binary": "examples/vuln-targets/bin/ncompress_x86-64_cve.dbg"
+}

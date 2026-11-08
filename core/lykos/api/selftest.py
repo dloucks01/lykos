@@ -35,7 +35,11 @@ def _line(msg) -> None:
 def _only(matrix, only: Optional[list]):
     if not only:
         return matrix
+    if isinstance(only, str):                        # "a,b" as the CLI's --only takes it
+        only = only.split(",")
     want = {str(x).strip() for x in only if str(x).strip()}
+    if not want:
+        return matrix
     picked = [c for c in matrix if c.label in want]
     if not picked:
         # An empty selection would "pass" vacuously (realgate reports PASS on zero cases).
@@ -64,8 +68,20 @@ def _run(kind: str, opts: dict) -> dict:
                            else "candidate")
     rep = harness.run(None, **kw)
     passed, verdict, reason = gate(rep.metrics, rep.meta, stage=stage)
-    return {"passed": bool(passed), "verdict": verdict, "reason": reason, "table": rep.table(),
-            "report": rep.to_dict()}
+    out = {"passed": bool(passed), "verdict": verdict, "reason": reason, "table": rep.table(),
+           "report": rep.to_dict()}
+    # `record` = the CLI's `lykos eval --record`: append the scored run to the benchmark history
+    # (what GET /selftest/history and `lykos dashboard` read). The path is the server's default,
+    # never a client-supplied one.
+    if opts.get("record"):
+        from ..eval import history as histmod
+        label = opts.get("label")
+        label = str(label)[:80] if isinstance(label, str) and label.strip() else "gui"
+        histmod.record(histmod.DEFAULT_PATH, rep, stage=stage,
+                       min_state=kw.get("min_state"), label=label)
+        out["recorded"] = histmod.DEFAULT_PATH
+        _line(f"recorded to the benchmark history ({histmod.DEFAULT_PATH})")
+    return out
 
 
 def _worker(kind: str, opts: dict) -> None:

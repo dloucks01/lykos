@@ -71,6 +71,22 @@ const DYNAMIC_BACKENDS = new Set([
 // operator scans, started from the Scans panel with the operator's choices (a function name, a
 // set of implementations to compare); the source-pattern scan reads an archived source tree:
 // not-in-tab: variant_scan, weggli_scan, diff_test
+//
+// source-tree detectors added after this list was last kept up (doc 60/61): like the source-only
+// group above they read an archived source tree, which the workbench does not upload:
+// not-in-tab: wire_flow, param_sink, lifecycle_scan, intwidth_scan, dop_scan, race_scan, guard_gap, alloc_overflow, sibling_guard, codeql, coverage_sweep
+//
+// format-specific directed over-reads: the server routes them by the sniffed input format, which
+// an in-tab run does not sniff:
+// not-in-tab: palette_overread, png_overread, bmp_overread, jpeg_overread, zip_overflow
+//
+// the finalizers -- they resolve, plan and chain what the WHOLE pass found, so they only mean
+// anything at the end of a server-side run:
+// not-in-tab: drivable_confirm, triage, weaponize_plan, attack_path, finding_resolve
+//
+// the propose -> solve -> validate loop: a long, memory-capped angr run (systemd-run MemoryMax)
+// the server schedules before the fuzz campaigns; the browser cannot hold that slice:
+// not-in-tab: hypo_hunt
 // -------------------------------------------------------------------------------------
 
 const PIPELINE = [
@@ -86,6 +102,7 @@ const PIPELINE = [
   { stage: "directed_fuzz", phase: "search" },
   { stage: "boundary_fuzz", phase: "search" },              // IPC/protocol boundary, if any
   { stage: "firmware_rehost", phase: "search" },            // emulate a carved firmware image
+  { stage: "harness", phase: "search" },                    // drive parsers under the emulator
   { stage: "concolic", isBackend: true, onlyIfNoCrash: true, phase: "search" },
   { stage: "root_cause", needsCrash: true, phase: "prove" },
   { stage: "build_poc", needsCrash: true, phase: "prove" },

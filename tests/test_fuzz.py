@@ -796,3 +796,40 @@ def test_a_static_pie_executable_is_not_mistaken_for_a_library(gcc, tmp_path):
     assert sandbox._has_df_1_pie(exe), "a static-PIE must carry DF_1_PIE"
     assert not sandbox._is_elf_shared_object(exe), \
         "a static-PIE executable must be runnable, not refused as a library"
+
+
+_CUSTOM_ASSERT = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#define MY_ASSERT(c) do { if (!(c)) { fprintf(stderr, "LIB: x.c:42: Assertion '" #c "' failed.\n"); exit(1); } } while (0)
+int main(void){ char b[64]; size_t n = fread(b, 1, sizeof b, stdin);
+  if (n >= 2 && b[0] == 'Z') MY_ASSERT(1 == 0);       /* "unreachable" */
+  return 0; }
+"""
+
+
+def test_a_reachable_assertion_with_a_custom_handler_is_found(store, case, pool, gcc, tmp_path):
+    """md4c's MD_ASSERT prints 'Assertion ... failed' and exit(1)s: no signal, so every engine
+    filed it as an ordinary error exit. Verified differentially it is a CWE-617 DoS."""
+    import base64
+    src = tmp_path / "ca.c"; src.write_text(_CUSTOM_ASSERT)
+    exe = tmp_path / "ca"
+    if subprocess.run([gcc, "-O0", "-w", str(src), "-o", str(exe)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="ca")
+    q = JobQueue(store.conn)
+    run = enqueue_fuzz(q, target, params={
+        "input_mode": "stdin", "max_execs": 300, "max_seconds": 20, "exec_timeout": 1,
+        "seeds": [base64.b64encode(b"ok").decode(), base64.b64encode(b"Zq").decode()]})
+    assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
+    fs = [f for f in FindingDAO(store.conn).list_by_target(target.id) if f.cwe == "CWE-617"]
+    assert fs and fs[0].state == "confirmed", [f.title for f in FindingDAO(store.conn).list_by_target(target.id)]
+    assert "1 == 0" in fs[0].title
+
+
+def test_assertion_message_matching():
+    from lykos.analyze.fuzz.stage import assertion_message
+    assert assertion_message(b"MD4C: md4c.c:5531: Assertion '1 == 0' failed.\n")
+    assert assertion_message(b"prog: x.c:3: main: Assertion `n > 0' failed.")
+    assert assertion_message(b"usage: prog [file]\n") is None

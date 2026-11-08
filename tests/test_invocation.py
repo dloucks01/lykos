@@ -185,6 +185,27 @@ def test_from_help_mines_flags_and_value_shapes():
     assert names["-c"] == "config" and names["-t"] == "timeout"   # alias kept as a kind hint
 
 
+def test_from_help_reads_both_columns_of_a_two_column_option_table():
+    """unzip (and busybox, and many getopt tools) print TWO options per row:
+
+        -p  extract files to pipe, no messages     -l  list files (short format)
+        -f  freshen existing files, create none    -t  test compressed archive data
+
+    Reading only the left column dropped -l/-t/-z/-T/-d -- unzip's list/test/zipinfo MODES, which
+    is exactly where its CVEs live, so a blind campaign never left the default extract path."""
+    help_txt = (
+        "Usage: unzip [-Z] [-opts[modifiers]] file[.zip] [list] [-x xlist] [-d exdir]\n"
+        "  -p  extract files to pipe, no messages     -l  list files (short format)\n"
+        "  -f  freshen existing files, create none    -t  test compressed archive data\n"
+        "  -v  list verbosely/show version info       -T  timestamp archive to latest\n"
+        "  -x  exclude files that follow (in xlist)   -d  extract files into exdir\n")
+    takes, _ph, _names = invocation.from_help(help_txt.splitlines())
+    for f in ("-p", "-f", "-v", "-x", "-l", "-t", "-T", "-d"):
+        assert f in takes, f"{f} missing: a column of the option table was dropped"
+    # the right-column mode switches take no value (they select a mode, they do not consume an arg)
+    assert takes["-t"] is False and takes["-l"] is False
+
+
 def test_discover_from_help_when_the_binary_usage_is_terse():
     """The modern-GNU-tool case: usage says only '[options]', the flags live in --help."""
     import re

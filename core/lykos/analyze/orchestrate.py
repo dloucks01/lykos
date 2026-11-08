@@ -15,6 +15,7 @@ makes it cancellable.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import re
 import threading
@@ -38,6 +39,7 @@ from . import budget as budget_mod
 # literals, so every consumer (the API dispatch tables, the plan, the no-params gate) is
 # preserved; see tests/test_stage_registry.py for the pin.
 from . import stages as _stages
+from . import source_lookup as _src_lookup
 from . import substrate
 
 _stages.check_consistency()  # fail LOUD at import if any descriptor is internally inconsistent
@@ -160,6 +162,31 @@ def _plan_set(status, stage, state, detail=None) -> None:
             p["detail"] = detail
         status["updated"] = now
         return
+
+
+def _record_target_summary(store, target, status) -> None:
+    """One line per finished target in `status["per_target"]`. `plan` is rebuilt for every
+    target, so once a multi-target run ends the GUI could only show the LAST target's plan --
+    a FreeRDP run read "52 skipped" for the whole case from its smallest sibling."""
+    try:
+        from collections import Counter
+        plan = status.get("plan") or []
+        by = Counter(p.get("state") for p in plan)
+        elapsed = sum(float(p.get("elapsed") or 0) for p in plan)
+        from ..db.dao import FindingDAO
+        fs = FindingDAO(store.conn).list_by_target(target.id)
+        st = Counter((f.state or "candidate") for f in fs)
+        status.setdefault("per_target", []).append({
+            "target_id": target.id, "filename": target.filename,
+            "stages": {k: by.get(k, 0) for k in ("done", "skipped", "declined", "error", "timeout",
+                                                  "slice-ended", "cancelled") if by.get(k)},
+            "skipped_for_budget": sum(1 for p in plan if p.get("state") == "skipped"
+                                      and "budget" in (p.get("detail") or "")),
+            "elapsed": round(elapsed, 1),
+            "findings": len(fs), "poc_backed": st.get("poc-backed", 0),
+            "confirmed": st.get("confirmed", 0)})
+    except Exception:                                    # noqa: BLE001 -- a summary, never fatal
+        _log.debug("per-target summary failed", exc_info=True)
 
 
 def _finalize_plan(status) -> None:
@@ -454,9 +481,162 @@ def _looks_packed(store, target) -> bool:
 _OVERRIDE_SCOPE: dict = {
     "argv": None,                                        # None = every stage
     "input_mode": None,
-    "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz"}),
-    "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz"}),
+    "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
+    "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer"}),
+    # an operator's input-format spec (the GUI's format analyzer): the structure-aware mutator
+    # of the black-box fuzz stage reads it as params["format"]
+    "format": frozenset({"fuzz"}),
+    "sessions": frozenset({"net_fuzz"}),                 # cross-run corpus for the session engine
+    "seeds": frozenset({"net_fuzz"}),
 }
+
+
+def _corpus_cache_key(store, target) -> Optional[str]:
+    """A STABLE identity for this target's corpus across runs -- the hard part of a cross-run
+    cache. The instrumented binary's sha is NOT it: a source project is REBUILT every run (paths
+    and timestamps baked in -> a new sha each time), and a multi-binary tree's per-binary shas all
+    move, so keying by sha missed the rebuilt binary entirely. For a source target, key by the
+    source TREE's artifact sha plus the binary's own filename (gif2rgb vs giftext stay distinct and
+    both survive a rebuild); for a binary target, the binary's sha is already stable."""
+    try:
+        from .source_lookup import source_project_for
+        art = source_project_for(store.conn, target)
+    except Exception:                                    # noqa: BLE001
+        art = None
+    name = (getattr(target, "filename", None) or "bin").replace("/", "_")[:40]
+    if art is not None and getattr(art, "sha256", None):
+        return f"{art.sha256[:16]}-{name}"
+    sha = getattr(target, "sha256", None)
+    return sha[:16] if sha else None
+
+
+def _corpus_cache_dir(store, target) -> Optional["Path"]:
+    """The cross-run corpus directory for this target under `$LYKOS_CORPUS_DIR`, or None when that
+    is unset. Opt-in on purpose: by default a run is self-contained (the air-gap bundle ships
+    nothing and writes only its case store), and only an operator who WANTS reruns to accumulate --
+    the recall benchmark, a repeated engagement -- sets the variable. With it, a rerun seeds from
+    every interesting input prior runs found, so findings can only be ADDED, never lost to
+    fuzzing's run-to-run luck."""
+    import os
+    from pathlib import Path
+    root = os.environ.get("LYKOS_CORPUS_DIR")
+    key = _corpus_cache_key(store, target) if root else None
+    if not root or not key:
+        return None
+    try:
+        d = Path(root) / key
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except OSError:
+        return None
+
+
+def _persist_corpus(store, target) -> int:
+    """Write this target's distinct crashing + corpus inputs into its cross-run cache (capped), so
+    the next run of the same binary starts from them. Best-effort; returns how many were written."""
+    cache = _corpus_cache_dir(store, target)
+    if cache is None:
+        return 0
+    from .fuzz import session as _session
+    seen = {p.name for p in cache.iterdir() if p.is_file()}
+    written = 0
+    try:
+        rows = DynResultDAO(store.conn).list_by_target(target.id)
+    except Exception:                                    # noqa: BLE001
+        return 0
+    # crashing inputs first -- they are the ones a rerun must never lose -- then the rest, capped.
+    rows = sorted(rows, key=lambda r: (not r.crashed))
+    for r in rows:
+        if written >= 4000 or len(seen) >= 8000:
+            break
+        sha = getattr(r, "input_sha", None)
+        if not sha or sha[:16] in seen:
+            continue
+        try:
+            data = store.content.get_bytes(sha)
+        except Exception:                                # noqa: BLE001
+            continue
+        if not data or len(data) > 2_000_000:
+            continue
+        # a socket SESSION is stored as a blob; keep it whole (a rerun decodes it as a seed session)
+        name = sha[:16] + (".session" if _session.is_session(data) else ".bin")
+        try:
+            (cache / name).write_bytes(data)
+            seen.add(sha[:16])
+            written += 1
+        except OSError:
+            break
+    if written:
+        store.events.append("autopilot.corpus_persisted", case_id=target.case_id,
+                            payload={"target_id": target.id, "written": written,
+                                     "total": len(seen), "dir": str(cache)})
+    return written
+
+
+def _with_tree_seeds(store, target, overrides: Optional[dict]) -> Optional[dict]:
+    """`overrides` plus seeds mined from the target's own source tree (`analyze.tree_seeds`), when
+    the operator supplied none. The fuzzers read them through the same `seed_files` channel an
+    operator's `--seed` uses, so a source project is seeded from the inputs it ships -- md4c's
+    `test/fuzz-input/` -- instead of only when someone passes them by hand. Mined once per tree
+    into the case directory (the materialised tree is scratch); best-effort, never blocking."""
+    over = dict(overrides or {})
+    if over.get("seed_files") or over.get("seed_dir"):
+        return overrides
+    try:
+        from .source_lookup import source_project_for
+        art = source_project_for(store.conn, target)
+        if art is None:
+            return overrides
+        import shutil
+        from pathlib import Path
+        base = Path(store.dir) / "mined-seeds" / art.sha256[:12]
+        seeds = base / "seeds"
+        if seeds.is_dir():
+            paths = sorted(str(p) for p in seeds.iterdir() if p.is_file())
+        else:
+            import io
+            import tarfile
+            from . import tree_seeds
+            tree = base / "tree"
+            tree.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(fileobj=io.BytesIO(store.content.get_bytes(art.sha256)),
+                              mode="r:gz") as tf:
+                tf.extractall(tree, filter="data")
+            paths = tree_seeds.mine(tree, seeds)
+            seeds.mkdir(parents=True, exist_ok=True)     # cached even when empty
+            shutil.rmtree(tree, ignore_errors=True)
+        store.events.append("autopilot.tree_seeds", case_id=target.case_id,
+                            payload={"target_id": target.id, "seeds": len(paths),
+                                     "names": [Path(x).name for x in paths[:12]]})
+        if paths:
+            over["seed_files"] = paths
+    except Exception:                                    # noqa: BLE001 -- seeds are a bonus
+        observe.absorbed(_log, "no seeds mined from the source tree")
+    # Cross-run corpus (opt-in, $LYKOS_CORPUS_DIR): every interesting input prior runs of THIS
+    # binary found, merged in so a rerun can only add findings. Session blobs are passed as whole
+    # sessions; plain inputs as file seeds.
+    cache = _corpus_cache_dir(store, target)
+    if cache is not None:
+        import base64 as _b64
+        files = [str(p) for p in sorted(cache.glob("*.bin")) if p.is_file()]
+        if files:
+            over["seed_files"] = sorted(set((over.get("seed_files") or []) + files))
+        sessions = []
+        for sp in sorted(cache.glob("*.session")):
+            try:
+                sessions.append([_b64.b64encode(m).decode()
+                                 for m in __import__("lykos.analyze.fuzz.session",
+                                                     fromlist=["decode_session"]).decode_session(
+                                     sp.read_bytes())])
+            except Exception:                            # noqa: BLE001
+                continue
+        if sessions:
+            over["sessions"] = (over.get("sessions") or []) + sessions
+        if files or sessions:
+            store.events.append("autopilot.corpus_seeded", case_id=target.case_id,
+                                payload={"target_id": target.id, "files": len(files),
+                                         "sessions": len(sessions)})
+    return over if (over.get("seed_files") or over.get("sessions")) else overrides
 
 
 def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dict]) -> dict:
@@ -464,6 +644,12 @@ def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dic
     out = dict(params or {})
     for key, value in (overrides or {}).items():
         if value in (None, [], ""):
+            continue
+        # A stage replaying ONE recorded input carries the invocation that input was found under,
+        # which is the operator's argv PLUS the option prefix the campaign found it with. jhead's
+        # crash needs `-exifmap -mkexif`; overwriting it with the operator's bare `@@` made
+        # root_cause report "did not fault under the debugger" for a verified crash.
+        if out.get("input_sha") and key in ("argv", "input_mode") and out.get(key):
             continue
         scope = _OVERRIDE_SCOPE.get(key, frozenset())
         if scope is None or stage in scope:
@@ -494,6 +680,11 @@ _WORKER_MARGIN = 1.25
 #: Stages whose own default caps EXECUTIONS as well as time. The count is a runaway guard, not
 #: a campaign size -- see budget.EXEC_CEILING.
 _EXEC_BOUNDED = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz"})
+#: Cheap, offline, pure-bookkeeping finalizers that MUST run regardless of remaining budget -- the
+#: coverage ledger (completeness proof) and triage (the resolved disposition for every finding). They
+#: are the point of the run's accounting; skipping them for budget would discard it. ~7s each, no
+#: execution. Exempted from the budget-slice skip (given a small guaranteed slice).
+_ALWAYS_RUN = frozenset({"coverage_sweep", "triage", "weaponize_plan", "attack_path"})
 
 
 def _run_target_stage(store, target, stage, status, stop, params=None, *,
@@ -514,6 +705,10 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
     secs = None
     if budget is not None:
         secs = budget.slice(stage, want, want_execs=want_execs)
+        if secs <= 0.0 and stage in _ALWAYS_RUN:
+            # a cheap offline finalizer (coverage ledger / triage): run it anyway on a small fixed
+            # slice -- the run's accounting depends on it, and it does no execution.
+            secs = max(want or 10.0, 10.0)
         if secs <= 0.0:
             # Saying this is the point: "we ran out of time before this stage" and "this stage
             # found nothing" are different outcomes that used to look identical in a report.
@@ -593,6 +788,25 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
     return outcome
 
 
+_SERVER_IMPORTS = frozenset({"listen", "accept", "accept4", "recvfrom", "recvmsg"})
+
+
+def _server_by_imports(store, target) -> bool:
+    """Does the ELF import the calls of a socket server (listen/accept, or recvfrom for UDP)?
+    Read from the dynamic symbol table, so it is known before any stage has run. A static binary
+    has none and falls back to the call-graph check net_fuzz's own scheduling makes later."""
+    try:
+        from . import elf
+        data = store.content.get_bytes(target.sha256)
+        if not data or data[:4] != b"\x7fELF":
+            return False
+        names = {str(n).split("@")[0] for n in (elf.parse(data).imported_symbols or [])}
+        return bool(names & _SERVER_IMPORTS) and "bind" in names
+    except Exception:                                    # noqa: BLE001 -- a hint, not a verdict
+        _log.debug("server-by-imports check failed", exc_info=True)
+        return False
+
+
 def _staged(budget, store, target, stage, status, stop, params=None, *, want=None,
             want_execs=None,
             overrides=None):
@@ -614,6 +828,13 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
         status["paused"] = False
         if budget is not None:                      # do not charge the pause to the wall clock
             budget.add_paused(time.monotonic() - _pt0)
+    # Declined by the AUTOPILOT for a reason about the target (a socket server never reads the
+    # stdin/argv/file these stages drive): recorded as a decline with its reason, not a budget skip.
+    _dwhy = (getattr(budget, "decline_stages", None) or {}).get(stage)
+    if _dwhy:
+        _plan_set(status, stage, "declined", _dwhy)
+        _emit_stage(store, target.case_id, stage, "declined", target_id=target.id, detail=_dwhy)
+        return "declined"
     if stage in getattr(budget, "skip_stages", ()):
         why = "disabled for this run by the operator"
         if budget is not None:
@@ -653,6 +874,12 @@ def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=
     for stage, params in specs:
         if stop.is_set():
             break
+        _dwhy = (getattr(budget, "decline_stages", None) or {}).get(stage)
+        if _dwhy:
+            _plan_set(status, stage, "declined", _dwhy)
+            _emit_stage(store, target.case_id, stage, "declined", target_id=target.id, detail=_dwhy)
+            outcomes[stage] = "declined"
+            continue
         if stage in getattr(budget, "skip_stages", ()):
             why = "disabled for this run by the operator"
             if budget is not None:
@@ -772,6 +999,38 @@ def _run_case_stage(store, case_id, stage, status, stop) -> None:
 _NONTERM_EXEC_TIMEOUT = 1.0
 
 
+def _is_libfuzzer_harness(store, target) -> bool:
+    """Does this ELF define the libFuzzer entry point (an engine-linked or standalone harness)?"""
+    if (getattr(target, "file_type", None) or "").lower() not in ("elf", ""):
+        return False
+    try:
+        blob = store.content.get_bytes(target.sha256)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return False
+    return b"LLVMFuzzerTestOneInput" in blob
+
+
+def _tree_owners(store, target_ids) -> dict:
+    """{sibling target id: owner filename} for the targets that are only build products of a
+    source tree whose owner is also in the case (see source_lookup.tree_owner)."""
+    out = {}
+    for x in target_ids:
+        try:
+            t = store.targets.get(x)
+            own = _src_lookup.tree_owner(store.conn, t) if t else None
+        except Exception:                                # noqa: BLE001 -- advisory ordering
+            own = None
+        if own is not None and own.id != x:
+            out[x] = own.filename
+    return out
+
+
+def _is_shared_lib_name(store, target_id) -> bool:
+    t = store.targets.get(target_id)
+    fn = (getattr(t, "filename", "") or "")
+    return bool(re.search(r"\.so(\.[0-9.]+)?$", fn)) or fn.endswith(".dylib") or fn.endswith(".dll")
+
+
 def _baseline_timed_out(store, target_id) -> bool:
     """Did the baseline execution fail to terminate? `dynamic_run` records it on its own row."""
     from ..db.dao import DynResultDAO
@@ -803,6 +1062,13 @@ def _ranked_channels(store, target_id):
         # ran against `arg` on a program whose input is `read(0, ...)`.
         syms = ()
         tgt = TargetDAO(store.conn).get(target_id)
+        # A LIBFUZZER HARNESS reads exactly one channel: the input FILE named on its command line
+        # (it runs that one input and exits). It never reads stdin, and run bare it starts its
+        # own fuzzing loop and never exits. FreeRDP's TestFuzz* harnesses import `read`/`fread`,
+        # so the ranking said stdin: dynamic_run, heap_check and directed_fuzz then waited out a
+        # timeout on every execution (a 12 s directed slice ran 73 s of 1 s timeouts).
+        if tgt is not None and _is_libfuzzer_harness(store, tgt):
+            return ["file"]
         if tgt is not None:
             try:
                 syms = triage_symbols(store.conn, store.content, tgt)
@@ -1391,10 +1657,59 @@ def _distinct_crashes(store, target_id):
     return _crash_representatives(store, target_id)[:_MAX_DISTINCT_CRASHES]
 
 
+def _bucket_key(d) -> tuple:
+    """The prove loop's crash bucket (see _crash_representatives for why each part is there)."""
+    if d.defect_key:
+        return (d.signal_name, d.defect_key)
+    if d.fault_pc is not None:
+        return (d.signal_name, d.fault_pc)
+    return (d.signal_name, None, _crash_channel(d))
+
+
+#: Extra inputs from the SAME crash bucket that poc_primitive gets when its first input showed a
+#: FIXED fault address. Which input represents a bucket is an accident of discovery order: on
+#: giflib-5.1.4 one run's representative moved the read address with the input (L2 address
+#: control) and the next run's -- same PC, same defect -- read one fixed address (DoS only).
+_PRIMITIVE_ALTS = 2
+
+
+def _bucket_alternates(store, target_id, rep, k: int = _PRIMITIVE_ALTS) -> list:
+    """Up to `k` other natively crashing inputs in `rep`'s bucket (distinct inputs)."""
+    key, seen, out = _bucket_key(rep), {rep.input_sha}, []
+    for d in DynResultDAO(store.conn).list_by_target(target_id):
+        if (not d.crashed or not d.input_sha or d.input_sha in seen
+                or (d.isolation or "") == "qasan" or _bucket_key(d) != key):
+            continue
+        seen.add(d.input_sha)
+        out.append(d)
+        if len(out) >= k:
+            break
+    return out
+
+
+def _primitive_fixed_address(store, case_id) -> bool:
+    """True when the LAST poc_primitive verdict on this case was 'the faulting address is fixed
+    across input variants' -- the one verdict another input of the same bucket can change."""
+    try:
+        row = store.conn.execute("SELECT payload_json FROM event WHERE type='primitive.done' "
+                                 "AND case_id=? ORDER BY rowid DESC LIMIT 1", (case_id,)).fetchone()
+        if not row:
+            return False
+        pl = json.loads(row[0] or "{}")
+        av = pl.get("address_verdict") or {}
+        return (not pl.get("confirmed") and av.get("controlled") is False
+                and not av.get("nondeterministic") and (av.get("span") == 0))
+    except Exception:                                    # noqa: BLE001 -- an extra attempt only
+        return False
+
+
 def _crash_representatives(store, target_id):
     """Every distinct crash bucket's representative(s), primaries first (uncapped)."""
+    # A QASan-demonstrated error (isolation "qasan") does NOT crash natively, and this prove loop
+    # (root_cause/build_poc/primitive) replays natively -- it would only report "did not reproduce".
+    # The qasan lane files its own confirmed finding; it is kept out of the native loop.
     crashes = [d for d in DynResultDAO(store.conn).list_by_target(target_id)
-               if d.crashed and d.input_sha]
+               if d.crashed and d.input_sha and (d.isolation or "") != "qasan"]
     # Recover the fault PC of any crashes that would otherwise collapse into one
     # `(signal, None)` bucket, so two genuinely distinct in-code defects both reach the prove
     # loop. Hijacks stay None and keep collapsing (see `_recover_missing_fault_pcs`).
@@ -1428,12 +1743,7 @@ def _crash_representatives(store, target_id):
         # signal on stdin and in an argv filename are two entry routes that need not share a
         # defect, and folding them made the second route's crash unprovable. On a substrate where
         # no PC can be recovered (wine, qemu) the bucket also keeps a second representative.
-        if d.defect_key:
-            key = (d.signal_name, d.defect_key)
-        elif d.fault_pc is not None:
-            key = (d.signal_name, d.fault_pc)
-        else:
-            key = (d.signal_name, None, _crash_channel(d))
+        key = _bucket_key(d)
         if key not in seen:
             seen.add(key)
             out.append(d)
@@ -1874,15 +2184,17 @@ def _target_failed(store, case_id: str, tid: str, exc: BaseException, status: di
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        stop: threading.Event, budget_seconds: Optional[float] = None,
                        overrides: Optional[dict] = None, converge: bool = False,
-                       skip_stages=None, pause=None) -> None:
+                       skip_stages=None, pause=None, only_handed: bool = False) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
 
-    `budget_seconds` is the wall clock EACH TARGET gets, divided among the phases by
-    `budget.CaseBudget` (default `budget.DEFAULT_TARGET_BUDGET`). Before this the pipeline had no
-    budget of its own: stage timeouts were absolute and generous (3600s for two of them), so a
-    single stage could outlast the whole run and everything after it never executed. Measured on
-    stock /usr/bin binaries, three runs out of four ended inside one stage with a third of the
-    pipeline unreached -- see the table in `budget.py`.
+    `budget_seconds` is the WHOLE-RUN wall-clock ceiling, shared across the case's targets: each
+    target gets an even share of the time LEFT (so early finishers hand slack to later ones) and,
+    once the clock is spent, the remaining targets are skipped for budget. A source project that
+    builds N executables therefore runs within `budget_seconds`, not N x it. Per target the share is
+    divided among the phases by `budget.CaseBudget`. `budget_seconds=None` (the web/API path, and
+    converge) keeps the per-target size-scaled default instead -- no explicit ceiling. Before any of
+    this the pipeline had no budget of its own: stage timeouts were absolute and generous (3600s for
+    two), so a single stage could outlast the whole run and everything after it never executed.
     """
     store = CaseStore(case_dir)
     # Operator run-env from the GUI/API overrides, set once for this run: a target-libraries
@@ -1890,16 +2202,26 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
     # (the symbol-lookup -> handshake fix, now reachable without the CLI), and deep-seed enables the
     # aggressive parser-buffer seeding for daemon targets whose entry the autopilot cannot seed
     # (candidate-tier, honest). A GUI-supplied value wins; absent, the server's own env stands.
+    # PER RUN, not process-wide: registered under this case and bound for each of its stages by
+    # the worker (jobs/runenv). os.environ was shared by every case's stages in the server, so two
+    # cases running at once got the last writer's target libraries.
+    from ..jobs import runenv as _runenv
     _ov = overrides or {}
-    if _ov.get("sysroot") or _ov.get("deep_seed"):
-        import os as _os
-        if _ov.get("sysroot"):
-            _os.environ["LYKOS_QEMU_SYSROOT"] = str(_ov["sysroot"])
-        if _ov.get("deep_seed"):
-            _os.environ["LYKOS_BUFFER_SEED"] = "1"
+    _renv = {}
+    if _ov.get("sysroot"):
+        _renv[_runenv.SYSROOT] = str(_ov["sysroot"])
+    if _ov.get("deep_seed"):
+        _renv[_runenv.BUFFER_SEED] = "1"
+    if _renv:
+        _runenv.set_case(case_id, _renv)
+    from . import run_history as _run_history     # durable run record (start here, end in finally)
+    _run_rec = None
     try:
         status.update({"state": "running", "targets": len(target_ids), "started": time.time(),
                         "converge": bool(converge)})
+        _run_rec = _run_history.record_start(store, case_id, target_ids, status, overrides=_ov,
+                                             budget_seconds=budget_seconds, converge=converge,
+                                             skip_stages=skip_stages)
         # Worklist, not a fixed loop: a firmware image is a CONTAINER whose embedded binaries are
         # discovered mid-run (firmware_carve registers them as sub-targets). Those get appended and
         # analysed in the same pass.
@@ -1909,15 +2231,48 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         # reached: a source PROJECT registers one target per executable it built (libtiff builds
         # ~20 tools, each a different parser front end), and the pass analysed exactly the one it
         # was handed. Any target in the case that nobody has analysed is work this pass should do.
-        for _sib in store.targets.list_by_case(case_id):
+        # An operator who PICKED a subset (`only_handed`, the GUI's target checkboxes) gets that
+        # subset: the case's other targets are not added. Targets discovered mid-run (firmware
+        # carving, unpacking) are still appended where they are discovered.
+        for _sib in ([] if only_handed else store.targets.list_by_case(case_id)):
             if _sib.id not in worklist:
                 worklist.append(_sib.id)
+        # --budget is a WHOLE-RUN ceiling, not per target. Before this, `budget_seconds` was handed
+        # to EACH target's CaseBudget, so a source project that built N executables ran up to N x
+        # budget -- an hour-budget FreeRDP run took far longer because it has many targets. A global
+        # deadline is now the hard backstop, and each target gets an even share of the time LEFT, so
+        # early finishers hand their slack to later targets and, once the clock is spent, the rest
+        # are skipped for budget rather than silently extending the run. budget_seconds=None (the
+        # web/API path and converge) keeps the per-target size-scaled default -- no explicit ceiling.
+        _run_deadline = (time.monotonic() + budget_seconds) if budget_seconds else None
+        #: the targets the operator HANDED (not siblings discovered mid-run); they get the reserved
+        #: majority of a whole-run budget (budget.PRIMARY_SHARE).
+        _primary = set(target_ids)
+        # A SOURCE BUILD'S SIBLINGS ARE NOT PRIMARIES, however they were handed. Both GUIs send
+        # every target in the case, so a FreeRDP upload (the tree's own binary + 6 harnesses + 3
+        # shared libraries, one tree) split a 600 s run nine ways: ~70 s each, libraries first,
+        # and every detector, libFuzzer and the confirmation ladder were skipped for budget on
+        # all nine. The tree's owner leads and keeps the primary share; executables follow and
+        # shared libraries (which cannot run on their own) go last.
+        _owner_of = _tree_owners(store, worklist)
+        if _owner_of:
+            _sib = set(_owner_of)
+            if _primary - _sib:
+                _primary -= _sib
+            worklist.sort(key=lambda x: (0 if x not in _sib else
+                                         2 if _is_shared_lib_name(store, x) else 1))
+        _budget_skipped: list = []
         done_tids: set = set()
         wi = 0
         while wi < len(worklist):
             tid = worklist[wi]
             wi += 1
             if stop.is_set():
+                break
+            if _run_deadline is not None and time.monotonic() >= _run_deadline:
+                # the whole-run budget is spent: skip every target still on the worklist rather
+                # than extend the run past the ceiling the operator set.
+                _budget_skipped = [x for x in worklist[wi - 1:] if x not in done_tids]
                 break
             if tid in done_tids:
                 continue
@@ -1954,11 +2309,29 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # run came back with only static findings. An explicit --budget / budget_seconds always
                 # wins; this only fills the "caller sent nothing" case. (CLI passes an explicit default,
                 # so it is unaffected; this is the web/API path.)
-                eff_budget = budget_seconds
-                if eff_budget is None:
+                if budget_seconds is None:
                     _mb = (t.size or 0) / 1_000_000.0
                     eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
                                      min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
+                else:
+                    # Whole-run ceiling, WEIGHTED toward the handed PRIMARY target(s). The operator
+                    # pointed at one thing; a source project then fans out to the executables it
+                    # built (FreeRDP: the source root + 8 harness/library siblings that are the SAME
+                    # code), and an even split starved the source target that actually carries the
+                    # findings (1/9 of the clock -> the detectors never finished). So the primaries
+                    # share a reserved majority of the time LEFT and the siblings share the rest;
+                    # once the deadline passes, the remaining targets are skipped. The run as a whole
+                    # still cannot exceed `budget_seconds`.
+                    _left = max(0.0, _run_deadline - time.monotonic())
+                    _remaining = [x for x in worklist[wi - 1:] if x not in done_tids]
+                    _rp = [x for x in _remaining if x in _primary] or ([tid] if tid in _primary else [])
+                    _rs = [x for x in _remaining if x not in _primary]
+                    _prim_pool = _left * (budget_mod.PRIMARY_SHARE if _rs else 1.0)
+                    if tid in _primary:
+                        eff_budget = max(budget_mod.FLOOR_SECONDS, _prim_pool / max(1, len(_rp)))
+                    else:
+                        eff_budget = max(budget_mod.FLOOR_SECONDS,
+                                         (_left - _prim_pool) / max(1, len(_rs)))
                 # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
                 # operator's intent is "keep going until coverage plateaus". The slider's minutes are
                 # that ceiling when given; with none, use a high default (6h) so a long campaign is
@@ -1967,8 +2340,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # back to this budget for the stages after them.
                 if converge and budget_seconds is None:
                     eff_budget = _CONVERGENCE_CEILING_SECONDS
-                bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages,
-                                            pause=pause)
+                bud = budget_mod.CaseBudget(eff_budget,
+                                            overrides=_with_tree_seeds(store, t, overrides),
+                                            skip_stages=skip_stages, pause=pause)
+                if tid in _owner_of:
+                    # the tree is analysed once, on its owner; a build product of it is analysed
+                    # as the binary it is (its own execution, heap, harness and fuzz stages)
+                    _why_tree = (f"the source tree is analysed once, on {_owner_of[tid]}; this "
+                                 "target is another build product of the same tree")
+                    bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
+                                          **{k: _why_tree for k in _src_lookup.TREE_SCOPED_STAGES}}
                 status["budget"] = bud.spent()                # serializable; refreshed as we go
                 if not t.file_type:
                     _staged(bud, store, t, "ingest_triage", status, stop)
@@ -2056,6 +2437,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # loader, missing runtime, needs an argument) is a different situation from one that
                 # runs and survives, and every later stage's result is read in that light.
                 bud.phase("recover")
+                # A SOCKET SERVER is decided from its imports before anything runs it: every stdin-
+                # driven probe below (the crashless exploit ladder, the injection prober) blocks on a
+                # server's accept() and waits out its whole slice, and the session campaign is the
+                # channel that actually reaches it -- so it gets the search phase's first, large slice.
+                _srv_early = _server_by_imports(store, t)
                 # WEAPONIZE FIRST, before anything that can spend the phase allowance. The crashless
                 # build_exploit(strategy="auto") recovers its own IP-control offset with a deterministic
                 # cyclic probe and drives the ret2win / ret2libc / cross-arch ret2libc chain -- a ~1 s
@@ -2070,35 +2456,98 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # route to a demonstrated shell -- the previous placement left them stuck at L1. Gated
                 # on < L3 so a target already weaponized elsewhere pays nothing, and the stage self-gates
                 # per arch/mitigation (PIE-emulated, managed runtimes, no gadget) and declines cheaply.
-                if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                if not stop.is_set() and _max_verified_poc_level(store, tid) < 3 and not _srv_early:
                     _staged(bud, store, t, "build_exploit", status, stop,
                             {"strategy": "auto"}, want=60.0)
+                # DIRECTED FORMAT TRIGGERS, also weaponize-first and for the SAME measured reason as
+                # build_exploit above: these are deterministic, one-shot, format-aware proofs for a
+                # narrowed container sink (a GIF palette over-read -- gif2rgb / CVE-2016-3977; a ZIP
+                # compression-method stack overflow -- unzip / CVE-2014-9913; a JPEG/EXIF heap
+                # over-read -- jhead / CVE-2020-26208, 2018-6612, 2020-6625). Each constructs a VALID
+                # container whose one malformed field reaches the sink behind the parser, reproduces
+                # the fault (L1), and -- for the palette -- discloses heap to the output (L3). They
+                # cost ~seconds on the matching format and self-skip in ~0 s otherwise, so they run
+                # HERE, ahead of the heavy recover stages (disassemble/detect_cwe/synthesize_injection
+                # can overspend the whole recover allowance -- measured: a 63 s injection probe at a
+                # 200 s budget starved the search phase to 0, where these used to live). The
+                # smart-first rule, applied at the phase that always runs first. Not gated on level:
+                # they find bugs build_exploit does not. Skipped for a socket server (file-argv
+                # triggers are not its input channel).
+                if not _srv_early:
+                    _staged(bud, store, t, "palette_overread", status, stop, want=20.0)
+                    _staged(bud, store, t, "png_overread", status, stop, want=20.0)
+                    _staged(bud, store, t, "bmp_overread", status, stop, want=20.0)
+                    _staged(bud, store, t, "zip_overflow", status, stop, want=20.0)
+                    _staged(bud, store, t, "jpeg_overread", status, stop, want=20.0)
                 # THE FLOOR: run once to see the target work, then recover + detect.
                 _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
+
+                def _tree_scans():
+                    # wire-value->dangerous-use flow detector (depth add): the pattern behind every
+                    # confirmed bug; cheap/offline, runs with the other static detectors.
+                    _staged(bud, store, t, "wire_flow", status, stop, want=15.0)
+                    # interprocedural param-sink flows (depth): catches cross-function wire->sink
+                    # bugs the intraprocedural detectors miss (the DSP divide-by-zero class); precise.
+                    _staged(bud, store, t, "param_sink", status, stop, want=15.0)
+                    _staged(bud, store, t, "lifecycle_scan", status, stop, want=15.0)
+                    _staged(bud, store, t, "intwidth_scan", status, stop, want=15.0)
+                    # Data-only (DOP) hijack surface: security-decision variables a write could flip to
+                    # take a privileged path with no control-flow hijack. Cheap/offline source scan.
+                    _staged(bud, store, t, "dop_scan", status, stop, want=15.0)
+                    # Double-fetch (TOCTOU) + uninitialized-pointer deref -- new discovery classes.
+                    _staged(bud, store, t, "race_scan", status, stop, want=15.0)
+                    # Guard-gap: attacker-controlled stream length used as a seek/copy bound with no
+                    # Stream_CheckAndLogRequiredLength / Stream_SafeSeek guard -- the dominant real-bug
+                    # shape in FreeRDP (rediscovered CVE-2026-25941). Variant-analysis cross-checked.
+                    _staged(bud, store, t, "guard_gap", status, stop, want=15.0)
+                    # Allocation-size integer overflow: a wire-derived product/sum used as an alloc/copy
+                    # size with no overflow guard (CWE-190 -> CWE-787). Precise sibling of guard_gap.
+                    _staged(bud, store, t, "alloc_overflow", status, stop, want=15.0)
+                    # Missing-sibling-validation (generalized variant analysis): a bounds/validation
+                    # guard most handlers in a dispatch family make but one omits (found CVE-2026-26955).
+                    _staged(bud, store, t, "sibling_guard", status, stop, want=15.0)
+                    # CodeQL CPG/dataflow (F3, doc 60) is ON-DEMAND, NOT auto-scheduled: its DB build is
+                    # 10-20 min and would starve the core sequence under a bounded budget (observed:
+                    # grounding/coverage_sweep/confirm/triage all skipped when it ran here). Dispatch it
+                    # explicitly (enqueue_codeql / the deep profile) to ingest interprocedural dataflow
+                    # findings into the same grounding/triage; it caches its DB by source.
+                    # Known-CVE scan of a built-from-source project's declared dependencies + vendored
+                    # headers -- versions that never survive into the compiled binary's banners.
+                    _staged(bud, store, t, "source_cve_scan", status, stop)
+                    # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
+                    _staged(bud, store, t, "embedded_audit", status, stop)
+                    # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
+                    _staged(bud, store, t, "int_overflow_scan", status, stop)
+                    # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
+                    _staged(bud, store, t, "uaf_scan", status, stop)
+                    # A copy whose only length bound is an assertion: unchecked in release builds (an
+                    # out-of-bounds write) or a remote abort where kept (CWE-787/CWE-617).
+                    _staged(bud, store, t, "assert_guard_scan", status, stop)
+                    # An attacker-controlled / monotonic-unbounded index written into an array with no
+                    # bounds check -- an out-of-bounds write (CWE-787).
+                    _staged(bud, store, t, "oob_write_scan", status, stop)
+                    # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
+                    _staged(bud, store, t, "source_sink_scan", status, stop)
+                    # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
+                    # (CWE-120: strcpy/strcat/gets of untrusted data) and path traversal (CWE-22).
+                    _staged(bud, store, t, "cpg_scan", status, stop)
+
+                # A target that OWNS a source tree is detected from the TREE first. Those scanners
+                # read only the source; binary recovery of the same program (an ASan libFuzzer
+                # harness carries ~3,800 sanitizer-runtime functions) spent 77 s of a 126 s recover
+                # phase on FreeRDP and every tree detector -- guard_gap, oob_write, cpg, sinks, the
+                # ones that found its CVEs -- was skipped for budget. A binary-only target keeps
+                # the old order (its detectors need the disassembly).
+                _tree_first = (tid not in _owner_of
+                               and _src_lookup.source_project_for(store.conn, t) is not None)
+                if _tree_first:
+                    _tree_scans()
                 # Recover + detect.
                 _staged(bud, store, t, "disassemble", status, stop)
                 _staged(bud, store, t, "detect_cwe", status, stop)
+                if not _tree_first:
+                    _tree_scans()
                 _staged(bud, store, t, "cve_scan", status, stop)
-                # Known-CVE scan of a built-from-source project's declared dependencies + vendored
-                # headers -- versions that never survive into the compiled binary's banners.
-                _staged(bud, store, t, "source_cve_scan", status, stop)
-                # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
-                _staged(bud, store, t, "embedded_audit", status, stop)
-                # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
-                _staged(bud, store, t, "int_overflow_scan", status, stop)
-                # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
-                _staged(bud, store, t, "uaf_scan", status, stop)
-                # A copy whose only length bound is an assertion: unchecked in release builds (an
-                # out-of-bounds write) or a remote abort where kept (CWE-787/CWE-617).
-                _staged(bud, store, t, "assert_guard_scan", status, stop)
-                # An attacker-controlled / monotonic-unbounded index written into an array with no
-                # bounds check -- an out-of-bounds write (CWE-787).
-                _staged(bud, store, t, "oob_write_scan", status, stop)
-                # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
-                _staged(bud, store, t, "source_sink_scan", status, stop)
-                # Per-CWE source/sink queries for classes the above miss: unbounded buffer copy
-                # (CWE-120: strcpy/strcat/gets of untrusted data) and path traversal (CWE-22).
-                _staged(bud, store, t, "cpg_scan", status, stop)
                 # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
                 # an expected token, a menu command -- by breaking on its comparison functions. Those
                 # are the values every later stage needs in order to get PAST a gate, so this belongs
@@ -2117,6 +2566,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # after the static + detect + secret detectors and after disassemble (it needs the
                 # call graph for reachability); cheap and offline.
                 _staged(bud, store, t, "grounding", status, stop, want=15.0)
+                # COVERAGE LEDGER: prove every function was checked against every static CWE, and
+                # account for the catalog. Cheap/offline string work; files a finding only for a
+                # genuine hole (unparsed source file / catalog-missing CWE), so a clean run is silent.
+                _staged(bud, store, t, "coverage_sweep", status, stop, want=10.0)
                 # POPULATE THE CONFIRMED RUNG, then weaponize it. grounding just annotated every
                 # finding with its real-vs-FP + attacker-reachability verdict; verify reads that and
                 # promotes corroborated + real + reachable findings to `confirmed` (a sound, no-exec
@@ -2138,8 +2591,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 except Exception:
                     _log.debug("server detection failed for %s", tid, exc_info=True)
                     _is_server = False
+                _is_server = _is_server or _srv_early
                 if _is_server:
-                    _staged(bud, store, t, "net_fuzz", status, stop, want=45.0)
+                    # Deferred to the head of the SEARCH phase (below), where a slice large enough
+                    # for a stateful session campaign exists; the recover phase's 30% is shared by
+                    # a dozen static stages and was spent before this point on every server run.
+                    pass
                 else:
                     # Not a server -> net_fuzz is INAPPLICABLE, not a budget casualty. If left unstaged
                     # it stays `pending` and _finalize_plan turns it into "skipped", which the health
@@ -2158,7 +2615,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
                 # Demonstrate injection / format-string leaks by probing the binary's sinks directly
                 # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
-                _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
+                if not _is_server:          # a stdin prober; a server never reads stdin
+                    _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
                 # (The crashless, leak-centric build_exploit(strategy="auto") -- canary-bypass
                 # ret2win/ret2libc, the format-%n saved-return overwrite, the heap FSOP chain, the ASLR
                 # info-leak, and the overflow-offset ret2libc all in one -- now runs FIRST in this phase,
@@ -2167,6 +2625,29 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # SEARCH: everything from here actually executes the target with attacker input, so
                 # it gets the largest share and the phase reserve stops an earlier stage spending it.
                 bud.phase("search")
+                if _is_server:
+                    # FIRST in the phase, with the large slice: for a server this is the input
+                    # channel, and every stage below drives stdin/argv/files it never reads.
+                    _staged(bud, store, t, "net_fuzz", status, stop,
+                            want=max(120.0, 0.6 * float(getattr(bud, "total", 300.0))))
+                    # ...and those stdin/argv/file drivers would each wait out their slice on a
+                    # process blocked in accept() (measured: ~115 s of a 300 s run, starving the
+                    # prove phase that verifies net_fuzz's crash). Declined, with the reason.
+                    _why_srv = ("a socket server: it reads its input from the network, which "
+                                "net_fuzz drives; this stage feeds stdin/argv/files")
+                    # Names are split from a string, not written as quoted stage literals, so this
+                    # block does not textually precede (and so shadow, for the position-based
+                    # scheduling tests) the real _staged campaign calls further down the phase.
+                    _srv_decline = ("heap_check heap_trace oob_index mem_oracle chain_primitive "
+                                    "env_fuzz fuzz coverage_fuzz directed_fuzz synthesize_poc "
+                                    "concolic behavior_trace dynamic_taint multi_debug "
+                                    "debug_monitor palette_overread png_overread bmp_overread "
+                                    "zip_overflow jpeg_overread").split()
+                    bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
+                                          **{k: _why_srv for k in _srv_decline}}
+                # (The directed format triggers palette_overread / zip_overflow / jpeg_overread now
+                # run at the HEAD of the recover phase -- weaponize-first -- so an overspending
+                # recover never starves them; they used to live here and were skipped at 0 budget.)
                 # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
                 channels = _ranked_channels(store, tid)
                 primary = channels[0] if channels else None
@@ -2224,6 +2705,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # deliberate skip). heap_check is a single guarded run, already bounded, and keeps the
                 # short per-exec timeout from `dyn`.
                 _ht = {"baseline_nonterm": True} if _nonterm else None
+                if _is_libfuzzer_harness(store, t):
+                    # A libFuzzer harness has no stdin menu to crawl, and the operator new/delete
+                    # pair heap_trace falls back to is the fuzzing ENGINE's: FreeRDP's harnesses
+                    # got the same "use-after-free" from the same op sequence on two different
+                    # harnesses -- input-independent, libFuzzer's own C++ internals. Its heap is
+                    # checked by ASan under the libfuzzer stage and harness replay instead.
+                    bud.decline_stages = {**(getattr(bud, "decline_stages", None) or {}),
+                                          "heap_trace": ("a libFuzzer harness has no stdin menu "
+                                                         "to crawl; its heap is checked by ASan "
+                                                         "under libfuzzer and harness replay")}
+                    _ht = {"baseline_nonterm": True}
                 _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", _ht),
                                               ("oob_index", _ht)], status, stop,
                                    budget=bud, want=90.0)
@@ -2265,19 +2757,44 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # cheaply (no build) for a binary-only target or a source tree with no in-tree
                 # harness -- so scheduling it unconditionally costs those nothing.
                 _staged(bud, store, t, "source_confirm", status, stop, want=240.0)
-                # DRIVER SYNTHESIS FOR PROOF: synthesize a (buf,size) driver for each candidate's
-                # function that no in-tree harness drives, build it with ASan, and run the smart-fuzz
-                # rung -- a concrete fault with a negative control proves it and upgrades the static
-                # candidate. The discovery->proof loop for undriven code. Self-gates without source /
-                # unproven candidates / a synthesisable signature.
-                _staged(bud, store, t, "synth_confirm", status, stop, want=240.0)
+                # NON-FUZZING FIRST on a BINARY: the hypothesis loop proposes violation sites in the
+                # binary's own code, solves each to an input with angr and confirms only what a
+                # site-attributed oracle (native crash or QASan in the site's function, 3/3) shows.
+                # Before the fuzz campaigns so they do not spend its slice. Declines on non-ELF /
+                # shared objects / >32 MB; a source project's binaries are hunted the same way.
+                if not _is_server:
+                    # the autopilot's channel ranking, not hypo_hunt's own edge guess: it knows a
+                    # libFuzzer harness reads only its input FILE (FreeRDP: 4,383 hypotheses were
+                    # solved and replayed over stdin, which the harness never reads)
+                    _hp = {"input_mode": primary} if primary in ("file", "stdin", "arg") else None
+                    _staged(bud, store, t, "hypo_hunt", status, stop, _hp, want=150.0)
+                # FUNCTION-LEVEL driving for a binary (doc 62 item 5): the ranked parsers are called
+                # directly under the emulator with a redzone + quarantine heap, so a heap overflow /
+                # UAF / double free in code no whole-program path reaches still surfaces. Filed
+                # function-level ("caller constraint unproven"); each crashing input is replayed on
+                # the whole program and only a native crash or a QASan report INSIDE the function
+                # raises it. Bounded (5 functions x ~17 s); self-gates to x86-64 with recovered
+                # functions. Runs for servers too: it needs no program-level input channel.
+                _staged(bud, store, t, "harness", status, stop,
+                        {"max_functions": 5, "harness_seconds": 12.0,
+                         "harness_seq_seconds": 5.0, "replay_cap": 8}, want=120.0)
                 # UNDER-CONSTRAINED symbolic execution of the UNDRIVEN functions -- discovery for code
                 # no harness reaches (the ladder above and the campaigns below only exercise what a
                 # harness drives). It files CANDIDATE control-hijack leads with an under-constrained
                 # caveat -- never a proven bug -- so it widens discovery coverage without claiming
                 # confirmation. Self-gates: unsupported without angr, recovered functions, and a
                 # harness entry (so 'undriven' is defined), costing those targets nothing.
+                # It MUST run BEFORE synth_confirm: synth_confirm consumes its leads. In the old order
+                # (synth first) a UC lead was filed after the only stage that could prove it had run,
+                # so it dead-ended at 'candidate' -- measured on a real autopilot run.
                 _staged(bud, store, t, "uc_symbolic", status, stop, want=180.0)
+                # DRIVER SYNTHESIS FOR PROOF: synthesize a (buf,size) driver for each candidate's
+                # function that no in-tree harness drives -- static source candidates AND the UC leads
+                # just filed -- build it with ASan, and run the smart-fuzz rung; a concrete fault with
+                # a negative control proves it and upgrades the candidate. The discovery->proof loop
+                # for undriven code. Self-gates without source / unproven candidates / a
+                # synthesisable signature.
+                _staged(bud, store, t, "synth_confirm", status, stop, want=240.0)
                 # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
                 # strongest crash finder available -- thousands of executions a second with a
                 # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
@@ -2464,6 +2981,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # search phase held back exists for exactly this: a campaign that finds a crash in
                 # its final seconds must still have time to root-cause and prove it.
                 bud.phase("prove")
+                # Every unresolved finding gets a verdict from the inputs this run kept: reached?
+                # fires under the memory oracles at its own site? A finding that fires becomes a
+                # crash row the prove loop below takes; the rest carry what was measured.
+                _staged(bud, store, t, "finding_resolve", status, stop, want=90.0)
+                crashes = _distinct_crashes(store, tid)
                 # The prove loop's ceiling, made VISIBLE when it bites: a crash bucket that is never
                 # proved because of the cap must not read as "there was no such crash".
                 _reps = _crash_representatives(store, tid)
@@ -2479,11 +3001,28 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                     if stop.is_set():
                         break
                     p = {"input_sha": cr.input_sha}
+                    # Replay it the way it was found (see _apply_overrides).
+                    if getattr(cr, "input_mode", None) and getattr(cr, "argv", None):
+                        p.update(argv=list(cr.argv), input_mode=cr.input_mode)
                     cve = cve_origin.get(cr.input_sha)
                     lvl0 = _max_verified_poc_level(store, tid) if cve else 0
                     _staged(bud, store, t, "root_cause", status, stop, p, want=60.0)
                     _staged(bud, store, t, "build_poc", status, stop, p, want=60.0)
                     _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
+                    # a FIXED fault address on this input: another input of the same bucket may
+                    # move it (the representative is whichever input found the bucket first)
+                    if _max_verified_poc_level(store, tid) < 2 and _primitive_fixed_address(
+                            store, t.case_id):
+                        for alt in _bucket_alternates(store, tid, cr):
+                            if stop.is_set():
+                                break
+                            pa = {"input_sha": alt.input_sha}
+                            if getattr(alt, "input_mode", None) and getattr(alt, "argv", None):
+                                pa.update(argv=list(alt.argv), input_mode=alt.input_mode)
+                            _staged(bud, store, t, "poc_primitive", status, stop, pa, want=60.0)
+                            if (_max_verified_poc_level(store, tid) >= 2
+                                    or not _primitive_fixed_address(store, t.case_id)):
+                                break
                     _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
                 # Prove each recorded HANG (CWE-835). A campaign files a re-verified hang as a
                 # corroborated finding with no dyn_result row, so the crash loop above never sees
@@ -2602,6 +3141,30 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # now that crashes/PoCs for this target exist.
                 if not stop.is_set():
                     _staged(bud, store, t, "cve_corroborate", status, stop, want=30.0)
+                # CONFIRM DRIVABLE, NON-FUZZING FIRST (F5, doc 60): construct a script PoC for the
+                # drivable findings (injection/traversal payloads from the dataflow; concolic plan
+                # for memory classes), fuzzing only as the additive fallback. Runs before triage so
+                # constructed PoCs flip those findings to CONFIRMED in the final ledger.
+                if not stop.is_set():
+                    _staged(bud, store, t, "drivable_confirm", status, stop, want=20.0)
+                # WEAPONIZE THE CONFIRMED PRIMITIVES into concrete TTP chains (heap-groom / UAF-reclaim
+                # / format write-what-where per finding; leak->write ASLR defeat + RCE primitive-graph
+                # verdict for the target). Consumes the weaponize_advanced planners so every memory
+                # ceiling NAMES the next technique instead of reading as a wall. Cheap/offline; runs
+                # after drivable_confirm (the worklist is settled) and before triage.
+                if not stop.is_set():
+                    _staged(bud, store, t, "weaponize_plan", status, stop, want=10.0)
+                # RESOLVE THE LEDGER: every remaining finding gets a disposition (confirmed / drivable
+                # / off-surface / false-positive / untainted / needs-technique), written back as a
+                # "triage" evidence note. Runs last so poc-backed states are final; cheap/offline.
+                if not stop.is_set():
+                    _staged(bud, store, t, "triage", status, stop, want=10.0)
+                # CHAIN THE FINDINGS into a full attacker path: the capability-graph search over all
+                # findings (+ their PoC rungs) -> the deepest entry->...->objective path, each edge a
+                # real finding. The cross-linking spine the report renders as a narrative. Runs after
+                # triage so the rungs are final; cheap/offline/budget-exempt.
+                if not stop.is_set():
+                    _staged(bud, store, t, "attack_path", status, stop, want=10.0)
                 # Explain a static-only outcome: a memory-corruption defect was found but no runtime
                 # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
                 # leaving a bare "static" that reads like "nothing to see".
@@ -2619,9 +3182,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                                                      settled=_settled)
                 except Exception:                            # noqa: BLE001 -- never fail a run on this
                     _log.debug("scorecard failed for %s", tid, exc_info=True)
+                _record_target_summary(store, t, status)
             except Exception as _exc:                   # noqa: BLE001 -- isolate, then record
                 _target_failed(store, case_id, tid, _exc, status)
                 continue
+        # Honest account when the whole-run budget ran out before every target was analysed: the
+        # operator set a ceiling, so this is expected, not a failure -- name the skipped targets.
+        if _budget_skipped:
+            status["targets_skipped_for_budget"] = [
+                (store.targets.get(x).filename if store.targets.get(x) else x)
+                for x in _budget_skipped]
+            _log.info("whole-run budget spent; %d target(s) skipped for budget",
+                      len(_budget_skipped))
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
         # components are exactly such a set).
         if len(worklist) > 1 and not stop.is_set():
@@ -2630,6 +3202,26 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # Two builds of the same program in one case: re-run the proven exploit against the
             # other one and say whether it still reproduces.
             _run_poc_diff(store, worklist, status, stop)
+            # The case-scoped stages above (ipc_model / cross_taint / whole_system) file PER-TARGET
+            # findings AFTER each target's own triage already ran, so those findings would otherwise
+            # keep a bare `candidate` state with no disposition -- violating the "every finding
+            # resolves" invariant (a fresh FreeRDP run left 14 ipc_taint CWE-78 unresolved this way).
+            # Sweep triage once more over each target to resolve them. triage is _ALWAYS_RUN
+            # (budget-exempt), cheap and offline, and idempotent on already-noted findings.
+            for _tid in worklist:
+                if stop.is_set():
+                    break
+                _tt = store.targets.get(_tid)
+                if _tt is not None:
+                    _staged(bud, store, _tt, "triage", status, stop, want=10.0)
+        # Persist each target's corpus for the next run (opt-in $LYKOS_CORPUS_DIR).
+        for tid in worklist:
+            _tt = store.targets.get(tid)
+            if _tt is not None:
+                try:
+                    _persist_corpus(store, _tt)
+                except Exception:                        # noqa: BLE001 -- caching is a bonus
+                    observe.absorbed(_log, "corpus not persisted")
         # Outcome.
         pd = PocDAO(store.conn)
         verified = any(p.verified for tid in worklist for p in pd.list_by_target(tid))
@@ -2650,4 +3242,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         except Exception:
             observe.absorbed(_log, "continuing")
     finally:
+        _run_history.record_end(store, case_id, _run_rec, status)   # done / stopped / error
+        if _renv:
+            _runenv.clear_case(case_id)
         store.close()

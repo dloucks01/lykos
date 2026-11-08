@@ -4,6 +4,7 @@ L2 primitive stage and the root-cause stage."""
 from __future__ import annotations
 
 import json
+import os
 import logging
 import shutil
 import tempfile
@@ -389,6 +390,19 @@ def plain_build_bytes(ctx, target):
     return None
 
 
+def variant_build_bytes(ctx, target, kind: str):
+    """Bytes of a stored build VARIANT of this target (`plain-blob`, `aflsan-blob`, ...) keyed to
+    the ingested binary's sha, or None. Same lookup as `plain_build_bytes`, for any kind."""
+    from ...db.dao import ArtifactDAO
+    try:
+        for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
+            if a.kind == kind and (a.meta or {}).get("binary_sha") in (None, target.sha256):
+                return ctx.content.get_bytes(a.sha256)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "no stored variant build")
+    return None
+
+
 def replay_exe_for(ctx, target, input_sha):
     """`(binary, kind)` for whatever actually consumes `input_sha`: a libFuzzer harness
     (`"libfuzzer"`), a sanitizer-variant build (`"sanitizer"`), or `(None, "")` when it is the
@@ -445,6 +459,23 @@ def replay_exe_for(ctx, target, input_sha):
     if sha is None and arts and not prefix:
         sha = arts[-1].sha256
     return (ctx.content.get_bytes(sha), "libfuzzer") if sha else (None, "")
+
+
+def harness_lib_dirs(ctx, target, input_sha) -> list:
+    """The shared-library dirs a stored harness needs to load (`libfuzzer-harness` meta), keeping
+    only the ones still on disk. A shared-linked ASan harness (a cmake project's fuzz build) cannot
+    even start without its project's .so files, so a replay that omits them reads as 'did not
+    reproduce'."""
+    from ...db.dao import ArtifactDAO, DynResultDAO
+    iso = next((d.isolation for d in DynResultDAO(ctx.conn).list_by_target(target.id)
+                if d.input_sha == input_sha and (d.isolation or "").startswith("libfuzzer/")), "")
+    prefix = iso.split("/", 1)[1] if "/" in iso else ""
+    if not prefix:
+        return []
+    for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
+        if a.kind == "libfuzzer-harness" and a.sha256.startswith(prefix):
+            return [d for d in ((a.meta or {}).get("lib_dirs") or []) if os.path.isdir(d)]
+    return []
 
 
 def env_var_from_argv(argv):
@@ -665,9 +696,17 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
     anything else is a starting guess that the caller sweeps past.
     """
     from ...db.dao import DynResultDAO
-    if params.get("input_mode"):
+    # The run that found THIS input is consulted before the operator's facts: its argv is the
+    # operator's own argv PLUS the option prefix the campaign found the crash under (`run_argv =
+    # prefix + base_argv`). jhead's heap over-read only fires under `-exifmap -mkexif`; taking the
+    # operator's bare `@@` first built a PoC that ran `jhead input.bin`, exited 0 and shipped as an
+    # unverified L0 for a confirmed crash. The operator's facts still decide every input no run
+    # recorded (a supplied crasher, a synthesized payload).
+    recorded = DynResultDAO(conn).list_by_target(target.id) if input_sha else []
+    if params.get("input_mode") and not any(r.input_sha == input_sha and r.input_mode
+                                            for r in recorded):
         return params["input_mode"], list(params.get("argv") or []), FEED_GIVEN
-    for r in DynResultDAO(conn).list_by_target(target.id):
+    for r in recorded:
         # PROMPTED delivery is recorded in the ISOLATION tag, not in `input_mode`: the campaign
         # runs the prompt protocol over the stdin CHANNEL (`channels = ["stdin"]` in fuzz/stage),
         # so the mode it stores is "stdin" and the pacing is what the tag remembers. `poc/stage`

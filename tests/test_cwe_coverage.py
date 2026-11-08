@@ -32,6 +32,50 @@ def test_named_classes_with_a_ceiling_agree_with_the_matrix():
             assert m[cwe] == ceil
 
 
+def test_invalid_free_classes_weaponize_to_rce():
+    """CWE-590/762 now route into the double_free tcache-poison / fastbin-dup engine (chain_primitive),
+    so their honest ceiling is code execution, not denial of service."""
+    assert cc.weaponizable("CWE-590") == "rce"
+    assert cc.weaponizable("CWE-762") == "rce"
+    # CWE-190 (integer-overflow allocation) was already rce and now actually chains there.
+    assert cc.weaponizable("CWE-190") == "rce"
+
+
+def test_array_index_and_pointer_primitives_reach_rce():
+    """CWE-129 (array-index write), CWE-822 (indirect call through a controlled field) and CWE-823
+    (out-of-range pointer offset) are driven to a detonation-confirmed control-flow hijack by the
+    chain engine, so their honest ceiling is code execution; CWE-119 stays the generic primitive."""
+    assert cc.weaponizable("CWE-129") == "rce"
+    assert cc.weaponizable("CWE-822") == "rce"
+    assert cc.weaponizable("CWE-823") == "rce"
+    assert cc.weaponizable("CWE-119") == "primitive"
+
+
+def test_run_matrix_scores_the_best_poc_level_per_class():
+    """With PoC rows joined in, the run matrix reports the best L0..L3 level each class reached and
+    counts the classes driven to a validated L3 -- the scorecard that makes 'every class to L3' a
+    tracked number, distinct from the finding's confidence state."""
+    findings = [
+        {"id": "f1", "cwe": "CWE-787", "state": "poc-backed", "dedup_key": "a"},
+        {"id": "f2", "cwe": "CWE-125", "state": "poc-backed", "dedup_key": "b"},
+        {"id": "f3", "cwe": "CWE-476", "state": "confirmed", "dedup_key": "c"},
+    ]
+    pocs = [
+        {"finding_id": "f1", "level": "L1"}, {"finding_id": "f1", "level": "L3"},  # best = L3
+        {"finding_id": "f2", "level": "L1"},                                       # best = L1
+        {"finding_id": "x", "level": "L3"},                                        # orphan -> ignored
+    ]
+    run = cc.run_matrix(findings, pocs)
+    by = {e["cwe"]: e for e in run["rows"]}
+    assert by["CWE-787"]["best_level"] == "L3"
+    assert by["CWE-125"]["best_level"] == "L1"
+    assert by["CWE-476"]["best_level"] is None          # a finding with no PoC has no level
+    assert run["l3_classes"] == ["CWE-787"] and run["l3_class_count"] == 1
+    # backward compatible: no pocs -> no levels, no crash
+    r2 = cc.run_matrix(findings)
+    assert r2["l3_class_count"] == 0 and all(e["best_level"] is None for e in r2["rows"])
+
+
 def test_capability_matrix_covers_all_named_classes():
     m = cc.capability_matrix()
     assert len(m) == len(CWE_NAMES)

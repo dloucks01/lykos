@@ -186,7 +186,11 @@ def _first_err_line(proc) -> str:
     return ""
 
 
-def _spawn_server(exe: str, argv: list, mem_mb: int = 1024) -> "subprocess.Popen | None":
+def _spawn_server(exe: str, argv: list, mem_mb: int = 1024, *, launch=(),
+                  extra_env=None) -> "subprocess.Popen | None":
+    """Start `exe argv` contained (see below). `launch` is a command prefix the target runs under
+    (an `afl-qemu-trace` that reports its coverage), `extra_env` variables added on top (the
+    coverage map id, a preloaded fault reporter)."""
     # A shared object has no entry point: spawning it as a server faults in the loader rather than
     # binding a port. Refuse it like a spawn failure (the campaign then reports "no-listen", which
     # is honest) rather than execute a library as a program -- the same guard sandbox.run has.
@@ -244,8 +248,10 @@ def _spawn_server(exe: str, argv: list, mem_mb: int = 1024) -> "subprocess.Popen
                 renv.populate_cwd(cwd)
             except OSError:
                 pass
+    if extra_env:
+        env = {**(env if env is not None else os.environ), **extra_env}
     try:
-        proc = subprocess.Popen(prefix + [exe] + [str(a) for a in argv],
+        proc = subprocess.Popen(prefix + [str(a) for a in launch] + [exe] + [str(a) for a in argv],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, preexec_fn=preexec,
                                 start_new_session=True, env=env, cwd=cwd)
@@ -393,7 +399,20 @@ def replay_once(exe: str, proto: str, payload: bytes, *, argv=(), port: "int | N
     after the server is up and listening -- so a crash found this way could not be replayed by the
     PoC path at all, and was filed as an unverified L0. This is the same spawn -> wait-for-port ->
     send -> poll sequence fuzz_server already uses for its confirm pass, exposed so the PoC and
-    bundle paths can reproduce a socket crash instead of guessing a channel that cannot carry it."""
+    bundle paths can reproduce a socket crash instead of guessing a channel that cannot carry it.
+
+    A stored multi-message SESSION (session.encode_session) is replayed message by message over
+    one connection by the session engine, which also reads the server's stderr -- a forked worker
+    that crashed leaves its report there while the parent keeps listening."""
+    from . import session as _session
+    if _session.is_session(payload):
+        r = _session.replay_session(exe, proto, payload, argv=argv, port=port,
+                                    settle=max(settle, 0.8))
+        if r.connect_failed and not r.responses:
+            return False, "no-listen", None, None
+        if not r.crashed:
+            return False, ("survived" if not r.died else (r.signal_name or "exited")), None, None
+        return True, r.signal_name, r.signal, None
     proc = _spawn_server(exe, list(argv))
     if proc is None:
         return False, "spawn-failed", None, None

@@ -117,6 +117,9 @@ export const api = {
   // The coverage ledger: the three axes (checks/classes run, findings weaponized, code exercised)
   // + the gaps worklist -- the "how close to 100%" dashboard.
   coverage: (caseId) => _req("GET", `/cases/${caseId}/coverage`),
+  // The weaponization backlog: findings not yet at a validated PoC + the technique to build next
+  // for each, grouped by leverage. The live mirror of the report's backlog section.
+  backlog: (caseId) => _req("GET", `/cases/${caseId}/backlog`),
   // Per-technique time + yield and the overall analysis time (the timing panel).
   timing: (caseId) => _req("GET", `/cases/${caseId}/timing`),
   systemmap: (caseId) => _req("GET", `/cases/${caseId}/systemmap`),
@@ -197,7 +200,7 @@ export const api = {
   // The tool's own validation gates (`lykos archgate` / `realgate` / `eval`), one at a time in the
   // background; poll selftest() for progress and the verdict. selftestHistory() = `lykos dashboard`.
   selftest: () => _req("GET", "/selftest"),
-  startSelftest: (kind, options = {}) => _req("POST", "/selftest", { kind, options }),
+  startSelftest: (kind, options = {}) => _req("POST", "/selftest", { body: { kind, options } }),
   selftestHistory: () => _req("GET", "/selftest/history"),
 };
 

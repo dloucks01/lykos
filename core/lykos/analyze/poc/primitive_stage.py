@@ -289,9 +289,13 @@ def _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout, *, asl
     else:
         return None, b""
     try:
+        # a file-mode input lives in scratch under /tmp, which the sandbox masks with an empty
+        # tmpfs: bind it back or the target only ever says it cannot open its input (the run
+        # console showed every one of these detonations failing that way on gif2rgb)
         res = sandbox.run(exe, argv=argv, stdin=stdin_bytes, timeout=timeout,
                           arch=target.arch, endianness=target.endianness, bits=target.bits,
-                          env_overrides=env, aslr=aslr)
+                          env_overrides=env, aslr=aslr,
+                          ro_binds=((str(work),) if mode == "file" else ()))
     except Exception:                                    # noqa: BLE001 -- advisory step
         return None, b""
     return (parse_asan_report((res.stderr or b"").decode("utf-8", "replace")),
@@ -1087,10 +1091,29 @@ def primitive_stage(ctx) -> dict:
         # control marker) then go exactly where the filler was. Unstructured inputs minimize to a
         # single run and frame as a whole (b"", b""), i.e. exactly the old behaviour.
         min_cap = _capture_for(mode)
+        # THE SAME DEFECT, not any fault. "Still faults" alone let a 1,914-byte md4c crash
+        # (heap-buffer-overflow READ at md4c.c:2315, found through a synthesized md_parse driver)
+        # minimise to ONE byte that aborts for some other reason -- and every experiment below then
+        # ran on an input that no longer reaches the defect: no sanitizer report, no out-of-bounds
+        # verdict, "no primitive", L1. On a sanitizer build the minimised input must give the same
+        # class at the same source line; on a plain build the same signal in the same code page.
+        _san_min = (not emulated) and aflpp.is_sanitizer_build(target_bytes)
+        _orig_rep = (_detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+                     if _san_min and len(orig) > 64 else None)
+        _orig_cap = min_cap(orig) if (len(orig) > 64 and not emulated and not _orig_rep) else {}
 
         def _still_faults(b):
+            if _orig_rep:
+                r = _detonate_for_report(ctx, target, exe, mode, base_argv, b, timeout)
+                return bool(r) and r.get("class") == _orig_rep.get("class") \
+                    and r.get("source") == _orig_rep.get("source")
             c = min_cap(b)
-            return bool(c.get("ok") and c.get("signal_name"))
+            if not (c.get("ok") and c.get("signal_name")):
+                return False
+            pc0, pc1 = _orig_cap.get("pc"), c.get("pc")
+            if _orig_cap.get("signal_name") and c.get("signal_name") != _orig_cap["signal_name"]:
+                return False
+            return pc0 is None or pc1 is None or (int(pc0) >> 12) == (int(pc1) >> 12)
         # Native only: minimization is up to `cap` detonations, cheap under ptrace but far too slow
         # over a qemu gdbstub (each exec is a full emulated run), where it would blow the stage's
         # budget. Cross-arch keeps the raw crash input, exactly as before.
@@ -1428,6 +1451,7 @@ def primitive_stage(ctx) -> dict:
         # question here too, for the same reason it is asked when the cyclic does not fault at
         # all. Skipped when a SANITIZER reported the defect: those classes have their own
         # verdicts above, measured from a report rather than from a faulting instruction.
+        _av = None
         if not _cls and not emulated:
             _av, _demo, _dcap, _dmode = _address_verdict(
                 ctx, lambda m: _capture_for(m), sweep_modes(mode, orig),
@@ -1447,6 +1471,10 @@ def primitive_stage(ctx) -> dict:
         ctx.emit("primitive.done", payload={
             "primitive": ("register-control" if regs else None), "supported": True,
             "registers": regs, "signal": cap0.get("signal_name"), "sanitizer_class": _cls,
+            # the measured answer even when it is "no control" -- the report states WHY the
+            # defect stops at a crash from exactly this (an out-of-bounds read past a buffer end
+            # whose address the attacker does not choose); dropping it left the reader nothing
+            "address_verdict": _av,
             "note": (f"no primitive verdict for {_cls}: {_why}" if _why else
                      "crash reproduced but no instruction-pointer / memory primitive found")})
         ctx.progress(pct=100, msg=(f"{_cls}: no verdict ({_why[:60]})" if _why
@@ -1460,6 +1488,12 @@ def primitive_stage(ctx) -> dict:
 #: one ptrace-captured detonation (milliseconds native), so the budget is generous for the
 #: minimized crash inputs this runs on and bounded for anything larger.
 _ADDR_PROBE_OFFSETS = 48
+#: When the evenly spaced sample finds no lever, the offsets it skipped are tried too, up to this
+#: input length and wall time. A lever byte sitting between two samples was invisible: giflib-5.1.4
+#: (150-byte crash, step 3) read "a FIXED address" while an 84-byte input of the SAME bucket (step
+#: 1, every byte tried) showed address control -- the verdict depended on the input's length.
+_ADDR_PROBE_FULL = 1024
+_ADDR_PROBE_FULL_S = 30.0
 _ADDR_PROBE_VALUES = (0x00, 0x40, 0x80, 0xff)
 
 
@@ -1564,6 +1598,23 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
             d = abs(int(cap["fault_addr"]) - base_addr)
             if d > best[0]:
                 best = (d, off, bytes(var))
+    if best[1] is None and step > 1 and len(orig) <= _ADDR_PROBE_FULL:
+        import time as _t
+        _stop = _t.monotonic() + _ADDR_PROBE_FULL_S
+        for off in range(len(orig)):
+            if off % step == 0:
+                continue                                   # already sampled above
+            if _t.monotonic() > _stop:
+                break
+            v = 0xFF if orig[off] != 0xFF else 0x00
+            var = bytearray(orig); var[off] = v
+            cap = cap_fn(bytes(var))
+            if cap.get("ok") and cap.get("fault_addr") is not None:
+                d = abs(int(cap["fault_addr"]) - base_addr)
+                if d:
+                    obs.append((f"byte@{off}=0x{v:02x}", cap))
+                    best = (d, off, bytes(var))
+                    break                                  # the lever; its scale is measured below
     # The campaign's OTHER crashes, each one a free observation of the same question.
     for sha, data in siblings or ():
         cap = cap_fn(data)

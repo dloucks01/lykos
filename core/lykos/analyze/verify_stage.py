@@ -15,7 +15,9 @@ A finding is promoted `corroborated -> confirmed` only when ALL THREE legs hold,
                (taint-dataflow / bounds / observed effect / source-sink / cpg) -- above a flat
                `pattern` match. A bare `candidate`, a finding corroborated on `pattern` alone, and a
                synthesized `recipe` row (corroborated at most by its own honesty contract) are never
-               promoted.
+               promoted. Nor is an audit ADVISORY (dangerous_api: "check the size is not attacker-
+               controlled" names an API to review, not a defect) or a ROLL-UP citing many call sites
+               (its dataflow leg is one site out of hundreds) -- a confirmed claim is about one site.
   * reach    : taint_reach positively places the enclosing function on the malicious-peer
                attack surface (`reachable is True`). Reachability merely UNDECIDED is not enough --
                an undecided finding stays corroborated (the honest ceiling), never confirmed.
@@ -110,6 +112,35 @@ def _has_derivation(f) -> bool:
                for e in _evidence(f))
 
 
+#: Detectors whose rows are AUDIT ADVISORIES ("calloc -- check the count/size are not
+#: attacker-controlled"): they name an API to review, not a defect, so there is nothing to confirm.
+_ADVISORY_DETECTORS = frozenset({"dangerous_api"})
+_ADDR_RE = re.compile(r"\bat (0x[0-9a-fA-F]+)\b")
+
+
+def _pattern_sites(f) -> set:
+    """Distinct call-site addresses the finding's `pattern` channels cite."""
+    out = set()
+    for e in _evidence(f):
+        if isinstance(e, dict) and e.get("channel") == "pattern":
+            m = _ADDR_RE.search(str(e.get("detail") or ""))
+            if m:
+                out.add(m.group(1).lower())
+    return out
+
+
+def _is_rollup(f) -> bool:
+    """A finding that aggregates MANY call sites (one row for every sprintf in the binary). Its
+    'dataflow' leg is whichever single site some taint reached, so confirming the row would confirm
+    hundreds of unrelated sites. A confirmed claim must be about one site."""
+    return len(_pattern_sites(f)) > 1
+
+
+def _promotable(f) -> bool:
+    return (not _is_recipe(f) and (f.detector or "") not in _ADVISORY_DETECTORS
+            and not _is_rollup(f) and _has_derivation(f))
+
+
 def _source_str(f) -> str:
     """A human source locator for the emitted artifact: 'func() at file:line' when the evidence
     carries a file:line, else the finding title."""
@@ -132,8 +163,7 @@ def promote(fd: FindingDAO, target, run_id: str | None) -> list:
             continue
         real = bool(gm.get("grounded"))
         reach_ok = gm.get("reachable") is True
-        if (f.state == "corroborated" and real and reach_ok
-                and not _is_recipe(f) and _has_derivation(f)):
+        if f.state == "corroborated" and real and reach_ok and _promotable(f):
             basis = (f"verified REAL and attacker-reachable: grounding kept it "
                      f"(verdict={gm.get('verdict')}), the enclosing function is on the "
                      f"malicious-peer attack surface (reach basis: {gm.get('reach_basis')}), and a "
@@ -198,6 +228,9 @@ def _emit_recipe(ctx, target, f, technique: str, level: str) -> bool:
                      f"from a build of the target."),
             why_not_executed="source-level finding; no build was executed in this environment",
             severity="high", detector="confirm", lead=f,
+            missing_technique=("a build of the target to recover the concrete stack frame (the "
+                                "exact offset / payload) and detonate -- this is a source finding "
+                                "with no binary to measure"),
             dedup_key=f"recipe:{f.cwe}:{technique}:{f.dedup_key}")
         return True
     except Exception:                                    # noqa: BLE001

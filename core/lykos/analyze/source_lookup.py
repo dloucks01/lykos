@@ -32,3 +32,34 @@ def source_project_for(conn, target, *, kind: str = "source-project"):
     if exact is not None:
         return exact
     return arts[0] if len(arts) == 1 else None
+
+
+#: Stages whose only input is the SOURCE TREE (they return nothing for a binary with no tree).
+#: Run on every build product of one tree, they repeat the same scan and file the same findings
+#: once per product: FreeRDP builds 8 siblings (harnesses + shared libraries) from one tree.
+TREE_SCOPED_STAGES = frozenset({
+    "wire_flow", "param_sink", "lifecycle_scan", "intwidth_scan", "dop_scan", "race_scan",
+    "guard_gap", "alloc_overflow", "sibling_guard", "codeql", "source_cve_scan", "embedded_audit",
+    "int_overflow_scan", "uaf_scan", "assert_guard_scan", "oob_write_scan", "cpg_scan",
+    "source_sink_scan", "coverage_sweep", "source_confirm", "libfuzzer",
+})
+
+
+def tree_owner(conn, target):
+    """The target that OWNS `target`'s source tree when `target` is only a sibling build product
+    of it, else None.
+
+    A source upload registers the binary it was built for (`binary_sha`) plus every other
+    executable and library the build produced. All of them resolve to the same tree through
+    `source_project_for`'s sole-artifact fallback, which is right for grounding a sibling's own
+    findings -- and wrong for re-running the tree's analysis on each of them. None when `target`
+    is the owner, matches no tree, or the owner is not a target in this case."""
+    arts = [a for a in ArtifactDAO(conn).list_by_case(target.case_id) if a.kind == "source-project"]
+    if len(arts) != 1:
+        return None
+    owner_sha = (arts[0].meta or {}).get("binary_sha")
+    if not owner_sha or owner_sha == target.sha256:
+        return None
+    from ..db.dao import TargetDAO
+    return next((t for t in TargetDAO(conn).list_by_case(target.case_id)
+                 if t.sha256 == owner_sha), None)

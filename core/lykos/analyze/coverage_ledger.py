@@ -323,18 +323,27 @@ def build_ledger(store, case_id: str) -> dict[str, Any]:
         # Coverage across ALL weakness classes: the honest answer to "consider all CWEs" -- the
         # per-class weaponization ceiling (what CAN be proven) and how far each class present on
         # this case actually climbed the confidence ladder. Breadth is wide; depth is the lever.
-        "cwe_coverage": _cwe_coverage_rollup(all_findings),
+        "cwe_coverage": _cwe_coverage_rollup(all_findings, conn, case_id),
         "gaps": gaps,
     }
 
 
-def _cwe_coverage_rollup(all_findings) -> dict:
+def _cwe_coverage_rollup(all_findings, conn=None, case_id=None) -> dict:
     """The CWE coverage matrix for this case: the static capability summary (classes detected, how
-    many reach RCE) and the per-class run matrix (how far each class present climbed). One source
-    for the CLI (`lykos cwe-coverage`), the report, and the GUI."""
+    many reach RCE) and the per-class run matrix (how far each class present climbed, plus the best
+    PoC LEVEL L0..L3 it reached). One source for the CLI (`lykos cwe-coverage`), the report, and the
+    GUI."""
     from . import cwe_coverage
+    pocs = None
+    if conn is not None and case_id is not None:
+        try:
+            pocs = [{"finding_id": r[0], "level": r[1]} for r in conn.execute(
+                "SELECT finding_id, level FROM poc WHERE case_id=?", (case_id,)).fetchall()]
+        except Exception:                                # noqa: BLE001 -- scorecard is best-effort
+            pocs = None
     run = cwe_coverage.run_matrix(
-        [{"cwe": f.cwe, "state": f.state, "dedup_key": f.dedup_key} for f in all_findings])
+        [{"id": f.id, "cwe": f.cwe, "state": f.state, "dedup_key": f.dedup_key}
+         for f in all_findings], pocs)
     return {"summary": cwe_coverage.summary(), "run": run}
 
 

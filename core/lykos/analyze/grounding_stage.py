@@ -77,6 +77,17 @@ def grounding_stage(ctx) -> dict:
     except Exception:                                    # noqa: BLE001
         reachable = set()
     root = _source_root(ctx, target)
+    # F1/F2 (doc 60): for a SOURCE project the DB call graph is empty, so the binary reachability
+    # above is ∅ and grounding would fall back to the weak "is it in a fuzz harness" heuristic.
+    # Build a REAL call graph from the source tree and union its attacker-reachable closure in, so
+    # reachability is a fact (BFS from wire entries over caller->callee), not a heuristic.
+    if root is not None:
+        try:
+            from . import source_reach
+            src_reach, _adj, _entries = source_reach.reachable_from_wire(str(root))
+            reachable = (reachable or set()) | src_reach
+        except Exception:                                # noqa: BLE001
+            _log.debug("source reachability unavailable; keeping binary set", exc_info=True)
     # (path, line) -> context slice, for grounding's source checks; path -> whole-file text, for
     # taint_reach to parse the enclosing function of a source finding (so reachability can be
     # DECIDED rather than left undecided -- what gates the confirm promoter).

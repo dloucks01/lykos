@@ -109,9 +109,11 @@ def test_an_option_travels_with_the_input_it_crashed(tmp_path):
         run_input(tmp_path / "t", "file", wf, 1.0, "x86-64", b"data",
                   base_argv=["-exonly", "-v"])
         assert seen["argv"][:2] == ["-exonly", "-v"], seen["argv"]
-        assert seen["argv"][-1] == str(wf), "the carrier still comes last"
+        # the carrier is the input in its own writable slot beside `wf` (runner.writable_slot)
+        slot = str(runner.writable_slot(wf))
+        assert seen["argv"][-1] == slot, "the carrier still comes last"
         run_input(tmp_path / "t", "file", wf, 1.0, "x86-64", b"data")
-        assert seen["argv"] == [str(wf)], "and no prefix when none was given"
+        assert seen["argv"] == [slot], "and no prefix when none was given"
     finally:
         runner.sandbox = real
 

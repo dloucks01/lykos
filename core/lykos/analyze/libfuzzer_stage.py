@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import re
+import shutil
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,31 +30,52 @@ LF_CORPUS_UNITS = 2000
 
 
 def _materialize_source(ctx, target) -> Path | None:
-    """Recover the target's source into a scratch directory: the archived source-project tree, or a
-    single source-code file. None when the target was not built from source."""
-    d = ctx.scratch() / "src"
-    d.mkdir(parents=True, exist_ok=True)
+    """Recover the target's source into a STABLE per-target directory: the archived source-project
+    tree, or a single source-code file. None when the target was not built from source.
+
+    STABLE, not per-job. `ctx.scratch()` is a fresh mkdtemp per STAGE, so extracting there made every
+    stage re-extract the tree AND rebuild its cmake harnesses from scratch: `source_confirm` builds
+    FreeRDP (~90s), then `synth_confirm` got a ~30s prove slice, could not rebuild it, and
+    driver-synth synthesized 0 drivers. Keyed by the source archive's sha under the (exec-capable)
+    scratch base, the tree -- and the expensive `_lykos_cmake_*` build written into it -- is built
+    ONCE and reused by later stages, and across runs of the same target. Published atomically (a
+    marker file), so a crash mid-extract or a concurrent stage never leaves a half-tree in use."""
     proj = source_project_for(ctx.conn, target)
-    if proj:
-        try:
+    sp = proj or source_project_for(ctx.conn, target, kind="source-code")
+    if sp is None:
+        return None
+    try:
+        base = ctx._scratch_base()
+    except Exception:                                    # noqa: BLE001
+        base = None
+    base = base or tempfile.gettempdir()
+    d = Path(base) / f"lykos-src-{sp.sha256[:16]}"
+    marker = d / ".lykos-extracted"
+    if marker.is_file():
+        return d                                         # already materialized (+ possibly built)
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)             # a partial tree from a crash: start clean
+    tmp = Path(tempfile.mkdtemp(prefix="lykos-srcx-", dir=base))
+    try:
+        if proj:
             with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),
                               mode="r:gz") as tf:
                 # filter="data" rejects absolute/.. members AND symlink/hardlink escapes (a naive
                 # name check misses a symlink member pointing outside, then a file written through
                 # it) -- the attacker-supplied source tree must not escape the scratch dir.
-                tf.extractall(d, filter="data")
-            return d
-        except Exception:                                # noqa: BLE001
-            return None
-    single = source_project_for(ctx.conn, target, kind="source-code")
-    if single:
-        try:
-            fn = (single.meta or {}).get("filename") or "a.c"
-            (d / Path(fn).name).write_bytes(ctx.content.path(single.sha256).read_bytes())
-            return d
-        except Exception:                                # noqa: BLE001
-            return None
-    return None
+                tf.extractall(tmp, filter="data")
+        else:
+            fn = (sp.meta or {}).get("filename") or "a.c"
+            (tmp / Path(fn).name).write_bytes(ctx.content.path(sp.sha256).read_bytes())
+        (tmp / ".lykos-extracted").write_text("1")
+    except Exception:                                    # noqa: BLE001
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    try:
+        os.replace(tmp, d)                               # atomic publish; fails if d now exists
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)           # a concurrent stage published it first
+    return d if marker.is_file() else None
 
 
 def _corpus_cache(ctx, target):
@@ -309,6 +333,33 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
         row["why"] = _build_why(build["log"])
         return row
     row["built"], row["harness"] = True, build["harness"]
+    # A SYNTHESIZED call must survive a trivial input before anything it finds is believed: one
+    # that crashes on nothing is crashing on an argument WE invented (see trivial_input_crash).
+    # In-tree and known harnesses are the project's own / documented calls and are exempt.
+    if spec.get("kind") not in ("in-tree", "known"):
+        bad = LF.trivial_input_crash(build["binary"], ctx.scratch() / f"triv-{spec['id']}",
+                                     lib_dirs=build.get("lib_dirs"))
+        # The FILE shape is a guess from the function's name (`parse*(char *)` might take a path)
+        # and the guess can be the invented argument: it hands the function a 19-byte temp PATH,
+        # and `parse(char *s){ char t[16]; strcpy(t, s); }` overflows on that path on every input
+        # -- a crash the fuzz bytes play no part in. Fall back to handing it the bytes themselves,
+        # where the same overflow is reached by attacker data instead of by our path.
+        if bad and spec.get("kind") == "function" and "[file]" in (build.get("harness") or ""):
+            alt = dict(spec, fn_kind="cstring", id=spec["id"] + "-str")
+            b2 = LF.build_libfuzzer(src, ctx.scratch() / f"lf-{alt['id']}.bin", spec=alt,
+                                    cache=cache)
+            if b2["ok"] and not LF.trivial_input_crash(
+                    b2["binary"], ctx.scratch() / f"triv-{alt['id']}",
+                    lib_dirs=b2.get("lib_dirs")):
+                bad, build, spec = None, b2, alt
+                row["harness"] = build["harness"]
+                row["kind_fallback"] = "file -> cstring (the path the file shape passes crashed it)"
+        if bad:
+            row["why"] = (f"not fuzzed: the synthesized call to {spec.get('entry')} {bad} -- an "
+                          "argument the harness had to invent is not a valid call, so its crashes "
+                          "would be ours, not the library's")
+            row["rejected"] = True
+            return row
     # SEED IT with the format this target reads. `run_libfuzzer` has always taken a corpus and
     # this caller never passed one, so the in-process engine started from an empty corpus and had
     # to invent a container format byte by byte -- while the pipeline already knows the format and
@@ -327,6 +378,18 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     cache_dir = (corpus_root / spec["id"]) if corpus_root is not None else None
     kept = _load_corpus(cache_dir, pool=corpus_root)
     corpus = kept + [c for c in corpus if c not in kept]
+    # The operator's seeds, or the ones mined from the project's own tests (`tree_seeds`): real
+    # inputs of the format, which the in-process engine never had -- `seed_files` reached the
+    # out-of-process fuzzers only.
+    for fp in ((ctx.params or {}).get("seed_files") or [])[:64]:
+        try:
+            q = Path(fp)
+            if q.is_file() and q.stat().st_size <= (1 << 20):
+                data = q.read_bytes()
+                if data not in corpus:
+                    corpus.append(data)
+        except OSError:
+            continue
     # Always prime with a few GENERIC over-long inputs: a plain stack overflow (strcpy/memcpy/sprintf
     # into a small array) is then hit on the FIRST replay instead of left to the mutator to grow an
     # input large enough -- which a short, CPU-contended campaign may not do in time. Cheap, and it
@@ -335,8 +398,22 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     corpus = corpus + [g for g in _generic if g not in corpus]
     ctx.progress(msg=f"libFuzzer: {spec.get('entry')} for {int(seconds)}s"
                      + (f", {len(corpus)} seeds" if corpus else ""))
+    _t0 = time.monotonic()
     res = LF.run_libfuzzer(build["binary"], ctx.scratch() / spec["id"], seconds=int(seconds),
                            max_len=max_len, corpus=corpus or None, lib_dirs=build.get("lib_dirs"))
+    # A plain run stops at its FIRST crash. When it did and the slice has time left, keep fuzzing
+    # the same entry point past it (fork mode), so one door's second and third defects are found
+    # instead of handing the rest of its time to the next entry point.
+    _left = seconds - (time.monotonic() - _t0)
+    if res.get("crashes") and _left >= 20:
+        more = LF.run_libfuzzer(build["binary"], ctx.scratch() / (spec["id"] + "-kg"),
+                                seconds=int(_left), max_len=max_len,
+                                corpus=(res.get("corpus") or corpus or None),
+                                lib_dirs=build.get("lib_dirs"), keep_going=True)
+        res["crashes"] = list(res["crashes"]) + list(more.get("crashes") or [])
+        res["execs"] = int(res.get("execs") or 0) + int(more.get("execs") or 0)
+        res["corpus"] = more.get("corpus") or res.get("corpus")
+        row["kept_going"] = True
     row["execs"] = int(res.get("execs") or 0)
     row["corpus_in"] = len(corpus)
     row["corpus_kept"] = _save_corpus(cache_dir, res.get("corpus") or [])

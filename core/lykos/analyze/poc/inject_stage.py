@@ -30,14 +30,24 @@ def _marker():
     return "LYK" + os.urandom(5).hex().upper()       # unique per run, avoids stale-output hits
 
 
+#: Go / Rust stdin readers. A managed binary never imports libc `read`/`fgets`, so without these a
+#: Go/Rust program that reads stdin had `stdin` ranked below `arg`. Recovered-symbol forms (Go's are
+#: `_go_canon`-normalized): bufio/os.Stdin/fmt.Scan* for Go, std::io::stdin / Stdin::read_line for
+#: Rust. Substring-matched because the mangled suffix (`::h<hex>`) varies.
+_MANAGED_STDIN = ("os.Stdin", "bufio.", "fmt.Scan", "fmt.Fscan", "io::stdin", "Stdin", "read_line",
+                  "read_to_string", "read_to_end", "ReadString", "ReadLine", "ReadBytes")
+
+
 def _channels(call_edges, given):
     if given:
         return [given]
     names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
+    raw = {e.dst_name for e in call_edges if e.dst_name}       # unnormalized: managed symbols
     order = []
     if names & {"fopen", "fopen64", "open", "open64", "freopen"}:
         order.append("file")
-    if names & {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getline"}:
+    if (names & {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getline"}
+            or any(tok in n for n in raw for tok in _MANAGED_STDIN)):
         order.append("stdin")
     order.append("arg")
     for m in ("stdin", "arg", "file"):
@@ -95,6 +105,147 @@ def _nav_preambles(ctx, target, target_bytes):
     return uniq[:10]
 
 
+def _directed_navs(ctx, target, target_bytes, exe, sink_names, *, depth=3, cap=140):
+    """Multi-step stdin preambles that DRIVE execution to a sink behind MULTI-STEP STATE -- a gate
+    that single-menu-nav (`_nav_preambles`) cannot pass, e.g. `system(buf)` reachable only after an
+    earlier option sets `unlocked=1`. Found by breakpointing the sink's call site and searching
+    menu-option SEQUENCES (depth-limited BFS) until one reaches it: a `reaches_address` hit means
+    control actually arrived at the sink under that preamble. The preamble is only a search guide --
+    the injection's own forgery-proof marker still gates confirmation -- so a reach that is not the
+    vulnerable call simply fails to confirm. Non-PIE only (the breakpoint needs a fixed call-site
+    address). Returns up to a few reaching option-sequence prefixes, cheapest (shortest) first."""
+    from ...db.dao import StringDAO
+    from .. import interaction
+    try:
+        strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id)]
+        model = interaction.build_model(target_bytes, strings=strings)
+    except Exception:                                    # noqa: BLE001
+        return []
+    opts = [str(o).encode() for o in (model.menu_opts or [])][:6]
+    if not opts:
+        return []
+    pie = (target.mitigations or {}).get("pie") == "on"
+    sinks = [] if pie else _sink_call_sites(exe, sink_names)
+    if sinks:
+        # NON-PIE: a fixed sink address lets a cheap breakpoint PRUNE the search -- confirm which
+        # option sequence drives to the sink before paying for an injection attempt.
+        return _bfs_reach(str(exe), opts, sinks, depth=depth, cap=cap,
+                          should_cancel=ctx.should_cancel)
+    # PIE (no fixed sink address) or a sink with no discrete call-site: enumerate bounded option
+    # sequences and let the inject loop's own forgery-proof marker confirm the reach -- the sink's
+    # side effect is the oracle, which is ASLR-independent, so no breakpoint is needed.
+    return _nav_variants(opts, depth=min(depth, 2), cap=36)
+
+
+def _sink_call_sites(exe, sink_names):
+    """Fixed call-site vaddrs of the probe's sinks (non-PIE), from the disassembly, for the
+    breakpoint-pruned reach."""
+    import subprocess
+    try:
+        dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-M", "intel", str(exe)],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    sinks = []
+    for ln in dis.splitlines():
+        if "call" in ln and any(f"<{s}" in ln for s in sink_names):
+            try:
+                sinks.append(int(ln.split(":", 1)[0].strip(), 16))
+            except ValueError:
+                pass
+    return sinks[:3]
+
+
+def _nav_variants(opts, *, depth=3, cap=40, data=b"A"):
+    """Menu-option stdin prefixes up to `depth`, shortest first, capped. For EACH option sequence
+    two variants: bare option lines, and one with a benign data line after every NON-final option --
+    which is what lets the reach pass an INTERMEDIATE option that reads its own data (a "set name"
+    before "run"), where a bare option line desyncs (the data read eats the next option). The final
+    option gets no data line: its read is where the payload lands when `_attempt` appends it. A menu
+    that tolerates an unknown choice simply ignores a spurious data line, so trying both is safe."""
+    from itertools import product
+    seen, out = set(), []
+    for d in range(1, depth + 1):
+        for seq in product(opts, repeat=d):
+            for withdata in (False, True):
+                parts = []
+                for i, o in enumerate(seq):
+                    parts.append(o + b"\n")
+                    if withdata and i < len(seq) - 1:
+                        parts.append(data + b"\n")
+                nav = b"".join(parts)
+                if nav not in seen:
+                    seen.add(nav)
+                    out.append(nav)
+                    if len(out) >= cap:
+                        return out
+    return out
+
+
+def _bfs_reach(exe, opts, sinks, *, depth=3, cap=140, should_cancel=lambda: False, want=3):
+    """Breadth-first over menu-option SEQUENCES (shortest first): return the option-sequence stdin
+    prefixes that DRIVE execution to any sink call-site, each confirmed by a `reaches_address`
+    breakpoint. `opts` are option tokens (bytes), `sinks` are call-site vaddrs. Bounded by `cap`
+    breakpoint runs; stops at `want` reaching prefixes. The core of the directed deep-sink reach."""
+    from . import detonate
+    navs, runs = [], 0
+    for pre in _nav_variants(opts, depth=depth, cap=cap):   # bare + data-after-intermediate variants
+        if should_cancel() or runs >= cap:
+            return navs
+        for s in sinks:
+            runs += 1
+            # `x\n` is a benign placeholder for the sink option's own read -- just enough to drive
+            # it to the call; the real payload replaces it when `_attempt` sends `nav + payload`.
+            if detonate.reaches_address(exe, pre + b"x\n", s, input_mode="stdin", timeout=5):
+                navs.append(pre)
+                break
+        if len(navs) >= want:
+            return navs
+    return navs
+
+
+def _image_sink_offsets(exe, sink_names):
+    """Image OFFSETS of the probe's sink call-sites. On a PIE the objdump address IS the image
+    offset (link base 0), so the same disassembly scrape that `_sink_call_sites` uses for a non-PIE
+    fixed vaddr gives the offset a runtime breakpoint needs once the base is leaked."""
+    return _sink_call_sites(exe, sink_names)
+
+
+def directed_reach_pie(exe, opts, sink_offsets, target_bytes, *, depth=3, cap=48,
+                       should_cancel=lambda: False, want=3):
+    """Directed deep-reach to a NON-INJECTION sink in a PIE, confirmed by the two-stage runtime
+    oracle. A non-injection sink (a dangerous call, a memory-corruption site) has NO side-effect
+    marker, so the injection PIE path (enumerate + marker-confirm) cannot serve it; and the non-PIE
+    `_bfs_reach` breakpoint needs a fixed address ASLR denies. `detonate.reaches_runtime_address`
+    closes both: it leaks the PIE base from a pointer the target discloses (page-offset matched by
+    `exploit.recover_pie_base`), then plants an INT3 at base+offset and delivers the nav preamble --
+    a SIGTRAP at that runtime address proves control reached the sink under that preamble. `opts`
+    are menu-option tokens, `sink_offsets` the sink call-site image offsets (`_image_sink_offsets`).
+    Returns reaching option-sequence prefixes, shortest first (the leak must be disclosed BEFORE the
+    target first blocks for input -- the common startup-leak case; a leak that only appears mid-nav
+    is not yet covered). Sound exactly as `_bfs_reach`: a reach that is not the vulnerable call is a
+    search guide, not a confirmation, and a preamble that does not drive to the sink never trips the
+    breakpoint (the caller still supplies the negative control)."""
+    from . import detonate
+    navs, runs = [], 0
+    for pre in _nav_variants(opts, depth=depth, cap=cap):
+        if should_cancel() or runs >= cap:
+            return navs
+        for off in sink_offsets:
+            runs += 1
+            # `x\n` is a benign placeholder for the sink option's own read -- just enough to drive
+            # control to the call. The nav preamble rides stage 2 (post-leak) via make_payload.
+            reached, _base = detonate.reaches_runtime_address(
+                exe, win_off=off, target_bytes=target_bytes,
+                make_payload=lambda _b, _rt, _p=pre: _p + b"x\n")
+            if reached:
+                navs.append(pre)
+                break
+        if len(navs) >= want:
+            return navs
+    return navs
+
+
 def synthesize_injection_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -133,13 +284,28 @@ def synthesize_injection_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     ctx.emit("inject.start", payload={"probes": sorted(applicable), "channels": channels})
+    import time as _time
+    # A DEADLINE across every probe and channel: the stage had none, and on md4c it ran 65 s of a
+    # 30 s slice -- time taken from the fuzzers scheduled after it. Probes the clock does not reach
+    # are named in the done-event, never silently treated as "not injectable".
+    _deadline = _time.monotonic() + float(p.get("max_seconds") or 120)
+    cut_short: list = []
+
+    def _over() -> bool:
+        return _time.monotonic() > _deadline
     confirmed = []
     navs = None                                      # built lazily: only a failing probe needs it
+    concolic_out = None                              # angr solve, run at most once across probes
     for name, spec in applicable.items():
+        if _over():
+            cut_short.append(name)
+            continue
         marker = _marker()
         payloads = spec["payloads"](marker)
 
         def _attempt(payload, mode, nav=b"", spec=spec, marker=marker):
+            if _over():
+                return None
             run_argv, stdin = _deliver(mode, payload, argv_base, ctx, nav)
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
                               arch=target.arch, endianness=target.endianness, bits=target.bits)
@@ -158,6 +324,9 @@ def synthesize_injection_stage(ctx) -> dict:
                     break
             if hit:
                 break
+        if hit is None and _over():
+            cut_short.append(name)
+            continue
         if hit is None:                              # 2. NAVIGATE to a sink behind a menu / gate
             if navs is None:
                 navs = _nav_preambles(ctx, target, target_bytes)
@@ -169,6 +338,33 @@ def synthesize_injection_stage(ctx) -> dict:
                         break
                 if hit:
                     break
+        if hit is None and not _over():              # 3. DIRECTED multi-step reach to a DEEP sink
+            # The sink sits behind multi-step state single-nav cannot pass: breakpoint it and search
+            # option sequences that drive execution to it, then inject + confirm on each.
+            for nav in _directed_navs(ctx, target, target_bytes, exe, spec["sinks"]):
+                for payload in payloads:
+                    ctx.progress(msg=f"probing {name} (directed reach after {nav!r})")
+                    hit = _attempt(payload, "stdin", nav)
+                    if hit:
+                        break
+                if hit:
+                    break
+        if hit is None and not _over() and spec.get("cwe") == "CWE-78":       # 4. THE FILENAME
+            # The payload is the input file's NAME: a program that pastes the path it was given into
+            # a shell command (jhead -rgt, CVE-2022-41751). A valid file of the program's format,
+            # named with the payload, under each of its own flags; confirmed by a split marker only
+            # an executing shell joins (filename_inject's docstring).
+            ctx.progress(msg=f"probing {name} (payload in the input file's name)")
+            hit = _filename_channel(ctx, target, exe, timeout, _deadline, p)
+        if hit is None and not _over() and spec.get("cwe") in ("CWE-78", "CWE-134"):   # 5. CONCOLIC
+            # A sink behind a VALUE GUARD (a magic number / byte compare) that no option sequence
+            # passes: symbolically solve a stdin that reaches it (angr hypo driver, scoped under
+            # MemoryMax), then substitute our forgery-proof payload into the solved sink argument.
+            if concolic_out is None:
+                concolic_out = _run_concolic(ctx, target, target_bytes, exe)
+            if concolic_out:
+                ctx.progress(msg=f"probing {name} (concolic value-guard reach)")
+                hit = _concolic_consume(concolic_out, spec, payloads, marker, exe, target, timeout)
         if hit:
             confirmed.append({"probe": name, **_finalize(ctx, target, target_bytes, spec, hit)})
 
@@ -186,6 +382,14 @@ def synthesize_injection_stage(ctx) -> dict:
     # of the recovered frame and image. Compute and file it as concrete payload bytes for each
     # CWE-134 site, whether or not this sandbox could run the target (additive: a demonstrated
     # format exploit from build_exploit suppresses it).
+    # CWE-78 command injection: construct + DETONATE (a shell separator + echo-nonce marker).
+    # Different oracle from the memory-corruption classes; additive and best-effort.
+    try:
+        from . import cmdi_construct
+        cmdi_construct.construct_command_injections(ctx, target)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "command-injection construct skipped")
+
     if "format-string" in applicable:
         fmt_ok = any(c.get("cwe") == "CWE-134" for c in confirmed)
         from . import fmt_recipe
@@ -197,6 +401,7 @@ def synthesize_injection_stage(ctx) -> dict:
                  "target could not run); the write plan is computed from the recovered frame"))
 
     ctx.emit("inject.done", payload={"ok": True, "confirmed": len(confirmed),
+             "cut_short_for_budget": cut_short,
              # input_sha + resolved_base are the HANDOFF to build_exploit: a CWE-134 leak that
              # already resolved a PIE/libc base is a measured disclosure recipe, so L3's leak recon
              # can replay this exact input instead of re-deriving the %p offset from scratch (see
@@ -274,6 +479,9 @@ def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
             summary=(f"the binary imports the {name} sink; candidate payload {shown!r} delivered "
                      f"over {chan} is built to trigger it"),
             why_not_executed=why, lead=leads.get(cwe),
+            missing_technique=(f"a reaching input channel that carries the payload past the "
+                                f"unreached navigation state to the {name} sink, plus a live target "
+                                f"to observe the injected-command runtime marker"),
             input_bytes=pb, input_mode=chan)
 
 
@@ -457,6 +665,116 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha, bases=None):
     return (None, title, {"channel": "effects", "detail": json.dumps(effs)})
 
 
+#: The marker payloads the angr hypo driver embeds at a reached injection sink (hyp_driver
+#: CMD_PAYLOADS + FMT_PAYLOADS). We locate one in a solved input to find the sink-argument slot,
+#: then substitute OUR forgery-proof payload there -- the bytes BEFORE it are the value-guard-passing
+#: prefix the solver found, which we keep verbatim.
+_HYPO_INJECT_PAYLOADS = [b";id>&2;#", b"|id>&2|", b"$(id>&2)", b"`id>&2`", b"\nid>&2\n", b";id>&2",
+                         b"%n%n%n%n", b"%s%s%s%s%s%s", b"%n%n", b"%x%n"]
+
+
+def _run_concolic(ctx, target, target_bytes, exe):
+    """Run the angr hypo driver ONCE over the target to solve inputs reaching its injection sinks,
+    scoped under MemoryMax so a runaway solve kills only the driver. Returns the out.json dict or
+    None (angr absent, image too large, or nothing solved). Shared across probes."""
+    try:
+        from ...hypo import engine
+    except Exception:                                    # noqa: BLE001
+        return None
+    if engine.angr_python() is None or len(target_bytes) > 8_000_000:
+        return None
+    budget = float((ctx.params or {}).get("concolic_budget", 60))
+    try:
+        # The driver's precise stdin models, all opt-in so the Tier-0 corpus can't regress, enabled
+        # here because the concolic fallback's whole job is to SOLVE a non-menu state gate and then
+        # RUN-reproduce it:
+        #   fork_scanf     -- fork scanf-from-stdin on concrete consumed-lengths (positions stay
+        #                     concrete, so a scanf("%u") numeric guard replays).
+        #   line_fgets     -- KLEE-fork fgets per concrete line length, so a gate whose earlier state
+        #                     is set by a line read (e.g. a "mode"/"key" line tested before the sink)
+        #                     is REACHABLE and the offsets stay concrete so it replays.
+        #   precise_strcspn-- exact strcspn/strspn, so `s[strcspn(s,"\n")]=0` does not pin a line at
+        #                     its max length (write-concretization) and lose the real line bytes.
+        # The run-confirm gate below still has the final say -- these just make a solved reaching
+        # input replayable.
+        out = engine.run_driver(str(exe), argv=["@@"], input_mode="stdin", budget=budget,
+                                input_size=200,
+                                extra={"fork_scanf": True, "line_fgets": True,
+                                       "precise_strcspn": True})
+    except Exception:                                    # noqa: BLE001
+        return None
+    return out if out.get("hypotheses") else None
+
+
+def _concolic_consume(out, spec, payloads, marker, exe, target, timeout):
+    """Turn the angr hypo driver's solved reaching inputs into a CONFIRMED injection: for each
+    solution that reaches THIS probe's sink (matched by cwe), the bytes before the solver's embedded
+    marker payload are the value-guard-passing prefix; substitute our own forgery-proof payload into
+    that slot and confirm by effect (the injected command RUNS, not echoes). This is what carries a
+    payload past a value guard (a magic number / byte compare) that enumeration cannot pass. Returns
+    a `_finalize`-shaped hit or None."""
+    import base64
+    sols = [base64.b64decode(s["input_b64"])
+            for h in (out.get("hypotheses") or []) if h.get("cwe") == spec.get("cwe")
+            for s in (h.get("solutions") or []) if s.get("input_b64")]
+    for inp in sols[:5]:
+        hp = next((p for p in _HYPO_INJECT_PAYLOADS if p in inp), None)
+        if hp is None:
+            continue
+        guard = inp[:inp.find(hp)]                        # the solver's value-guard-passing prefix
+        for payload in payloads:
+            pb = payload if isinstance(payload, bytes) else payload.encode()
+            stdin = inp.replace(hp, pb, 1)
+            res = sandbox.run(exe, argv=[], stdin=stdin, timeout=timeout, arch=target.arch,
+                              endianness=target.endianness, bits=target.bits)
+            o = (res.stdout or b"") + b"\n" + (res.stderr or b"")
+            if spec["confirm"](o, payload, marker):
+                return {"payload": payload, "mode": "stdin", "signal": res.signal_name, "out": o,
+                        "marker": marker, "argv_base": [], "nav": guard, "stdin": stdin}
+    return None
+
+
+def _help_text(exe, target, timeout) -> str:
+    """What the program says about its options: its output for no arguments, -h and --help."""
+    out = []
+    for argv in ([], ["-h"], ["--help"]):
+        try:
+            r = sandbox.run(exe, argv=argv, timeout=min(5.0, timeout), arch=target.arch,
+                            endianness=target.endianness, bits=target.bits)
+            out.append(((r.stdout or b"") + b"\n" + (r.stderr or b"")).decode("latin-1", "ignore"))
+        except Exception:                                # noqa: BLE001 -- discovery is best effort
+            continue
+    return "\n".join(out)[:200000]
+
+
+def _filename_channel(ctx, target, exe, timeout, deadline, p):
+    """The filename-carried command injection probe; a `hit` for `_finalize`, or None."""
+    from ...db.dao import StringDAO
+    from .. import invocation
+    from . import filename_inject as fni
+    strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id, limit=20000)
+               if s.value]
+    found = invocation.discover(strings, help_text=_help_text(exe, target, timeout))
+    marker = _marker()
+
+    def _run(argv, cwd_dir):
+        try:
+            r = sandbox.run(exe, argv=argv, timeout=timeout, arch=target.arch,
+                            endianness=target.endianness, bits=target.bits,
+                            rw_binds=(str(cwd_dir),))
+        except Exception:                                # noqa: BLE001 -- one failed probe
+            return b""
+        return (r.stdout or b"") + b"\n" + (r.stderr or b"")
+    got = fni.probe(_run, strings, found, marker=marker,
+                    given_seeds=list(p.get("seed_files") or []), deadline=deadline,
+                    workdir=ctx.scratch() / "fninj")
+    if not got:
+        return None
+    return {"payload": got["name"], "mode": "filename", "signal": None, "out": got["out"],
+            "marker": marker, "argv_base": got["prefix"], "nav": b"", "stdin": None,
+            "seed": got["seed"]}
+
+
 def _finalize(ctx, target, target_bytes, spec, hit):
     payload = hit["payload"]
     pb = payload if isinstance(payload, bytes) else payload.encode()
@@ -466,6 +784,10 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     # a bundle that replays to a clean exit.
     nav = hit.get("nav") or b""
     delivered = hit.get("stdin") if mode == "stdin" and hit.get("stdin") else pb
+    extra = None
+    if mode == "filename":
+        # the FILE is the valid seed; the payload is its NAME (bundle.py: mode "filename")
+        delivered, extra = hit["seed"], {"name.txt": pb}
     input_sha = ctx.put_artifact("inject-input", data=delivered)
     # Record the ACTUAL base argv that delivered the payload (the discovered flags / `@@`), not a
     # bare re-derivation: dropping it produced a bundle that a replayer could not reproduce for any
@@ -474,6 +796,11 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     shown = pb.decode("latin-1")[:80]
     detail = (f"{spec['title']} confirmed at runtime via {mode}: payload {shown!r} produced the "
               f"expected effect (no fuzzing)")
+    if mode == "filename":
+        detail = (f"{spec['title']} confirmed at runtime: a valid input file NAMED {shown!r}"
+                  + (f", passed with {' '.join(run_argv)}" if run_argv else "")
+                  + ", made the program run the command in its name -- the shell joined the "
+                  "split marker, which no echo of the name can produce (no fuzzing)")
     if nav:
         detail += (f" -- reached by navigating first with {nav.decode('latin-1')!r} "
                    "(the sink is behind a menu branch / input gate)")
@@ -489,7 +816,8 @@ def _finalize(ctx, target, target_bytes, spec, hit):
             "tool_version": TOOL_VERSION}
     if nav:
         meta["navigation"] = nav.decode("latin-1")
-    data = bundle.build(target_bytes, delivered, meta, b"", mode, run_argv, "none")
+    data = bundle.build(target_bytes, delivered, meta, b"", mode, run_argv, "none",
+                        extra_files=extra)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": level})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
@@ -514,7 +842,7 @@ def _finalize(ctx, target, target_bytes, spec, hit):
         PocDAO(ctx.conn).set_finding(poc_id, fid)
     # The operator-runnable deliverable: a standalone command-injection script (proven -- the marker
     # ran in the sandbox). Best-effort, alongside the bundle.
-    if spec.get("cwe") == "CWE-78":
+    if spec.get("cwe") == "CWE-78" and mode != "filename":
         _emit_injection_script(ctx, target, spec, mode, nav, proven=True)
     return {"cwe": spec["cwe"], "mode": mode, "bundle": bundle_sha, "input_sha": input_sha,
             "level": level, "bases": {k: v for k, v in bases.items()

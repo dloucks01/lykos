@@ -36,10 +36,26 @@ _MAX_SOURCE_RECIPES = 64
 
 _IDENT = r"[A-Za-z_]\w*"
 # the deallocators, across libc / kernel / FreeRTOS / glib / C++ (`delete p;`). The captured group
-# is the pointer expression being freed.
-_FREE = re.compile(rf"\b(?:free|cfree|kfree|kvfree|vfree|vPortFree|pvPortFree|g_free|"
-                   rf"OPENSSL_free|CRYPTO_free)\s*\(\s*({_IDENT})\s*\)")
+# is the pointer expression being freed. `_NOT_METHOD` rejects a deallocator name reached through a
+# member access -- `obj.free(&obj)` / `dev->iface.free(&dev->iface)` is a FUNCTION-POINTER METHOD
+# call (its arg is the object's own address), NOT libc free(); matching it free-of-non-start
+# false-positived across FreeRDP's urbdrc channel. A `.` / `->` right before the name is the tell.
+_NOT_METHOD = r"(?<![.>])"
+_FREE_NAMES = (r"free|cfree|kfree|kvfree|vfree|vPortFree|pvPortFree|g_free|OPENSSL_free|CRYPTO_free")
+_FREE = re.compile(rf"{_NOT_METHOD}\b(?:{_FREE_NAMES})\s*\(\s*({_IDENT})\s*\)")
 _DELETE = re.compile(rf"\bdelete\s*(?:\[\s*\])?\s+({_IDENT})\s*;")
+# CWE-761: free of a pointer that is NOT the allocation start. Two syntactically distinctive, very
+# low-FP shapes -- you can only free the exact value malloc returned:
+#   * pointer ARITHMETIC: free(p + n), free(buf - 1), free(s->data + k)  (a base, member/index
+#     access, THEN a + or - and more) -- NOT free(p), free(p->next), free(arr[i]) (no trailing +/-).
+#   * ADDRESS-OF: free(&x), free(&arr[i])  -- you never free the address of an object.
+# Both reach the invalid/mismatched-free substrate (routed as CWE-590's sibling by chain_primitive).
+_BASE = rf"{_IDENT}(?:\s*(?:->|\.)\s*{_IDENT}|\s*\[[^\]]*\])*"
+# the arithmetic operator is a `+` or a `-` that is NOT the `-` of a `->` member access (so
+# free(p->next) / free(list->head) are NOT mistaken for `p` minus `>next`).
+_ARITH_OP = r"(?:\+|-(?!>))"
+_FREE_ARITH = re.compile(rf"{_NOT_METHOD}\b(?:{_FREE_NAMES})\s*\(\s*({_BASE}\s*{_ARITH_OP}\s*[^;)]+?)\s*\)")
+_FREE_ADDROF = re.compile(rf"{_NOT_METHOD}\b(?:{_FREE_NAMES})\s*\(\s*(&\s*{_BASE}[^;)]*?)\s*\)")
 def _assigns(line: str, var: str) -> bool:
     return re.search(rf"(?<![=!<>])\b{re.escape(var)}\s*=(?!=)", line) is not None
 
@@ -192,12 +208,51 @@ def _mk(name, free_line, use_line, var, dealloc, cwe, label, detail_tail, lines)
         "evidence": ev}
 
 
+def _scan_bad_free(name: str, lines: list) -> list:
+    """CWE-761: free of a pointer that is not the allocation start (pointer arithmetic or an
+    address-of). One finding per site; the freed expression is the subject."""
+    out: list = []
+    for i, ln in enumerate(lines):
+        for rx, kind in ((_FREE_ARITH, "pointer arithmetic (base + offset)"),
+                         (_FREE_ADDROF, "the address of an object")):
+            m = rx.search(ln)
+            if not m:
+                continue
+            expr = " ".join(m.group(1).split())
+            base = base_ident_safe(expr)
+            # TAINT-LITE: if the offset / base flows from input, the free target is attacker-steered.
+            taint = srctaint.untrusted_link(lines, i, base) if base else None
+            ev = [{"channel": "source",
+                   "detail": f"{name}:{i + 1}: free() is passed {kind}: '{expr}' -- not the pointer "
+                             "a matching allocation returned (free of a non-start pointer)"}]
+            if taint:
+                ev.append({"channel": "source-flow",
+                           "detail": f"the freed expression's base '{base}' flows from "
+                                     f"{taint['source']} ({taint['via']})"})
+            out.append({
+                "cwe": "CWE-761", "severity": "high",
+                "title": f"Free of a pointer not at the start of a buffer ('{expr}') (CWE-761)",
+                "dedup_key": f"badfree:{name}:{i + 1}:{expr}",
+                "fn": "free()", "arg": expr, "file": name, "line": i + 1, "taint": taint,
+                "evidence": ev})
+            break                                        # one finding per line is enough
+    return out
+
+
+def base_ident_safe(expr: str):
+    """The leading identifier of a freed expression ('&buf[i]' -> 'buf', 'p + n' -> 'p'), or None."""
+    m = re.search(_IDENT, expr.lstrip("&* "))
+    return m.group(0) if m else None
+
+
 def scan_source(root: Path) -> list:
-    """Every freed-then-used / freed-twice pointer across the source tree. Returns finding dicts
-    (minus target/case ids), one per (free-site, use-site, pointer)."""
+    """Every freed-then-used / freed-twice pointer (CWE-415/416) and every free of a non-start
+    pointer (CWE-761) across the source tree. Returns finding dicts (minus target/case ids)."""
     findings: list = []
     for label, _p, text in source_files(root):
-        findings.extend(_scan_text(label, _strip_comments(text).splitlines()))
+        lines = _strip_comments(text).splitlines()
+        findings.extend(_scan_text(label, lines))
+        findings.extend(_scan_bad_free(label, lines))
     return findings
 
 

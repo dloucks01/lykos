@@ -195,6 +195,26 @@ def parse_token_file(data: bytes) -> list:
     return toks
 
 
+_WRAPPER_NOISE: Optional[set] = None
+
+
+def _wrapper_noise() -> set:
+    """Tokens the SANDBOX'S OWN wrapper chain compares (bwrap, setarch inside it), captured once by
+    running a no-op program through the same confinement. Anything the wrapper compares is not
+    the target's -- measured: setarch's 'uname26'/'linux32'/'x86_64' arrived as runtime tokens."""
+    global _WRAPPER_NOISE
+    if _WRAPPER_NOISE is None:
+        _WRAPPER_NOISE = set()
+        true = shutil.which("true")
+        if true:
+            try:
+                _WRAPPER_NOISE = set(_capture_tokens(true, b"", mode="stdin", base_argv=(),
+                                                     timeout=10.0))
+            except Exception:                            # noqa: BLE001 -- noise filter is advisory
+                _WRAPPER_NOISE = set()
+    return _WRAPPER_NOISE
+
+
 def runtime_tokens(exe, data: bytes, *, mode: str = "stdin", base_argv=(), timeout: float = 20.0,
                    host_arch: str = "", target_arch: Optional[str] = None) -> list:
     """Tokens the target actually COMPARED its input against, observed at runtime. [] if n/a.
@@ -209,10 +229,19 @@ def runtime_tokens(exe, data: bytes, *, mode: str = "stdin", base_argv=(), timeo
     Same preload constraints as `dislocator_preload`: host-architecture ELF only, and a target
     that is dynamically linked (a static binary resolves no symbols through the loader).
     """
-    lib = tokencap_lib()
-    if lib is None:
+    if tokencap_lib() is None:
         return []
     if target_arch and host_arch and target_arch != host_arch:
+        return []
+    noise = _wrapper_noise()
+    return [t for t in _capture_tokens(exe, data, mode=mode, base_argv=base_argv, timeout=timeout)
+            if t not in noise]
+
+
+def _capture_tokens(exe, data: bytes, *, mode: str, base_argv, timeout: float) -> list:
+    """One libtokencap run of `exe` inside the sandbox; the raw token list (wrapper noise included)."""
+    lib = tokencap_lib()
+    if lib is None:
         return []
     import tempfile
     d = tempfile.mkdtemp(prefix="lykos-tokcap-")
@@ -238,6 +267,14 @@ def runtime_tokens(exe, data: bytes, *, mode: str = "stdin", base_argv=(), timeo
             argv = [(tmp if a == "@@" else a) for a in argv] if "@@" in argv else argv + [tmp]
         cmd = _confined(argv, exe, rw=[d], setenv={"LD_PRELOAD": env["LD_PRELOAD"],
                                                    "AFL_TOKEN_FILE": str(out)})
+        if cmd[:len(argv)] != argv:
+            # Wrapped: bwrap hands the preload to the TARGET via --setenv. Leaving it in bwrap's
+            # own environment preloaded libtokencap into bwrap itself, so its option parsing
+            # ('--unshare-user-try', '--die-with-parent', ...) was logged as the target's tokens
+            # and fed to the fuzzing dictionary (measured: 77 'runtime tokens', all bwrap's).
+            env = {k: v for k, v in env.items() if k not in ("LD_PRELOAD", "AFL_TOKEN_FILE")}
+            if prior:
+                env["LD_PRELOAD"] = prior
         # Own process group, killed whole on timeout: a wedged target (or a child it forked)
         # must not outlive the probe, and a bare subprocess.run timeout kills only the child.
         from . import sandbox as _sandbox

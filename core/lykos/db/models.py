@@ -81,7 +81,7 @@ STATIC_DETECTORS = frozenset({
     "dangerous_api", "stack_frame", "hardcoded_secrets", "weak_crypto", "weak_random",
     "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
     "int_overflow_check", "int_overflow_alloc", "scanf_bounded_overflow", "heap_fptr_call",
-    "lang_sinks", "scriptscan", "pyc_scan",
+    "lang_sinks", "scriptscan", "pyc_scan", "pcode_alloc_overflow",
     # detect/ -- the logic/auth detectors and static CWE-129, re-derived by detect/stage on every
     # run (its `_STATIC_DETECTORS`), so static by construction
     "unchecked_privdrop", "world_writable_perms", "privilege_drop_order", "format_string",
@@ -278,6 +278,9 @@ class Poc:
     signal_name: Optional[str] = None
     input_sha: Optional[str] = None
     bundle_sha: Optional[str] = None
+    #: doc 58: "constructed" (sound payload computed from the program, not run here) | "detonated"
+    #: (an execution fired the oracle). NULL for legacy rows; a verified row is a detonation.
+    provenance: Optional[str] = None
 
 
 @dataclass

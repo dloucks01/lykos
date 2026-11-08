@@ -161,6 +161,25 @@ def test_ingest_source_from_mismatched_ondisk_name(store, case, gcc_or_skip):
     assert arts and arts[0].meta.get("filename") == "overflow.c"
 
 
+def test_single_file_upload_is_also_archived_as_a_source_tree(store, case):
+    """The source detectors read the `source-project` tree; a single-file upload must provide one,
+    or every one of them reports 'no archived source tree' with the source right there."""
+    import io
+    import tarfile
+    import tempfile
+    from pathlib import Path
+
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.source_lookup import source_project_for
+    src = Path(tempfile.mkdtemp()) / "svc.c"
+    src.write_text("int main(void){ return 0; }\n")
+    t = ingest(store, case.id, src)
+    proj = source_project_for(store.conn, t)
+    assert proj is not None and proj.meta.get("binary_sha") == t.sha256
+    with tarfile.open(fileobj=io.BytesIO(store.content.path(proj.sha256).read_bytes())) as tf:
+        assert tf.getnames() == ["svc.c"]
+
+
 def test_failed_source_build_surfaces_reason_not_bundle_error(store, case, monkeypatch):
     """A source project that fails to build (e.g. cmake/make not installed) must report WHY. The
     code falls through to the prebuilt-binary bundle path, which found no ELF and raised the generic
@@ -305,13 +324,14 @@ def test_every_builder_forces_a_rebuild():
     from lykos.analyze import source_project
     src = inspect.getsource(source_project.build_source_project)
     assert '["make", "-B", "-j"]' in src, "the autotools builder does not force a rebuild"
-    # The make builder assembles its argv (it has a CC/CFLAGS override to pass) and inserts -B
-    # ahead of it, so the forced rebuild is this splice rather than a literal command line. The
-    # spelling changed when a plain-make RETRY was added for trees whose maintainer rules cannot
-    # run here; the guarantee this test exists for did not.
-    assert 'argv[:1] + ["-B"] + argv[1:]' in src, \
-        "the make builder does not force a rebuild"
-    assert 'f"CC={wrapdir' in src, "the make builder does not override the compiler"
+    # The make builder now runs a SEQUENCE of attempts -- `-B` (forced rebuild) first, then a plain
+    # make, then the aggregate targets `all`/`generic` for a Makefile whose default builds nothing,
+    # then a `-std=gnu89` retry for a pre-ANSI K&R tree. The forced-rebuild guarantee this test
+    # exists for lives in the first attempt (`("-B", ["-B"], ...)`); the compiler override lives in
+    # `_cc_vars`, which every attempt passes.
+    assert '("-B",      ["-B"],      env_mk)' in src, \
+        "the make builder does not force a rebuild first"
+    assert 'f"CC={wd' in src, "the make builder does not override the compiler"
     assert '"--clean-first"' in src, "the cmake builder does not force a rebuild"
 
 
@@ -354,35 +374,161 @@ def test_a_prebuilt_tree_is_rebuilt_not_reused(tmp_path, gcc_or_skip):
     assert "asan" in out or "asan" in dyn, "the rebuilt binary carries no ASan"
 
 # ----------------------------------------------- what stopped two real libraries from building
-def test_a_plain_make_is_the_retry_when_B_cannot_run():
-    """`-B` first (it is what makes an already-built tree rebuild with our instrumentation), and
-    a plain make as the RETRY when it fails having produced nothing.
+def test_autotools_defeats_maintainer_rules_then_cleans_before_a_plain_make():
+    """The autotools builder must NOT lead with `make -B`, and must clean before a plain make.
 
-    Measured on libsndfile 1.0.28: `./configure` succeeded, then `make -B -j` forced autotools'
-    maintainer rules and died with
+    `make -B` traded one failure for another. It is what rebuilds an already-built tree with our
+    instrumentation -- but it also forces autotools' MAINTAINER rules, so the tree tries to
+    regenerate aclocal.m4 and dies, because `aclocal` is not installed here:
 
-        make: *** [Makefile:484: aclocal.m4] Error 127
+        make: *** [Makefile:587: aclocal.m4] Error 127
 
-    because `aclocal` is not installed here. The project fell through to the `loose` builder,
-    which cannot link a tree containing several programs with their own main(), so libsndfile
-    ingested as a PREBUILT BINARY with no source -- which is why its libFuzzer stage reported
-    "no source for this target" and the campaign ran at 359 exec/s through the black-box path
-    instead of building in-process doors. With the retry: 10 entry points, primary
-    `programs/sndfile-info`, an 8 MB ASan ELF.
+    Measured on BOTH libsndfile 1.0.28 and giflib 5.1.4: each fell through to the `loose` builder
+    and ingested wrong -- libsndfile as a prebuilt binary with no source (libFuzzer said "no
+    source", 359 exec/s), giflib as a SINGLE library, so gif2rgb/giftool -- where its CVEs live --
+    were never analysed and its recall went 6 -> 0 between two runs of the same code (the only
+    difference was whether the tree had already been built).
 
-    The order matters in both directions, which is why both tests exist: reversing it (plain
-    make first) makes `test_a_prebuilt_tree_is_rebuilt_not_reused` fail, because make then says
-    "nothing to be done" and the stale uninstrumented artifact is analysed instead.
+    The fix fixes both at the root: defeat the maintainer rules (so make never reaches for
+    aclocal), `make clean` so the stale artifacts are gone, THEN a plain `make` that rebuilds every
+    program from source with our wrappers. `-B` survives only as a last-resort retry gated on the
+    plain make having produced nothing. `test_a_prebuilt_tree_is_rebuilt_not_reused` and
+    `test_an_already_built_autotools_tree_rebuilds_all_programs` guard that it still rebuilds.
     """
     import inspect
 
     from lykos.analyze import source_project as sp
     src = inspect.getsource(sp.build_source_project)
-    first = src.index('_run(["make", "-B", "-j"], cwd=root)')
-    retry = src.index('_run(["make", "-j"], cwd=root)')
-    assert first < retry, "-B has to be attempted first; a plain make is the fallback"
-    assert 'if rcm != 0 and not _elf_executables(root, start_make)' in src, \
-        "the retry must be gated on -B having FAILED and produced nothing"
+    i_auto = src.index("def _b_autotools")
+    i_make = src.index("def _b_make")
+    body = src[i_auto:i_make]                      # the autotools builder only
+    defeat = body.index("_defeat_maintainer_rules(root)")
+    clean = body.index('_run(["make", "clean"]')
+    plain = body.index('_run(["make", "-j"], cwd=root)')
+    forced = body.index('_run(["make", "-B", "-j"], cwd=root)')
+    assert defeat < clean < plain < forced, \
+        "autotools must defeat maintainer rules, clean, then plain make; -B is only the last retry"
+    assert 'if rcm != 0 and not _elf_executables(root, start_make)' in body, \
+        "the -B retry must be gated on the plain make having produced nothing"
+
+
+# ------------------------------------------- Info-ZIP unzip 6.0: a non-building default + K&R tree
+def test_make_builder_tries_aggregate_targets_then_a_gnu89_retry():
+    """The make builder must cope with two things an old hand-written Makefile does, both measured
+    on Info-ZIP unzip 6.0 (which the whole unzip benchmark, 0/11, waits on):
+
+      * its DEFAULT target is `help:` -- it succeeds (rc 0) while building nothing, so success must
+        be judged by a freshly-produced ELF, not by rc, and the conventional aggregate targets
+        `all`/`generic` must be tried when the default yields no binary;
+      * its sources carry a pre-ANSI K&R redeclaration (`struct tm *gmtime(), *localtime();`) that
+        gcc 14+ makes a HARD conflicting-types error, cleared by compiling `-std=gnu89`.
+
+    A source-level guard: reproducing it needs the real tree, and that is the slow part.
+    """
+    import inspect
+
+    from lykos.analyze import source_project as sp
+    src = inspect.getsource(sp.build_source_project)
+    i_make = src.index("def _b_make")
+    body = src[i_make:src.index("def _b_loose")]
+    assert '("all",     ["all"],     env_mk)' in body and \
+           '("generic", ["generic"], env_mk)' in body, \
+        "the make builder does not try the aggregate targets when the default builds nothing"
+    assert 'only a freshly-produced ELF counts' in body.lower() or \
+           'Only a freshly-produced ELF counts' in body, \
+        "success must be judged by a produced ELF, not by rc"
+    # the gnu89 retry wrapper and its clean-before-retry
+    assert 'env89' in body and 'gnu89' in body, "no gnu89 retry attempt"
+    assert '(root / junk).unlink()' in body, \
+        "the gnu89 retry must reset the stale configure/flags state first"
+    # and the wrapper actually appends -std=gnu89 AFTER the project args so it overrides
+    wsrc = inspect.getsource(sp._write_wrappers)
+    assert '"$@"{tail}' in wsrc, "the trailing wrapper flag is not placed after the project args"
+
+
+def test_defines_main_distinguishes_main_from_other_objects(tmp_path, gcc_or_skip):
+    from lykos.analyze.source_project import _defines_main
+    m = tmp_path / "m.c"; m.write_text("int main(void){return 0;}\n")
+    h = tmp_path / "h.c"; h.write_text("int helper(void){return 1;}\n")
+    mo, ho = tmp_path / "m.o", tmp_path / "h.o"
+    subprocess.run(["cc", "-c", str(m), "-o", str(mo)], check=True)
+    subprocess.run(["cc", "-c", str(h), "-o", str(ho)], check=True)
+    assert _defines_main(str(mo)) is True
+    assert _defines_main(str(ho)) is False
+
+
+def test_loose_builder_links_each_main_into_its_own_program(tmp_path, gcc_or_skip):
+    """A tree with several `main`s and NO build file forces the loose fallback. Linking them all
+    into one executable fails with 'multiple definition of main' (Info-ZIP unzip ships
+    unzip/funzip/unzipsfx/unzipstb; bzip2 ships four). The builder must link each main-object with
+    the shared objects into its OWN program so every entry point is produced."""
+    from lykos.analyze.source_project import build_source_project
+    root = tmp_path / "multi"
+    root.mkdir()
+    # a shared helper plus TWO programs, no Makefile/configure/CMakeLists -> loose builder
+    (root / "util.c").write_text("int shared_add(int a,int b){return a+b;}\n")
+    (root / "alpha.c").write_text(
+        "#include <stdio.h>\nint shared_add(int,int);\n"
+        "int main(void){printf(\"%d\\n\", shared_add(1,2));return 0;}\n")
+    (root / "beta.c").write_text(
+        "#include <stdio.h>\nint shared_add(int,int);\n"
+        "int main(void){printf(\"%d\\n\", shared_add(3,4));return 0;}\n")
+    r = build_source_project(root) or {}
+    assert r.get("ok"), f"a multi-main loose tree did not build: {(r.get('log') or '')[-400:]}"
+    assert r.get("system") == "loose", f"expected the loose builder, got {r.get('system')!r}"
+    names = {Path(b).name for b in r.get("binaries", [])}
+    assert len(names) >= 2, f"the loose builder did not produce a program per main(): {names}"
+
+
+def test_an_already_built_autotools_tree_rebuilds_all_programs(tmp_path, gcc_or_skip):
+    """The giflib 5.1.4 shape, minimised: an autotools tree (a `configure`, a Makefile whose `all`
+    depends on a MAINTAINER target that needs a tool we lack) that is ALREADY BUILT with stale,
+    uninstrumented binaries. The old `make -B` strategy hit the maintainer rule and died; the
+    retry (plain make) then did nothing because the tree looked up to date -- so the tree ingested
+    as a single mis-built artefact and every program behind it went unanalysed. The builder must
+    now rebuild BOTH programs, instrumented."""
+    import time
+    root = tmp_path / "proj"
+    (root / "m4").mkdir(parents=True)
+    (root / "configure.ac").write_text("AC_INIT([proj],[1])\n")
+    # the shipped, generated files a release tarball carries -- present, so no autoconf is needed.
+    (root / "aclocal.m4").write_text("# generated\n")
+    (root / "configure").write_text("#!/bin/sh\nexit 0\n")
+    os.chmod(root / "configure", 0o755)
+    for name in ("tool", "helper"):
+        (root / f"{name}.c").write_text(
+            "#include <stdio.h>\n#include <string.h>\n"
+            f"int main(int c,char**v){{char b[8]; if(c>1) strcpy(b,v[1]); printf(\"{name} %s\\n\",b);"
+            " return 0;}\n")
+    # `all` reaches the two programs THROUGH a maintainer rule that runs a missing tool: exactly
+    # what `make -B` forces (and what defeating the maintainer rules + a clean must route around).
+    (root / "Makefile").write_text(
+        "all: aclocal.m4 tool helper\n"
+        "aclocal.m4: configure.ac\n\taclocal-1.15 -I m4\n"
+        "tool: tool.c\n\t$(CC) $(CFLAGS) tool.c -o tool\n"
+        "helper: helper.c\n\t$(CC) $(CFLAGS) helper.c -o helper\n"
+        "clean:\n\trm -f tool helper\n")
+    # pre-build with the PROJECT's flags (no sanitizer), newest, and make configure.ac newer than
+    # the generated aclocal.m4 so a naive `make` WOULD fire the maintainer rule.
+    os.utime(root / "aclocal.m4", (1, 1))
+    os.system(f"cd {root} && make tool helper CC=cc >/dev/null 2>&1")
+    assert (root / "tool").exists(), "fixture did not pre-build"
+    plain_sz = (root / "tool").stat().st_size
+    time.sleep(0.05)
+    os.utime(root / "tool", None)
+    os.utime(root / "helper", None)
+    os.utime(root / "configure.ac", None)                    # newer than aclocal.m4 -> rule armed
+
+    r = build_source_project(root) or {}
+    assert r.get("ok"), f"already-built autotools tree did not build: {(r.get('log') or '')[-500:]}"
+    names = {Path(b).name for b in (r.get("binaries") or [])}
+    assert {"tool", "helper"} <= names, \
+        f"not every program was rebuilt (got {names}); the maintainer-rule trap was not routed around"
+    exe = root / "tool"
+    assert exe.stat().st_size > plain_sz, "stale uninstrumented artefact reused, not rebuilt"
+    dyn = subprocess.run(["readelf", "-d", str(exe)], capture_output=True, text=True).stdout.lower()
+    nm = subprocess.run(["nm", "-D", str(exe)], capture_output=True, text=True).stdout.lower()
+    assert "asan" in dyn or "asan" in nm, "the rebuilt binary carries no ASan"
 
 
 def test_cmake_retries_past_a_removed_minimum_version():
@@ -514,3 +660,23 @@ def test_elf_objects_finds_relocatables_and_skips_scaffold(tmp_path, gcc_or_skip
     found = {p.name for p in _elf_objects(tmp_path, since)}
     assert "a.o" in found
     assert "conftest.o" not in found and "probe.o" not in found
+
+
+def test_a_source_project_also_gets_an_uninstrumented_build(store, case, gcc_or_skip):
+    """AFL++ cannot run an ASan binary, so without a plain build every source PROJECT declined
+    coverage-guided fuzzing (md4c). Single-file uploads always had one."""
+    import tempfile
+    from pathlib import Path
+
+    from lykos.analyze.fuzz import aflpp
+    d = Path(tempfile.mkdtemp())
+    _make_project(d)
+    register()
+    t = ingest(store, case.id, d, filename="myproj")
+    plain = [a for a in ArtifactDAO(store.conn).list_by_case(case.id) if a.kind == "plain-blob"]
+    assert plain and plain[0].meta.get("binary_sha") == t.sha256
+    blob = store.content.get_bytes(plain[0].sha256)
+    assert not aflpp.is_sanitizer_build(blob)
+    assert aflpp.is_sanitizer_build(store.content.get_bytes(t.sha256))
+    # the sanitizer build's tree is untouched by the second build
+    assert not (d / "_lykos_plain").exists()

@@ -38,3 +38,10 @@ def test_drive_shape_guesses_buf_len_when_unknown():
     # ptr_len=0 (nothing recovered) -> guess f(buf,len) so a `if(len<N) return;` guard does not
     # early-return on an uninitialised length and hide the bug
     assert _drive_shape(_rf("f", ptr_len=0, sinks=["memcpy"])) == "ptr_len"
+
+
+def test_program_entry_points_are_not_driven_as_parsers():
+    # main(argc, argv) driven as f(buf, len) dereferences its own garbage argv -- measured: a
+    # function-level "NULL dereference in main" on 3 of 5 recall targets
+    for nm in ("main", "_start", "entry0"):
+        assert not _drivable(_rf(nm, ptr_len=2, sinks=["memcpy"]))

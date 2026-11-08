@@ -52,7 +52,8 @@ def _dependency_blobs(ctx, target, sonames: list) -> list:
         except Exception:                                # noqa: BLE001
             continue
     # 2) an operator-supplied sysroot (the same one used to RUN a dynamically-linked target)
-    sr = os.environ.get("LYKOS_QEMU_SYSROOT")
+    from ...jobs import runenv as _runenv
+    sr = _runenv.get("LYKOS_QEMU_SYSROOT")
     if sr and len(seen) < len(want):
         try:
             from ..dynamic.sandbox import _sysroot_lib_dirs

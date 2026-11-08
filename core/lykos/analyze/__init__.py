@@ -53,6 +53,25 @@ def register() -> None:
     _register_firmware()
     _register_fingerprint()
     _register_unpack()
+    _register_declared()
+
+
+def _register_declared() -> None:
+    """Import every stage module the stage table declares. Newer stages register themselves on
+    import (register_stage at module level) and were registered only once something happened to
+    import them -- so a fresh process (the API server's workers) did not know guard_gap, triage,
+    attack_path, hypo_hunt, ... existed. The table is the source of truth; import all of it."""
+    import importlib
+    import logging
+    from . import stages as _stages
+    for spec in _stages.STAGES:
+        if not spec.module:
+            continue
+        try:
+            importlib.import_module(spec.module, __name__)
+        except Exception:                                    # noqa: BLE001 -- one bad module
+            logging.getLogger(__name__).warning("stage module %s failed to import", spec.module,
+                                                exc_info=True)
 
 
 register()

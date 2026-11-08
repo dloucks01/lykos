@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import functools
 import re
 import shutil
 import subprocess
@@ -48,6 +49,15 @@ _SAN = ["-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=fuzzer,address,undef
         "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-w",
         "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
         "-Wno-error=int-conversion", "-D_GNU_SOURCE"]
+
+#: The EXPLORE build: libFuzzer entry only, NO address/undefined sanitizer. angr is confused by
+#: ASan's shadow-memory accesses (see symbolic/directed_confirm), so the concolic rung explores a
+#: fuzzer-only build while confirmation still replays under the ASan `_SAN` build. The parser logic
+#: is identical, so an input the clean build's parser accepts drives the same path under ASan.
+_SAN_EXPLORE = ["-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=fuzzer",
+                "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-w",
+                "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
+                "-Wno-error=int-conversion", "-D_GNU_SOURCE"]
 
 
 def _clang(cxx: bool):
@@ -100,7 +110,11 @@ def find_harness(root) -> Path | None:
 _FN_DEF = re.compile(
     r"(?:^|\n)[ \t]*(?!static\b|typedef\b|return\b|else\b|switch\b|case\b)"
     r"(?:[A-Za-z_][\w \t*]*?[ \t*]+)?"
-    r"([A-Za-z_]\w*)[ \t]*\(([^;{}()]*)\)[ \t]*(?:\r?\n[ \t]*)?\{",
+    # One level of nesting inside the parameter list: a FUNCTION-POINTER parameter
+    # (`void (*process_output)(const MD_CHAR*, MD_SIZE, void*)`) has two paren groups, and with a
+    # flat `[^()]` the whole definition went unseen -- md4c's `md_html`, its main entry point, was
+    # absent from every index, so the library was fuzzed through `entity_lookup` instead.
+    r"([A-Za-z_]\w*)[ \t]*\(((?:[^;{}()]|\([^;{}()]*\))*)\)[ \t]*(?:\r?\n[ \t]*)?\{",
     re.M)
 # The first parameter has to be something fuzz bytes (or a path to them) can be delivered as.
 _PTR_FIRST = re.compile(r"^(?:const\s+)?(?:unsigned\s+)?(?:char|void|uint8_t|u_char)\s*\*", re.I)
@@ -122,7 +136,14 @@ _FILLABLE = re.compile(r"^(?:const\s+)?(?:unsigned\s+|signed\s+)?"
 
 
 def _opaque_param(param: str) -> bool:
-    """Is this parameter one the harness cannot supply an honest value for?"""
+    """Is this parameter one the harness cannot supply an honest value for? A void callback is
+    not: a do-nothing function is an honest output sink (see `_VOID_CB`)."""
+    if is_void_callback(param):
+        return False
+    # Any OTHER function pointer is opaque: `int (*cb)(void)` begins with `int`, matched the
+    # scalar pattern, and was handed 0 -- a NULL callback the library then calls.
+    if re.search(r"\(\s*\*", param or ""):
+        return True
     return not _FILLABLE.match(param.strip())
 
 
@@ -146,12 +167,46 @@ def defs_index(root) -> dict:
         return _DEFS_CACHE[key]
     idx: dict = {}
     sa = static_aliases(root)
+    tmap = typedef_map(root)
     for path, txt in _library_srcs(root):
         for name, params in _fn_defs(txt, sa):
             if name in _KEYWORDS:
                 continue
-            idx.setdefault(name, (path, params))
+            idx.setdefault(name, (path, resolve_params(params, tmap)))
+    # PROGRAM units (a file with its own `main`) last, never overriding a library definition. They
+    # are not library entry points -- the RANKING scanners read `_library_srcs` and never see them --
+    # but a function NAMED for a driver (a UC lead, a static candidate) may well live in one, and
+    # without its real signature the harness falls back to `void fn(char *)`: a one-argument call to
+    # a two-argument function, whose garbage second argument can fault and FABRICATE a confirmation.
+    # `_program_unit_shim` is what then links such a unit, with its `main` renamed.
+    for path in _sources(Path(root), exclude_main=False):
+        try:
+            txt = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        if not _MAIN_RE.search(txt) or _HARNESS_RE.search(txt):
+            continue
+        for name, params in _fn_defs(txt, sa):
+            if name in _KEYWORDS:
+                continue
+            idx.setdefault(name, (path, resolve_params(params, tmap)))
     return _cache_put(_DEFS_CACHE, key, idx)
+
+
+def _raw_params(root, fn: str) -> list:
+    """`fn`'s parameters as SPELLED in its definition (typedef names kept) -- what a harness that
+    includes the project's header must use."""
+    hit = defs_index(root).get(fn)
+    if not hit:
+        return []
+    try:
+        txt = Path(hit[0]).read_text(errors="ignore")
+    except OSError:
+        return list(hit[1])
+    for name, params in _fn_defs(txt, static_aliases(root)):
+        if name == fn:
+            return [] if params == ["void"] else list(params)
+    return list(hit[1])
 
 
 def fn_params(root, fn: str) -> list:
@@ -245,6 +300,10 @@ def _unwrap_macro_args(text: str) -> str:
 _INSTALL_AUTOMAKE = re.compile(r"^[ \t]*\w*include_HEADERS[ \t]*\+?=((?:[^\n\\]|\\\n)*)", re.M)
 _INSTALL_CMAKE = re.compile(r"\binstall\s*\(\s*FILES\b(.{0,2000}?)\)", re.S | re.I)
 _INSTALL_MESON = re.compile(r"\binstall_headers\s*\((.{0,2000}?)\)", re.S)
+#: `set_target_properties(md4c PROPERTIES PUBLIC_HEADER md4c.h)` + `install(TARGETS ... PUBLIC_HEADER
+#: DESTINATION ...)` -- the other way CMake installs a header, and md4c's only one. Missing it made
+#: the tree's API "unknown", so its public `md_html` scored like an internal helper.
+_INSTALL_CMAKE_PUBHDR = re.compile(r"\bPUBLIC_HEADER\s+((?:(?!DESTINATION\b)[^\s)]+\s*)+)", re.I)
 #: `set(ZLIB_PUBLIC_HDRS ... zlib.h)` -- zlib installs its headers through a variable, so the
 #: install rule itself names no file at all.
 _CMAKE_SET = re.compile(r"\bset\s*\(\s*([A-Za-z_]\w*)(.{0,2000}?)\)", re.S | re.I)
@@ -342,7 +401,7 @@ def installed_headers(root) -> frozenset:
             except OSError:
                 continue
             found = []
-            for pat in (_INSTALL_AUTOMAKE, _INSTALL_CMAKE, _INSTALL_MESON):
+            for pat in (_INSTALL_AUTOMAKE, _INSTALL_CMAKE, _INSTALL_MESON, _INSTALL_CMAKE_PUBHDR):
                 found += [m.group(1) for m in pat.finditer(txt)]
             if not found:
                 continue
@@ -534,6 +593,130 @@ def _kr_params(names: str, decls: str) -> list:
     return [typed.get(n, f"int {n}") for n in order]
 
 
+def split_params(s: str) -> list:
+    """A parameter list split on its TOP-LEVEL commas: a function-pointer parameter carries its
+    own parenthesised list, which a plain `split(",")` cut into three bogus parameters."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return [" ".join(a.split()) for a in out if a]
+
+
+#: `void (*name)(...)` -- a callback the library CALLS and whose result it ignores. The harness can
+#: supply one honestly: a function that does nothing (an output sink that discards the output).
+#: A callback that RETURNS something cannot be faked -- the library acts on the answer.
+_VOID_CB = re.compile(r"^\s*void\s*\(\s*\*\s*\w*\s*\)\s*\((.*)\)\s*$", re.S)
+
+
+def is_void_callback(param: str) -> bool:
+    """A void callback the harness can supply HONESTLY: every parameter of it is a type the harness
+    can name (a scalar, or a pointer to char/void/a scalar), because the stub has to be defined
+    with that exact signature -- UBSan's -fsanitize=function aborts a call through a mismatched
+    function-pointer type, so a generic stub would itself be a crash filed against the library."""
+    return callback_stub(param) is not None
+
+
+_TYPE_WORDS = frozenset({"const", "volatile", "unsigned", "signed", "char", "short", "int", "long",
+                         "void", "float", "double", "size_t", "ssize_t", "struct", "enum"})
+
+
+def _strip_param_name(a: str) -> str:
+    """`const char* text` -> `const char*`; `unsigned size` -> `unsigned`; `void*` -> `void*`."""
+    toks = re.findall(r"\*|[A-Za-z_]\w*", a or "")
+    if len(toks) >= 2 and toks[-1] != "*" and toks[-1] not in _TYPE_WORDS \
+            and not re.fullmatch(r"u?int\d+_t", toks[-1]):
+        toks = toks[:-1]
+    out = ""
+    for tk in toks:
+        out += ("*" if tk == "*" else (" " if out and not out.endswith(" ") else "") + tk)
+    return out.replace(" *", "*").strip()
+
+
+_CB_DEFS: dict = {}
+_CB_NAME = re.compile(r"\blykos_cb_[0-9a-f]{8}\b")
+
+
+def callback_stub(param: str) -> str | None:
+    """The name of a do-nothing stub matching this void-callback parameter's exact signature, or
+    None when it is not a void callback or names a type the harness cannot spell."""
+    m = _VOID_CB.match(param or "")
+    if not m:
+        return None
+    inner = split_params(m.group(1))
+    if inner in ([], ["void"]):
+        args = "void"
+    else:
+        parts = []
+        for i, a in enumerate(inner):
+            t = _strip_param_name(a)
+            if not (_FILLABLE.match(t) or re.match(r"^(?:const\s+)?(?:unsigned\s+|signed\s+)?"
+                                                   r"(?:char|short|int|long|size_t|u?int\d+_t)"
+                                                   r"\s*\*$", t)):
+                return None                              # a type the harness cannot name
+            parts.append(f"{t} a{i}")
+        args = ", ".join(parts)
+    import hashlib as _h
+    name = "lykos_cb_" + _h.sha1(args.encode()).hexdigest()[:8]
+    _CB_DEFS[name] = f"static void {name}({args}) {{ (void)0; }}\n"
+    return name
+
+
+#: `typedef <scalar or char type> NAME;` -- the simple aliases a library spells its API with.
+_TYPEDEF = re.compile(
+    r"\btypedef\s+((?:const\s+)?(?:(?:unsigned|signed)\s+)?(?:char|short|int|long\s+long|long|"
+    r"size_t|ssize_t|u?int\d+_t|u_char|unsigned|signed|wchar_t)(?:\s+int)?)\s+([A-Za-z_]\w*)\s*;")
+_TYPEDEF_CACHE: dict = {}
+
+
+def typedef_map(root) -> dict:
+    """{alias: base} for the tree's simple scalar/char typedefs (resolved through chains).
+
+    md4c spells its whole API in `MD_CHAR` (= char) and `MD_SIZE` (= unsigned): `md_parse(const
+    MD_CHAR*, MD_SIZE, ...)` failed the pointer-first test and its length was not a length, so the
+    parser was never a candidate. The harness never NAMES these types (see `_types_only`); this
+    only lets the shape tests see what they are."""
+    key = str(root)
+    if key in _TYPEDEF_CACHE:
+        return _TYPEDEF_CACHE[key]
+    tm: dict = {}
+    root = Path(root)
+    for p in list(root.rglob("*.h"))[:2000] + list(root.rglob("*.c"))[:2000]:
+        if any(seg in _SKIP_DIRS for seg in p.relative_to(root).parts):
+            continue
+        try:
+            txt = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _TYPEDEF.finditer(txt):
+            tm.setdefault(m.group(2), " ".join(m.group(1).split()))
+    # an alias of an alias
+    word = re.compile(r"\b(" + "|".join(map(re.escape, tm)) + r")\b") if tm else None
+    if word:
+        for _ in range(3):
+            tm = {k: word.sub(lambda m: tm.get(m.group(1), m.group(1)) if m.group(1) != k
+                              else m.group(1), v) for k, v in tm.items()}
+    return _cache_put(_TYPEDEF_CACHE, key, tm)
+
+
+def resolve_params(params: list, tmap: dict) -> list:
+    """`params` with the simple typedefs spelled as their base types."""
+    if not tmap:
+        return list(params)
+    word = re.compile(r"\b(" + "|".join(map(re.escape, tmap)) + r")\b")
+    return [word.sub(lambda m: tmap[m.group(1)], a) for a in params]
+
+
 def _fn_defs(txt: str, statics=()):
     """(name, params) for every NON-static function defined in `txt`, in either C style.
 
@@ -544,7 +727,7 @@ def _fn_defs(txt: str, statics=()):
     for m in _FN_DEF.finditer(txt):
         if _static_before(txt, m.start(1), statics):
             continue
-        yield m.group(1), [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
+        yield m.group(1), split_params(m.group(2) or "")
     for m in _KR_DEF.finditer(txt):
         if _static_before(txt, m.start(1), statics):
             continue
@@ -622,10 +805,13 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
     # the link failed on `gzlog_close`, which is not compiled at all. A function outside the
     # library is not a worse choice, it is not a choice -- see `_library_srcs`.
     _sa = static_aliases(root)
+    _tm = typedef_map(root)
+    _inst = installed_headers(root)
     for _p, txt in _library_srcs(root):
         for name, raw in _fn_defs(txt, _sa):
             if name in _KEYWORDS:
                 continue
+            raw = resolve_params(raw, _tm)
             first = raw[0] if raw else ""
             if not _PTR_FIRST.match(first):
                 continue                                 # nothing to deliver the bytes through
@@ -644,9 +830,22 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
             # parser-ish entry point of libtiff and it takes eight callbacks, so a synthesized
             # call passes NULL function pointers and faults inside our own harness. Prefer the
             # narrow door: `TIFFOpen(name, mode)` is the same parser reached honestly.
-            score = -2 * max(0, len(raw) - 2)
-            if any(_opaque_param(a) for a in raw[1:]):
-                score -= 6
+            # Every argument past (buffer, length) is one the harness must supply. One it can
+            # supply HONESTLY (a number, NULL for an optional pointer, a do-nothing output callback)
+            # costs a little; one it cannot (a handle, a struct it never built) costs a lot. A flat
+            # -2 per extra argument ranked md4c's `md_html(text, size, out_cb, userdata, flags,
+            # flags)` -- six honest arguments, the library's documented one-call API -- below
+            # `entity_lookup(name, len)`, an internal table lookup.
+            extra = raw[2:] if len(raw) > 2 else []
+            # a callbacks struct the tree's own header defines is constructed, not invented
+            _opq = [a for a in raw[1:] if _opaque_param(a) and not constructible(root, a)]
+            score = -sum(1 for a in extra if a not in _opq)
+            if _opq:
+                score -= 6 + 2 * len(_opq)
+            # The (bytes, length) pair libFuzzer hands over directly: the whole input reaches the
+            # function intact, with no NUL-termination or file round trip in between.
+            if len(raw) >= 2 and _LEN_PARAM.search(raw[1]) and "*" not in raw[1]:
+                score += 3
             if not _const:
                 score -= 3                               # plausibly input, but it does not say so
             if _PARSERISH.search(name):
@@ -667,8 +866,10 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
                 # A bonus and not an exclusion here: a single function is called through its own
                 # forward declaration, so an internal one still compiles, still runs, and is
                 # worth fuzzing once the public doors are taken.
-                if header_is_installed(root, _hdr) and installed_headers(root):
+                if _inst and header_is_installed(root, _hdr):
                     score += 4
+                elif _inst:
+                    score -= 3                       # declared, but in a header it never ships
             if score > best.get(name, -(10 ** 6)):
                 best[name] = score
     # Ties broken by NAME, so a plan is reproducible: two runs of the same tree have to build the
@@ -712,13 +913,30 @@ def _arg_values(params: list) -> list:                   # noqa: D401
     out = []
     for a in params:
         low = a.lower()
-        if "char" in low and "*" in low:
+        if is_void_callback(a):
+            out.append(f"(void*){callback_stub(a)}")     # an output sink that discards
+        elif "char" in low and "*" in low:
             out.append('(void*)"r"')                     # declared void *, so cast explicitly
         elif "*" in low:
             out.append("(void*)0")
         else:
             out.append("0")
     return out
+
+
+def with_stubs(src: str) -> str:
+    """Define each do-nothing callback stub (`callback_stub`) the harness passes, ahead of the
+    declarations that use it. Each has the callback's exact signature and returns nothing the
+    library could act on -- an output sink that discards."""
+    names = sorted(set(_CB_NAME.findall(src)))
+    defs = "".join(_CB_DEFS[n] for n in names if n in _CB_DEFS and _CB_DEFS[n] not in src)
+    if not defs:
+        return src
+    i = src.find("extern ")
+    j = src.find("int LLVMFuzzerTestOneInput") if i < 0 else i
+    if j < 0:
+        return defs + src
+    return src[:j] + defs + src[j:]
 
 
 _SCALARS = re.compile(r"\b(void|char|short|int|long|unsigned|signed|float|double|size_t|"
@@ -780,7 +998,7 @@ def synth_file_harness(fn: str, params: list, *, closer: str | None = None,
         decl = f'{fn_qual}void *{fn}({_types_only(params)});\n'
     close_decl = f'{fn_qual}void {closer}(void *);\n' if closer else ""
     close_call = f"        if (h) {closer}(h);\n" if closer else ""
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+    return with_stubs("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n#include <unistd.h>\n"
             + decl + close_decl
             + f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
@@ -1078,7 +1296,9 @@ def _opener_arg_values(params: list) -> list:
     """
     out, used_path = [], False
     for a in params or ():
-        if _is_string_param(a):
+        if is_void_callback(a):
+            out.append(callback_stub(a))
+        elif _is_string_param(a):
             if not used_path:
                 out.append("path")
                 used_path = True
@@ -1136,7 +1356,9 @@ def _ctor_arg_values(params: list) -> list:
     """
     out = []
     for a in params:
-        if "*" in a:
+        if is_void_callback(a):
+            out.append(callback_stub(a))
+        elif "*" in a:
             out.append("NULL")
         elif _is_capacity_param(a):
             out.append(_CAPACITY_DEFAULT)
@@ -1192,7 +1414,7 @@ def synth_file_handle_harness(triple: dict, *, cxx: bool = False) -> str:
     # ours first and closing afterwards would be a use-after-free committed by the harness and
     # reported against the library. Freeing last cannot be wrong: nothing holds the pointer once
     # the handle is gone.
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+    return with_stubs("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n#include <unistd.h>\n"
             f'#include "{hdr}"\n'
             f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
@@ -1249,7 +1471,7 @@ def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
         i += 1
     fuzz_qual = 'extern "C" ' if cxx else ""
     free_call = f"    {dtor}(h);\n" if dtor else ""
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+    return with_stubs("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
             f'#include "{hdr}"\n'
             f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
             f"    {h} h = {ctor}({ctor_args});\n"
@@ -1257,6 +1479,117 @@ def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
             f"    {consume}({', '.join(args)});\n"
             + free_call
             + "    return 0;\n}\n")
+
+
+# ---- constructing a callbacks struct an API takes by pointer ------------------------------------
+#
+# md4c's `md_parse(text, size, const MD_PARSER *parser, userdata)` takes its renderer as a struct of
+# callbacks, so the parser could only be fuzzed through `md_html` -- every other user of the parser
+# was unreachable, and handing it NULL makes it dereference our NULL (the trivial-input gate rejects
+# exactly that). The project's OWN header defines the struct, so the harness includes it, zeroes an
+# instance, and points each function-pointer field at a stub of that field's exact signature that
+# does nothing and returns 0 ("continue" / success, the near-universal C callback convention). A
+# field the library actually needs set to something else makes it fail on the trivial input, and the
+# gate then refuses the harness -- so this cannot manufacture a finding, only reach code.
+
+_STRUCT_DEF = r"(?:typedef\s+)?struct\s+(\w+)?\s*\{{([^{{}}]*)\}}\s*(\w*)\s*;"
+_FIELD_FNPTR = re.compile(r"^\s*(.+?)\s*\(\s*\*\s*(\w+)\s*\)\s*\((.*)\)\s*$", re.S)
+
+
+def _strip_comments_c(t: str) -> str:
+    return re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", "", t, flags=re.S))
+
+
+def struct_layout(root, name: str):
+    """(header, [(field_name, ret_type, [param types])] for the function-pointer fields) of the
+    struct named `name` (tag or typedef) in the tree's headers, or None when it is not defined
+    there, nests braces, or has a function-pointer field whose parameters cannot be spelled."""
+    root = Path(root)
+    for h in sorted(root.rglob("*.h")):
+        if any(seg in _SKIP_DIRS for seg in h.relative_to(root).parts):
+            continue
+        try:
+            txt = _strip_comments_c(h.read_text(errors="ignore"))
+        except OSError:
+            continue
+        for m in re.finditer(_STRUCT_DEF.format(), txt, re.S):
+            tag, body, alias = m.group(1), m.group(2), m.group(3)
+            if name not in (tag, alias):
+                continue
+            fns = []
+            for decl in body.split(";"):
+                decl = " ".join(decl.split())
+                if not decl or "(" not in decl:
+                    continue
+                fm = _FIELD_FNPTR.match(decl)
+                if not fm:
+                    return None
+                ret, fname, params = fm.group(1).strip(), fm.group(2), fm.group(3)
+                ps = [] if params.strip() in ("", "void") else split_params(params)
+                if any("(" in x for x in ps):
+                    return None                          # a callback taking a callback: not spelled
+                fns.append((fname, ret, ps))
+            return h, fns
+    return None
+
+
+def struct_param_type(param: str):
+    """The struct name a `T *name` / `const T* name` parameter points at, else None."""
+    m = re.match(r"^\s*(?:const\s+)?(?:struct\s+)?(\w+)\s*\*\s*\w*\s*$", param or "")
+    if not m or m.group(1) in ("char", "void", "int", "unsigned", "uint8_t", "u_char", "short",
+                               "long", "size_t", "FILE"):
+        return None
+    return m.group(1)
+
+
+def constructible(root, param: str) -> bool:
+    t = struct_param_type(param)
+    return bool(t) and struct_layout(root, t) is not None
+
+
+def synth_struct_harness(root, fn: str, raw_params: list) -> str | None:
+    """A harness that includes the header declaring `fn`, constructs every callbacks-struct
+    argument (see the block comment above), and passes the fuzz bytes as (data, size)."""
+    hdr = _declared_in_header(root, fn)
+    if hdr is None or len(raw_params) < 2:
+        return None
+    pre, stubs, args, n = [], [], [], 0
+    resolved = resolve_params(raw_params, typedef_map(root))     # shapes are tested resolved
+    for i, prm in enumerate(raw_params):
+        t = _strip_param_name(prm)
+        if i == 0:
+            args.append(f"({t})data")
+            continue
+        if i == 1 and _LEN_PARAM.search(resolved[i]) and "*" not in resolved[i]:
+            args.append(f"({t})size")
+            continue
+        st = struct_param_type(prm)
+        lay = struct_layout(root, st) if st else None
+        if lay is not None:
+            var = f"lykos_s{n}"
+            n += 1
+            pre.append(f"    {st} {var}; memset(&{var}, 0, sizeof {var});\n")
+            for fname, ret, ps in lay[1]:
+                sname = f"lykos_cb_{var}_{fname}"
+                named = ", ".join(f"{_strip_param_name(x)} a{k}" for k, x in enumerate(ps)) \
+                    or "void"
+                body = "" if ret.strip() == "void" else " return 0;"
+                stubs.append(f"static {ret} {sname}({named}) {{{body} }}\n")
+                pre.append(f"    {var}.{fname} = {sname};\n")
+            args.append(f"&{var}")
+        elif is_void_callback(prm):
+            args.append(f"(void*){callback_stub(prm)}")
+        elif "*" in prm:
+            args.append("NULL")
+        else:
+            args.append("0")
+    if not n:
+        return None
+    return with_stubs(
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
+        f'#include "{Path(hdr).name}"\n' + "".join(stubs)
+        + "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n" + "".join(pre)
+        + f"    {fn}({', '.join(args)});\n    return 0;\n}}\n")
 
 
 def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None,
@@ -1294,10 +1627,11 @@ def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None
         pre = ("    char *s = (char*)malloc(size + 1);\n    if (!s) return 0;\n"
                "    memcpy(s, data, size); s[size] = 0;\n")
         call = f"    {fn}(({at})s);\n    free(s);\n"
-    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
-            f"{fn_qual}void {fn}({decl});\n"
-            f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
-            f"{pre}{call}    return 0;\n}}\n")
+    return with_stubs(
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
+        f"{fn_qual}void {fn}({decl});\n"
+        f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
+        f"{pre}{call}    return 0;\n}}\n")
 
 
 def _sources(root: Path, exclude_main: bool):
@@ -1322,10 +1656,11 @@ def _sources(root: Path, exclude_main: bool):
     return out
 
 
-_SKIP_DIRS = (".git", "_lykos_build", "node_modules", ".deps", ".libs")
+_SKIP_DIRS = (".git", "_lykos_build", "node_modules", ".deps", ".libs",
+              "_lykos_cmake_sh_asan", "_qlbuild", "_lykos_cmake", "CMakeFiles")
 
 
-def include_dirs(root, cap: int = 32) -> list:
+def include_dirs(root, cap: int = 256) -> list:
     """Every directory that holds a header, shallowest first.
 
     `-I <root>` alone is not enough for any project that keeps its public header beside its
@@ -1340,8 +1675,26 @@ def include_dirs(root, cap: int = 32) -> list:
         parts = h.relative_to(root).parts
         if any(seg in _SKIP_DIRS for seg in parts):
             continue
-        dirs.add(h.parent)
-    return sorted(dirs, key=lambda d: (len(d.relative_to(root).parts), str(d)))[:cap]
+        # Add the leaf dir AND every ancestor up to root: a header is included both by its bare name
+        # (`tiffio.h` -> needs its own dir) and by a PATH-PREFIXED angle include (`<freerdp/dvc.h>`
+        # -> needs the dir ABOVE the `freerdp/` prefix, i.e. `<tree>/include`). FreeRDP keeps public
+        # headers only under `include/freerdp/..`, so without the ancestor `include/` the codec and
+        # channel fuzz harnesses failed to compile ("'freerdp/dvc.h' file not found") and nothing
+        # could detonate. Shallowest-first + the cap keep exactly these prefix roots.
+        d = h.parent
+        while True:
+            dirs.add(d)
+            if d == root:
+                break
+            d = d.parent
+    # Prioritise angle-include PREFIX ROOTS (dirs literally named `include`, e.g. `include/` and
+    # `winpr/include/`) -- an `<pkg/hdr.h>` include resolves only against them, and on a big tree
+    # (FreeRDP has hundreds of header dirs) a plain shallowest-first cap drops `winpr/include` and
+    # the codec harness fails on `winpr/winpr.h`. Then shallowest, then path.
+    def _key(d):
+        rel = d.relative_to(root).parts
+        return (0 if (d.name == "include" or rel[-1:] == ("include",)) else 1, len(rel), str(d))
+    return sorted(dirs, key=_key)[:cap]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1558,6 +1911,73 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 }
 
 
+_LF_STATUS = re.compile(r"^#(\d+)\s+(\w+)\s+(?:cov: (\d+))?.*?(?:corp: (\d+))?.*?(?:exec/s: (\d+))?")
+
+
+def _run_group_live(argv, *, timeout: float, cwd=None, env=None):
+    """`_run_group` for the fuzzing run itself: same group-kill timeout and return shape, but
+    libFuzzer's stderr is read AS IT ARRIVES so its status lines (`#1024 NEW cov: 312 ... exec/s:
+    480`) feed this campaign's window on the live run console (jobs/runlog). Outside a stage
+    (no console) it is exactly `_run_group`."""
+    from ..jobs import runlog
+    live = runlog.current()
+    if live is None:
+        return _run_group(argv, timeout=timeout, cwd=cwd, env=env)
+    import signal as _signal
+    import threading
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         stdin=subprocess.DEVNULL, cwd=cwd, env=env, start_new_session=True,
+                         errors="replace")
+    err_lines: list = []
+    out_buf: list = []
+    state = {"execs": None, "cov": None, "corp": None, "eps": None, "crashes": 0}
+
+    def _pump_err():
+        for ln in p.stderr:
+            err_lines.append(ln)
+            m = _LF_STATUS.match(ln)
+            if m:
+                state["execs"] = int(m.group(1))
+                for k, g in (("cov", 3), ("corp", 4), ("eps", 5)):
+                    if m.group(g):
+                        state[k] = int(m.group(g))
+            elif "ERROR: AddressSanitizer" in ln or "==ERROR" in ln or "deadly signal" in ln:
+                state["crashes"] += 1
+            live.fuzz("libFuzzer", execs=state["execs"], eps=state["eps"], cov=state["cov"],
+                      cov_label="cov", crashes=state["crashes"], corpus=state["corp"],
+                      status="running", out=[x.rstrip() for x in err_lines[-6:]])
+
+    def _pump_out():
+        for ln in p.stdout:
+            out_buf.append(ln)
+    t_err = threading.Thread(target=_pump_err, daemon=True)
+    t_out = threading.Thread(target=_pump_out, daemon=True)
+    t_err.start(); t_out.start()
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        try:
+            os.killpg(p.pid, _signal.SIGKILL)
+        except OSError:
+            p.kill()
+        t_err.join(5); t_out.join(5)
+        raise subprocess.TimeoutExpired(argv, timeout, output="".join(out_buf),
+                                        stderr="".join(err_lines)) from e
+    finally:
+        if p.poll() is None:
+            from .dynamic.sandbox import kill_quietly
+            kill_quietly(p)
+    t_err.join(5); t_out.join(5)
+    try:
+        os.killpg(p.pid, _signal.SIGKILL)
+    except OSError:
+        pass
+    live.fuzz("libFuzzer", final=True, execs=state["execs"], eps=state["eps"], cov=state["cov"],
+              cov_label="cov", crashes=state["crashes"], corpus=state["corp"],
+              status=f"exited {p.returncode}", out=[x.rstrip() for x in err_lines[-6:]])
+    return subprocess.CompletedProcess(argv, p.returncode, "".join(out_buf), "".join(err_lines))
+
+
 def _run_group(argv, *, timeout: float, cwd=None, env=None):
     """subprocess.run(capture_output=True, text=True) whose timeout takes the WHOLE process tree.
 
@@ -1672,6 +2092,101 @@ def _is_elf_exec(p: Path) -> bool:
 _FUZZ_PRELOAD_DIRS = ("ci", "cmake", ".clusterfuzzlite", "tools", "")
 _RE_CMAKE_NOTFOUND = re.compile(r"Could NOT find (\w+)")
 _RE_CMAKE_PROVIDED = re.compile(r'provided by "([\w\-]+)"')
+#: pkg-config's REQUIRED failure: "The following required packages were not found:\n\n - fuse3"
+_RE_PKGCFG_MISSING = re.compile(r"required packages were not found:\s*((?:\s*-\s*[\w.+\-]+(?:[<>=]+[\w.]+)?)+)")
+_RE_CMAKE_FRAME = re.compile(r"^\s*(?:CMake Error at )?([\w./\-]*CMakeLists\.txt|[\w./\-]+\.cmake):(\d+)",
+                             re.M)
+_RE_CMAKE_IF = re.compile(r"^\s*if\s*\(\s*(?:NOT\s+)?([A-Z][A-Z0-9_]+)\s*\)\s*$", re.I)
+
+
+def _cmake_error_blocks(out: str) -> list:
+    """The `CMake Error ...` blocks of a configure log (up to the next blank-line-separated
+    `CMake Warning`/`--` line). Warnings name packages too -- FreeRDP warns that jansson has no
+    CMake config and then finds it through pkg-config -- so a missing-package scan over the whole
+    log disabled a dependency that was present, and missed the one that failed."""
+    blocks, cur = [], None
+    for line in (out or "").splitlines():
+        if line.startswith("CMake Error"):
+            if cur:
+                blocks.append("\n".join(cur))
+            cur = [line]
+        elif cur is not None:
+            if line.startswith(("CMake Warning", "-- ", "CMake Deprecation")):
+                blocks.append("\n".join(cur))
+                cur = None
+            else:
+                cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+
+def _missing_cmake_pkgs(out: str) -> set:
+    """Package names a FAILED configure could not find (error blocks only)."""
+    pk: set = set()
+    for b in _cmake_error_blocks(out):
+        pk |= set(_RE_CMAKE_NOTFOUND.findall(b)) | set(_RE_CMAKE_PROVIDED.findall(b))
+        for m in _RE_PKGCFG_MISSING.finditer(b):
+            pk |= {re.split(r"[<>=]", x.strip(" -"))[0]
+                   for x in m.group(1).split("\n") if x.strip(" -")}
+    return pk
+
+
+def _guarding_options(root, out: str) -> set:
+    """`-DOPT=OFF` for the project option that guards each failing configure call.
+
+    The error's call stack names the project file and line (`client/common/CMakeLists.txt:61
+    (pkg_check_modules)`); the nearest enclosing `if(WITH_FUSE)` whose name the tree declares with
+    `option(...)` is the switch that turns the dependency off. This is the project's own option
+    name, so it works where the WITH_<PKG> naming guess does not (fuse3 -> WITH_FUSE)."""
+    root = Path(root)
+    flags: set = set()
+    for b in _cmake_error_blocks(out):
+        for rel, ln in _RE_CMAKE_FRAME.findall(b):
+            f = (root / rel) if not rel.startswith("/") else Path(rel)
+            try:
+                if root not in f.resolve().parents:
+                    continue
+                lines = f.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            depth = 0
+            for i in range(min(int(ln), len(lines)) - 1, -1, -1):
+                t = lines[i].strip().lower()
+                if t.startswith("endif"):
+                    depth += 1
+                    continue
+                if t.startswith("if") and (t[2:3] in ("(", " ")):
+                    if depth:
+                        depth -= 1
+                        continue
+                    m = _RE_CMAKE_IF.match(lines[i])
+                    if m and not re.match(r"^\s*if\s*\(\s*NOT", lines[i], re.I) \
+                            and _declares_option(root, m.group(1)):
+                        flags.add(f"-D{m.group(1)}=OFF")
+                        break
+    return flags
+
+
+def _declares_option(root: Path, name: str) -> bool:
+    return name.upper() in _declared_options(str(root))
+
+
+@functools.lru_cache(maxsize=8)
+def _declared_options(root: str) -> frozenset:
+    """Every `option(NAME ...)` / `cmake_dependent_option(NAME ...)` the tree declares (our own
+    `_lykos_cmake_*` build dirs excluded)."""
+    pat = re.compile(r"\b(?:option|cmake_dependent_option)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
+    names: set = set()
+    base = Path(root)
+    for f in list(base.rglob("CMakeLists.txt")) + list(base.rglob("*.cmake")):
+        if any(part.startswith("_lykos_cmake") for part in f.relative_to(base).parts):
+            continue
+        try:
+            names |= {n.upper() for n in pat.findall(f.read_text(errors="replace"))}
+        except OSError:
+            continue
+    return frozenset(names)
 
 
 def _find_fuzz_preload(root: Path):
@@ -1843,6 +2358,21 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
             # ELF, which the concolic rung needs -- angr loads the harness with auto_load_libs=False, so
             # a parser left in a .so would never be explored.
             f"-DBUILD_SHARED_LIBS={'ON' if shared else 'OFF'}", "-DCMAKE_BUILD_TYPE=Debug"]
+    if sanitize:
+        # FORCE ASan via the compiler/linker flags, not only the project's own WITH_SANITIZE_ADDRESS
+        # option. A project may gate that option behind its own compiler detection and SILENTLY skip
+        # it: FreeRDP wraps `add_compile_options(-fsanitize=address)` in
+        # `if(CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_GNUCC)`, a NON-STANDARD variable unset when
+        # the compiler is passed by path -- so the whole library built with NO address instrumentation
+        # and every heap overflow inside it was invisible (the fuzzers and the ladder found nothing on
+        # FreeRDP for this reason, not for lack of bugs). Appending the flags to CMAKE_*_FLAGS applies
+        # them to every translation unit and the shared libraries regardless of the project's guard;
+        # clang de-duplicates if the project also adds them. Only on the ASan build -- the clean
+        # EXPLORE build must stay un-instrumented for angr.
+        _asan = "-fsanitize=address -fno-omit-frame-pointer -g"
+        base += [f"-DCMAKE_C_FLAGS={_asan}", f"-DCMAKE_CXX_FLAGS={_asan}",
+                 "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address",
+                 "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address"]
     preload = _find_fuzz_preload(root)
     if preload:
         base += ["-C", str(preload)]
@@ -1858,12 +2388,16 @@ def cmake_build_harnesses(root, *, timeout: int = 600, deadline: float | None = 
         if rc == 0 or _time.time() >= deadline:
             break
         out = (r.stdout or "") + (r.stderr or "")
-        pkgs = (set(_RE_CMAKE_NOTFOUND.findall(out)) | set(_RE_CMAKE_PROVIDED.findall(out))) - disabled
-        if not pkgs:
+        pkgs = _missing_cmake_pkgs(out) - disabled
+        opts = _guarding_options(root, out) - disabled
+        if not pkgs and not opts:
             break
         for pk in pkgs:
             flags += _cmake_disable_flags(pk)
             disabled.add(pk)
+        for o in opts:
+            flags.append(o)
+            disabled.add(o)
     res["log"] = log
     if rc != 0:
         return res
@@ -2023,15 +2557,20 @@ class BuildCache:
 
 def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
                     harness_kind: str | None = None, timeout: int = 300,
-                    spec: dict | None = None, cache: BuildCache | None = None) -> dict:
+                    spec: dict | None = None, cache: BuildCache | None = None,
+                    sanitize: bool = True) -> dict:
     """Build a libFuzzer target from the project at `root`. Uses an in-tree LLVMFuzzerTestOneInput
     if present, else synthesizes one. Returns {ok, binary, harness, log}.
 
     `spec` names WHICH harness to build (see `plan_harnesses`); without one this resolves the
     strongest, which is what it has always done. `cache` carries the library's compiled objects
-    between calls so building a second harness does not recompile the library.
+    between calls so building a second harness does not recompile the library. `sanitize` False
+    builds the fuzzer-only EXPLORE variant (`_SAN_EXPLORE`, no ASan) that the concolic rung explores
+    -- the per-TU path honors it; the cmake in-tree fallback stays ASan (it is not on the synthesized
+    path this flag serves).
     """
     root = Path(root).resolve()
+    san = _SAN if sanitize else _SAN_EXPLORE
     if spec is None:
         if harness_fn:
             spec = fn_spec(root, harness_fn, harness_kind)
@@ -2055,7 +2594,7 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     ensure_configured(root, timeout=timeout)
     tmp = Path(tempfile.mkdtemp(prefix="lykos-lf-"))
     try:
-        res = _build_in(root, out, tmp, spec, kind, cxx, timeout, cache)
+        res = _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=san)
     finally:
         # any raise between mkdtemp and the old trailing rmtree (a synth helper, a path outside
         # the tree, a compile-pool error) leaked one lykos-lf-* directory per call
@@ -2098,7 +2637,152 @@ def _cmake_cached(cache, root, timeout):
     return res
 
 
-def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
+def _cmake_build_dir(root, sanitize: bool) -> Path:
+    """The config-keyed cmake build dir `cmake_build_harnesses` writes for the SHARED build of this
+    sanitize config (the name is deterministic, so a standalone driver can find the build's
+    compile_commands.json and shared libraries without re-deriving them)."""
+    return Path(root) / f"_lykos_cmake_sh_{'asan' if sanitize else 'clean'}"
+
+
+def _cmake_compile_flags(build_dir, *, prefer: str | None = None) -> list:
+    """The `-I`/`-D`/`-isystem` flags the project's OWN build used to compile a translation unit,
+    read from `build_dir/compile_commands.json`. A synthesized driver compiled with these sees the
+    exact include graph and config defines the library was built with -- the generated config
+    headers (FreeRDP's `winpr/config.h`), the private include dirs, `-DFREERDP_EXPORTS`, etc. --
+    which a hand-guessed flag set cannot reproduce. `prefer` (a path substring, e.g. the parser's
+    own library dir) picks a TU from that library so its private include dirs are present."""
+    import json as _json
+    import shlex as _shlex
+    try:
+        cc = _json.loads((Path(build_dir) / "compile_commands.json").read_text())
+    except (OSError, ValueError):
+        return []
+    tus = [e for e in cc if str(e.get("file", "")).endswith((".c", ".cc", ".cpp", ".cxx"))]
+    if not tus:
+        return []
+    pick = (next((e for e in tus if prefer and prefer in e["file"]), None)) or tus[0]
+    args = _shlex.split(pick["command"]) if "command" in pick else list(pick.get("arguments", []))
+    flags, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "-isystem" and i + 1 < len(args):
+            flags += [a, args[i + 1]]
+            i += 2
+            continue
+        if a.startswith(("-I", "-D", "-isystem")):
+            flags.append(a)
+        i += 1
+    return flags
+
+
+def _exported_symbol(libs, fn: str) -> bool:
+    """True when `fn` is a DEFINED, dynamically-exported symbol of one of the built shared libs.
+    A standalone driver links the parser from the library's `.so`, so a `static` function (not in
+    the dynamic symbol table) cannot be driven this way -- reported honestly rather than forced."""
+    pat = re.compile(r"^[0-9a-fA-F]+\s+[TtWw]\s+" + re.escape(fn) + r"$", re.M)
+    for lib in libs or ():
+        try:
+            r = subprocess.run(["nm", "-D", "--defined-only", str(lib)],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if pat.search(r.stdout or ""):
+            return True
+    return False
+
+
+def build_stream_synth(root, out: Path, *, fn: str, sanitize: bool = True,
+                       timeout: int = 600, cache: "BuildCache | None" = None) -> dict:
+    """Synthesize and build a STREAM-AWARE libFuzzer driver for a parser the plain `(buf,size)`
+    synthesizer rejects -- a function that reads attacker bytes THROUGH a project stream object
+    (e.g. FreeRDP's `wStream`) and writes an opaque context/out struct (`analyze/driver_synth`).
+    Those signatures are the norm in a protocol/format library and the reason a whole-library fuzz
+    of the few shipped harnesses reaches almost nothing: the vulnerable parsers have no driver.
+
+    This needs the project's CMAKE build -- the generated config headers, the shared libraries and
+    the exact compile flags -- so it is a cmake-only path (reusing the shared build
+    `cmake_build_harnesses` already produced). Returns {ok, binary, lib_dirs, harness, log}, shaped
+    like `build_libfuzzer` so `synth_confirm` can run the SAME confirmation ladder on it.
+
+    0-FP boundary -- builds ONLY when all three hold, and declines honestly (never forces) otherwise:
+      1. the project has a detectable stream idiom (`detect_stream_idiom`);
+      2. `fn`'s signature is stream-synthesisable (a byte-delivery param, no callbacks);
+      3. `fn` is an EXPORTED symbol of a built shared library (a static parser cannot be linked
+         from a standalone driver -- that one needs in-tree-harness driving instead).
+    The confirmation itself stays sound downstream: the ladder's ASan replay counts a fault only on
+    a parsed sanitizer class with a passing negative control, so a defensive `WINPR_ASSERT` abort
+    (no sanitizer report) never confirms, and a zeroed-context null-deref that fires on every input
+    fails the negative control.
+    """
+    from . import driver_synth as DS
+    root = Path(root).resolve()
+    idiom = DS.detect_stream_idiom(root)
+    if idiom is None:
+        return {"ok": False, "binary": None, "log": "no project stream idiom detected"}
+    try:
+        params = fn_params(root, fn)
+    except Exception:                                        # noqa: BLE001 -- unreadable signature
+        params = []
+    if not params or not DS.synthesisable(params, idiom):
+        return {"ok": False, "binary": None,
+                "log": f"{fn}: signature is not stream-synthesisable"}
+    cc = _clang(False)
+    if not cc:
+        return {"ok": False, "binary": None, "log": "clang not found"}
+    cres = _cmake_cached(cache, root, timeout) if sanitize else cmake_build_harnesses(
+        root, timeout=timeout, sanitize=False, shared=True)
+    if not cres or not cres.get("ok"):
+        return {"ok": False, "binary": None,
+                "log": "cmake build unavailable: " + ((cres or {}).get("log") or "")[-400:]}
+    libs = cres.get("libraries") or _collect_cmake_libraries(_cmake_build_dir(root, sanitize))
+    lib_dirs = cres.get("lib_dirs") or []
+    if not _exported_symbol(libs, fn):
+        return {"ok": False, "binary": None,
+                "log": (f"{fn} is not an exported symbol of a built shared library; a static "
+                        f"parser cannot be driven by a standalone harness (needs in-tree-harness "
+                        f"driving instead)")}
+    hdr = _declared_in_header(root, fn)
+    hdr_name = hdr.name if hdr is not None else None
+    extra_inc = ["-I" + str(hdr.parent)] if hdr is not None else []
+    def_file = fn_def_file(root, fn)
+    prefer = None
+    if def_file is not None:
+        try:
+            prefer = "/" + def_file.parent.relative_to(root).as_posix() + "/"
+        except ValueError:
+            prefer = None
+    flags = _cmake_compile_flags(_cmake_build_dir(root, sanitize), prefer=prefer)
+    libnames = []
+    for lib in libs:
+        m = re.match(r"lib(.+?)\.so", Path(lib).name)
+        if m and ("-l" + m.group(1)) not in libnames:
+            libnames.append("-l" + m.group(1))
+    if not libnames:
+        return {"ok": False, "binary": None, "log": "no shared library to link the parser from"}
+    san = ["-fsanitize=fuzzer,address"] if sanitize else ["-fsanitize=fuzzer"]
+    tmp = Path(tempfile.mkdtemp(prefix="lykos-ssyn-"))
+    try:
+        drv = tmp / "stream_driver.c"
+        drv.write_text(DS.synth_stream_harness(fn, params, idiom, header=hdr_name))
+        cmd = ([cc, "-g", "-O1", "-fno-omit-frame-pointer", *san, *flags, *extra_inc,
+                str(drv), "-o", str(out)]
+               + ["-L" + str(d) for d in lib_dirs] + libnames
+               + ["-Wl,-rpath," + str(d) for d in lib_dirs])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"ok": False, "binary": None, "log": f"driver compile could not run: {e!r}"}
+        if r.returncode != 0 or not Path(out).exists():
+            return {"ok": False, "binary": None,
+                    "log": f"stream driver for {fn}() failed to compile:\n" + (r.stderr or "")[-1500:]}
+        return {"ok": True, "binary": str(out), "lib_dirs": [str(d) for d in lib_dirs],
+                "harness": f"stream-synth driver for {fn}() via {idiom.name}",
+                "log": f"built stream-synth driver for {fn}() ({idiom.name})"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache, san=None) -> dict:
     srcs = _sources(root, exclude_main=True)
     # Compile THE LIBRARY the entry point belongs to, not the whole repository. Building every
     # source in a real project drags in `contrib/` and `test/`, which reference symbols that do
@@ -2149,16 +2833,31 @@ def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
         # `cstring` for everything, which delivers the fuzz bytes as a string -- wrong for every
         # entry point that takes a FILENAME, i.e. every file-format library.
         fk = spec.get("fn_kind") or harness_kind_for(root, fn)
-        if fk == "file":
+        _raw = _raw_params(root, fn)
+        _sh = (synth_struct_harness(root, fn, _raw)
+               if fk == "buflen" and not cxx and any(constructible(root, a) for a in _raw)
+               else None)
+        if _sh is not None:
+            h.write_text(_sh)
+            fk = "buflen+struct"
+        elif fk == "file":
             params = fn_params(root, fn)
             h.write_text(synth_file_harness(fn, params, closer=fn_closer(root, fn),
                                             cxx=cxx, c_linkage=c_linkage))
-        else:
+        elif _sh is None:
             h.write_text(synth_harness(fn, kind=fk, arg_type=fn_first_arg_type(root, fn),
                                        cxx=cxx, c_linkage=c_linkage,
                                        params=fn_params(root, fn)))
         srcs = srcs + [h]
         harness_desc = f"synthesized for {fn}() [{fk}]"
+        # The function may live in a PROGRAM's translation unit, beside its `main` -- which
+        # `_sources(exclude_main=True)` dropped, so the driver could never link ("undefined
+        # reference to <fn>"). That is the common shape of an exported-but-undriven parser in a
+        # single-file tool, and exactly what the UC/synth_confirm proof path is for.
+        shim = _program_unit_shim(def_file, srcs, tmp)
+        if shim is not None:
+            srcs = srcs + [shim]
+            harness_desc += f" [program unit {def_file.name}, its main() renamed]"
     # What a configured autotools build would have on its command line. Without it expat's
     # xmlparse.c does not compile at all (see `config_defines`).
     incs = list(config_defines(root))
@@ -2167,36 +2866,71 @@ def _build_in(root, out, tmp, spec, kind, cxx, timeout, cache) -> dict:
     # The harness is REQUIRED: skipping a translation unit is right for a platform shim or a test,
     # and wrong for the one file that defines the entry point. Silently skipping it produced a link
     # error about `LLVMFuzzerTestOneInput` instead of the compile error that caused it.
-    res = _compile_and_link(srcs, incs, out, tmp, timeout, required=h, cache=cache)
+    res = _compile_and_link(srcs, incs, out, tmp, timeout, required=h, cache=cache, san=san)
     res["harness"] = harness_desc
     res["harness_id"] = spec["id"]
     res["entry"] = spec.get("entry")
     return res
 
 
-def _obj_name(src, incs) -> str:
+#: what a program unit's `main` is renamed to when the unit is linked into a fuzz driver
+_PROGRAM_MAIN = "lykos_program_main"
+
+
+def _program_unit_shim(def_file, srcs, tmp: Path):
+    """A wrapper translation unit that compiles `def_file` -- a source file with its own `main`,
+    excluded from the build -- with that `main` renamed, so a driver can link the OTHER functions in
+    it without colliding with libFuzzer's `main`. None when `def_file` is already being compiled (no
+    main) or is not a C/C++ file.
+
+    The wrapper `#include`s the original by absolute path, so quoted includes still resolve from the
+    original file's directory and DWARF/ASan line attributions still name the original file and line
+    -- steering to a bug line and the crash's file:line are unchanged. The rename is a macro, scoped
+    to this one unit: every other source keeps its own `main` spelling (it has none)."""
+    if def_file is None or Path(def_file).suffix not in _SRC_EXT:
+        return None
+    d = Path(def_file).resolve()
+    if any(Path(s).resolve() == d for s in srcs):
+        return None
+    shim = tmp / f"_lykos_prog_{hashlib.sha1(str(d).encode()).hexdigest()[:10]}{d.suffix}"
+    shim.write_text(f"#define main {_PROGRAM_MAIN}\n#include \"{d}\"\n")
+    return shim
+
+
+def _san_tag(san) -> str:
+    """A short stable tag for a sanitizer flag set, to key cached objects by their instrumentation
+    (so an ASan object is never reused for a clean EXPLORE build)."""
+    return hashlib.sha1("\x00".join(san).encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _obj_name(src, incs, sant: str = "") -> str:
     """A stable object-file name for one translation unit: content-addressed by what decides its
-    contents (the path and the flags), so a cached object is only reused for the same compile."""
-    key = str(src) + "\x00" + "\x00".join(incs)
+    contents (the path, the flags, and the sanitizer set), so a cached object is only reused for the
+    same compile."""
+    key = str(src) + "\x00" + "\x00".join(incs) + "\x00" + sant
     return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:20] + ".o"
 
 
-def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
+def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None, san=None) -> list:
     """Compile each translation unit with the driver for ITS language. Returns [(src, obj, err)].
 
     `cache` makes the library's objects outlive one build, which is what lets several harnesses
-    share one compile of the library (see `BuildCache`).
+    share one compile of the library (see `BuildCache`). `san` is the sanitizer/instrumentation flag
+    set (default `_SAN`); it is part of the cache key and object name so an ASan object is never
+    reused for a clean EXPLORE build or vice versa.
     """
+    san = san or _SAN
+    sant = _san_tag(san)
     out_dir = cache.dir if cache is not None else tmp
-    todo = [s for s in srcs if cache is None or (str(s), tuple(incs)) not in cache.objs]
+    todo = [s for s in srcs if cache is None or (str(s), tuple(incs), sant) not in cache.objs]
 
     def _one(src):
         src = Path(src)
-        obj = out_dir / _obj_name(src, incs)
+        obj = out_dir / _obj_name(src, incs, sant)
         drv = _clang(src.suffix in _CXX_EXT)
         if not drv:
             return None, f"{src.name}: no clang driver"
-        argv = [drv] + _SAN + ["-c", str(src), "-o", str(obj)] + incs
+        argv = [drv] + san + ["-c", str(src), "-o", str(obj)] + incs
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError) as e:
@@ -2212,7 +2946,7 @@ def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
                 fresh[str(src)] = got
     results = []
     for src in srcs:
-        k = (str(src), tuple(incs))
+        k = (str(src), tuple(incs), sant)
         if str(src) in fresh:
             got = fresh[str(src)]
             if cache is not None:
@@ -2226,7 +2960,7 @@ def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
 
 
 def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, required=None,
-                      cache=None) -> dict:
+                      cache=None, san=None) -> dict:
     """Compile every translation unit, then link what compiled.
 
     One source file decided the language for the whole project, and `any(.cxx)` is true for
@@ -2242,9 +2976,10 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
     reported. The count of skipped units is in the log either way, so a build that quietly
     dropped half the project is visible rather than silently thinner than it looks.
     """
+    san = san or _SAN
     objs, failed, logs = [], [], []
     failed_paths = []
-    for src, obj, err in _compile_objs(srcs, incs, tmp, timeout, cache=cache):
+    for src, obj, err in _compile_objs(srcs, incs, tmp, timeout, cache=cache, san=san):
         if obj is not None:
             objs.append(obj)
         else:
@@ -2263,7 +2998,7 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
     # Link with the C++ driver when any C++ object is present, so libstdc++ comes along.
     link_cxx = any(Path(s).suffix in _CXX_EXT for s in srcs)
     drv = _clang(link_cxx) or _clang(False)
-    argv = [drv] + _SAN + [str(o) for o in objs] + ["-o", str(out)]
+    argv = [drv] + san + [str(o) for o in objs] + ["-o", str(out)]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
@@ -2295,7 +3030,7 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
                 "header or a missing -D."))[-4000:]}
         libs = _libs_for_undefined(err)
         if libs:
-            retry = [drv] + _SAN + [str(o) for o in objs] + libs + ["-o", str(out)]
+            retry = [drv] + san + [str(o) for o in objs] + libs + ["-o", str(out)]
             try:
                 r2 = subprocess.run(retry, capture_output=True, text=True, timeout=timeout)
                 logs.append("relinked with " + " ".join(libs))
@@ -2400,7 +3135,8 @@ _UNITS_RE = re.compile(r"stat::number_of_executed_units:\s*(\d+)")
 #: Every progress line is prefixed with the execution count (`#4096\tpulse  cov: 211 ...`). The
 #: final-stats block does not print when the run ends in a crash, which is precisely the run whose
 #: count matters, so the counter is read from the log as well.
-_TICK_RE = re.compile(r"^#(\d+)\s", re.M)
+# `#1234\tNEW ...` in the normal loop, `#55042: cov: ...` in fork mode (-fork=N)
+_TICK_RE = re.compile(r"^#(\d+):?\s", re.M)
 
 
 def executions(log: str) -> int:
@@ -2440,6 +3176,19 @@ def _report_has_source(report: str | None) -> bool:
         return False
 
 
+def _fault_signature(report: str) -> str:
+    """A defect's identity in a sanitizer report: its first SOURCE frame (file:line), else its
+    summary line -- so repeated hits of one bug collapse and two bugs stay two."""
+    m = re.search(r"#\d+ 0x[0-9a-f]+ in \S+ (\S+:\d+)", report or "")
+    if m:
+        return m.group(1).rsplit("/", 1)[-1]
+    m = re.search(r"([^\s/]+:\d+):\d+: runtime error", report or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"SUMMARY: (.+)", report or "")
+    return (m.group(1)[:120] if m else "")
+
+
 def _replay_report(binary, workdir: Path, data: bytes) -> str:
     """Replay ONE input through the harness directly (`binary <file>`, no fuzzing loop) and return
     the sanitizer report, or "".
@@ -2470,10 +3219,56 @@ def _replay_report(binary, workdir: Path, data: bytes) -> str:
     return fault_report((r.stderr or "") + (r.stdout or "")) or ""
 
 
+#: Inputs any honest call into a byte-consuming API must survive: nothing, and one byte.
+_TRIVIAL_INPUTS = (b"", b"A")
+
+
+def trivial_input_crash(binary, workdir, *, lib_dirs: list | None = None) -> str | None:
+    """The sanitizer/signal report when a SYNTHESIZED harness crashes on a trivial input, else None.
+
+    A synthesized call invents every argument past the bytes. When one of them is wrong -- NULL
+    for a struct the library dereferences (md4c's `md_parse(text, size, NULL, NULL)` reads
+    `parser->abi_version` first), a zero capacity -- the harness crashes inside the library on
+    the very first input, and that crash would be filed as a confirmed library defect. A real
+    parser handles an empty or one-byte input; a harness that cannot is testing our call, not the
+    library, so it is not fuzzed at all."""
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0:" + env.get("ASAN_OPTIONS", "")
+    if lib_dirs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [str(d) for d in lib_dirs] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH")
+                                          else []))
+    for i, data in enumerate(_TRIVIAL_INPUTS):
+        f = workdir / f"trivial{i}"
+        f.write_bytes(data)
+        try:
+            r = _run_group([str(binary), str(f)], timeout=30, env=env, cwd=str(workdir))
+        except subprocess.TimeoutExpired:
+            continue                                     # a hang is not this gate's question
+        except OSError:
+            return None
+        out = (r.stderr or "") + (r.stdout or "")
+        if r.returncode != 0 and ("ERROR: AddressSanitizer" in out or "deadly signal" in out
+                                  or "runtime error:" in out or r.returncode < 0):
+            head = next((ln for ln in out.splitlines() if "ERROR:" in ln or "deadly" in ln), "")
+            return f"crashes on a {len(data)}-byte input: {head.strip()[:200]}"
+    return None
+
+
+#: How many crash files a keep-going run replays for their own reports (each is one exec).
+_KEEP_GOING_REPLAYS = 64
+
+
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
-                  corpus: list | None = None, lib_dirs: list | None = None) -> dict:
+                  corpus: list | None = None, lib_dirs: list | None = None,
+                  keep_going: bool = False, fork: int = 1, rss_limit_mb: int = 2048,
+                  launcher: list | None = None) -> dict:
     """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
-    Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed."""
+    Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed.
+    `rss_limit_mb` is libFuzzer's own per-process RSS cap; `launcher` is an optional argv prefix the
+    fuzzing process runs under (e.g. a memory-capped `systemd-run --user --scope -p MemoryMax=...`)."""
     workdir = Path(workdir)
     art = workdir / "lf-artifacts"
     art.mkdir(parents=True, exist_ok=True)
@@ -2490,11 +3285,24 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         env["LD_LIBRARY_PATH"] = os.pathsep.join(        # project's .so dirs to load
             [str(d) for d in lib_dirs] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     argv = [str(binary), str(corpus_dir), f"-max_total_time={seconds}", f"-max_len={max_len}",
-            f"-artifact_prefix={art}/", "-print_final_stats=1", "-rss_limit_mb=2048"]
+            f"-artifact_prefix={art}/", "-print_final_stats=1", f"-rss_limit_mb={int(rss_limit_mb)}",
+            # Close the TARGET's stderr during execution. A chatty target that logs per input (FreeRDP's
+            # WLog prints a connection-state ERROR on every input) floods stderr and throttles the
+            # campaign to a crawl -- measured on FreeRDP's TestFuzzCoreClient: ~0.2 effective exec/s and
+            # 467 MB of log in 15s, vs ~480 exec/s with this flag (a ~2500x recovery). libFuzzer dups
+            # stderr for its OWN stats and ASan's crash report still reaches stderr (verified), so
+            # `fault_report` below and the crash harvest are unaffected -- only the routine spew is gone.
+            "-close_fd_mask=2"]
+    if keep_going:
+        # Past the first crash. A plain run STOPS at it: md4c's md_html harness found a heap
+        # overflow after 9,705 executions and the rest of its slice went to another entry point,
+        # while fork mode on the same harness reaches a second, different defect within seconds.
+        argv += [f"-fork={max(1, fork)}", "-ignore_crashes=1", "-ignore_timeouts=1", "-ignore_ooms=1"]
     crashes = []
     before = set(art.iterdir())
     try:
-        r = _run_group(argv, timeout=seconds + 30, env=env, cwd=str(workdir))
+        r = _run_group_live([str(a) for a in (launcher or [])] + argv, timeout=seconds + 30,
+                            env=env, cwd=str(workdir))
         out = (r.stderr or "") + (r.stdout or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stderr or b"").decode("latin-1", "ignore") if isinstance(e.stderr, bytes) else (e.stderr or "")
@@ -2502,6 +3310,29 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         return {"crashes": [], "log": f"libFuzzer binary could not be run: {e!r}", "corpus": [],
                 "execs": 0}
     report = fault_report(out)
+    if keep_going:
+        # One log, many crashes: the loop's report belongs to whichever crashed LAST. Each file is
+        # replayed on its own for its own report, and one input is kept per distinct fault site.
+        seen_sig: set = set()
+        for f in sorted(set(art.iterdir()) - before)[:_KEEP_GOING_REPLAYS]:
+            kind = next((k for pre, k in ARTIFACT_KINDS.items() if f.name.startswith(pre)), None)
+            if not kind:
+                continue
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            rep = _replay_report(binary, workdir, data) if kind == "crash" else ""
+            if kind == "crash" and not rep:
+                continue                                 # did not reproduce alone: not kept
+            sig = (kind, _fault_signature(rep))
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            crashes.append({"input": data, "report": rep, "kind": kind, "artifact": f.name,
+                            "reproduced": bool(rep) or kind != "crash"})
+        return {"crashes": crashes, "log": out[-4000:], "corpus": _harvest(corpus_dir),
+                "execs": executions(out)}
     for f in sorted(set(art.iterdir()) - before):
         kind = next((k for pre, k in ARTIFACT_KINDS.items() if f.name.startswith(pre)), None)
         if kind:

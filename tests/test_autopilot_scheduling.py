@@ -16,7 +16,7 @@ import pathlib
 import pkgutil
 
 import lykos.analyze as analyze_pkg
-from lykos.analyze.orchestrate import _CASE, _PLAN_STAGES, _TARGET
+from lykos.analyze.orchestrate import _CASE, _PLAN_STAGES, _TARGET, _enqueue_fn
 
 #: Stages that are deliberately NOT part of an autopilot run, each with the reason.
 _EXEMPT = {
@@ -90,6 +90,28 @@ def test_the_params_free_stages_really_take_no_required_params():
         assert stage not in _NO_PARAMS, stage
 
 
+def test_a_no_params_stage_does_not_read_params_it_is_never_given():
+    """`_NO_PARAMS` drops ALL params, the budget slice's `max_seconds` included. A stage whose
+    code reads `ctx.params` (beyond the generic control keys) is therefore never told what the
+    autopilot computed for it. heap_trace/oob_index were listed and read `baseline_nonterm`: on a
+    libFuzzer harness (a bare run never exits) heap_trace drove 12 sequences to its own ceiling,
+    ~100 s per FreeRDP harness, on a 70 s target share."""
+    import importlib
+    import re
+
+    from lykos.analyze import stages as _stages
+    bad = []
+    for s in _stages.STAGES:
+        if not s.no_params or s.scope != "target":
+            continue
+        fn = _enqueue_fn(_TARGET[s.name])
+        src = pathlib.Path(importlib.import_module(fn.__module__).__file__).read_text()
+        keys = set(re.findall(r"""\(ctx\.params or \{\}\)\.get\(["'](\w+)""", src))
+        if keys:
+            bad.append((s.name, sorted(keys)))
+    assert not bad, f"no_params stages that read params they never receive: {bad}"
+
+
 def test_every_stage_the_pass_calls_is_in_the_enqueue_map():
     """The mirror of the test above, and the one that was missing. `_run_target_stage` looks the
     stage up in `_TARGET`, and a KeyError there is swallowed by its own `except Exception`: the
@@ -137,3 +159,26 @@ def test_the_api_dispatch_tables_are_derived_from_the_autopilot_registry():
     from lykos.api.server import Handler
     assert Handler._TARGET_STAGES == _TARGET, "the API target-stage table drifted from orchestrate._TARGET"
     assert Handler._CASE_STAGES == _CASE, "the API case-stage table drifted from orchestrate._CASE"
+
+
+def test_uc_discovery_runs_before_the_synth_confirm_proof_that_consumes_it():
+    """synth_confirm proves uc_symbolic's leads, so UC must run FIRST. In the old order a UC lead
+    was filed after the only stage that could prove it had already run -- measured on a real
+    autopilot run, where synth_confirm declined 'no unproven source/UC candidates' and UC then
+    filed the very lead it would have proven."""
+    src = pathlib.Path(analyze_pkg.__path__[0], "orchestrate.py").read_text()
+    body = src.split("def run_case_autopilot", 1)[1]
+    assert body.index('"uc_symbolic"') < body.index('"synth_confirm"')
+
+
+def test_a_replay_keeps_the_invocation_its_input_was_found_under():
+    """jhead's crash needs `-exifmap -mkexif @@`; the operator gave `@@`. root_cause was handed the
+    operator's argv, replayed without the flags and reported 'did not fault' for a verified crash."""
+    from lykos.analyze.orchestrate import _apply_overrides
+    over = {"argv": ["@@"], "input_mode": "file"}
+    p = _apply_overrides("root_cause", {"input_sha": "ab", "argv": ["-exifmap", "-mkexif", "@@"],
+                                        "input_mode": "file"}, over)
+    assert p["argv"] == ["-exifmap", "-mkexif", "@@"]
+    # a stage with no recorded input still takes the operator's facts
+    assert _apply_overrides("fuzz", {}, over)["argv"] == ["@@"]
+    assert _apply_overrides("root_cause", {"input_sha": "ab"}, over)["argv"] == ["@@"]

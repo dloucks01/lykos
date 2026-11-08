@@ -37,12 +37,46 @@ _HELPER = Path(__file__).with_name("heaptrace.py")
 _WORD = 8
 
 
-def _array_candidates(objects: dict) -> list[dict]:
+
+def _static_site(ctx, target, pc, load_base, pie):
+    """The watchpoint's runtime PC in the coordinates every other finding uses (the decompiler's).
+    A PIE runs at an ASLR base: filing the raw PC (0x55555555cdd9) matched no function, so the
+    finding's reachability stayed 'unknown' and the code view could not open it."""
+    try:
+        if pc is None:
+            return None
+        a = int(str(pc), 16)
+        if not pie or not load_base:
+            return hex(a)
+        link = a - int(str(load_base), 16)
+        from ...db.dao import FunctionDAO
+        from .. import elf
+        from ..debug.rootcause import image_base
+        blob = ctx.content.path(target.sha256).read_bytes()
+        base = image_base(FunctionDAO(ctx.conn).list_by_target(target.id), elf.parse(blob).entry) or 0
+        return hex(link + base)
+    except Exception:                                    # noqa: BLE001 -- keep the raw pc
+        return str(pc) if pc is not None else None
+
+def _array_candidates(objects: dict, exclude=frozenset()) -> list[dict]:
     """Fixed-size global arrays worth guarding: a word-multiple OBJECT of at least two elements
     (a pointer/handle table). Scalars (size 8) and oversized blobs are skipped."""
+    from ..toolchain_runtime import is_toolchain_runtime
     out = []
     for name, (addr, size) in (objects or {}).items():
         if "@" in name or size % _WORD or not (2 * _WORD <= size <= (1 << 20)):
+            continue
+        # the sanitizer's / libFuzzer's own tables are not the program's (an ASan harness
+        # otherwise probes __sanitizer::internal_alloc_placeholder, which the runtime itself
+        # touches on every run)
+        if is_toolchain_runtime(name) or name in exclude:
+            continue
+        # compiler-generated C++ objects (vtables, typeinfo + names, VTTs, construction vtables,
+        # guard variables) are not tables an input indexes
+        if name.startswith(("_ZTV", "_ZTS", "_ZTI", "_ZTT", "_ZTC", "_ZGV")):
+            continue
+        # string literals, __func__ names and the crt ABI note are bytes, not pointer tables
+        if name.startswith((".str", "__func__.", "__PRETTY_FUNCTION__.")) or name == "__abi_tag":
             continue
         out.append({"name": name, "addr": addr, "size": size, "cap": size // _WORD,
                     "stride": _WORD})
@@ -186,6 +220,11 @@ def _file_oob_index_candidates(ctx, target, arrays, why) -> int:
     return n
 
 
+def _runtime_symbols(blob):
+    from ..toolchain_runtime import runtime_symbols
+    return runtime_symbols(blob)
+
+
 def _static_arrays(ctx, target):
     """Fixed-size arrays recovered WITHOUT executing the target: symbol-table objects (arch-
     independent) first, then the stripped-binary disassembly recovery. Best-effort."""
@@ -194,7 +233,7 @@ def _static_arrays(ctx, target):
     except Exception:                                    # noqa: BLE001
         return []
     try:
-        arrs = _array_candidates(exploit.elf_objects_sized(tb))
+        arrs = _array_candidates(exploit.elf_objects_sized(tb), _runtime_symbols(tb))
     except Exception:                                    # noqa: BLE001
         arrs = []
     if arrs:
@@ -246,7 +285,8 @@ def oob_index_stage(ctx) -> dict:
         return {}
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
-    sym_arrays = _array_candidates(exploit.elf_objects_sized(target_bytes))
+    sym_arrays = _array_candidates(exploit.elf_objects_sized(target_bytes),
+                                   _runtime_symbols(target_bytes))
     pie = (target.mitigations or {}).get("pie") == "on"
 
     workdir = Path(tempfile.mkdtemp(prefix="lykos-oob-"))
@@ -290,8 +330,9 @@ def oob_index_stage(ctx) -> dict:
             stride = arr.get("stride", _WORD)
             guards = [[arr["addr"] - stride, f"{arr['name']}[-1]"],
                       [arr["addr"] + arr["size"], f"{arr['name']}[{arr['cap']}]"]]
+            noisy = False
             for opt in idx_opts:
-                if found or ctx.should_cancel():
+                if found or noisy or ctx.should_cancel():
                     break
                 for boundary in (0, -1, arr["cap"], arr["cap"] + 1):
                     seq = prime + _drive(opt, model, boundary, width=width)
@@ -315,9 +356,18 @@ def oob_index_stage(ctx) -> dict:
                     except Exception:
                         observe.absorbed(_log, "skipping this item")
                         continue
+                    if rep.get("oob_index") and 0 <= boundary < arr["cap"]:
+                        # The guard fired on an IN-BOUNDS index: whatever touched the guard word
+                        # did not take this index from the input (the runtime or the program's
+                        # own bookkeeping walks past the table). That is not an out-of-bounds
+                        # index, and no later boundary on this table can be told from it.
+                        noisy = True
+                        break
                     if rep.get("oob_index"):
-                        ev = next((e for e in rep.get("events", [])
-                                   if e.get("error") == "oob-index"), {})
+                        ev = dict(next((e for e in rep.get("events", [])
+                                        if e.get("error") == "oob-index"), {}))
+                        ev["site"] = _static_site(ctx, target, ev.get("pc"), rep.get("load_base"),
+                                                  pie)
                         found = (arr, opt, boundary, seq, ev)
                         break
 
@@ -358,7 +408,8 @@ def oob_index_stage(ctx) -> dict:
             "cwe": "CWE-129", "title": "Improper validation of array index", "severity": "high",
             "detector": "oob_index", "state": "corroborated", "confidence": 0.85,
             "dedup_key": f"CWE-129:oobindex:{arr['name']}",
-            "function_addr": None, "site_addr": ev.get("pc"), "site_detail": arr["name"],
+            "function_addr": None, "site_addr": ev.get("site") or ev.get("pc"),
+            "site_detail": arr["name"],
             "evidence": [{"channel": "oob-index", "detail": detail}]})
         ctx.emit("oob_index.done", payload={
             "applicable": True, "oob_index": True, "array": arr["name"], "option": opt,
